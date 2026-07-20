@@ -1,0 +1,32 @@
+name: Test Model
+
+on:
+  push:
+    branches: [main, sabiyarn-mini]
+  pull_request:
+    branches: [main, sabiyarn-mini]
+env:
+  HF_TOKEN: ${{ secrets.HF_API_KEY }}
+  HF_DATASET_REVISION: "main"
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+      - name: Install dependencies
+        run: |
+          pip install pytest pyyaml python-dotenv
+
+      - name: Run unit tests
+        run: pytest tests/ -v
+
+      # - name: Train model on Modal
+      #   run: |
+      #     pip install modal
+      #     modal token set --token-id ${{ secrets.MODAL_TOKEN_ID }} --token-secret ${{ secrets.MODAL_TOKEN_SECRET }}
+      #     modal run training/modal_train.py::main

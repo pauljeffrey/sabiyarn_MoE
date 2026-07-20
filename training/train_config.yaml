@@ -1,0 +1,116 @@
+
+training: 
+  train_batch_size : 4
+  out_dir : "out"
+  eval_interval : 100
+  log_interval : 100
+  eval_iters : 200
+  eval_only : false  # if True, script exits right after the first eval
+  always_save_checkpoint : true  # if True, always save a checkpoint after each eval
+  gradient_accumulation_steps : 40  # used to simulate larger batch sizes (was 5 * 8)
+  decay_lr : True  # whether to decay the learning rate
+  warmup_iters : 20  # how many steps to warm up for
+  lr_decay_iters : 5000  # should be ~: max_iters per Chinchilla
+  min_lr : 6e-5  # minimum learning rate, should be ~: learning_rate/10 per Chinchilla
+  compile : true  # use PyTorch 2.0 to compile the model to be faster
+  display_model_output_iter : 128
+  use_cce : True  # to use cut cross entropy or not
+  scheduler: "cosine"
+  block_size: 32768
+  dtype: "bf16"
+  init_from: "hf"  # hf (HuggingFace hub) | resume (local ckpt)
+  resume_run_dir: ""
+  mode: "pretrain"  # pretrain | sft
+  hf_chkpt_path: "Aletheia-ng/SabiYarn_MoE_base"
+  schedule_trainable_layers: false
+
+tokenizer:
+  name: BeardedMonster/SabiYarn-32k
+  num_proc: 64
+  process_one_file_at_a_time: true
+
+model:
+  repo_name: Aletheia-ng/SabiYarn_MoE_translate_base
+  weights:
+    freeze_experts_only: false
+    freeze_pos_layer_only: true
+    freeze_emb_layer_only: false
+    freeze_router_layer_only: false
+    freeze_ffn_layer_only: false
+    freeze_attn_layer_only: false
+
+s3:
+  # Credentials are NOT stored here. Set S3_ACCESS_KEY_ID / S3_SECRET_ACCESS_KEY
+  # as env vars locally, or via the Modal "s3-secret" secret in production.
+  s3_endpoint: https://usc1.contabostorage.com
+  s3_bucket_name: sabiyarn-dataset
+
+# wandb logging
+wandb: 
+  log : true  # disabled by default
+  project : sabiyarn-ablations
+  run_name : ablation_1  # 'run' + str(time.time())
+  save_model_to_wandb: true
+  seed: 42
+
+# data
+data: 
+  pretrain_datasets: 
+    african:
+      - BeardeMonster/african_SFT
+    english:
+      - BeardedMonster/english_SFT
+  sft_datasets:
+    african: 
+      - BeardedMonster/african_sft
+    english:
+      - BeardedMonster/eng_sft
+  rl_datasets:
+      - Aletheia-ng/tds-sft
+  pretrain:
+    - eng_train_data_path : "datasets/eng_training.bin"
+    - afr_train_data_path : "datasets/training.bin"
+    - eval_data_path: "validation.bin"
+  sft:
+    - eng_train_data_path : "datasets/eng_sft_training.bin"
+    - afr_train_data_path : "datasets/nigerian_sft_training.bin"
+    - eval_data_path: "sft_validation.bin"
+  sampling:
+    - use_scheduled_sampling: false
+    - afr_sampling_weight: 0.5
+    - eng_sampling_weight: 0.5
+ 
+
+# adamw optimizer
+optimizer:
+  name : "adam"
+  learning_rate : 3e-4  # max learning rate
+  max_iters : 5000  # total number of training iterations
+  weight_decay : 1e-1
+  beta1 : 0.9
+  beta2 : 0.95
+  grad_clip : 1.0  # clip gradients at this value, or disable if :: 0.0
+  moe_aux_loss_weight: 0.01  # weight for MoE load-balancing auxiliary loss
+
+
+# DDP settings
+ddp:
+  rank : 0
+  backend : "nccl"
+  use_dp: False
+
+#Accelerate config
+accelerate: 
+  mixed_precision: "bf16"
+  zero_stage: 3
+  gradient_clipping: 1.0
+
+env:
+  world_size: 1
+  rank: 0
+
+modal:
+  num_nodes: 1
+  gpus_per_node: 2
+  gpu_type: "A100"
+
