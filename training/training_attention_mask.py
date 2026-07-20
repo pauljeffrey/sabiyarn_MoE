@@ -31,3 +31,14 @@ def build_document_causal_mask(input_ids: torch.Tensor, eos_token_id: int) -> to
     same_doc = doc_id.unsqueeze(2) == doc_id.unsqueeze(1)
 
     return (causal.unsqueeze(0) & same_doc).unsqueeze(1)
+
+
+
+if __name__ == "__main__":
+    # Example usage
+    input_ids = torch.tensor([[1, 2, 3, 4, 5, 6, 7, 8, 9, 10],
+                              [11, 12, 13, 14, 15, 16, 17, 5, 19, 20],
+                              [5, 22, 23, 5, 25, 26, 27, 28, 29, 30]])
+    eos_token_id = 5
+    mask = build_document_causal_mask(input_ids, eos_token_id)
+    print(mask)
