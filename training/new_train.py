@@ -43,7 +43,13 @@ except ImportError:
 try:
     import deepspeed
     HAS_DEEPSPEED = True
-except ImportError:
+except Exception:
+    # Broad except, not just ImportError: deepspeed's own git_version_info.py
+    # unconditionally calls is_compatible() on every registered op at import
+    # time with no error handling, so a container with torch's bundled CUDA
+    # runtime but no full CUDA toolkit/nvcc (e.g. a slim, non-devel image)
+    # raises deepspeed.ops.op_builder.builder.MissingCUDAException -- not an
+    # ImportError -- and crashes the whole `import deepspeed` statement.
     HAS_DEEPSPEED = False
 
 
