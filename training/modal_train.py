@@ -70,7 +70,16 @@ image = (
         "bitsandbytes",
         "psutil",
     )
-    .add_local_dir(str(ROOT), remote_path="/app", ignore=[".git", "__pycache__", "*.pyc", "out/", ".env"])
+    .add_local_dir(
+        str(ROOT), remote_path="/app",
+        ignore=[
+            ".git", "__pycache__", "*.pyc", "out/", ".env",
+            # Local-only dev state: Modal installs its own deps via pip_install
+            # above, and .venv can contain Unix-style symlinks (e.g. from uv)
+            # that Windows can't read when walking the directory to upload it.
+            ".venv", ".pytest_cache", ".claude",
+        ],
+    )
 )
 
 app = modal.App("sabiyarn-modal-training")
