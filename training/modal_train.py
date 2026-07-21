@@ -98,23 +98,8 @@ def _build_env(mode: str, override: bool) -> dict[str, str]:
     return env
 
 
-@app.function(
-    image=image,
-    gpu=GPU_SPEC,
-    cpu=NODE_CPU,
-    timeout=86400,
-    volumes={DATA_DIR: volume},
-    secrets=[modal.Secret.from_name("wandb-secret"), modal.Secret.from_name("hf-secret"), modal.Secret.from_name("s3-secret")],
-)
-@modal.experimental.clustered(size=NUM_NODES)
-def train_cluster(mode: str = "pretrain", override: bool = False):
-    cluster_info = modal.experimental.get_cluster_info()
-    rank = cluster_info.rank
-    master_addr = cluster_info.container_ips[0]
-
-    env = _build_env(mode, override)
+def _sync_data(env: dict[str, str]) -> None:
     os.makedirs(DATA_DIR, exist_ok=True)
-
     # Each node independently syncs its own local copy of the training data from
     # S3 (no-op if already present, e.g. via the shared Modal Volume). Both the
     # eng and afr bins are always synced -- training mixes them per-batch via
@@ -136,6 +121,52 @@ def train_cluster(mode: str = "pretrain", override: bool = False):
         if local_eval:
             env["VAL_DATA_PATH"] = local_eval
 
+
+_common_kwargs = dict(
+    image=image,
+    gpu=GPU_SPEC,
+    cpu=NODE_CPU,
+    timeout=86400,
+    volumes={DATA_DIR: volume},
+    secrets=[modal.Secret.from_name("wandb-secret"), modal.Secret.from_name("hf-secret"), modal.Secret.from_name("s3-secret")],
+)
+
+
+@app.function(**_common_kwargs)
+def train_single_node(mode: str = "pretrain", override: bool = False):
+    """Single node, `GPUS_PER_NODE` GPUs -- a plain Function, not clustered().
+
+    modal.experimental.clustered() reserves whole physical hosts and, on this
+    platform, requires the full GPU device count per node for the selected
+    GPU type (e.g. 8 for A100) even when num_nodes=1 -- it rejects partial
+    counts like 2. Single-node multi-GPU doesn't need that machinery at all;
+    --standalone torchrun on one container handles it directly.
+    """
+    env = _build_env(mode, override)
+    _sync_data(env)
+
+    cmd = [
+        "torchrun", "--standalone", f"--nproc_per_node={GPUS_PER_NODE}",
+        "-m", "training.new_train",
+    ]
+    print(f"[single node, {GPUS_PER_NODE} GPU(s)] launching: {' '.join(cmd)}")
+    subprocess.run(cmd, cwd="/app", env=env, check=True)
+    return True
+
+
+@app.function(**_common_kwargs)
+@modal.experimental.clustered(size=NUM_NODES)
+def train_cluster(mode: str = "pretrain", override: bool = False):
+    """True multi-node (num_nodes > 1). Modal requires gpus_per_node to be the
+    full device count for GPU_TYPE here (e.g. 8 for A100) -- partial counts
+    are rejected for clustered functions."""
+    cluster_info = modal.experimental.get_cluster_info()
+    rank = cluster_info.rank
+    master_addr = cluster_info.container_ips[0]
+
+    env = _build_env(mode, override)
+    _sync_data(env)
+
     cmd = [
         "torchrun",
         f"--nnodes={NUM_NODES}",
@@ -152,4 +183,7 @@ def train_cluster(mode: str = "pretrain", override: bool = False):
 
 @app.local_entrypoint()
 def main(mode: str = "pretrain", override: bool = False):
-    train_cluster.remote(mode=mode, override=override)
+    if NUM_NODES > 1:
+        train_cluster.remote(mode=mode, override=override)
+    else:
+        train_single_node.remote(mode=mode, override=override)

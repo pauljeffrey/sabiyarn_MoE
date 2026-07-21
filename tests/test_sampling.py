@@ -4,8 +4,8 @@ from training.load_config import load_train_config, sampling_weights
 def test_sampling_config_defaults_match_yaml():
     cfg = load_train_config("training/train_config.yaml")
     assert cfg.use_scheduled_sampling is False
-    assert cfg.eng_sampling_weight == 0.5
-    assert cfg.afr_sampling_weight == 0.5
+    assert cfg.eng_sampling_weight == 0.4
+    assert cfg.afr_sampling_weight == 0.6
 
 
 def test_fixed_sampling_holds_preset_regardless_of_iter():
