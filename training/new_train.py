@@ -126,6 +126,14 @@ class Trainer:
                 # copies of the model in host RAM across N GPUs.
                 cpu_ram_efficient_loading=True,
                 sync_module_states=True,
+                # Required for the freeze-policy config (freeze_*_layer_only):
+                # with the default use_orig_params=False, every parameter in
+                # one wrapped unit (e.g. a whole BlockJ, or the un-wrapped
+                # root containing wpe/ln_f) must share the same requires_grad,
+                # which any partial freeze violates. use_orig_params=True lets
+                # FSDP mix frozen and trainable parameters within a unit (this
+                # is PyTorch's own documented fix for exactly this case).
+                use_orig_params=True,
             )
 
         self.fsdp_plugin = fsdp_plugin
