@@ -152,7 +152,11 @@ _common_kwargs = dict(
     cpu=NODE_CPU,
     timeout=86400,
     volumes={DATA_DIR: volume},
-    secrets=[modal.Secret.from_name("wandb-secret"), modal.Secret.from_name("hf-secret"), modal.Secret.from_name("s3-secret")],
+    # Reads your local .env at `modal run` time and injects it through Modal's
+    # normal encrypted secret mechanism -- no `modal secret create` step, and
+    # .env itself is still never uploaded/baked into the image (it's excluded
+    # from add_local_dir above; from_dotenv reads it locally, not from /app).
+    secrets=[modal.Secret.from_dotenv(__file__)],
 )
 
 
