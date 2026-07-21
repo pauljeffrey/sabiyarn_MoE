@@ -61,13 +61,10 @@ NODE_CPU = max(16, 8 * GPUS_PER_NODE)
 
 image = (
     modal.Image.debian_slim(python_version="3.11")
-    .apt_install("libaio-dev")  # required by DeepSpeed's async-io op
     .pip_install(
         "torch>=2.4.0",
         "transformers>=4.55.0",
         "accelerate>=0.34.0",
-        "deepspeed>=0.15.0",
-        "ninja",
         "wandb",
         "structlog",
         "numpy",

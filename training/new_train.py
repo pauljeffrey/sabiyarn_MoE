@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 SabiYarn HF training — pretrain & SFT, single/multi-GPU/multi-node via
-Accelerate + DeepSpeed ZeRO-3.
+Accelerate + FSDP.
 
 Launch:
   python -m training.new_train                                        # single GPU / CPU smoke test
@@ -23,7 +23,7 @@ import numpy as np
 import structlog
 import torch
 from accelerate import Accelerator
-from accelerate.utils import DeepSpeedPlugin
+from accelerate.utils import FullyShardedDataParallelPlugin
 from torch.optim import AdamW
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
@@ -40,17 +40,12 @@ try:
 except ImportError:
     HAS_CCE = False
 
-try:
-    import deepspeed
-    HAS_DEEPSPEED = True
-except Exception:
-    # Broad except, not just ImportError: deepspeed's own git_version_info.py
-    # unconditionally calls is_compatible() on every registered op at import
-    # time with no error handling, so a container with torch's bundled CUDA
-    # runtime but no full CUDA toolkit/nvcc (e.g. a slim, non-devel image)
-    # raises deepspeed.ops.op_builder.builder.MissingCUDAException -- not an
-    # ImportError -- and crashes the whole `import deepspeed` statement.
-    HAS_DEEPSPEED = False
+# lm_head/wte are excluded from FSDP wrapping (see _setup_accelerator) since
+# they're tied weights -- sharding one while the other stays a plain
+# nn.Parameter would break the tie. That also means raw.lm_head.weight below
+# is always the full, un-sharded tensor; no DeepSpeed-style gather-before-use
+# dance is needed the way ZeRO-3 required.
+_FSDP_IGNORED_MODULES = r"lm_head|transformer\.wte"
 
 
 # Parameter-name substrings that actually appear in GPTJXMoEForCausalLM, keyed by
@@ -68,8 +63,8 @@ _FREEZE_PATTERNS = {
 def _freeze_layers(model, cfg: TrainConfig) -> None:
     """Freeze parameters matching configured layer patterns.
 
-    Must run before accelerator.prepare()/deepspeed.initialize(): flipping
-    requires_grad after DeepSpeed has partitioned/grouped parameters is unreliable.
+    Must run before accelerator.prepare(): flipping requires_grad after FSDP
+    has flattened/sharded parameters is unreliable.
     """
     active = {
         flag: patterns
@@ -116,19 +111,27 @@ class Trainer:
             self.cfg.gradient_accumulation_steps //= world_size_env
         self.cfg.gradient_accumulation_steps = max(1, self.cfg.gradient_accumulation_steps)
 
-        deepspeed_plugin = None
-        if self.cfg.zero_stage > 0:
-            deepspeed_plugin = DeepSpeedPlugin(
-                zero_stage=self.cfg.zero_stage,
-                gradient_accumulation_steps=self.cfg.gradient_accumulation_steps,
-                gradient_clipping=self.cfg.gradient_clipping,
-                # Consolidate sharded weights to full bf16/fp16 on save (accelerator.get_state_dict).
-                zero3_save_16bit_model=self.cfg.zero_stage == 3,
+        fsdp_plugin = None
+        if world_size_env > 1 and self.cfg.fsdp_sharding_strategy != "NO_SHARD":
+            fsdp_plugin = FullyShardedDataParallelPlugin(
+                sharding_strategy=self.cfg.fsdp_sharding_strategy,
+                auto_wrap_policy="transformer_based_wrap",
+                transformer_cls_names_to_wrap=["BlockJ"],
+                # lm_head/wte are tied weights -- see _FSDP_IGNORED_MODULES.
+                ignored_modules=_FSDP_IGNORED_MODULES,
+                state_dict_type="FULL_STATE_DICT",
+                # Only rank 0 materializes the pretrained checkpoint; others
+                # start on the meta device and receive a broadcast -- the FSDP
+                # analogue of ZeRO-3's shard-as-you-load, avoiding N full
+                # copies of the model in host RAM across N GPUs.
+                cpu_ram_efficient_loading=True,
+                sync_module_states=True,
             )
 
+        self.fsdp_plugin = fsdp_plugin
         self.accelerator = Accelerator(
             mixed_precision=self._accelerate_precision(),
-            deepspeed_plugin=deepspeed_plugin,
+            fsdp_plugin=fsdp_plugin,
             gradient_accumulation_steps=self.cfg.gradient_accumulation_steps,
         )
         self.device = self.accelerator.device
@@ -195,8 +198,11 @@ class Trainer:
         torch_dtype = dtype_map.get(self.cfg.dtype, torch.bfloat16)
 
         # Constructing Accelerator() before from_pretrained() (already done in
-        # _setup_accelerator) lets transformers' deepspeed integration shard the
-        # model as it loads under ZeRO-3, instead of materializing it whole first.
+        # _setup_accelerator) lets transformers' FSDP integration honor
+        # cpu_ram_efficient_loading/sync_module_states from the active FSDP
+        # plugin: only rank 0 materializes the full pretrained checkpoint,
+        # other ranks start on the meta device and receive a broadcast,
+        # instead of every rank loading a full copy into host RAM first.
         self.model = AutoModelForCausalLM.from_pretrained(
             self.cfg.model_name, trust_remote_code=True, torch_dtype=torch_dtype,
         )
@@ -204,8 +210,8 @@ class Trainer:
         _freeze_layers(self.model, self.cfg)
 
         if self.cfg.compile_model:
-            if self.cfg.zero_stage > 0:
-                LOG.warning("compile_skipped", reason="torch.compile + DeepSpeed ZeRO is unsupported/fragile")
+            if self.fsdp_plugin is not None:
+                LOG.warning("compile_skipped", reason="torch.compile + FSDP is unsupported/fragile")
             else:
                 self.model = torch.compile(self.model)
 
@@ -305,10 +311,10 @@ class Trainer:
                     out = self.model(input_ids=x, attention_mask=attention_mask, targets=y)
                 ce_loss = out.loss
             else:
+                # lm_head is FSDP-ignored (see _FSDP_IGNORED_MODULES), so
+                # raw.lm_head.weight is always the full tensor already --
+                # no gathering needed.
                 weight = raw.lm_head.weight
-                if self.cfg.zero_stage == 3 and HAS_DEEPSPEED:
-                    with deepspeed.zero.GatheredParameters(weight, modifier_rank=None):
-                        weight = weight.clone()
                 ce_loss = linear_cross_entropy(hidden, weight, y, shift=False, ignore_index=MASK)
         else:
             with self.accelerator.autocast():
@@ -389,7 +395,7 @@ class Trainer:
             LOG.error("hf_checkpoint_upload_failed", repo=self.cfg.hf_chkpt_path, reason=str(exc))
 
     def _save(self):
-        # get_state_dict / save_state are collective under ZeRO-3 (all-gather
+        # get_state_dict / save_state are collective under FSDP (all-gather
         # across ranks) — every rank must call them, not just master.
         unwrapped = self.accelerator.unwrap_model(self.model)
         state_dict = self.accelerator.get_state_dict(self.model)

@@ -2,11 +2,11 @@
 training: 
   train_batch_size : 4
   out_dir : "out"
-  eval_interval : 100
+  eval_interval : 20
   log_interval : 100
   eval_iters : 200
   eval_only : false  # if True, script exits right after the first eval
-  always_save_checkpoint : true  # if True, always save a checkpoint after each eval
+  always_save_checkpoint : false  # if True, always save a checkpoint after each eval
   gradient_accumulation_steps : 40  # used to simulate larger batch sizes (was 5 * 8)
   decay_lr : True  # whether to decay the learning rate
   warmup_iters : 20  # how many steps to warm up for
@@ -16,7 +16,7 @@ training:
   display_model_output_iter : 128
   use_cce : True  # to use cut cross entropy or not
   scheduler: "cosine"
-  block_size: 32768
+  block_size: 2048
   dtype: "bf16"
   init_from: "hf"  # hf (HuggingFace hub) | resume (local ckpt)
   resume_run_dir: ""
@@ -77,8 +77,8 @@ data:
     - eval_data_path: "sft_validation.bin"
   sampling:
     - use_scheduled_sampling: false
-    - afr_sampling_weight: 0.5
-    - eng_sampling_weight: 0.5
+    - afr_sampling_weight: 0.6
+    - eng_sampling_weight: 0.4
  
 
 # adamw optimizer
@@ -100,9 +100,9 @@ ddp:
   use_dp: False
 
 #Accelerate config
-accelerate: 
+accelerate:
   mixed_precision: "bf16"
-  zero_stage: 3
+  fsdp_sharding_strategy: "FULL_SHARD"  # NO_SHARD | SHARD_GRAD_OP | FULL_SHARD | HYBRID_SHARD
   gradient_clipping: 1.0
 
 env:
@@ -111,6 +111,6 @@ env:
 
 modal:
   num_nodes: 1
-  gpus_per_node: 2
-  gpu_type: "A100"
+  gpus_per_node: 8
+  gpu_type: "L4" # "A100" #"L4"
 

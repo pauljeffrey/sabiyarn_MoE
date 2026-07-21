@@ -232,8 +232,8 @@ class TrainConfig:
     num_nodes: int = 1
     mixed_precision: str = "bf16"
 
-    # accelerate / deepspeed
-    zero_stage: int = 0
+    # accelerate / fsdp
+    fsdp_sharding_strategy: str = "FULL_SHARD"  # NO_SHARD | SHARD_GRAD_OP | FULL_SHARD | HYBRID_SHARD
     gradient_clipping: float = 1.0
 
     # weight-freeze policy
@@ -400,7 +400,7 @@ def load_train_config(path: Optional[str] = None) -> TrainConfig:
         gpus_per_node=int(modal_cfg.get("gpus_per_node", env.get("world_size", 1))),
         num_nodes=int(modal_cfg.get("num_nodes", 1)),
         mixed_precision=mixed_precision,
-        zero_stage=int(accelerate.get("zero_stage", 0)),
+        fsdp_sharding_strategy=str(accelerate.get("fsdp_sharding_strategy", "FULL_SHARD")).upper(),
         gradient_clipping=float(accelerate.get("gradient_clipping", training.get("grad_clip", 1.0))),
         freeze_experts_only=bool(weights_cfg.get("freeze_experts_only", False)),
         freeze_pos_layer_only=bool(weights_cfg.get("freeze_pos_layer_only", False)),

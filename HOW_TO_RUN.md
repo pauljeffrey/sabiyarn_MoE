@@ -10,8 +10,6 @@ All commands assume your shell's working directory is the repo root.
 pip install -r requirements.txt
 ```
 
-`deepspeed` (needed only by `training/new_train.py` when `accelerate.zero_stage: 3`) is Linux/CUDA-only and will not build on native Windows. If you're on Windows, install everything else and run the actual training on a Linux GPU box (Modal or vast.ai) — you can still edit code and run `pytest` locally.
-
 **Secrets** — copy your real values into `.env` at the repo root (already gitignored, never commit it):
 
 | Variable | Used by | Purpose |
@@ -67,7 +65,7 @@ modal run data/prepare_modal.py::count_tag_main --mode pretrain --data-type afri
 
 ## 2. Training
 
-Config-driven — everything (mode, model, optimizer, ZeRO stage, freeze policy, data paths) comes from `training/train_config.yaml` (override the path via `TRAIN_CONFIG_PATH` env if needed). Uses Accelerate + DeepSpeed ZeRO-3 when `accelerate.zero_stage: 3` is set.
+Config-driven — everything (mode, model, optimizer, FSDP sharding strategy, freeze policy, data paths) comes from `training/train_config.yaml` (override the path via `TRAIN_CONFIG_PATH` env if needed). Uses Accelerate + FSDP; `accelerate.fsdp_sharding_strategy` (`NO_SHARD` | `SHARD_GRAD_OP` | `FULL_SHARD` | `HYBRID_SHARD`) controls sharding, applied whenever more than one process is launched (`FULL_SHARD` is the ZeRO-3-equivalent default).
 
 A training run always loads **both** the `eng_train_data_path` and `afr_train_data_path` bins configured under `data.<mode>` and mixes them per-batch (see "Language sampling" below) — there is no `--data-type` flag for training. `--data-type` only exists on the *data prep* scripts (`data/prepare.py`, `data/prepare_modal.py`), where it genuinely selects one language's raw datasets to tokenize.
 
