@@ -120,12 +120,17 @@ class Trainer:
                 # lm_head/wte are tied weights -- see _FSDP_IGNORED_MODULES.
                 ignored_modules=_FSDP_IGNORED_MODULES,
                 state_dict_type="FULL_STATE_DICT",
-                # Only rank 0 materializes the pretrained checkpoint; others
-                # start on the meta device and receive a broadcast -- the FSDP
-                # analogue of ZeRO-3's shard-as-you-load, avoiding N full
-                # copies of the model in host RAM across N GPUs.
-                cpu_ram_efficient_loading=True,
-                sync_module_states=True,
+                # Deliberately NOT using cpu_ram_efficient_loading/
+                # sync_module_states: that pair only materializes the real
+                # checkpoint on rank 0, then broadcasts to other ranks --
+                # but FSDP's sync only broadcasts FSDP-*managed* parameters
+                # (confirmed in torch/distributed/fsdp/_init_utils.py:
+                # _sync_module_params_and_buffers is only given
+                # managed_params, which excludes ignored_modules). Since
+                # lm_head/wte are ignored_modules here, they would silently
+                # stay uninitialized (meta-device) on every non-master rank.
+                # Every rank loads the full real checkpoint independently
+                # instead -- more host RAM per node, but guaranteed correct.
                 # Required for the freeze-policy config (freeze_*_layer_only):
                 # with the default use_orig_params=False, every parameter in
                 # one wrapped unit (e.g. a whole BlockJ, or the un-wrapped
@@ -205,12 +210,9 @@ class Trainer:
         dtype_map = {"bfloat16": torch.bfloat16, "float16": torch.float16, "float32": torch.float32}
         torch_dtype = dtype_map.get(self.cfg.dtype, torch.bfloat16)
 
-        # Constructing Accelerator() before from_pretrained() (already done in
-        # _setup_accelerator) lets transformers' FSDP integration honor
-        # cpu_ram_efficient_loading/sync_module_states from the active FSDP
-        # plugin: only rank 0 materializes the full pretrained checkpoint,
-        # other ranks start on the meta device and receive a broadcast,
-        # instead of every rank loading a full copy into host RAM first.
+        # Every rank independently loads the full real checkpoint here (see
+        # _setup_accelerator for why cpu_ram_efficient_loading/
+        # sync_module_states aren't used despite the extra host RAM cost).
         self.model = AutoModelForCausalLM.from_pretrained(
             self.cfg.model_name, trust_remote_code=True, torch_dtype=torch_dtype,
         )
