@@ -46,7 +46,10 @@ def _normalize_list_sections(text: str) -> str:
                     k = j
                     while k < len(lines):
                         cur = lines[k]
-                        if not cur.strip():
+                        if not cur.strip() or cur.lstrip().startswith("#"):
+                            # Blank lines and standalone comment lines don't end
+                            # the list block -- they're just skipped, not
+                            # treated as data or as a terminator.
                             k += 1
                             continue
                         cur_indent = len(cur) - len(cur.lstrip(" "))
