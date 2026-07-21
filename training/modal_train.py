@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import os
 import subprocess
+import sys
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -31,10 +32,20 @@ import modal
 import modal.experimental
 import yaml
 
+# Modal mounts add_local_dir's data at /app inside the container, but re-imports
+# *this entrypoint script itself* from a separate location (observed at
+# /root/modal_train.py) when hydrating a function for remote execution --
+# Path(__file__).resolve().parents[1] is only correct when running locally.
+# Detect which context we're in and resolve ROOT (and therefore the `training`
+# package on sys.path) accordingly.
+_APP_MOUNT = Path("/app")
+ROOT = _APP_MOUNT if (_APP_MOUNT / "training").is_dir() else Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
 from training.load_config import load_train_config
 from training.s3_utils import sync_training_files
 
-ROOT = Path(__file__).resolve().parents[1]
 DATA_DIR = "/data"
 CONFIG_PATH = str(ROOT / "training" / "train_config.yaml")
 MASTER_PORT = "29500"
