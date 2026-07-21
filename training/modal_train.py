@@ -113,21 +113,37 @@ def _sync_data(env: dict[str, str]) -> None:
     # eng and afr bins are always synced -- training mixes them per-batch via
     # data.sampling in train_config.yaml, it doesn't train on a single language.
     cfg = load_train_config(CONFIG_PATH)
-    if cfg.s3_bucket and cfg.s3_access_key and cfg.s3_secret_key and cfg.s3_endpoint:
-        local_train, local_eval = sync_training_files(
-            cfg.train_data_paths,
-            DATA_DIR,
-            bucket=cfg.s3_bucket,
-            endpoint=cfg.s3_endpoint,
-            access_key=cfg.s3_access_key,
-            secret_key=cfg.s3_secret_key,
-            prefix=cfg.s3_prefix,
-            eval_path=cfg.eval_data_path,
+    s3_fields = {
+        "s3_bucket": cfg.s3_bucket, "s3_endpoint": cfg.s3_endpoint,
+        "s3_access_key": bool(cfg.s3_access_key), "s3_secret_key": bool(cfg.s3_secret_key),
+    }
+    if not all(s3_fields.values()):
+        missing = [k for k, v in s3_fields.items() if not v]
+        print(
+            f"[data sync] SKIPPED -- missing/empty config: {missing}. "
+            "Training will fail to find local data files unless they're already "
+            "present (e.g. from a previous run's Modal Volume). Check that the "
+            "s3-secret Modal secret actually has non-empty S3_ACCESS_KEY_ID/"
+            "S3_SECRET_ACCESS_KEY values (`modal secret list` only shows names, "
+            "not contents)."
         )
-        if local_train:
-            env["TRAIN_DATA_PATHS_LOCAL"] = ",".join(local_train)
-        if local_eval:
-            env["VAL_DATA_PATH"] = local_eval
+        return
+
+    local_train, local_eval = sync_training_files(
+        cfg.train_data_paths,
+        DATA_DIR,
+        bucket=cfg.s3_bucket,
+        endpoint=cfg.s3_endpoint,
+        access_key=cfg.s3_access_key,
+        secret_key=cfg.s3_secret_key,
+        prefix=cfg.s3_prefix,
+        eval_path=cfg.eval_data_path,
+    )
+    print(f"[data sync] train files: {local_train}, eval file: {local_eval}")
+    if local_train:
+        env["TRAIN_DATA_PATHS_LOCAL"] = ",".join(local_train)
+    if local_eval:
+        env["VAL_DATA_PATH"] = local_eval
 
 
 _common_kwargs = dict(
