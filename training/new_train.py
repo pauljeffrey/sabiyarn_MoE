@@ -341,31 +341,50 @@ class Trainer:
         return ce_loss
 
     @torch.no_grad()
-    def _log_sample_generation(self, prompt_ids: torch.Tensor, tag: str = "sample_generation"):
-        """Generate a continuation from a real prompt and log it (master only).
+    def _generate_greedy(self, prompt_ids: torch.Tensor, max_new_tokens: int = 64) -> torch.Tensor:
+        """Greedy autoregressive decode using the model's own forward() directly,
+        not GenerationMixin.generate(). This custom model class doesn't implement
+        the hooks generate() expects (prepare_inputs_for_generation, etc.), which
+        under FSDP surfaced as "'weight' must be 2-D" -- calling forward()
+        ourselves uses the exact path already proven correct during real
+        training steps, at the cost of no KV-cache (recomputes the full
+        sequence each step, fine for a short periodic sanity check)."""
+        ids = prompt_ids
+        for _ in range(max_new_tokens):
+            out = self.model(input_ids=ids)
+            next_id = out.logits[:, -1, :].argmax(dim=-1, keepdim=True)
+            ids = torch.cat([ids, next_id], dim=1)
+        return ids
 
-        Every rank must call model.generate() -- FSDP's forward pass does a
-        collective all-gather per layer, so a single rank calling this alone
-        would deadlock waiting on the others. Only the master process decodes
-        and logs the result.
-        """
+    @torch.no_grad()
+    def _log_sample_generation(self, prompt_ids: torch.Tensor, tag: str = "sample_generation"):
+        """Generate continuations for a batch of real prompts and log them
+        (master only). Every rank must call the model's forward() collectively
+        -- FSDP does a per-layer all-gather, so a single rank calling this
+        alone would deadlock waiting on the others."""
         self.model.eval()
         try:
-            generated = self.model.generate(
-                input_ids=prompt_ids,
-                max_new_tokens=64,
-                do_sample=False,
-                pad_token_id=self.tokenizer.pad_token_id or self.tokenizer.eos_token_id,
-            )
+            generated = self._generate_greedy(prompt_ids)
         except Exception as exc:
             if self.master:
                 LOG.warning("sample_generation_failed", iter=self.iter_num, error=str(exc))
             self.model.train()
             return
         self.model.train()
-        if self.master:
-            text = self.tokenizer.decode(generated[0], skip_special_tokens=False)
-            LOG.info(tag, iter=self.iter_num, text=text)
+        if not self.master:
+            return
+
+        n = prompt_ids.size(0)
+        prompt_len = prompt_ids.size(1)
+        header = f" Sample generation @ iter {self.iter_num} ({tag}) "
+        print(f"\n{header:=^100}")
+        for i in range(n):
+            input_text = self.tokenizer.decode(prompt_ids[i], skip_special_tokens=False)
+            output_text = self.tokenizer.decode(generated[i, prompt_len:], skip_special_tokens=False)
+            print(f"--- sample {i + 1}/{n} ---")
+            print(f"[INPUT]  {input_text}")
+            print(f"[OUTPUT] {output_text}")
+        print("=" * 100 + "\n")
 
     @torch.no_grad()
     def estimate_loss(self):
@@ -470,9 +489,13 @@ class Trainer:
             LOG.warning("wandb_log_failed", error=str(exc))
             self.cfg.wandb_log = False
 
-    def _sample_prompt(self, x: torch.Tensor) -> torch.Tensor:
+    def _sample_prompt(self, x: torch.Tensor, num_samples: int = 5) -> torch.Tensor:
+        """Real token ids straight from the current batch -- up to num_samples
+        rows (fewer if train_batch_size is smaller), passed to the model
+        together as one batch."""
         prompt_len = min(32, x.size(1))
-        return x[:1, :prompt_len]
+        n = min(num_samples, x.size(0))
+        return x[:n, :prompt_len]
 
     def train(self):
         if self.master:
