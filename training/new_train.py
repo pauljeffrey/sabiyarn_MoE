@@ -530,7 +530,11 @@ class Trainer:
             if self.iter_num == 0 and self.cfg.eval_only:
                 break
 
-            if self.cfg.display_model_output_iter > 0 and self.iter_num % self.cfg.display_model_output_iter == 0:
+            if (
+                self.iter_num > 0
+                and self.cfg.display_model_output_iter > 0
+                and self.iter_num % self.cfg.display_model_output_iter == 0
+            ):
                 self._log_sample_generation(self._sample_prompt(x))
 
             for _ in range(self.cfg.gradient_accumulation_steps):
