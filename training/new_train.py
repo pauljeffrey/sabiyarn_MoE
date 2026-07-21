@@ -206,6 +206,12 @@ class Trainer:
         self.model = AutoModelForCausalLM.from_pretrained(
             self.cfg.model_name, trust_remote_code=True, torch_dtype=torch_dtype,
         )
+        # from_pretrained's torch_dtype cast isn't always exhaustive for every
+        # parameter (e.g. LayerNorm weights can be left in the checkpoint's
+        # original dtype) -- FSDP's FlatParamHandle requires every parameter
+        # within one wrapped unit to share a dtype, so force a uniform cast
+        # here rather than relying on from_pretrained alone.
+        self.model = self.model.to(torch_dtype)
 
         _freeze_layers(self.model, self.cfg)
 
@@ -327,6 +333,33 @@ class Trainer:
         return ce_loss
 
     @torch.no_grad()
+    def _log_sample_generation(self, prompt_ids: torch.Tensor, tag: str = "sample_generation"):
+        """Generate a continuation from a real prompt and log it (master only).
+
+        Every rank must call model.generate() -- FSDP's forward pass does a
+        collective all-gather per layer, so a single rank calling this alone
+        would deadlock waiting on the others. Only the master process decodes
+        and logs the result.
+        """
+        self.model.eval()
+        try:
+            generated = self.model.generate(
+                input_ids=prompt_ids,
+                max_new_tokens=64,
+                do_sample=False,
+                pad_token_id=self.tokenizer.pad_token_id or self.tokenizer.eos_token_id,
+            )
+        except Exception as exc:
+            if self.master:
+                LOG.warning("sample_generation_failed", iter=self.iter_num, error=str(exc))
+            self.model.train()
+            return
+        self.model.train()
+        if self.master:
+            text = self.tokenizer.decode(generated[0], skip_special_tokens=False)
+            LOG.info(tag, iter=self.iter_num, text=text)
+
+    @torch.no_grad()
     def estimate_loss(self):
         """Every rank evaluates a shard of eval_iters and results are averaged
         via an all-reduce, so all ranks do equal work and stay in lockstep
@@ -429,11 +462,20 @@ class Trainer:
             LOG.warning("wandb_log_failed", error=str(exc))
             self.cfg.wandb_log = False
 
+    def _sample_prompt(self, x: torch.Tensor) -> torch.Tensor:
+        prompt_len = min(32, x.size(1))
+        return x[:1, :prompt_len]
+
     def train(self):
         if self.master:
             LOG.info("training_start", mode=self.cfg.mode, world_size=self.world_size)
 
         x, y = self.get_batch("train")
+
+        # Sanity-check the loaded checkpoint (and FSDP wrapping) before
+        # spending any real training time on it.
+        self._log_sample_generation(self._sample_prompt(x), tag="startup_sample_generation")
+
         t0 = time.time()
         last_loss = None
 
@@ -454,6 +496,9 @@ class Trainer:
 
             if self.iter_num == 0 and self.cfg.eval_only:
                 break
+
+            if self.cfg.display_model_output_iter > 0 and self.iter_num % self.cfg.display_model_output_iter == 0:
+                self._log_sample_generation(self._sample_prompt(x))
 
             for _ in range(self.cfg.gradient_accumulation_steps):
                 with self.accelerator.accumulate(self.model):

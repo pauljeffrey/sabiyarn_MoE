@@ -190,6 +190,7 @@ class TrainConfig:
     eval_interval: int = 2000
     log_interval: int = 100
     eval_iters: int = 200
+    display_model_output_iter: int = 0  # 0 disables periodic sample generation
     eval_only: bool = False
     always_save_checkpoint: bool = True
     hf_chkpt_path: Optional[str] = None
@@ -371,6 +372,7 @@ def load_train_config(path: Optional[str] = None) -> TrainConfig:
         eval_interval=int(training.get("eval_interval", 2000)),
         log_interval=int(training.get("log_interval", 100)),
         eval_iters=int(training.get("eval_iters", 200)),
+        display_model_output_iter=int(training.get("display_model_output_iter", 0)),
         eval_only=bool(training.get("eval_only", False)),
         always_save_checkpoint=bool(training.get("always_save_checkpoint", True)),
         seed=int(wandb_cfg.get("seed", 42)),
