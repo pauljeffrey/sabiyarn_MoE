@@ -184,8 +184,8 @@ class TrainConfig:
     compile_model: bool = False
     dtype: str = "bfloat16"
     use_cce: bool = False
-    init_from: str = "hf"  # hf | resume
-    resume_run_dir: Optional[str] = None
+    init_from: str = "hf"  # hf | resume -- controls model weights only, see train_config.yaml
+    resume_run_dir: Optional[str] = None  # explicit override; blank = auto-discover latest under out_dir
     out_dir: str = "out"
     eval_interval: int = 2000
     log_interval: int = 100

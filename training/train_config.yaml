@@ -18,7 +18,21 @@ training:
   scheduler: "cosine"
   block_size: 4096
   dtype: "bf16"
+  # init_from controls MODEL WEIGHTS only: "hf" pulls model.repo_name from the
+  # HF Hub; "resume" loads the latest local checkpoint's weights instead (see
+  # resume_run_dir below). Regardless of this setting, optimizer state,
+  # iter_num, best_val, and (since they're pure functions of iter_num) the LR
+  # and dynamic sampling-ratio schedules ALWAYS auto-resume from the latest
+  # checkpoint when one exists -- e.g. init_from: "hf" still continues the
+  # step count/optimizer momentum from a prior local run while pulling fresh
+  # weights, which is intentional for continuous pretraining across Modal
+  # container restarts.
   init_from: "hf"  # hf (HuggingFace hub) | resume (local ckpt)
+  # Optional explicit override; leave blank to auto-discover the most recent
+  # matching run directory under training.out_dir (works the same on a Modal
+  # Volume, a vast.ai instance's local disk, or your own machine -- purely a
+  # filesystem scan, no platform-specific logic -- as long as out_dir points
+  # at somewhere that actually persists across restarts there).
   resume_run_dir: ""
   mode: "pretrain"  # pretrain | sft
   hf_chkpt_path: "Aletheia-ng/SabiYarn_MoE_base"

@@ -61,6 +61,35 @@ _FREEZE_PATTERNS = {
 }
 
 
+def _find_latest_run_dir(out_dir: str, mode: str) -> str | None:
+    """Scans out_dir for existing run directories named `{timestamp}_{mode}`
+    (see Trainer._setup_dirs) that have a valid trainer_state.json, and
+    returns the most recent one (directory names sort chronologically), or
+    None if none exist yet.
+
+    This is how training state (optimizer, iter_num, best_val, and -- since
+    the LR and sampling-ratio schedules are pure functions of iter_num, not
+    separate stateful objects -- their progress too) auto-resumes regardless
+    of platform: out_dir is just a filesystem path, whether it's a Modal
+    Volume mount, a vast.ai instance's local disk, or your own machine, so
+    no platform-specific resume logic is needed as long as out_dir points at
+    a location that actually persists across restarts there.
+    """
+    if not os.path.isdir(out_dir):
+        return None
+    suffix = f"_{mode}"
+    candidates = []
+    for name in os.listdir(out_dir):
+        if not name.endswith(suffix):
+            continue
+        full = os.path.join(out_dir, name)
+        if os.path.isfile(os.path.join(full, "trainer_state.json")):
+            candidates.append(full)
+    if not candidates:
+        return None
+    return sorted(candidates)[-1]
+
+
 def _freeze_layers(model, cfg: TrainConfig) -> None:
     """Freeze parameters matching configured layer patterns.
 
@@ -89,6 +118,7 @@ class Trainer:
         self.cfg = config
         self.iter_num = 0
         self.best_val = 1e9
+        self._resume_dir = None  # set by _setup_dirs, used by _build_model/_prepare_for_training
         self._setup_accelerator()
         self._setup_dirs()
         self._setup_wandb()
@@ -154,10 +184,31 @@ class Trainer:
         torch.manual_seed(self.cfg.seed + self.accelerator.process_index)
 
     def _setup_dirs(self):
-        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        self.run_dir = os.path.join(self.cfg.out_dir, f"{ts}_{self.cfg.mode}")
-        if self.cfg.init_from == "resume" and self.cfg.resume_run_dir:
-            self.run_dir = self.cfg.resume_run_dir
+        # Training state (optimizer, iter_num, best_val, schedule progress --
+        # see _prepare_for_training) always auto-resumes from the latest
+        # checkpoint under out_dir when one exists, regardless of init_from;
+        # init_from only controls where MODEL WEIGHTS come from (see
+        # _build_model). resume_run_dir, if set, is an explicit override that
+        # wins over auto-discovery -- otherwise the most recent matching run
+        # directory is found automatically, which is what makes this work
+        # across Modal container restarts (a fresh timestamped run_dir would
+        # otherwise be created every time and never find prior state).
+        self._resume_dir = None
+        if self.cfg.resume_run_dir:
+            if os.path.isfile(os.path.join(self.cfg.resume_run_dir, "trainer_state.json")):
+                self._resume_dir = self.cfg.resume_run_dir
+            else:
+                LOG.warning("resume_run_dir_has_no_checkpoint", path=self.cfg.resume_run_dir)
+        else:
+            self._resume_dir = _find_latest_run_dir(self.cfg.out_dir, self.cfg.mode)
+
+        if self._resume_dir:
+            self.run_dir = self._resume_dir
+            LOG.info("found_existing_checkpoint_dir", path=self.run_dir)
+        else:
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+            self.run_dir = os.path.join(self.cfg.out_dir, f"{ts}_{self.cfg.mode}")
+
         if self.master:
             os.makedirs(self.run_dir, exist_ok=True)
 
@@ -206,16 +257,51 @@ class Trainer:
             sft_masking=self.cfg.is_sft,
         )
 
+    def _resolve_resume_weights_path(self) -> str | None:
+        """The local model-weights directory to load from when
+        init_from=="resume": the latest_ckpt recorded in the resumed run's
+        trainer_state.json (see _setup_dirs for how _resume_dir itself is
+        found), if any checkpoint has actually been saved there yet."""
+        if not self._resume_dir:
+            return None
+        meta_path = os.path.join(self._resume_dir, "trainer_state.json")
+        if not os.path.isfile(meta_path):
+            return None
+        with open(meta_path, "r") as f:
+            meta = json.load(f)
+        latest_ckpt = meta.get("latest_ckpt")
+        if latest_ckpt and os.path.isdir(latest_ckpt):
+            return latest_ckpt
+        return None
+
     def _build_model(self):
-        LOG.info("loading_model", source=self.cfg.init_from, repo=self.cfg.model_name)
         dtype_map = {"bfloat16": torch.bfloat16, "float16": torch.float16, "float32": torch.float32}
         torch_dtype = dtype_map.get(self.cfg.dtype, torch.bfloat16)
+
+        # init_from controls MODEL WEIGHTS only -- optimizer/iter_num/best_val
+        # always auto-resume separately regardless of this setting (see
+        # _prepare_for_training).
+        weights_source = self.cfg.model_name
+        load_desc = self.cfg.init_from
+        if self.cfg.init_from == "resume":
+            resume_weights = self._resolve_resume_weights_path()
+            if resume_weights is not None:
+                weights_source = resume_weights
+            else:
+                LOG.warning(
+                    "resume_requested_but_no_checkpoint_weights_found",
+                    out_dir=self.cfg.out_dir, mode=self.cfg.mode,
+                    fallback=f"loading model_name={self.cfg.model_name!r} from HF instead",
+                )
+                load_desc = "hf (resume fallback, no checkpoint found)"
+
+        LOG.info("loading_model", source=load_desc, repo=weights_source)
 
         # Every rank independently loads the full real checkpoint here (see
         # _setup_accelerator for why cpu_ram_efficient_loading/
         # sync_module_states aren't used despite the extra host RAM cost).
         self.model = AutoModelForCausalLM.from_pretrained(
-            self.cfg.model_name, trust_remote_code=True, torch_dtype=torch_dtype,
+            weights_source, trust_remote_code=True, torch_dtype=torch_dtype,
         )
         # from_pretrained's torch_dtype cast isn't always exhaustive for every
         # parameter (e.g. LayerNorm weights can be left in the checkpoint's
@@ -244,17 +330,27 @@ class Trainer:
     def _prepare_for_training(self):
         self.model, self.optimizer = self.accelerator.prepare(self.model, self.optimizer)
 
-        if self.cfg.init_from == "resume" and self.cfg.resume_run_dir:
-            meta_path = os.path.join(self.cfg.resume_run_dir, "trainer_state.json")
-            if os.path.exists(meta_path):
+        # Always attempt to resume optimizer state / iter_num / best_val from
+        # the latest checkpoint (self._resume_dir, found in _setup_dirs),
+        # regardless of init_from -- init_from only controls where MODEL
+        # WEIGHTS come from (see _build_model). The LR schedule (_lr) and the
+        # dynamic eng/afr sampling-ratio schedule (sampling_weights) are both
+        # pure functions of iter_num, not separate stateful objects, so
+        # restoring iter_num alone is what continues them correctly.
+        if self._resume_dir:
+            meta_path = os.path.join(self._resume_dir, "trainer_state.json")
+            if os.path.isfile(meta_path):
                 with open(meta_path, "r") as f:
                     meta = json.load(f)
                 self.iter_num = meta.get("iter_num", 0)
                 self.best_val = meta.get("best_val_loss", 1e9)
-            resume_state_dir = os.path.join(self.cfg.resume_run_dir, "resume_state")
+            resume_state_dir = os.path.join(self._resume_dir, "resume_state")
             if os.path.isdir(resume_state_dir):
+                # accelerator.save_state/load_state captures optimizer state
+                # (and RNG generator state) for whatever was passed to
+                # accelerator.prepare() -- self.optimizer here.
                 self.accelerator.load_state(resume_state_dir)
-                LOG.info("resumed_from_checkpoint", path=resume_state_dir, iter=self.iter_num)
+                LOG.info("resumed_training_state", path=resume_state_dir, iter=self.iter_num)
 
     # ------------------------------------------------------------------
     # Data
