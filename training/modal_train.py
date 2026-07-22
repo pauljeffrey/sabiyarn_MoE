@@ -59,6 +59,14 @@ GPU_TYPE = str(_modal_cfg.get("gpu_type", "A100"))
 GPU_SPEC = f"{GPU_TYPE}:{GPUS_PER_NODE}" if GPUS_PER_NODE > 1 else GPU_TYPE
 NODE_CPU = max(16, 8 * GPUS_PER_NODE)
 
+# training.out_dir names this run's checkpoint subdirectory on the persistent
+# volume (e.g. "out_280M") -- keeping it config-driven, rather than a single
+# fixed "checkpoints" folder shared by every config, means different model
+# sizes/experiments don't collide in the same directory and confuse
+# new_train.py's latest-checkpoint auto-discovery with an incompatible run.
+_training_cfg = _raw_cfg.get("training", {}) or {}
+CFG_OUT_DIR = str(_training_cfg.get("out_dir", "checkpoints"))
+
 image = (
     modal.Image.debian_slim(python_version="3.11")
     .pip_install(
@@ -101,7 +109,10 @@ def _build_env(mode: str, override: bool) -> dict[str, str]:
     env["TRAIN_MODE"] = mode
     # Persist checkpoints on the mounted volume (not the training container's ephemeral
     # disk) so they survive preemption and are visible to eval/test_generation containers.
-    env["TRAIN_OUT_DIR"] = os.path.join(DATA_DIR, "checkpoints")
+    # Namespaced under CFG_OUT_DIR (training.out_dir) so separate configs/experiments
+    # get separate checkpoint trees on the shared volume instead of overwriting/
+    # colliding with each other's runs.
+    env["TRAIN_OUT_DIR"] = os.path.join(DATA_DIR, CFG_OUT_DIR)
     env["OVERRIDE_DATA"] = "1" if override else "0"
     return env
 

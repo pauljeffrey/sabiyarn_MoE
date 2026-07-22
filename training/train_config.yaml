@@ -1,6 +1,13 @@
 
 training: 
   train_batch_size : 8
+  # Local/vast.ai: checkpoints go directly under this path. On Modal
+  # (training/modal_train.py), this name is instead used as a subdirectory
+  # under the persistent "sabiyarn-data" volume -- checkpoints land at
+  # /data/<out_dir> there, not at a literal "./<out_dir>" relative to the
+  # container's cwd -- so give each distinct experiment/config its own
+  # out_dir to keep their checkpoint trees (and latest-checkpoint
+  # auto-discovery) from colliding.
   out_dir : "out"
   eval_interval : 20
   log_interval : 100
