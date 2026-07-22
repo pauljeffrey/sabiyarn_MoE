@@ -114,7 +114,34 @@ env:
   rank: 0
 
 modal:
+  # gpu_type/gpus_per_node/num_nodes here ONLY configure Modal's
+  # @app.function(gpu=...) parameter (training/modal_train.py) -- they have
+  # no effect if you're running on vast.ai or any other bare GPU box instead.
+  # There, you pick/rent the hardware yourself when provisioning the
+  # instance, and gpus_per_node's number is just what you'd manually pass to
+  # torchrun's --nproc_per_node (see HOW_TO_RUN.md's generic launch command).
+  #
+  # Valid gpu_type strings on Modal, with VRAM per GPU (confirmed against
+  # Modal's own docs at https://modal.com/docs/guide/gpu; double check
+  # modal.com/pricing for current availability/pricing before committing to
+  # one, especially the newer/less common entries):
+  #   T4            16 GB
+  #   L4            24 GB
+  #   A10           24 GB
+  #   L40S          48 GB
+  #   A100-40GB     40 GB  (also just "A100")
+  #   A100-80GB     80 GB
+  #   H100          80 GB  (also "H100!" -- a specific availability SKU)
+  #   H200         141 GB
+  #   RTX-PRO-6000  -- newer card, check current Modal docs for VRAM
+  #   B200/B200+    -- newer card, check current Modal docs for VRAM
+  #   B300          -- newer card, check current Modal docs for VRAM
+  #
+  # A single gpu_type string requests that many of that type (e.g. "L40S:2"
+  # via gpus_per_node: 2 below); num_nodes > 1 additionally requires
+  # gpus_per_node to be the FULL device count Modal offers per physical host
+  # for that type (see the clustered() note in training/modal_train.py).
   num_nodes: 1
   gpus_per_node: 8
-  gpu_type: "L4" # "A100" #"L4"
+  gpu_type: "L40S"  # 48 GB -- change freely, see the list above
 
