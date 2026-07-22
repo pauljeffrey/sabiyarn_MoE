@@ -144,6 +144,17 @@ def _resolve_tag_ids(translate_tag: str, marker_tag: str, eos_tag: str) -> tuple
     return _single_id(translate_tag), _single_id(marker_tag), _single_id(eos_tag)
 
 
+def _resolve_action_token_ids() -> list[int]:
+    """The full list of language/action tag ids (<eng>, <yor>, <ibo>, <twi>,
+    <hau>, ..., plus a few non-language action tags) -- reused as-is from
+    training/constant_tokens.py, the single canonical definition, rather than
+    re-derived here. Used to detect the language/action tag inside each
+    <translate>...</s> segment for the empty-source/empty-target check."""
+    from training.constant_tokens import action_tokens
+
+    return list(action_tokens)
+
+
 @app.function(
     image=image, cpu=CPU_COUNT, memory=MEMORY_MB, timeout=86400,
     volumes={DATA_DIR: volume}, secrets=[modal.Secret.from_dotenv(__file__)],
@@ -155,12 +166,18 @@ def report_stats(
     marker_tag: str = "<twi>",
     eos_tag: str = "</s>",
     keep_count: int = 100_000,
+    remove_empty_segments: bool = True,
 ) -> dict:
     """Scans and reports segment counts WITHOUT writing any output file --
     a fast sanity check before committing to the full (slower) clean run."""
     import numpy as np
 
-    from data.clean_translate_segments import compute_delete_ranges, find_token_positions
+    from data.clean_translate_segments import (
+        compute_delete_ranges,
+        compute_delete_ranges_full,
+        find_any_token_positions,
+        find_token_positions,
+    )
 
     local_path = _fetch_input(mode, data_type)
     translate_id, marker_id, eos_id = _resolve_tag_ids(translate_tag, marker_tag, eos_tag)
@@ -172,7 +189,14 @@ def report_stats(
     translate_pos, marker_pos, eos_pos = find_token_positions(
         local_path, total_len, (translate_id, marker_id, eos_id), num_workers=CPU_COUNT
     )
-    _, stats = compute_delete_ranges(translate_pos, marker_pos, eos_pos, keep_count)
+
+    if remove_empty_segments:
+        action_ids = _resolve_action_token_ids()
+        action_tag_pos = find_any_token_positions(local_path, total_len, action_ids, num_workers=CPU_COUNT)
+        _, stats = compute_delete_ranges_full(translate_pos, marker_pos, eos_pos, action_tag_pos, keep_count)
+    else:
+        _, stats = compute_delete_ranges(translate_pos, marker_pos, eos_pos, keep_count)
+
     print(f"stats: {stats}")
     return stats
 
@@ -270,10 +294,12 @@ def report_main(
     marker_tag: str = "<twi>",
     eos_tag: str = "</s>",
     keep_count: int = 100_000,
+    remove_empty_segments: bool = True,
 ):
     report_stats.remote(
         mode=mode, data_type=data_type, translate_tag=translate_tag,
         marker_tag=marker_tag, eos_tag=eos_tag, keep_count=keep_count,
+        remove_empty_segments=remove_empty_segments,
     )
 
 
@@ -290,11 +316,14 @@ def clean_bin_file(
     keep_count: int = 100_000,
     out_s3_key: str = "",
     upload: bool = True,
+    remove_empty_segments: bool = True,
 ) -> dict:
     """Downloads the configured bin file, removes all but the first
-    keep_count <translate>...<marker>...</s> segments, and writes the result
-    to a NEW local file + (if upload=True) a NEW S3 key. Never modifies or
-    overwrites the original file/S3 object."""
+    keep_count <translate>...<marker>...</s> segments, and (if
+    remove_empty_segments) also unconditionally removes empty-source
+    (<translate><LANG>...) and empty-target (...<LANG></s>) segments. Writes
+    the result to a NEW local file + (if upload=True) a NEW S3 key. Never
+    modifies or overwrites the original file/S3 object."""
     import yaml
 
     from data.clean_translate_segments import clean_translate_segments
@@ -304,12 +333,14 @@ def clean_bin_file(
     translate_id, marker_id, eos_id = _resolve_tag_ids(translate_tag, marker_tag, eos_tag)
     print(f"tag ids: {translate_tag}={translate_id} {marker_tag}={marker_id} {eos_tag}={eos_id}")
 
+    action_ids = _resolve_action_token_ids() if remove_empty_segments else None
+
     base, ext = os.path.splitext(os.path.basename(local_in))
     local_out = os.path.join(DATA_DIR, f"{base}_cleaned{ext}")
 
     stats = clean_translate_segments(
         local_in, local_out, translate_id, marker_id, eos_id,
-        keep_count=keep_count, num_workers=CPU_COUNT,
+        keep_count=keep_count, num_workers=CPU_COUNT, action_token_ids=action_ids,
     )
     print(f"cleaned: {local_in} -> {local_out}")
     print(f"stats: {stats}")
@@ -346,9 +377,10 @@ def clean_main(
     keep_count: int = 100_000,
     out_s3_key: str = "",
     upload: bool = True,
+    remove_empty_segments: bool = True,
 ):
     clean_bin_file.remote(
         mode=mode, data_type=data_type, translate_tag=translate_tag,
         marker_tag=marker_tag, eos_tag=eos_tag, keep_count=keep_count,
-        out_s3_key=out_s3_key, upload=upload,
+        out_s3_key=out_s3_key, upload=upload, remove_empty_segments=remove_empty_segments,
     )
