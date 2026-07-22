@@ -138,7 +138,10 @@ def _resolve_tag_ids(translate_tag: str, marker_tag: str, eos_tag: str) -> tuple
     return _single_id(translate_tag), _single_id(marker_tag), _single_id(eos_tag)
 
 
-@app.function(image=image, cpu=CPU_COUNT, memory=MEMORY_MB, timeout=86400, volumes={DATA_DIR: volume})
+@app.function(
+    image=image, cpu=CPU_COUNT, memory=MEMORY_MB, timeout=86400,
+    volumes={DATA_DIR: volume}, secrets=[modal.Secret.from_dotenv(__file__)],
+)
 def report_stats(
     mode: str = "pretrain",
     data_type: str = "african",
@@ -183,7 +186,10 @@ def report_main(
     )
 
 
-@app.function(image=image, cpu=CPU_COUNT, memory=MEMORY_MB, timeout=86400, volumes={DATA_DIR: volume})
+@app.function(
+    image=image, cpu=CPU_COUNT, memory=MEMORY_MB, timeout=86400,
+    volumes={DATA_DIR: volume}, secrets=[modal.Secret.from_dotenv(__file__)],
+)
 def clean_bin_file(
     mode: str = "pretrain",
     data_type: str = "african",
