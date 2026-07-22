@@ -56,6 +56,12 @@ image = (
         "python-dotenv",
         "structlog",
         "boto3",
+        # data/prepare.py (imported for tokenizer resolution) needs these at
+        # module level too, even though this script never calls its dataset-
+        # tokenization functions directly.
+        "datasets",
+        "tqdm",
+        "lmdb",
     )
     .add_local_dir(
         str(ROOT), remote_path="/app",
