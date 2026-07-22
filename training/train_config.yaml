@@ -1,6 +1,6 @@
 
 training: 
-  train_batch_size : 4
+  train_batch_size : 8
   out_dir : "out"
   eval_interval : 20
   log_interval : 100
@@ -14,9 +14,9 @@ training:
   min_lr : 6e-5  # minimum learning rate, should be ~: learning_rate/10 per Chinchilla
   compile : true  # use PyTorch 2.0 to compile the model to be faster
   display_model_output_iter : 128
-  use_cce : True  # to use cut cross entropy or not
+  use_cce : false  # to use cut cross entropy or not
   scheduler: "cosine"
-  block_size: 2048
+  block_size: 4096
   dtype: "bf16"
   init_from: "hf"  # hf (HuggingFace hub) | resume (local ckpt)
   resume_run_dir: ""
@@ -33,7 +33,7 @@ model:
   repo_name: Aletheia-ng/SabiYarn_MoE_translate_base
   weights:
     freeze_experts_only: false
-    freeze_pos_layer_only: true
+    freeze_pos_layer_only: false
     freeze_emb_layer_only: false
     freeze_router_layer_only: false
     freeze_ffn_layer_only: false
@@ -70,7 +70,11 @@ data:
   pretrain:
     - eng_train_data_path : "datasets/eng_training.bin"
     - afr_train_data_path : "datasets/training.bin"
-    - eval_data_path: "validation.bin"
+    # TEMPORARY for smoke testing: validation.bin doesn't exist in the S3
+    # bucket. Pointing eval at an existing training bin just unblocks the
+    # pipeline check -- this is NOT a real held-out eval set. Restore to
+    # "validation.bin" (or a real eval split) before actual training.
+    - eval_data_path: "datasets/eng_training.bin"
   sft:
     - eng_train_data_path : "datasets/eng_sft_training.bin"
     - afr_train_data_path : "datasets/nigerian_sft_training.bin"
