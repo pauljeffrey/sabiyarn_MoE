@@ -24,6 +24,7 @@ import structlog
 import torch
 from accelerate import Accelerator
 from accelerate.utils import FullyShardedDataParallelPlugin
+from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.optim import AdamW
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
@@ -342,15 +343,25 @@ class Trainer:
             return ce_loss + self.cfg.moe_aux_loss_weight * lb_loss
         return ce_loss
 
+    # Matches the config the checkpoint was manually verified against outside
+    # this pipeline (plain single-GPU/CPU, no FSDP) -- kept identical here so
+    # in-training samples are directly comparable to that known-good baseline.
+    _GENERATION_CONFIG = dict(
+        max_new_tokens=100,
+        num_beams=5,
+        do_sample=False,
+        temperature=0.99,
+        top_k=50,
+        top_p=0.95,
+        repetition_penalty=4.0,
+        length_penalty=3.0,
+        early_stopping=True,
+    )
+
     @torch.no_grad()
     def _generate_greedy(self, prompt_ids: torch.Tensor, max_new_tokens: int = 64) -> torch.Tensor:
         """Greedy autoregressive decode using the model's own forward() directly,
-        not GenerationMixin.generate(). This custom model class doesn't implement
-        the hooks generate() expects (prepare_inputs_for_generation, etc.), which
-        under FSDP surfaced as "'weight' must be 2-D" -- calling forward()
-        ourselves uses the exact path already proven correct during real
-        training steps, at the cost of no KV-cache (recomputes the full
-        sequence each step, fine for a short periodic sanity check)."""
+        not GenerationMixin.generate(). Fallback only -- see _log_sample_generation."""
         ids = prompt_ids
         for _ in range(max_new_tokens):
             out = self.model(input_ids=ids)
@@ -359,26 +370,49 @@ class Trainer:
         return ids
 
     @torch.no_grad()
+    def _generate_with_config(self, prompt_ids: torch.Tensor) -> torch.Tensor:
+        """Real GenerationMixin.generate() with _GENERATION_CONFIG, temporarily
+        un-sharding parameters via FSDP.summon_full_params so generate()'s
+        internal machinery (prepare_inputs_for_generation, beam search, etc.)
+        sees ordinary full 2-D weight tensors instead of FSDP's flat shards --
+        calling generate() directly on the FSDP-wrapped model without this
+        raised "'weight' must be 2-D". Collective: every rank must enter the
+        context and call generate() together, matching FSDP's per-layer
+        all-gather requirement."""
+        pad_id = self.tokenizer.pad_token_id or self.tokenizer.eos_token_id
+        if self.fsdp_plugin is not None:
+            with FSDP.summon_full_params(self.model, writeback=False, recurse=True):
+                return self.model.generate(prompt_ids, pad_token_id=pad_id, **self._GENERATION_CONFIG)
+        return self.model.generate(prompt_ids, pad_token_id=pad_id, **self._GENERATION_CONFIG)
+
+    @torch.no_grad()
     def _log_sample_generation(self, prompt_ids: torch.Tensor, tag: str = "sample_generation"):
         """Generate continuations for a batch of real prompts and log them
-        (master only). Every rank must call the model's forward() collectively
+        (master only). Every rank must participate in generation collectively
         -- FSDP does a per-layer all-gather, so a single rank calling this
         alone would deadlock waiting on the others."""
         self.model.eval()
+        method = "generate"
         try:
-            generated = self._generate_greedy(prompt_ids)
+            generated = self._generate_with_config(prompt_ids)
         except Exception as exc:
             if self.master:
-                LOG.warning("sample_generation_failed", iter=self.iter_num, error=str(exc))
-            self.model.train()
-            return
+                LOG.warning("generate_failed_falling_back_to_greedy", iter=self.iter_num, error=str(exc))
+            try:
+                generated = self._generate_greedy(prompt_ids)
+                method = "greedy_fallback"
+            except Exception as exc2:
+                if self.master:
+                    LOG.warning("sample_generation_failed", iter=self.iter_num, error=str(exc2))
+                self.model.train()
+                return
         self.model.train()
         if not self.master:
             return
 
         n = prompt_ids.size(0)
         prompt_len = prompt_ids.size(1)
-        header = f" Sample generation @ iter {self.iter_num} ({tag}) "
+        header = f" Sample generation @ iter {self.iter_num} ({tag}, method={method}) "
         print(f"\n{header:=^100}")
         for i in range(n):
             input_text = self.tokenizer.decode(prompt_ids[i], skip_special_tokens=False)

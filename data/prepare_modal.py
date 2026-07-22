@@ -14,7 +14,13 @@ load_dotenv()  # picks up MODAL_TOKEN_ID/SECRET, S3/HF keys for local `modal run
 
 import modal
 
-ROOT = Path(__file__).resolve().parents[1]
+# See training/modal_train.py for why: Modal re-imports this entrypoint script
+# from a separate location when hydrating a function remotely, so
+# Path(__file__).resolve().parents[1] is only correct when running locally.
+_APP_MOUNT = Path("/app")
+ROOT = _APP_MOUNT if (_APP_MOUNT / "training").is_dir() else Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 DATA_DIR = "/data"
 
 image = (
@@ -33,7 +39,10 @@ image = (
         "lmdb",
         "boto3",
     )
-    .add_local_dir(str(ROOT), remote_path="/app", ignore=[".git", "__pycache__", "*.pyc", "out/", ".env"])
+    .add_local_dir(
+        str(ROOT), remote_path="/app",
+        ignore=[".git", "__pycache__", "*.pyc", "out/", ".env", ".venv", ".pytest_cache", ".claude"],
+    )
 )
 
 app = modal.App("sabiyarn-data-prepare")
@@ -41,7 +50,12 @@ volume = modal.Volume.from_name("sabiyarn-data", create_if_missing=True)
 
 
 def _nested_list_dict(items) -> dict:
-    """Merge YAML list-of-mapping sections like `[{k: v}, {k2: v2}, ...]` into one dict."""
+    """Merge a plain dict, or YAML list-of-mapping sections like
+    `[{k: v}, {k2: v2}, ...]`, into one dict."""
+    if items is None:
+        return {}
+    if isinstance(items, dict):
+        return dict(items)
     out: dict = {}
     for item in items or []:
         if isinstance(item, dict):
@@ -88,7 +102,7 @@ def _resolve_paths(mode: str, data_type: str, override: bool) -> tuple[str, str,
     return train_path, eval_path, {"datasets": dataset_names, "mode": mode, "data_type": data_type}
 
 
-@app.function(image=image, cpu=8, timeout=86400, volumes={DATA_DIR: volume}, secrets=[modal.Secret.from_name("hf-secret")])
+@app.function(image=image, cpu=8, timeout=86400, volumes={DATA_DIR: volume}, secrets=[modal.Secret.from_dotenv(__file__)])
 def prepare_data(mode: str = "pretrain", data_type: str = "eng", override: bool = False):
     import yaml
     from data.prepare import run
@@ -112,7 +126,7 @@ def main(mode: str = "pretrain", data_type: str = "eng", override: bool = False)
     prepare_data.remote(mode=mode, data_type=data_type, override=override)
 
 
-@app.function(image=image, cpu=4, timeout=3600, volumes={DATA_DIR: volume}, secrets=[modal.Secret.from_name("s3-secret")])
+@app.function(image=image, cpu=4, timeout=3600, volumes={DATA_DIR: volume}, secrets=[modal.Secret.from_dotenv(__file__)])
 def count_tag(mode: str = "pretrain", data_type: str = "african", tag: str = "<twi>") -> int:
     """Count occurrences of a tag's token id in the tokenized data.<mode>.<data_type>_train_data_path bin."""
     import yaml

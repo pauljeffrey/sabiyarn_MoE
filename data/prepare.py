@@ -43,7 +43,18 @@ config = OmegaConf.load(config_path)
 
 
 def _merge_list_section(items) -> dict:
-    """Merge YAML list sections like `[name, {k: v}, ...]`."""
+    """Merge a plain mapping, or YAML list sections like `[name, {k: v}, ...]`.
+
+    A section written directly as a mapping (e.g. `tokenizer: {name: ..., num_proc: ...}`)
+    loads as an OmegaConf DictConfig, which is not `isinstance(x, dict)` -- iterating
+    it (the `for item in items` path below) yields its *keys*, not its items, so this
+    must be checked before falling into that loop or the keys get misread as bare
+    list entries (e.g. tokenizer.name silently becoming the literal string "name").
+    """
+    if items is None:
+        return {}
+    if OmegaConf.is_dict(items) or isinstance(items, dict):
+        return dict(OmegaConf.to_container(items, resolve=True)) if OmegaConf.is_dict(items) else dict(items)
     out = {}
     for item in items or []:
         if isinstance(item, str):
@@ -54,6 +65,10 @@ def _merge_list_section(items) -> dict:
 
 
 def _nested_list_dict(items) -> dict:
+    if items is None:
+        return {}
+    if OmegaConf.is_dict(items) or isinstance(items, dict):
+        return dict(OmegaConf.to_container(items, resolve=True)) if OmegaConf.is_dict(items) else dict(items)
     out = {}
     for item in items or []:
         if OmegaConf.is_dict(item) or isinstance(item, dict):
@@ -74,7 +89,7 @@ DATASET_REVISION = os.getenv("HF_DATASET_REVISION")  # Optional pin to commit/ta
 # best number might be different from num_proc above as it also depends on NW speed.
 # it is better than 1 usually though
 
-DATASETS = config.data.datasets
+DATASETS = config.get("data", {}).get("datasets", [])
 
 PROCESS_ONE_FILE_AT_A_TIME = _tokenizer_cfg.get("process_one_file_at_a_time", True)
 
