@@ -62,6 +62,46 @@ def upload_if_absent(
     return key
 
 
+def upload_folder(
+    local_dir: str,
+    remote_prefix: str,
+    *,
+    bucket: str,
+    endpoint: str,
+    access_key: str,
+    secret_key: str,
+    prefix: str = "",
+    override: bool = False,
+) -> list[str]:
+    """Recursively upload every file under local_dir to S3, mirroring its
+    internal structure under remote_prefix.
+
+    Skips a file if its remote object already exists and override is False,
+    so re-pushing a checkpoint (e.g. one still being written to) doesn't
+    re-upload files that already made it up. Returns every resulting key
+    (uploaded or already-present).
+    """
+    client = _s3_client(endpoint, access_key, secret_key)
+    base = Path(local_dir)
+    uploaded = []
+    for path in sorted(base.rglob("*")):
+        if not path.is_file():
+            continue
+        rel = path.relative_to(base).as_posix()
+        remote_key = f"{remote_prefix.rstrip('/')}/{rel}"
+        key = f"{prefix.rstrip('/')}/{remote_key.lstrip('/')}" if prefix else remote_key.lstrip("/")
+
+        if not override and _object_exists(client, bucket, key):
+            LOG.info("s3_upload_skipped_exists", bucket=bucket, key=key)
+            uploaded.append(key)
+            continue
+
+        LOG.info("uploading_s3_object", bucket=bucket, key=key, src=str(path))
+        client.upload_file(str(path), bucket, key)
+        uploaded.append(key)
+    return uploaded
+
+
 def download_if_missing(
     remote_key: str,
     local_path: str,
