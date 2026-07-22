@@ -177,6 +177,91 @@ def report_stats(
     return stats
 
 
+@app.function(
+    image=image, cpu=CPU_COUNT, memory=MEMORY_MB, timeout=86400,
+    volumes={DATA_DIR: volume}, secrets=[modal.Secret.from_dotenv(__file__)],
+)
+def inspect_examples(
+    mode: str = "pretrain",
+    data_type: str = "african",
+    translate_tag: str = "<translate>",
+    marker_tag: str = "<twi>",
+    eos_tag: str = "</s>",
+    num_examples: int = 8,
+    context: int = 20,
+) -> None:
+    """Read-only: decodes and prints real [<translate> ... matched </s>] spans
+    (plus a bit of surrounding context) for visual inspection, and reports how
+    many OTHER <translate> tokens fall inside that same span before reaching
+    the matched </s> -- run this BEFORE clean_main if report_stats shows a
+    large malformed_overlapping_segments_merged count, since that number means
+    the "one <translate>...</s> per marker" assumption may not hold for this
+    data (e.g. one <translate> block might contain multiple language-tagged
+    translations sharing a single closing </s>), which would need the
+    algorithm's segmentation redesigned before it's safe to actually delete
+    anything.
+    """
+    import numpy as np
+
+    from data.clean_translate_segments import find_token_positions
+    from data.prepare import _tokenizer_cfg, get_tokenizer_and_eot
+
+    local_path = _fetch_input(mode, data_type)
+    tok_name = _tokenizer_cfg.get("name", "BeardedMonster/SabiYarn-32k")
+    enc, _ = get_tokenizer_and_eot(tok_name)
+    translate_id, marker_id, eos_id = _resolve_tag_ids(translate_tag, marker_tag, eos_tag)
+
+    total_len = int(np.memmap(local_path, dtype=np.uint16, mode="r").shape[0])
+    translate_pos, marker_pos, eos_pos = find_token_positions(
+        local_path, total_len, (translate_id, marker_id, eos_id), num_workers=CPU_COUNT
+    )
+    eos_idx = np.searchsorted(eos_pos, translate_pos, side="right")
+
+    arr = np.memmap(local_path, dtype=np.uint16, mode="r")
+    shown = 0
+    for i in range(len(translate_pos)):
+        if shown >= num_examples:
+            break
+        if eos_idx[i] >= len(eos_pos):
+            continue  # trailing unterminated, skip for this inspection
+        t_pos = int(translate_pos[i])
+        e_pos = int(eos_pos[eos_idx[i]])
+
+        # How many OTHER <translate> tokens land inside (t_pos, e_pos) before
+        # its matched </s> -- directly quantifies nested/back-to-back reopens.
+        nested_translates = int(np.count_nonzero((translate_pos > t_pos) & (translate_pos < e_pos)))
+        markers_inside = int(np.count_nonzero((marker_pos > t_pos) & (marker_pos < e_pos)))
+
+        lo = max(0, t_pos - context)
+        hi = min(total_len, e_pos + 1 + context)
+        window = arr[lo:hi].tolist()
+        decoded = enc.decode(window, skip_special_tokens=False)
+
+        print(f"\n=== example {shown + 1} (translate_pos={t_pos}, matched_eos_pos={e_pos}, "
+              f"segment_len={e_pos - t_pos + 1}, nested_translate_tags_inside={nested_translates}, "
+              f"marker_tags_inside={markers_inside}) ===")
+        print(decoded)
+        shown += 1
+
+    print(f"\nshown {shown}/{num_examples} requested examples")
+
+
+@app.local_entrypoint()
+def inspect_main(
+    mode: str = "pretrain",
+    data_type: str = "african",
+    translate_tag: str = "<translate>",
+    marker_tag: str = "<twi>",
+    eos_tag: str = "</s>",
+    num_examples: int = 8,
+    context: int = 20,
+):
+    inspect_examples.remote(
+        mode=mode, data_type=data_type, translate_tag=translate_tag,
+        marker_tag=marker_tag, eos_tag=eos_tag, num_examples=num_examples, context=context,
+    )
+
+
 @app.local_entrypoint()
 def report_main(
     mode: str = "pretrain",
