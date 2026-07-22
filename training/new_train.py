@@ -338,19 +338,36 @@ class Trainer:
         # pure functions of iter_num, not separate stateful objects, so
         # restoring iter_num alone is what continues them correctly.
         if self._resume_dir:
+            resume_iter_num, resume_best_val = 0, 1e9
             meta_path = os.path.join(self._resume_dir, "trainer_state.json")
             if os.path.isfile(meta_path):
                 with open(meta_path, "r") as f:
                     meta = json.load(f)
-                self.iter_num = meta.get("iter_num", 0)
-                self.best_val = meta.get("best_val_loss", 1e9)
+                resume_iter_num = meta.get("iter_num", 0)
+                resume_best_val = meta.get("best_val_loss", 1e9)
             resume_state_dir = os.path.join(self._resume_dir, "resume_state")
             if os.path.isdir(resume_state_dir):
                 # accelerator.save_state/load_state captures optimizer state
                 # (and RNG generator state) for whatever was passed to
-                # accelerator.prepare() -- self.optimizer here.
-                self.accelerator.load_state(resume_state_dir)
-                LOG.info("resumed_training_state", path=resume_state_dir, iter=self.iter_num)
+                # accelerator.prepare() -- self.optimizer here. This can fail
+                # if the discovered run_dir belongs to an incompatible run
+                # (e.g. a leftover checkpoint from an earlier smoke test with
+                # different freeze_*/model settings, so the optimizer's
+                # trainable-param groups don't line up) -- degrade to a fresh
+                # optimizer/iter_num rather than crashing the whole launch,
+                # since a stale directory under out_dir shouldn't be able to
+                # take down a real run.
+                try:
+                    self.accelerator.load_state(resume_state_dir)
+                except Exception as e:
+                    LOG.warning(
+                        "resume_state_incompatible", path=resume_state_dir, error=str(e),
+                        action="starting this run's optimizer/iter_num/best_val fresh",
+                    )
+                else:
+                    self.iter_num = resume_iter_num
+                    self.best_val = resume_best_val
+                    LOG.info("resumed_training_state", path=resume_state_dir, iter=self.iter_num)
 
     # ------------------------------------------------------------------
     # Data
