@@ -60,6 +60,10 @@ _FREEZE_PATTERNS = {
     "freeze_attn_layer_only": ("attn.",),
 }
 
+# Val-loss band (see Trainer._should_push_to_hf) within which loss is
+# considered "oscillating"/plateaued rather than having definitely moved.
+_HF_PUSH_LOSS_BAND = 0.25
+
 
 def _find_latest_run_dir(out_dir: str, mode: str) -> str | None:
     """Scans out_dir for existing run directories named `{timestamp}_{mode}`
@@ -118,6 +122,8 @@ class Trainer:
         self.cfg = config
         self.iter_num = 0
         self.best_val = 1e9
+        self._last_hf_push_loss = None  # val loss at the last successful HF push, if any
+        self._last_hf_push_iter = 0
         self._resume_dir = None  # set by _setup_dirs, used by _build_model/_prepare_for_training
         self._setup_accelerator()
         self._setup_dirs()
@@ -281,27 +287,30 @@ class Trainer:
         # init_from controls MODEL WEIGHTS only -- optimizer/iter_num/best_val
         # always auto-resume separately regardless of this setting (see
         # _prepare_for_training).
-        weights_source = self.cfg.model_name
-        load_desc = self.cfg.init_from
-        if self.cfg.init_from == "resume":
-            resume_weights = self._resolve_resume_weights_path()
-            if resume_weights is not None:
-                weights_source = resume_weights
-            else:
-                LOG.warning(
-                    "resume_requested_but_no_checkpoint_weights_found",
-                    out_dir=self.cfg.out_dir, mode=self.cfg.mode,
-                    fallback=f"loading model_name={self.cfg.model_name!r} from HF instead",
-                )
-                load_desc = "hf (resume fallback, no checkpoint found)"
+        #
+        # The base architecture always comes from the HF Hub (model.repo_name)
+        # -- this guarantees a complete, canonical set of config/generation/
+        # tokenizer files regardless of what a local checkpoint directory
+        # happens to contain. init_from=="resume" then overlays that
+        # architecture's weights with the last local checkpoint's state dict
+        # (see _load_checkpoint_weights) rather than instantiating
+        # from_pretrained directly against the local checkpoint dir.
+        resume_weights = self._resolve_resume_weights_path() if self.cfg.init_from == "resume" else None
+        if self.cfg.init_from == "resume" and resume_weights is None:
+            LOG.warning(
+                "resume_requested_but_no_checkpoint_weights_found",
+                out_dir=self.cfg.out_dir, mode=self.cfg.mode,
+                fallback=f"loading model_name={self.cfg.model_name!r} from HF instead",
+            )
+        load_desc = "hf base + local checkpoint weights (resume)" if resume_weights else self.cfg.init_from
 
-        LOG.info("loading_model", source=load_desc, repo=weights_source)
+        LOG.info("loading_model", source=load_desc, repo=self.cfg.model_name)
 
         # Every rank independently loads the full real checkpoint here (see
         # _setup_accelerator for why cpu_ram_efficient_loading/
         # sync_module_states aren't used despite the extra host RAM cost).
         self.model = AutoModelForCausalLM.from_pretrained(
-            weights_source, trust_remote_code=True, torch_dtype=torch_dtype,
+            self.cfg.model_name, trust_remote_code=True, torch_dtype=torch_dtype,
         )
         # from_pretrained's torch_dtype cast isn't always exhaustive for every
         # parameter (e.g. LayerNorm weights can be left in the checkpoint's
@@ -310,6 +319,9 @@ class Trainer:
         # here rather than relying on from_pretrained alone.
         self.model = self.model.to(torch_dtype)
 
+        if resume_weights is not None:
+            self._load_checkpoint_weights(resume_weights, torch_dtype)
+
         _freeze_layers(self.model, self.cfg)
 
         if self.cfg.compile_model:
@@ -317,6 +329,20 @@ class Trainer:
                 LOG.warning("compile_skipped", reason="torch.compile + FSDP is unsupported/fragile")
             else:
                 self.model = torch.compile(self.model)
+
+    def _load_checkpoint_weights(self, ckpt_dir: str, torch_dtype) -> None:
+        """Overlays self.model's weights (already built from the HF Hub
+        architecture) with a local checkpoint's state dict. Loads the
+        checkpoint via from_pretrained (the same trust_remote_code path
+        already proven to work) purely to obtain its state dict, then
+        discards that temporary model -- avoids hand-parsing the checkpoint's
+        safetensors/bin shards directly."""
+        ckpt_model = AutoModelForCausalLM.from_pretrained(
+            ckpt_dir, trust_remote_code=True, torch_dtype=torch_dtype,
+        )
+        self.model.load_state_dict(ckpt_model.state_dict(), strict=True)
+        del ckpt_model
+        LOG.info("resume_checkpoint_weights_loaded", path=ckpt_dir)
 
     def _build_optimizer(self):
         trainable = [p for p in self.model.parameters() if p.requires_grad]
@@ -339,12 +365,15 @@ class Trainer:
         # restoring iter_num alone is what continues them correctly.
         if self._resume_dir:
             resume_iter_num, resume_best_val = 0, 1e9
+            resume_last_push_loss, resume_last_push_iter = None, 0
             meta_path = os.path.join(self._resume_dir, "trainer_state.json")
             if os.path.isfile(meta_path):
                 with open(meta_path, "r") as f:
                     meta = json.load(f)
                 resume_iter_num = meta.get("iter_num", 0)
                 resume_best_val = meta.get("best_val_loss", 1e9)
+                resume_last_push_loss = meta.get("last_hf_push_loss")
+                resume_last_push_iter = meta.get("last_hf_push_iter", 0)
             resume_state_dir = os.path.join(self._resume_dir, "resume_state")
             if os.path.isdir(resume_state_dir):
                 # accelerator.save_state/load_state captures optimizer state
@@ -367,6 +396,8 @@ class Trainer:
                 else:
                     self.iter_num = resume_iter_num
                     self.best_val = resume_best_val
+                    self._last_hf_push_loss = resume_last_push_loss
+                    self._last_hf_push_iter = resume_last_push_iter
                     LOG.info("resumed_training_state", path=resume_state_dir, iter=self.iter_num)
 
     # ------------------------------------------------------------------
@@ -457,12 +488,16 @@ class Trainer:
         return ce_loss
 
     # Matches the config the checkpoint was manually verified against outside
-    # this pipeline (plain single-GPU/CPU, no FSDP) -- kept identical here so
-    # in-training samples are directly comparable to that known-good baseline.
+    # this pipeline (plain single-GPU/CPU, no FSDP), except do_sample -- set
+    # to True (beam-sample decoding) since deterministic beam search
+    # (do_sample=False) is prone to repetitive-loop degeneration, especially
+    # early in training when the model's next-token distribution isn't yet
+    # sharply peaked. temperature/top_k/top_p only take effect once
+    # do_sample=True; they were inert under the original do_sample=False.
     _GENERATION_CONFIG = dict(
         max_new_tokens=100,
         num_beams=5,
-        do_sample=False,
+        do_sample=True,
         temperature=0.99,
         top_k=50,
         top_p=0.95,
@@ -553,6 +588,27 @@ class Trainer:
         self.model.train()
         return out
 
+    def _should_push_to_hf(self, val_loss: float) -> bool:
+        """Local checkpoints now save on every eval regardless of val loss
+        (see train()), but pushing every one of those to the HF Hub would be
+        wasteful. Push when:
+          - nothing has been pushed yet this run, or
+          - val loss has moved by more than _HF_PUSH_LOSS_BAND from the loss
+            at the last push (a real, decisive change worth recording), or
+          - hf_push_interval iters have elapsed since the last push AND loss
+            has stayed within that band the whole time (i.e. it's plateaued/
+            oscillating rather than trending) -- keeps the HF repo from going
+            stale during a long plateau without pushing on every single eval.
+        """
+        if not self.cfg.hf_chkpt_path:
+            return False
+        if self._last_hf_push_loss is None:
+            return True
+        moved = abs(val_loss - self._last_hf_push_loss) > _HF_PUSH_LOSS_BAND
+        if moved:
+            return True
+        return (self.iter_num - self._last_hf_push_iter) >= self.cfg.hf_push_interval
+
     def _push_checkpoint_to_hf(self, ckpt_dir: str) -> None:
         if not self.cfg.hf_chkpt_path:
             return
@@ -603,12 +659,14 @@ class Trainer:
         except Exception as exc:
             LOG.error("hf_checkpoint_upload_failed", repo=self.cfg.hf_chkpt_path, reason=str(exc))
 
-    def _save(self):
+    def _save(self, val_loss: float):
         # get_state_dict / save_state are collective under FSDP (all-gather
         # across ranks) — every rank must call them, not just master.
         unwrapped = self.accelerator.unwrap_model(self.model)
         state_dict = self.accelerator.get_state_dict(self.model)
         ckpt_dir = os.path.join(self.run_dir, f"ckpt_{self.iter_num}")
+
+        push_now = self.master and self._should_push_to_hf(val_loss)
 
         if self.master:
             os.makedirs(ckpt_dir, exist_ok=True)
@@ -618,14 +676,23 @@ class Trainer:
                 save_function=self.accelerator.save,
                 state_dict=state_dict,
             )
+            if push_now:
+                self._last_hf_push_loss = val_loss
+                self._last_hf_push_iter = self.iter_num
             with open(os.path.join(self.run_dir, "trainer_state.json"), "w") as f:
-                json.dump({"iter_num": self.iter_num, "best_val_loss": self.best_val, "latest_ckpt": ckpt_dir}, f)
+                json.dump({
+                    "iter_num": self.iter_num,
+                    "best_val_loss": self.best_val,
+                    "latest_ckpt": ckpt_dir,
+                    "last_hf_push_loss": self._last_hf_push_loss,
+                    "last_hf_push_iter": self._last_hf_push_iter,
+                }, f)
             LOG.info("checkpoint_saved", path=ckpt_dir, iter=self.iter_num)
 
         self.accelerator.save_state(os.path.join(self.run_dir, "resume_state"))
         self.accelerator.wait_for_everyone()
 
-        if self.master:
+        if push_now:
             self._push_checkpoint_to_hf(ckpt_dir)
 
     def _maybe_log_wandb(self, losses, lr):
@@ -669,10 +736,13 @@ class Trainer:
                 if self.master:
                     LOG.info("eval", iter=self.iter_num, **losses)
                     self._maybe_log_wandb(losses, lr)
-                if losses["val"] < self.best_val or self.cfg.always_save_checkpoint:
-                    self.best_val = min(self.best_val, losses["val"])
-                    if self.iter_num > 0:
-                        self._save()
+                # Checkpoint on every eval regardless of whether val loss
+                # improved -- best_val is still tracked (for metadata/logging),
+                # but no longer gates whether a checkpoint is written.
+                # Pushing to the HF Hub remains selective (_should_push_to_hf).
+                self.best_val = min(self.best_val, losses["val"])
+                if self.iter_num > 0:
+                    self._save(losses["val"])
 
             if self.iter_num == 0 and self.cfg.eval_only:
                 break

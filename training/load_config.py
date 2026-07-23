@@ -193,6 +193,11 @@ class TrainConfig:
     display_model_output_iter: int = 0  # 0 disables periodic sample generation
     eval_only: bool = False
     always_save_checkpoint: bool = True
+    # Iters between HF Hub pushes while val loss is plateaued/oscillating
+    # within _HF_PUSH_LOSS_BAND of the loss at the last push -- a decisive
+    # move outside that band pushes immediately regardless of this interval
+    # (see Trainer._should_push_to_hf in training/new_train.py).
+    hf_push_interval: int = 100
     hf_chkpt_path: Optional[str] = None
     seed: int = 42
     world_size: int = 1
@@ -401,6 +406,7 @@ def load_train_config(path: Optional[str] = None) -> TrainConfig:
         wandb_run_name=str(wandb_cfg.get("run_name", "run")),
         save_model_to_wandb=bool(wandb_cfg.get("save_model_to_wandb", False)),
         hf_chkpt_path=training.get("hf_chkpt_path") or None,
+        hf_push_interval=int(training.get("hf_push_interval", 100)),
         ddp_backend=str(ddp.get("backend", "nccl")),
         gpus_per_node=int(modal_cfg.get("gpus_per_node", env.get("world_size", 1))),
         num_nodes=int(modal_cfg.get("num_nodes", 1)),
