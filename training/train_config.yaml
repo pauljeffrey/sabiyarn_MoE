@@ -41,6 +41,13 @@ training:
   # filesystem scan, no platform-specific logic -- as long as out_dir points
   # at somewhere that actually persists across restarts there).
   resume_run_dir: ""
+  # If true, skip the local-vs-S3 recency comparison in Trainer._setup_dirs
+  # and always resume from S3 when it has any checkpoint -- useful when
+  # training across multiple Modal accounts/volumes where "local" state on
+  # whichever account you're on right now may just be stale or absent, and
+  # S3 is the actual shared source of truth. Overridable per-invocation via
+  # the FORCE_S3_RESUME env var (checked first) without editing this file.
+  force_download_from_s3: false
   mode: "pretrain"  # pretrain | sft
   hf_chkpt_path: "Aletheia-ng/SabiYarn_MoE_base"
   schedule_trainable_layers: false
