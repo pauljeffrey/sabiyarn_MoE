@@ -193,31 +193,40 @@ def train_single_node(mode: str = "pretrain", override: bool = False):
     return True
 
 
-@app.function(**_common_kwargs)
-@modal.experimental.clustered(size=NUM_NODES)
-def train_cluster(mode: str = "pretrain", override: bool = False):
-    """True multi-node (num_nodes > 1). Modal requires gpus_per_node to be the
-    full device count for GPU_TYPE here (e.g. 8 for A100) -- partial counts
-    are rejected for clustered functions."""
-    cluster_info = modal.experimental.get_cluster_info()
-    rank = cluster_info.rank
-    master_addr = cluster_info.container_ips[0]
+# Only define train_cluster at all when it's actually needed. Modal validates
+# a clustered() function's GPU spec against the full-per-node-device-count
+# rule at *deploy* time -- as soon as the function exists in the app, whether
+# or not it's ever invoked. If this were defined unconditionally, a
+# single-node config with gpus_per_node < the full device count for GPU_TYPE
+# (e.g. 2 A100s instead of 8) would fail the whole `modal run` before
+# train_single_node ever got a chance to be scheduled, even though nothing
+# actually calls train_cluster in that case.
+if NUM_NODES > 1:
+    @app.function(**_common_kwargs)
+    @modal.experimental.clustered(size=NUM_NODES)
+    def train_cluster(mode: str = "pretrain", override: bool = False):
+        """True multi-node (num_nodes > 1). Modal requires gpus_per_node to be the
+        full device count for GPU_TYPE here (e.g. 8 for A100) -- partial counts
+        are rejected for clustered functions."""
+        cluster_info = modal.experimental.get_cluster_info()
+        rank = cluster_info.rank
+        master_addr = cluster_info.container_ips[0]
 
-    env = _build_env(mode, override)
-    _sync_data(env)
+        env = _build_env(mode, override)
+        _sync_data(env)
 
-    cmd = [
-        "torchrun",
-        f"--nnodes={NUM_NODES}",
-        f"--node_rank={rank}",
-        f"--nproc_per_node={GPUS_PER_NODE}",
-        f"--master_addr={master_addr}",
-        f"--master_port={MASTER_PORT}",
-        "-m", "training.new_train",
-    ]
-    print(f"[node {rank}/{NUM_NODES}] launching: {' '.join(cmd)}")
-    subprocess.run(cmd, cwd="/app", env=env, check=True)
-    return True
+        cmd = [
+            "torchrun",
+            f"--nnodes={NUM_NODES}",
+            f"--node_rank={rank}",
+            f"--nproc_per_node={GPUS_PER_NODE}",
+            f"--master_addr={master_addr}",
+            f"--master_port={MASTER_PORT}",
+            "-m", "training.new_train",
+        ]
+        print(f"[node {rank}/{NUM_NODES}] launching: {' '.join(cmd)}")
+        subprocess.run(cmd, cwd="/app", env=env, check=True)
+        return True
 
 
 @app.local_entrypoint()
