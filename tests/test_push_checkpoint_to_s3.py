@@ -72,7 +72,12 @@ def test_resolve_checkpoint_dir_missing_folder_raises(tmp_path, monkeypatch):
         m._resolve_checkpoint_dir("pretrain", "does/not/exist")
 
 
-def test_resolve_checkpoint_dir_auto_discovers_latest_ckpt(tmp_path, monkeypatch):
+def test_resolve_checkpoint_dir_auto_discovers_whole_run_dir(tmp_path, monkeypatch):
+    """Default (no --folder) push target is the WHOLE run directory -- not
+    just the latest_ckpt weights subfolder -- so a push is always fully
+    resumable (weights + resume_state + trainer_state.json) from any
+    machine, matching what Trainer._resolve_resume_dir_local_or_s3 looks
+    for on the fetch side."""
     monkeypatch.setattr(m, "DATA_DIR", str(tmp_path))
     monkeypatch.setattr(m, "_load_yaml_cfg", lambda: {"training": {"out_dir": "out_280M"}})
     out_dir = tmp_path / "out_280M"
@@ -80,7 +85,7 @@ def test_resolve_checkpoint_dir_auto_discovers_latest_ckpt(tmp_path, monkeypatch
     run_dir = _make_run_dir(out_dir, "20260722_000000_pretrain", "ckpt_800")
 
     resolved = m._resolve_checkpoint_dir("pretrain", "")
-    assert resolved == str(run_dir / "ckpt_800")
+    assert resolved == str(run_dir)
 
 
 def test_resolve_checkpoint_dir_no_run_dir_raises(tmp_path, monkeypatch):
@@ -91,12 +96,15 @@ def test_resolve_checkpoint_dir_no_run_dir_raises(tmp_path, monkeypatch):
         m._resolve_checkpoint_dir("pretrain", "")
 
 
-def test_resolve_checkpoint_dir_invalid_latest_ckpt_raises(tmp_path, monkeypatch):
+def test_resolve_checkpoint_dir_auto_discovery_ignores_latest_ckpt_validity(tmp_path, monkeypatch):
+    """The run dir is still resolved even if trainer_state.json's
+    latest_ckpt is missing/invalid -- auto-discovery no longer depends on
+    it, since the whole run dir (not just one ckpt_N) is what gets pushed."""
     monkeypatch.setattr(m, "DATA_DIR", str(tmp_path))
     monkeypatch.setattr(m, "_load_yaml_cfg", lambda: {"training": {"out_dir": "out_280M"}})
     out_dir = tmp_path / "out_280M"
     out_dir.mkdir()
-    _make_run_dir(out_dir, "20260722_000000_pretrain", latest_ckpt_name=None)
+    run_dir = _make_run_dir(out_dir, "20260722_000000_pretrain", latest_ckpt_name=None)
 
-    with pytest.raises(FileNotFoundError):
-        m._resolve_checkpoint_dir("pretrain", "")
+    resolved = m._resolve_checkpoint_dir("pretrain", "")
+    assert resolved == str(run_dir)

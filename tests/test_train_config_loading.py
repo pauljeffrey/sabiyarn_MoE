@@ -6,9 +6,9 @@ from training.load_config import _normalize_list_sections, load_train_config
 def test_load_train_config_reads_yaml_sections():
     cfg = load_train_config(Path('training/train_config.yaml'))
     assert cfg.mode == 'pretrain'
-    assert cfg.model_name == 'Aletheia-ng/SabiYarn_MoE_translate_base'
-    # Exact paths are under active tuning (e.g. swapping in a cleaned bin) --
-    # assert structure, not literal values.
+    # model_name (model.repo_name) and the data paths below are under active
+    # tuning -- assert structure, not literal values.
+    assert cfg.model_name.startswith('Aletheia-ng/SabiYarn_MoE')
     assert len(cfg.train_data_paths) == 2
     assert all(p.startswith('datasets/') and p.endswith('.bin') for p in cfg.train_data_paths)
     assert cfg.process_one_file_at_a_time is True

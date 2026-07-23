@@ -2,36 +2,34 @@
 """Modal entrypoint: push a training checkpoint from the persistent
 sabiyarn-data volume (see training/modal_train.py) to S3-compatible storage.
 
-By default, pushes the LATEST checkpoint for --mode: the folder
-new_train.py's own trainer_state.json (under the most recently modified
-run directory for that mode) currently points at via its "latest_ckpt"
-field -- i.e. exactly what a fresh `init_from: "resume"` run would load
-weights from. Pass --folder to push something else instead: a path
-relative to the volume's <out_dir> root, e.g. "20260722_143012_pretrain"
-for a whole run directory (HF weights + resume_state, i.e. a full
-resumable-training backup) or "20260722_143012_pretrain/ckpt_800" for one
-specific checkpoint's HF weights only.
+By default, pushes the WHOLE latest run directory for --mode (weights for
+every ckpt_N saved so far, resume_state/ optimizer+RNG state, and
+trainer_state.json) -- the exact same directory structure
+training/new_train.py's Trainer._resolve_resume_dir_local_or_s3 looks for
+and downloads when comparing local vs. S3 recency, so a push here is always
+fully resumable (weights + optimizer + step count) from any Modal
+account/machine that shares this S3 bucket, not just a snapshot of the
+latest weights. Pass --folder to push something else instead: a path
+relative to the volume's <out_dir> root, e.g.
+"20260722_143012_pretrain/ckpt_800" for one specific checkpoint's HF weights
+only (NOT independently resumable -- no resume_state/trainer_state.json --
+useful only if you specifically want to publish a single snapshot's weights).
 
 Never touches the original training data objects in the bucket -- this
 only ever writes new keys under --dest-prefix (default "checkpoints"),
 mirroring the local path under the volume's DATA_DIR.
 
 Usage:
-    # Push whatever new_train.py currently considers "latest" for pretrain.
+    # Push the whole latest run directory for pretrain (weights + full resume state).
     modal run training/push_checkpoint_to_s3_modal.py --mode pretrain
 
-    # Push one specific checkpoint folder (HF weights only).
+    # Push one specific checkpoint's weights only (not independently resumable).
     modal run training/push_checkpoint_to_s3_modal.py \
         --folder 20260722_143012_pretrain/ckpt_800
-
-    # Push a whole run directory (weights + optimizer/resume state).
-    modal run training/push_checkpoint_to_s3_modal.py \
-        --folder 20260722_143012_pretrain
 """
 
 from __future__ import annotations
 
-import json
 import os
 import sys
 from pathlib import Path
@@ -124,17 +122,7 @@ def _resolve_checkpoint_dir(mode: str, folder: str) -> str:
     run_dir = _find_latest_run_dir(out_dir, mode)
     if run_dir is None:
         raise FileNotFoundError(f"no checkpoint run directory found under {out_dir} for mode={mode!r}")
-
-    meta_path = os.path.join(run_dir, "trainer_state.json")
-    with open(meta_path, "r") as f:
-        meta = json.load(f)
-    latest_ckpt = meta.get("latest_ckpt")
-    if not latest_ckpt or not os.path.isdir(latest_ckpt):
-        raise FileNotFoundError(
-            f"trainer_state.json at {meta_path} has no valid latest_ckpt "
-            f"(got {latest_ckpt!r}) -- pass --folder explicitly instead"
-        )
-    return latest_ckpt
+    return run_dir
 
 
 @app.function(
