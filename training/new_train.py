@@ -31,7 +31,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 from training.constant_tokens import MASK, assistant_token, end_of_text_token, system_token, user_token
 from training.label_masking import apply_label_mask
 from training.load_config import TrainConfig, load_train_config, sampling_weights
-from training.s3_utils import download_folder, find_latest_remote_run_dir
+from training.s3_utils import download_folder, find_latest_remote_run_dir, read_remote_json
 from training.training_attention_mask import build_document_causal_mask
 
 LOG = structlog.get_logger()
@@ -193,13 +193,15 @@ class Trainer:
     def _setup_dirs(self):
         # Training state (optimizer, iter_num, best_val, schedule progress --
         # see _prepare_for_training) always auto-resumes from the latest
-        # checkpoint under out_dir when one exists, regardless of init_from;
-        # init_from only controls where MODEL WEIGHTS come from (see
-        # _build_model). resume_run_dir, if set, is an explicit override that
-        # wins over auto-discovery -- otherwise the most recent matching run
-        # directory is found automatically, which is what makes this work
-        # across Modal container restarts (a fresh timestamped run_dir would
-        # otherwise be created every time and never find prior state).
+        # checkpoint when one exists, regardless of init_from; init_from only
+        # controls where MODEL WEIGHTS come from (see _build_model).
+        # resume_run_dir, if set, is an explicit override that wins over
+        # everything below -- otherwise the most recent state is found
+        # automatically, comparing local out_dir against S3 (see
+        # _resolve_resume_dir_local_or_s3), which is what makes this work
+        # across Modal container restarts *and* across switching between
+        # different Modal accounts/volumes with the same S3 bucket as the
+        # shared source of truth.
         self._resume_dir = None
         if self.cfg.resume_run_dir:
             if os.path.isfile(os.path.join(self.cfg.resume_run_dir, "trainer_state.json")):
@@ -207,17 +209,7 @@ class Trainer:
             else:
                 LOG.warning("resume_run_dir_has_no_checkpoint", path=self.cfg.resume_run_dir)
         else:
-            self._resume_dir = _find_latest_run_dir(self.cfg.out_dir, self.cfg.mode)
-            if self._resume_dir is None:
-                # No local checkpoint (e.g. a fresh Modal Volume, a different
-                # machine, or out_dir just doesn't have one yet) -- fall back
-                # to whatever was last pushed to S3 via
-                # training/push_checkpoint_to_s3_modal.py, so training state
-                # (optimizer, iter_num, best_val, hf-push tracking) can still
-                # resume even when init_from="hf" is only supplying fresh
-                # model weights from the HF Hub. If S3 has nothing either,
-                # this just returns None and training starts fresh as usual.
-                self._resume_dir = self._maybe_download_resume_dir_from_s3()
+            self._resume_dir = self._resolve_resume_dir_local_or_s3()
 
         if self._resume_dir:
             self.run_dir = self._resume_dir
@@ -229,15 +221,107 @@ class Trainer:
         if self.master:
             os.makedirs(self.run_dir, exist_ok=True)
 
-    def _maybe_download_resume_dir_from_s3(self) -> str | None:
-        """S3 fallback for _setup_dirs when no local checkpoint exists.
-        Downloads the latest matching checkpoint previously pushed via
-        training/push_checkpoint_to_s3_modal.py (same "checkpoints/<out_dir
-        basename>/<run_dir>" layout that script writes) into a local
-        directory under out_dir with the same run-dir name, so the rest of
-        the resume machinery (_resolve_resume_weights_path,
-        _prepare_for_training's accelerator.load_state) can treat it exactly
-        like a locally-found run_dir -- no separate code path needed there.
+    def _run_name_timestamp(self, run_name: str) -> str:
+        """Strips the trailing `_{mode}` off a run dir name (`{timestamp}_{mode}`),
+        leaving just the sortable creation timestamp."""
+        suffix = f"_{self.cfg.mode}"
+        return run_name[: -len(suffix)] if run_name.endswith(suffix) else run_name
+
+    def _local_run_recency(self, local_run_dir: str | None) -> tuple[int, str]:
+        """(iter_num, creation_timestamp) for the local candidate, or the
+        lowest-possible sentinel if there isn't one -- so it always loses a
+        comparison against any real S3 checkpoint."""
+        if not local_run_dir:
+            return (-1, "")
+        meta_path = os.path.join(local_run_dir, "trainer_state.json")
+        if not os.path.isfile(meta_path):
+            return (-1, "")
+        with open(meta_path, "r") as f:
+            meta = json.load(f)
+        name = os.path.basename(local_run_dir.rstrip("/"))
+        return (int(meta.get("iter_num", 0)), self._run_name_timestamp(name))
+
+    def _remote_run_recency(self, remote_run_prefix: str, s3_kwargs: dict) -> tuple[int, str]:
+        """(iter_num, creation_timestamp) for the S3 candidate, read from
+        just its trainer_state.json -- no need to download the (potentially
+        large) rest of the checkpoint just to compare recency."""
+        try:
+            meta = read_remote_json(f"{remote_run_prefix}trainer_state.json", **s3_kwargs)
+        except Exception as e:
+            LOG.warning("s3_trainer_state_read_failed", path=remote_run_prefix, error=str(e))
+            meta = None
+        if meta is None:
+            return (-1, "")
+        name = remote_run_prefix.rstrip("/").rsplit("/", 1)[-1]
+        return (int(meta.get("iter_num", 0)), self._run_name_timestamp(name))
+
+    def _resolve_resume_dir_local_or_s3(self) -> str | None:
+        """Auto-discovery when resume_run_dir isn't explicitly set: compares
+        the latest local checkpoint against the latest one pushed to S3 (via
+        training/push_checkpoint_to_s3_modal.py) and uses whichever is more
+        recent -- by iter_num first, then by creation timestamp as a
+        tiebreaker. This is what lets training continue correctly no matter
+        which Modal account/volume you're currently running on, as long as
+        checkpoints get pushed to the same S3 bucket: an account with a
+        stale or empty local out_dir still picks up the real latest state
+        from S3 instead of silently restarting from scratch or resuming an
+        outdated local checkpoint.
+
+        cfg.force_download_from_s3 skips the comparison entirely and always
+        uses S3 when it has anything, regardless of what's local -- for
+        cases where you know local is wrong/irrelevant and just want a clean
+        pull from the shared source of truth.
+        """
+        local_run_dir = _find_latest_run_dir(self.cfg.out_dir, self.cfg.mode)
+
+        s3_ready = bool(
+            self.cfg.s3_bucket and self.cfg.s3_endpoint and self.cfg.s3_access_key and self.cfg.s3_secret_key
+        )
+        if not s3_ready:
+            return local_run_dir
+
+        s3_kwargs = dict(
+            bucket=self.cfg.s3_bucket, endpoint=self.cfg.s3_endpoint,
+            access_key=self.cfg.s3_access_key, secret_key=self.cfg.s3_secret_key,
+        )
+        remote_root = f"checkpoints/{os.path.basename(self.cfg.out_dir.rstrip('/'))}"
+        try:
+            remote_run_prefix = find_latest_remote_run_dir(
+                remote_root, self.cfg.mode, prefix=self.cfg.s3_prefix, **s3_kwargs,
+            )
+        except Exception as e:
+            LOG.warning("s3_latest_run_lookup_failed", error=str(e))
+            remote_run_prefix = None
+
+        if remote_run_prefix is None:
+            return local_run_dir
+
+        use_s3 = bool(self.cfg.force_download_from_s3)
+        if not use_s3:
+            remote_recency = self._remote_run_recency(remote_run_prefix, s3_kwargs)
+            local_recency = self._local_run_recency(local_run_dir)
+            use_s3 = remote_recency > local_recency
+            LOG.info(
+                "resume_source_comparison",
+                local_dir=local_run_dir, local_iter=local_recency[0], local_ts=local_recency[1],
+                remote_dir=remote_run_prefix, remote_iter=remote_recency[0], remote_ts=remote_recency[1],
+                chosen="s3" if use_s3 else "local",
+            )
+
+        if not use_s3:
+            return local_run_dir
+
+        return self._download_remote_run_dir(remote_run_prefix, s3_kwargs)
+
+    def _download_remote_run_dir(self, remote_run_prefix: str, s3_kwargs: dict) -> str | None:
+        """Downloads a full remote run dir (weights + resume_state +
+        trainer_state.json, as pushed by training/push_checkpoint_to_s3_modal.py
+        with --folder <run_dir_name>) into a local directory under out_dir
+        with the same run-dir name, so the rest of the resume machinery
+        (_resolve_resume_weights_path, _prepare_for_training's
+        accelerator.load_state and its incompatible-checkpoint graceful
+        degradation) can treat it exactly like a locally-found run_dir -- no
+        separate code path needed there.
 
         Only the master rank downloads, to avoid every rank racing to write
         the same local files when ranks share a filesystem (the single-node
@@ -247,20 +331,6 @@ class Trainer:
         reliable than trying to propagate success/failure through a
         Python-local variable that only master actually set.
         """
-        if not (self.cfg.s3_bucket and self.cfg.s3_endpoint and self.cfg.s3_access_key and self.cfg.s3_secret_key):
-            return None
-
-        s3_kwargs = dict(
-            bucket=self.cfg.s3_bucket, endpoint=self.cfg.s3_endpoint,
-            access_key=self.cfg.s3_access_key, secret_key=self.cfg.s3_secret_key,
-        )
-        remote_root = f"checkpoints/{os.path.basename(self.cfg.out_dir.rstrip('/'))}"
-        remote_run_prefix = find_latest_remote_run_dir(
-            remote_root, self.cfg.mode, prefix=self.cfg.s3_prefix, **s3_kwargs,
-        )
-        if remote_run_prefix is None:
-            return None
-
         run_name = remote_run_prefix.rstrip("/").rsplit("/", 1)[-1]
         local_run_dir = os.path.join(self.cfg.out_dir, run_name)
 

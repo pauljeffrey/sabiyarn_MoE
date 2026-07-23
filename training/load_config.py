@@ -186,6 +186,13 @@ class TrainConfig:
     use_cce: bool = False
     init_from: str = "hf"  # hf | resume -- controls model weights only, see train_config.yaml
     resume_run_dir: Optional[str] = None  # explicit override; blank = auto-discover latest under out_dir
+    # If True, skip the local-vs-S3 recency comparison in Trainer._setup_dirs
+    # and always resume from S3 when it has any checkpoint -- useful when
+    # training across multiple Modal accounts/volumes where "local" state on
+    # whichever account you're on right now may just be stale or absent, and
+    # S3 is the actual shared source of truth. Overridable per-invocation via
+    # the FORCE_S3_RESUME env var (checked first) without editing the yaml.
+    force_download_from_s3: bool = False
     out_dir: str = "out"
     eval_interval: int = 2000
     log_interval: int = 100
@@ -370,6 +377,11 @@ def load_train_config(path: Optional[str] = None) -> TrainConfig:
         use_cce=bool(training.get("use_cce", False)),
         init_from=str(training.get("init_from", "hf")),
         resume_run_dir=training.get("resume_run_dir"),
+        force_download_from_s3=(
+            os.getenv("FORCE_S3_RESUME").strip().lower() in ("1", "true", "yes")
+            if os.getenv("FORCE_S3_RESUME") is not None
+            else bool(training.get("force_download_from_s3", False))
+        ),
         # TRAIN_OUT_DIR (set by modal_train.py to a path under the mounted Modal volume)
         # wins over the yaml so checkpoints persist and are visible to other containers
         # (eval, test_generation) instead of living in the training container's ephemeral disk.

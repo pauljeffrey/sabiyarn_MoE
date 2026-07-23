@@ -34,6 +34,27 @@ def _object_exists(client, bucket: str, key: str) -> bool:
         raise
 
 
+def read_remote_json(
+    key: str,
+    *,
+    bucket: str,
+    endpoint: str,
+    access_key: str,
+    secret_key: str,
+) -> Optional[dict]:
+    """Read and parse a single small JSON object from S3, without
+    downloading anything else -- used to cheaply compare recency (e.g.
+    iter_num) before committing to downloading a whole checkpoint. Returns
+    None if the object doesn't exist."""
+    import json
+
+    client = _s3_client(endpoint, access_key, secret_key)
+    if not _object_exists(client, bucket, key):
+        return None
+    obj = client.get_object(Bucket=bucket, Key=key)
+    return json.loads(obj["Body"].read())
+
+
 def upload_if_absent(
     local_path: str,
     remote_key: str,

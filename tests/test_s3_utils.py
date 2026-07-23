@@ -55,6 +55,18 @@ class _FakeS3Client:
         with open(local_path, "w") as f:
             f.write(content)
 
+    def get_object(self, Bucket, Key):
+        content = self.objects.get(Key, "{}")
+        return {"Body": _FakeBody(content.encode())}
+
+
+class _FakeBody:
+    def __init__(self, data: bytes):
+        self._data = data
+
+    def read(self):
+        return self._data
+
 
 def _make_tree(tmp_path):
     (tmp_path / "ckpt_100").mkdir()
@@ -214,3 +226,26 @@ def test_download_folder_skips_existing_local_files(tmp_path, monkeypatch):
 
     assert fake.downloaded == []
     assert (local_dir / "config.json").read_text() == "already here"
+
+
+def test_read_remote_json_returns_parsed_object(monkeypatch):
+    objects = {"checkpoints/run1/trainer_state.json": '{"iter_num": 420, "best_val_loss": 3.2}'}
+    fake = _FakeS3Client(existing_keys=set(objects.keys()), objects=objects)
+    monkeypatch.setattr(s3_utils, "_s3_client", lambda *a, **k: fake)
+
+    result = s3_utils.read_remote_json(
+        "checkpoints/run1/trainer_state.json",
+        bucket="b", endpoint="e", access_key="a", secret_key="s",
+    )
+    assert result == {"iter_num": 420, "best_val_loss": 3.2}
+
+
+def test_read_remote_json_returns_none_when_missing(monkeypatch):
+    fake = _FakeS3Client()
+    monkeypatch.setattr(s3_utils, "_s3_client", lambda *a, **k: fake)
+
+    result = s3_utils.read_remote_json(
+        "checkpoints/run1/trainer_state.json",
+        bucket="b", endpoint="e", access_key="a", secret_key="s",
+    )
+    assert result is None
