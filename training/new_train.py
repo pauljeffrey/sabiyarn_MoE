@@ -31,6 +31,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 from training.constant_tokens import MASK, assistant_token, end_of_text_token, system_token, user_token
 from training.label_masking import apply_label_mask
 from training.load_config import TrainConfig, load_train_config, sampling_weights
+from training.s3_utils import download_folder, find_latest_remote_run_dir
 from training.training_attention_mask import build_document_causal_mask
 
 LOG = structlog.get_logger()
@@ -207,6 +208,16 @@ class Trainer:
                 LOG.warning("resume_run_dir_has_no_checkpoint", path=self.cfg.resume_run_dir)
         else:
             self._resume_dir = _find_latest_run_dir(self.cfg.out_dir, self.cfg.mode)
+            if self._resume_dir is None:
+                # No local checkpoint (e.g. a fresh Modal Volume, a different
+                # machine, or out_dir just doesn't have one yet) -- fall back
+                # to whatever was last pushed to S3 via
+                # training/push_checkpoint_to_s3_modal.py, so training state
+                # (optimizer, iter_num, best_val, hf-push tracking) can still
+                # resume even when init_from="hf" is only supplying fresh
+                # model weights from the HF Hub. If S3 has nothing either,
+                # this just returns None and training starts fresh as usual.
+                self._resume_dir = self._maybe_download_resume_dir_from_s3()
 
         if self._resume_dir:
             self.run_dir = self._resume_dir
@@ -217,6 +228,72 @@ class Trainer:
 
         if self.master:
             os.makedirs(self.run_dir, exist_ok=True)
+
+    def _maybe_download_resume_dir_from_s3(self) -> str | None:
+        """S3 fallback for _setup_dirs when no local checkpoint exists.
+        Downloads the latest matching checkpoint previously pushed via
+        training/push_checkpoint_to_s3_modal.py (same "checkpoints/<out_dir
+        basename>/<run_dir>" layout that script writes) into a local
+        directory under out_dir with the same run-dir name, so the rest of
+        the resume machinery (_resolve_resume_weights_path,
+        _prepare_for_training's accelerator.load_state) can treat it exactly
+        like a locally-found run_dir -- no separate code path needed there.
+
+        Only the master rank downloads, to avoid every rank racing to write
+        the same local files when ranks share a filesystem (the single-node
+        multi-GPU case, which is what out_dir being a shared path already
+        assumes for local-checkpoint resume too). Other ranks wait at the
+        barrier below, then check the shared filesystem directly -- more
+        reliable than trying to propagate success/failure through a
+        Python-local variable that only master actually set.
+        """
+        if not (self.cfg.s3_bucket and self.cfg.s3_endpoint and self.cfg.s3_access_key and self.cfg.s3_secret_key):
+            return None
+
+        s3_kwargs = dict(
+            bucket=self.cfg.s3_bucket, endpoint=self.cfg.s3_endpoint,
+            access_key=self.cfg.s3_access_key, secret_key=self.cfg.s3_secret_key,
+        )
+        remote_root = f"checkpoints/{os.path.basename(self.cfg.out_dir.rstrip('/'))}"
+        remote_run_prefix = find_latest_remote_run_dir(
+            remote_root, self.cfg.mode, prefix=self.cfg.s3_prefix, **s3_kwargs,
+        )
+        if remote_run_prefix is None:
+            return None
+
+        run_name = remote_run_prefix.rstrip("/").rsplit("/", 1)[-1]
+        local_run_dir = os.path.join(self.cfg.out_dir, run_name)
+
+        if self.master:
+            os.makedirs(local_run_dir, exist_ok=True)
+            try:
+                # remote_run_prefix already folds in cfg.s3_prefix (it came
+                # straight from find_latest_remote_run_dir's listing), so
+                # pass prefix="" here to avoid applying it a second time.
+                download_folder(remote_run_prefix, local_run_dir, prefix="", **s3_kwargs)
+
+                meta_path = os.path.join(local_run_dir, "trainer_state.json")
+                if os.path.isfile(meta_path):
+                    with open(meta_path, "r") as f:
+                        meta = json.load(f)
+                    latest_ckpt = meta.get("latest_ckpt")
+                    if latest_ckpt:
+                        # latest_ckpt in the downloaded json is an absolute
+                        # path from wherever it was originally saved (e.g. a
+                        # different machine/volume) -- repoint it at this
+                        # machine's actual local copy.
+                        meta["latest_ckpt"] = os.path.join(local_run_dir, os.path.basename(latest_ckpt.rstrip("/")))
+                        with open(meta_path, "w") as f:
+                            json.dump(meta, f)
+                LOG.info("resume_state_downloaded_from_s3", remote=remote_run_prefix, local=local_run_dir)
+            except Exception as e:
+                LOG.warning("resume_state_s3_download_failed", remote=remote_run_prefix, error=str(e))
+
+        self.accelerator.wait_for_everyone()
+
+        if os.path.isfile(os.path.join(local_run_dir, "trainer_state.json")):
+            return local_run_dir
+        return None
 
     def _setup_wandb(self):
         if not self.master or not self.cfg.wandb_log:

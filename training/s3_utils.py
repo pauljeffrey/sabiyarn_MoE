@@ -102,6 +102,86 @@ def upload_folder(
     return uploaded
 
 
+def find_latest_remote_run_dir(
+    remote_root: str,
+    mode: str,
+    *,
+    bucket: str,
+    endpoint: str,
+    access_key: str,
+    secret_key: str,
+    prefix: str = "",
+) -> Optional[str]:
+    """S3 counterpart to training/new_train.py's local _find_latest_run_dir:
+    lists "directories" (common prefixes) directly under remote_root, keeps
+    only those ending in `_{mode}` that actually contain a trainer_state.json
+    object, and returns the lexicographically-latest one's full remote key
+    (run dir names are `{timestamp}_{mode}`, so this sorts chronologically).
+    Returns None if none exist.
+    """
+    client = _s3_client(endpoint, access_key, secret_key)
+    root_key = f"{prefix.rstrip('/')}/{remote_root.strip('/')}/" if prefix else f"{remote_root.strip('/')}/"
+
+    candidates = []
+    paginator = client.get_paginator("list_objects_v2")
+    for page in paginator.paginate(Bucket=bucket, Prefix=root_key, Delimiter="/"):
+        for common in page.get("CommonPrefixes", []) or []:
+            run_key = common["Prefix"]
+            name = run_key.rstrip("/").rsplit("/", 1)[-1]
+            if not name.endswith(f"_{mode}"):
+                continue
+            if _object_exists(client, bucket, f"{run_key}trainer_state.json"):
+                candidates.append(run_key)
+
+    if not candidates:
+        return None
+    return sorted(candidates)[-1]
+
+
+def download_folder(
+    remote_prefix: str,
+    local_dir: str,
+    *,
+    bucket: str,
+    endpoint: str,
+    access_key: str,
+    secret_key: str,
+    prefix: str = "",
+) -> list[str]:
+    """Recursively download every object under remote_prefix into local_dir,
+    mirroring its structure -- the download-side counterpart to
+    upload_folder. Skips a file that already exists locally with nonzero
+    size (same "cached" convention as download_if_missing).
+
+    remote_prefix may already be a full key (e.g. as returned by
+    find_latest_remote_run_dir, which already folds in `prefix`) -- pass
+    prefix="" in that case to avoid applying it twice.
+    """
+    client = _s3_client(endpoint, access_key, secret_key)
+    full_prefix = f"{prefix.rstrip('/')}/{remote_prefix.strip('/')}/" if prefix else f"{remote_prefix.strip('/')}/"
+
+    downloaded = []
+    paginator = client.get_paginator("list_objects_v2")
+    for page in paginator.paginate(Bucket=bucket, Prefix=full_prefix):
+        for obj in page.get("Contents", []) or []:
+            key = obj["Key"]
+            rel = key[len(full_prefix):]
+            if not rel:
+                continue
+            local_path = os.path.join(local_dir, *rel.split("/"))
+            os.makedirs(os.path.dirname(local_path), exist_ok=True)
+
+            if os.path.exists(local_path) and os.path.getsize(local_path) > 0:
+                LOG.info("s3_download_skipped_cached", bucket=bucket, key=key)
+                downloaded.append(local_path)
+                continue
+
+            LOG.info("downloading_s3_object", bucket=bucket, key=key, dest=local_path)
+            client.download_file(bucket, key, local_path)
+            downloaded.append(local_path)
+    return downloaded
+
+
 def download_if_missing(
     remote_key: str,
     local_path: str,
