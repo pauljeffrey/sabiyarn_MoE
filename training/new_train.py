@@ -842,6 +842,75 @@ class Trainer:
         if push_now:
             self._push_checkpoint_to_hf(ckpt_dir)
 
+    def _log_moe_stats(self) -> None:
+        """Surfaces per-layer expert utilization (load) and average router
+        probability -- the actual numbers needed to see whether the router
+        has collapsed onto a handful of experts, rather than inferring it
+        indirectly from the scalar aux loss alone. Reads the same
+        block.mlp._expert_utilization/_router_probs attributes
+        get_expert_utilization() already reads for the aux loss (set during
+        the model's own forward -- this doesn't depend on which modeling.py
+        is actually loaded via trust_remote_code, just that it sets those
+        attributes, which it demonstrably does since aux loss training
+        already works). Reflects the last forward call before this point,
+        i.e. the last eval batch. Master-only; every rank runs the same
+        forward pass so the stats don't differ across ranks.
+        """
+        if not self.master:
+            return
+        raw = self.accelerator.unwrap_model(self.model)
+        if not getattr(raw.config, "use_moe", False):
+            return
+
+        layers = []
+        for i, block in enumerate(raw.transformer.h):
+            if not (hasattr(block, "use_moe") and block.use_moe and hasattr(block.mlp, "_expert_utilization")):
+                continue
+            util = block.mlp._expert_utilization.tolist()
+            probs = block.mlp._router_probs.tolist() if hasattr(block.mlp, "_router_probs") else None
+            num_experts = len(util)
+            # Normalized entropy of the router probability distribution:
+            # 1.0 = perfectly balanced across all experts, 0.0 = fully
+            # collapsed onto a single expert -- the single-number collapse
+            # signal to watch; the raw per-expert arrays are there for
+            # actually seeing which experts are starved.
+            entropy = None
+            if probs and num_experts > 1:
+                p = torch.tensor(probs).clamp_min(1e-12)
+                entropy = float(-(p * p.log()).sum() / math.log(num_experts))
+            layers.append({
+                "layer": i,
+                "max_util": round(max(util), 4),
+                "entropy": round(entropy, 4) if entropy is not None else None,
+                "utilization": [round(u, 4) for u in util],
+                "router_probs": [round(p, 4) for p in probs] if probs else None,
+            })
+
+        if not layers:
+            return
+        # Re-reads the same per-layer _aux_lb attributes get_expert_utilization()
+        # already aggregates for the training loss -- free (no extra forward
+        # pass), just surfaces a number that was previously computed every
+        # step but never actually logged anywhere.
+        _, lb_loss = raw.get_expert_utilization()
+        lb_loss_value = float(lb_loss) if lb_loss is not None and not isinstance(lb_loss, int) else None
+
+        LOG.info("moe_expert_stats", iter=self.iter_num, lb_loss=lb_loss_value, layers=layers)
+
+        if self.cfg.wandb_log:
+            try:
+                import wandb
+                log_dict = {}
+                if lb_loss_value is not None:
+                    log_dict["moe/lb_loss"] = lb_loss_value
+                for l in layers:
+                    log_dict[f"moe/layer{l['layer']}_max_util"] = l["max_util"]
+                    if l["entropy"] is not None:
+                        log_dict[f"moe/layer{l['layer']}_entropy"] = l["entropy"]
+                wandb.log(log_dict, step=self.iter_num)
+            except Exception as exc:
+                LOG.warning("wandb_moe_log_failed", error=str(exc))
+
     def _maybe_log_wandb(self, losses, lr):
         if not self.cfg.wandb_log or not self.master:
             return
@@ -883,6 +952,7 @@ class Trainer:
                 if self.master:
                     LOG.info("eval", iter=self.iter_num, **losses)
                     self._maybe_log_wandb(losses, lr)
+                    self._log_moe_stats()
                 # Checkpoint on every eval regardless of whether val loss
                 # improved -- best_val is still tracked (for metadata/logging),
                 # but no longer gates whether a checkpoint is written.
