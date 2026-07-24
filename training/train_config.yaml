@@ -16,9 +16,18 @@ training:
   always_save_checkpoint : false  # if True, always save a checkpoint after each eval
   gradient_accumulation_steps : 40  # used to simulate larger batch sizes (was 5 * 8)
   decay_lr : True  # whether to decay the learning rate
-  warmup_iters : 20  # how many steps to warm up for
+  # _lr(it) in new_train.py is a pure function of the GLOBAL iter_num, not
+  # "steps since this config changed" -- so warmup_iters must sit comfortably
+  # above wherever training currently is (~iter 1200 as of 2026-07-23) for a
+  # real ramp to actually happen after resuming, rather than warmup already
+  # being "in the past" the instant this takes effect. Re-check the actual
+  # latest iter_num before relaunching and raise this further if needed.
+  warmup_iters : 1500  # was 20 -- deliberately short before; now a real ramp from ~current step
   lr_decay_iters : 5000  # should be ~: max_iters per Chinchilla
-  min_lr : 6e-5  # minimum learning rate, should be ~: learning_rate/10 per Chinchilla
+  # Must stay BELOW learning_rate (optimizer.learning_rate) or the cosine
+  # decay direction inverts (LR would rise toward min_lr instead of falling
+  # toward it). Kept at the same learning_rate/10 ratio used before.
+  min_lr : 1e-6  # was 6e-5 -- that was learning_rate/5 for the old 3e-4 peak; now scaled to the new 1e-5 peak
   compile : true  # use PyTorch 2.0 to compile the model to be faster
   display_model_output_iter : 128
   use_cce : false  # to use cut cross entropy or not
@@ -116,13 +125,13 @@ data:
 # adamw optimizer
 optimizer:
   name : "adam"
-  learning_rate : 3e-4  # max learning rate
+  learning_rate : 1e-5  # was 3e-4 -- lowered; see training.min_lr's comment, must stay above it
   max_iters : 5000  # total number of training iterations
   weight_decay : 1e-1
   beta1 : 0.9
   beta2 : 0.95
   grad_clip : 1.0  # clip gradients at this value, or disable if :: 0.0
-  moe_aux_loss_weight: 0.01  # weight for MoE load-balancing auxiliary loss
+  moe_aux_loss_weight: 0.02  # was 0.01 -- raised to push harder against router imbalance
 
 
 # DDP settings
