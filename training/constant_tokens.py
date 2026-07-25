@@ -68,9 +68,9 @@ lang_id_label_token2 = _id("<lang_id>")
 summary_token2 = _id("<text>")
 prompt_token = _id("<prompt>")
 response_token = _id("<response>")
-end_of_text_token = (
-    _id("<|end_of_text|>") if "<|end_of_text|>" in tokenizer.get_vocab() else tokenizer.eos_token_id
-)
+# The actual document-boundary token the data was tokenized with -- always
+# the tokenizer's own eos_token_id, not a special-cased alternative token.
+end_of_text_token = tokenizer.eos_token_id
 
 prompting_tokens = [
     lang_id_token, classify_token, qa_token, diacritize_token, clean_token,
