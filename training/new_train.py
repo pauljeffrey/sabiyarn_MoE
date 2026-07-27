@@ -523,16 +523,26 @@ class Trainer:
         # pure functions of iter_num, not separate stateful objects, so
         # restoring iter_num alone is what continues them correctly.
         if self._resume_dir:
-            resume_iter_num, resume_best_val = 0, 1e9
-            resume_last_push_loss, resume_last_push_iter = None, 0
             meta_path = os.path.join(self._resume_dir, "trainer_state.json")
             if os.path.isfile(meta_path):
+                # iter_num/best_val/hf-push tracking are plain facts recorded
+                # at save time -- resume them unconditionally whenever
+                # trainer_state.json is present, regardless of whether the
+                # optimizer's exact momentum can also be restored below.
+                # Previously these were only set inside the resume_state
+                # try/except's success branch, so ANY resume_state issue
+                # (missing, incompatible, or deliberately omitted -- e.g. to
+                # warm-start weights from one checkpoint with a fresh
+                # optimizer rather than reusing another checkpoint's
+                # mismatched momentum) silently threw away iter_num too,
+                # even though it was sitting right there in the same file.
                 with open(meta_path, "r") as f:
                     meta = json.load(f)
-                resume_iter_num = meta.get("iter_num", 0)
-                resume_best_val = meta.get("best_val_loss", 1e9)
-                resume_last_push_loss = meta.get("last_hf_push_loss")
-                resume_last_push_iter = meta.get("last_hf_push_iter", 0)
+                self.iter_num = meta.get("iter_num", 0)
+                self.best_val = meta.get("best_val_loss", 1e9)
+                self._last_hf_push_loss = meta.get("last_hf_push_loss")
+                self._last_hf_push_iter = meta.get("last_hf_push_iter", 0)
+
             resume_state_dir = os.path.join(self._resume_dir, "resume_state")
             if os.path.isdir(resume_state_dir):
                 # accelerator.save_state/load_state captures optimizer state
@@ -542,21 +552,18 @@ class Trainer:
                 # (e.g. a leftover checkpoint from an earlier smoke test with
                 # different freeze_*/model settings, so the optimizer's
                 # trainable-param groups don't line up) -- degrade to a fresh
-                # optimizer/iter_num rather than crashing the whole launch,
-                # since a stale directory under out_dir shouldn't be able to
-                # take down a real run.
+                # optimizer rather than crashing the whole launch, since a
+                # stale directory under out_dir shouldn't be able to take
+                # down a real run. iter_num/best_val above are unaffected
+                # either way.
                 try:
                     self.accelerator.load_state(resume_state_dir)
                 except Exception as e:
                     LOG.warning(
                         "resume_state_incompatible", path=resume_state_dir, error=str(e),
-                        action="starting this run's optimizer/iter_num/best_val fresh",
+                        action="continuing with a fresh optimizer state; iter_num/best_val still resumed from trainer_state.json",
                     )
                 else:
-                    self.iter_num = resume_iter_num
-                    self.best_val = resume_best_val
-                    self._last_hf_push_loss = resume_last_push_loss
-                    self._last_hf_push_iter = resume_last_push_iter
                     LOG.info("resumed_training_state", path=resume_state_dir, iter=self.iter_num)
 
     # ------------------------------------------------------------------

@@ -72,6 +72,57 @@ def read_remote_json(
     return json.loads(obj["Body"].read())
 
 
+def write_remote_json(
+    key: str,
+    data: dict,
+    *,
+    bucket: str,
+    endpoint: str,
+    access_key: str,
+    secret_key: str,
+) -> None:
+    """Overwrite a single small JSON object on S3 directly, unconditionally
+    -- e.g. for manually correcting a run_dir's trainer_state.json (to point
+    at a specific checkpoint/iter_num) without a full local round-trip."""
+    import json
+
+    client = _s3_client(endpoint, access_key, secret_key)
+    client.put_object(Bucket=bucket, Key=key, Body=json.dumps(data).encode())
+
+
+def delete_prefix(
+    remote_prefix: str,
+    *,
+    bucket: str,
+    endpoint: str,
+    access_key: str,
+    secret_key: str,
+    prefix: str = "",
+) -> list[str]:
+    """Delete every object under remote_prefix on S3. Used to remove a
+    run_dir's resume_state/ (optimizer/RNG state) when it no longer matches
+    the checkpoint being resumed from -- e.g. warm-starting weights from a
+    checkpoint whose own resume_state was never pushed, where reusing a
+    different checkpoint's mismatched optimizer momentum under a new
+    iter_num label would be worse than just starting the optimizer fresh.
+    Returns every deleted key. Irreversible -- callers should be sure.
+    """
+    client = _s3_client(endpoint, access_key, secret_key)
+    full_prefix = f"{prefix.rstrip('/')}/{remote_prefix.strip('/')}/" if prefix else f"{remote_prefix.strip('/')}/"
+
+    deleted = []
+    paginator = client.get_paginator("list_objects_v2")
+    for page in paginator.paginate(Bucket=bucket, Prefix=full_prefix):
+        keys = [obj["Key"] for obj in page.get("Contents", []) or []]
+        if not keys:
+            continue
+        client.delete_objects(Bucket=bucket, Delete={"Objects": [{"Key": k} for k in keys]})
+        for k in keys:
+            LOG.info("deleted_s3_object", bucket=bucket, key=k)
+        deleted.extend(keys)
+    return deleted
+
+
 def upload_if_absent(
     local_path: str,
     remote_key: str,

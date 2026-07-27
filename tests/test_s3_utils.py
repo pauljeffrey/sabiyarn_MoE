@@ -59,6 +59,15 @@ class _FakeS3Client:
         content = self.objects.get(Key, "{}")
         return {"Body": _FakeBody(content.encode())}
 
+    def put_object(self, Bucket, Key, Body):
+        self.objects[Key] = Body.decode() if isinstance(Body, bytes) else Body
+        self.existing_keys.add(Key)
+
+    def delete_objects(self, Bucket, Delete):
+        for entry in Delete["Objects"]:
+            self.objects.pop(entry["Key"], None)
+            self.existing_keys.discard(entry["Key"])
+
 
 class _FakeBody:
     def __init__(self, data: bytes):
@@ -306,3 +315,53 @@ def test_read_remote_json_returns_none_when_missing(monkeypatch):
         bucket="b", endpoint="e", access_key="a", secret_key="s",
     )
     assert result is None
+
+
+def test_write_remote_json_overwrites_regardless_of_existing_content(monkeypatch):
+    objects = {"checkpoints/run1/trainer_state.json": '{"iter_num": 420}'}
+    fake = _FakeS3Client(existing_keys=set(objects.keys()), objects=objects)
+    monkeypatch.setattr(s3_utils, "_s3_client", lambda *a, **k: fake)
+
+    s3_utils.write_remote_json(
+        "checkpoints/run1/trainer_state.json", {"iter_num": 1000, "best_val_loss": 3.45},
+        bucket="b", endpoint="e", access_key="a", secret_key="s",
+    )
+
+    result = s3_utils.read_remote_json(
+        "checkpoints/run1/trainer_state.json",
+        bucket="b", endpoint="e", access_key="a", secret_key="s",
+    )
+    assert result == {"iter_num": 1000, "best_val_loss": 3.45}
+
+
+def test_delete_prefix_removes_every_object_under_prefix(monkeypatch):
+    objects = {
+        "checkpoints/run1/resume_state/optimizer.bin": "x",
+        "checkpoints/run1/resume_state/random_states_0.pkl": "y",
+        "checkpoints/run1/ckpt_100/config.json": "{}",  # outside the deleted prefix
+    }
+    fake = _FakeS3Client(objects=objects)
+    monkeypatch.setattr(s3_utils, "_s3_client", lambda *a, **k: fake)
+
+    deleted = s3_utils.delete_prefix(
+        "checkpoints/run1/resume_state",
+        bucket="b", endpoint="e", access_key="a", secret_key="s",
+    )
+
+    assert sorted(deleted) == sorted([
+        "checkpoints/run1/resume_state/optimizer.bin",
+        "checkpoints/run1/resume_state/random_states_0.pkl",
+    ])
+    assert "checkpoints/run1/ckpt_100/config.json" in fake.objects
+    assert "checkpoints/run1/resume_state/optimizer.bin" not in fake.objects
+
+
+def test_delete_prefix_returns_empty_when_nothing_matches(monkeypatch):
+    fake = _FakeS3Client(objects={"checkpoints/run1/ckpt_100/config.json": "{}"})
+    monkeypatch.setattr(s3_utils, "_s3_client", lambda *a, **k: fake)
+
+    deleted = s3_utils.delete_prefix(
+        "checkpoints/run1/resume_state",
+        bucket="b", endpoint="e", access_key="a", secret_key="s",
+    )
+    assert deleted == []

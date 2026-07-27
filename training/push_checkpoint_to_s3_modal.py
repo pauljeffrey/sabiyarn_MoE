@@ -180,3 +180,128 @@ def main(
     override: bool = False,
 ):
     push_checkpoint.remote(mode=mode, folder=folder, dest_prefix=dest_prefix, override=override)
+
+
+@app.function(
+    image=image, cpu=2, memory=1024, timeout=300,
+    secrets=[modal.Secret.from_dotenv(__file__)],
+)
+def reset_resume_state_to_checkpoint(
+    run_dir: str,
+    ckpt_name: str,
+    iter_num: int,
+    best_val_loss: float = 1e9,
+    dest_prefix: str = "checkpoints",
+) -> dict:
+    """Corrects a run_dir's S3 state to warm-start from a specific
+    checkpoint whose own resume_state was never pushed -- e.g. ckpt_name
+    came from a different training process/account than whichever last
+    pushed trainer_state.json for this run_dir, so the resume_state
+    currently on S3 has mismatched optimizer/RNG momentum for it.
+
+    Overwrites trainer_state.json to point at ckpt_name/iter_num/
+    best_val_loss, and DELETES resume_state/ entirely, so the next training
+    launch loads ckpt_name's weights (if init_from="resume") and correctly
+    resumes iter_num for the LR/sampling schedule, but starts with a FRESH
+    optimizer rather than silently reusing a different checkpoint's
+    momentum under a new iter_num label. Irreversible for resume_state/ --
+    only run this when you're sure the existing resume_state doesn't
+    actually match ckpt_name.
+    """
+    from training.s3_utils import delete_prefix, write_remote_json
+
+    raw_cfg = _load_yaml_cfg()
+    s3_cfg = _nested_list_dict(raw_cfg.get("s3", {}))
+    bucket = s3_cfg.get("s3_bucket_name") or os.environ["S3_BUCKET"]
+    endpoint = s3_cfg.get("s3_endpoint") or os.environ["S3_ENDPOINT"]
+    access_key = os.environ["S3_ACCESS_KEY_ID"]
+    secret_key = os.environ["S3_SECRET_ACCESS_KEY"]
+    bucket_prefix = str(s3_cfg.get("prefix", ""))
+
+    out_dir_name = str((raw_cfg.get("training", {}) or {}).get("out_dir", "checkpoints"))
+    run_prefix = f"{dest_prefix.rstrip('/')}/{out_dir_name}/{run_dir.strip('/')}"
+
+    def _full_key(rel: str) -> str:
+        remote_key = f"{run_prefix}/{rel}"
+        return f"{bucket_prefix.rstrip('/')}/{remote_key.lstrip('/')}" if bucket_prefix else remote_key.lstrip("/")
+
+    state = {
+        "iter_num": iter_num,
+        "best_val_loss": best_val_loss,
+        "latest_ckpt": f"/data/{out_dir_name}/{run_dir}/{ckpt_name}",
+        "last_hf_push_loss": None,
+        "last_hf_push_iter": 0,
+    }
+    trainer_state_key = _full_key("trainer_state.json")
+    print(f"writing corrected trainer_state.json -> s3://{bucket}/{trainer_state_key}: {state}")
+    write_remote_json(trainer_state_key, state, bucket=bucket, endpoint=endpoint, access_key=access_key, secret_key=secret_key)
+
+    deleted = delete_prefix(
+        f"{run_prefix}/resume_state", bucket=bucket, endpoint=endpoint,
+        access_key=access_key, secret_key=secret_key, prefix=bucket_prefix,
+    )
+    print(f"deleted {len(deleted)} stale resume_state object(s)")
+
+    return {"trainer_state_key": trainer_state_key, "state": state, "deleted_resume_state_keys": deleted}
+
+
+@app.local_entrypoint()
+def reset_main(
+    run_dir: str,
+    ckpt_name: str,
+    iter_num: int,
+    best_val_loss: float = 1e9,
+    dest_prefix: str = "checkpoints",
+):
+    reset_resume_state_to_checkpoint.remote(
+        run_dir=run_dir, ckpt_name=ckpt_name, iter_num=iter_num,
+        best_val_loss=best_val_loss, dest_prefix=dest_prefix,
+    )
+
+
+@app.function(
+    image=image, cpu=2, memory=1024, timeout=300,
+    volumes={DATA_DIR: volume}, secrets=[modal.Secret.from_dotenv(__file__)],
+)
+def clear_local_checkpoints(mode: str = "pretrain", run_dir: str = "") -> dict:
+    """Deletes local checkpoint run director(ies) on THIS Modal account's
+    volume under out_dir -- for forcing the next training launch on this
+    account to fall back to S3 (via Trainer._resolve_resume_dir_local_or_s3)
+    instead of resuming from local state known to be stale/wrong, e.g.
+    after correcting S3 with reset_resume_state_to_checkpoint. Irreversible.
+
+    run_dir: delete just this one run directory name (relative to out_dir).
+    Leave blank to delete every `_{mode}`-suffixed run directory found
+    under out_dir on this account's volume.
+    """
+    import shutil
+
+    raw_cfg = _load_yaml_cfg()
+    out_dir_name = str((raw_cfg.get("training", {}) or {}).get("out_dir", "checkpoints"))
+    out_dir = os.path.join(DATA_DIR, out_dir_name)
+
+    if not os.path.isdir(out_dir):
+        return {"out_dir": out_dir, "deleted": []}
+
+    if run_dir:
+        targets = [run_dir]
+    else:
+        suffix = f"_{mode}"
+        targets = [name for name in os.listdir(out_dir) if name.endswith(suffix)]
+
+    deleted = []
+    for name in targets:
+        path = os.path.join(out_dir, name)
+        if os.path.isdir(path):
+            shutil.rmtree(path)
+            deleted.append(path)
+            print(f"deleted {path}")
+
+    volume.commit()
+    return {"out_dir": out_dir, "deleted": deleted}
+
+
+@app.local_entrypoint()
+def clear_main(mode: str = "pretrain", run_dir: str = ""):
+    result = clear_local_checkpoints.remote(mode=mode, run_dir=run_dir)
+    print(result)
