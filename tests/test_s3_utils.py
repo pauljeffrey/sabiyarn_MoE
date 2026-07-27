@@ -124,6 +124,28 @@ def test_upload_folder_override_reuploads_existing(tmp_path, monkeypatch):
     assert "checkpoints/run1/ckpt_100/config.json" in uploaded_keys
 
 
+def test_upload_folder_force_override_reuploads_regardless_of_flag(tmp_path, monkeypatch):
+    local_dir = _make_tree(tmp_path)
+    (local_dir / "trainer_state.json").write_text('{"iter_num": 1000}')
+    fake = _FakeS3Client(existing_keys={
+        "checkpoints/run1/ckpt_100/config.json",
+        "checkpoints/run1/ckpt_100/trainer_state.json",
+    })
+    monkeypatch.setattr(s3_utils, "_s3_client", lambda *a, **k: fake)
+
+    s3_utils.upload_folder(
+        str(local_dir), "checkpoints/run1/ckpt_100",
+        bucket="b", endpoint="e", access_key="a", secret_key="s",
+        override=False,
+        force_override_paths=s3_utils.is_mutable_checkpoint_file,
+    )
+    uploaded_keys = [key for (_, _, key) in fake.uploaded]
+    # trainer_state.json existed remotely but must still be re-uploaded
+    # (mutable); config.json existed remotely and override=False -> skipped.
+    assert "checkpoints/run1/ckpt_100/trainer_state.json" in uploaded_keys
+    assert "checkpoints/run1/ckpt_100/config.json" not in uploaded_keys
+
+
 def test_upload_folder_applies_bucket_prefix(tmp_path, monkeypatch):
     local_dir = _make_tree(tmp_path)
     fake = _FakeS3Client()
@@ -226,6 +248,41 @@ def test_download_folder_skips_existing_local_files(tmp_path, monkeypatch):
 
     assert fake.downloaded == []
     assert (local_dir / "config.json").read_text() == "already here"
+
+
+def test_download_folder_force_redownload_ignores_local_cache(tmp_path, monkeypatch):
+    objects = {
+        "checkpoints/run1/trainer_state.json": '{"iter_num": 1000}',
+        "checkpoints/run1/ckpt_100/config.json": '{"a": 1}',
+    }
+    fake = _FakeS3Client(objects=objects)
+    monkeypatch.setattr(s3_utils, "_s3_client", lambda *a, **k: fake)
+
+    local_dir = tmp_path / "dest"
+    local_dir.mkdir()
+    (local_dir / "trainer_state.json").write_text('{"iter_num": 420}')  # stale
+    (local_dir / "ckpt_100").mkdir()
+    (local_dir / "ckpt_100" / "config.json").write_text("already here")
+
+    s3_utils.download_folder(
+        "checkpoints/run1", str(local_dir),
+        bucket="b", endpoint="e", access_key="a", secret_key="s",
+        force_redownload_paths=s3_utils.is_mutable_checkpoint_file,
+    )
+
+    # trainer_state.json is mutable -- always re-downloaded, overwriting stale cache.
+    assert (local_dir / "trainer_state.json").read_text() == '{"iter_num": 1000}'
+    # ckpt_100/config.json is immutable -- local cache still respected.
+    assert (local_dir / "ckpt_100" / "config.json").read_text() == "already here"
+
+
+def test_is_mutable_checkpoint_file():
+    assert s3_utils.is_mutable_checkpoint_file("trainer_state.json") is True
+    assert s3_utils.is_mutable_checkpoint_file("resume_state/optimizer.bin") is True
+    assert s3_utils.is_mutable_checkpoint_file("resume_state/random_states_0.pkl") is True
+    assert s3_utils.is_mutable_checkpoint_file("ckpt_100/config.json") is False
+    assert s3_utils.is_mutable_checkpoint_file("ckpt_100/model.safetensors") is False
+    assert s3_utils.is_mutable_checkpoint_file("not_trainer_state.json") is False
 
 
 def test_read_remote_json_returns_parsed_object(monkeypatch):

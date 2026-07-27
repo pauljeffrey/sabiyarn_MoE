@@ -4,11 +4,28 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-from typing import Iterable, Optional
+from typing import Callable, Iterable, Optional
 
 import structlog
 
 LOG = structlog.get_logger()
+
+
+def is_mutable_checkpoint_file(rel_path: str) -> bool:
+    """True for the parts of a run_dir that get REWRITTEN IN PLACE on every
+    checkpoint save -- trainer_state.json and everything under
+    resume_state/ (optimizer/RNG/FSDP shard state) -- as opposed to ckpt_N/,
+    a brand new, immutable folder created fresh each save.
+
+    These live at the same S3 key / local path across every save, so plain
+    skip-if-exists (override=False / "already cached") silently freezes
+    them at whatever content existed the FIRST time this run_dir was
+    pushed/downloaded -- even as local training progresses far beyond that
+    point and newer ckpt_N folders keep getting added correctly (since
+    those have never-before-seen keys). Callers should force these to
+    always be (re-)transferred regardless of the override/cache flag.
+    """
+    return rel_path == "trainer_state.json" or rel_path.startswith("resume_state/")
 
 
 def _s3_client(endpoint: str, access_key: str, secret_key: str):
@@ -93,14 +110,19 @@ def upload_folder(
     secret_key: str,
     prefix: str = "",
     override: bool = False,
+    force_override_paths: Optional[Callable[[str], bool]] = None,
 ) -> list[str]:
     """Recursively upload every file under local_dir to S3, mirroring its
     internal structure under remote_prefix.
 
     Skips a file if its remote object already exists and override is False,
     so re-pushing a checkpoint (e.g. one still being written to) doesn't
-    re-upload files that already made it up. Returns every resulting key
-    (uploaded or already-present).
+    re-upload files that already made it up. force_override_paths, if given,
+    is checked (against the path relative to local_dir) before that skip --
+    when it returns True the file is always re-uploaded regardless of
+    override, for files like trainer_state.json that get rewritten in place
+    (see is_mutable_checkpoint_file). Returns every resulting key (uploaded
+    or already-present).
     """
     client = _s3_client(endpoint, access_key, secret_key)
     base = Path(local_dir)
@@ -112,7 +134,8 @@ def upload_folder(
         remote_key = f"{remote_prefix.rstrip('/')}/{rel}"
         key = f"{prefix.rstrip('/')}/{remote_key.lstrip('/')}" if prefix else remote_key.lstrip("/")
 
-        if not override and _object_exists(client, bucket, key):
+        force = force_override_paths(rel) if force_override_paths else False
+        if not override and not force and _object_exists(client, bucket, key):
             LOG.info("s3_upload_skipped_exists", bucket=bucket, key=key)
             uploaded.append(key)
             continue
@@ -168,11 +191,18 @@ def download_folder(
     access_key: str,
     secret_key: str,
     prefix: str = "",
+    force_redownload_paths: Optional[Callable[[str], bool]] = None,
 ) -> list[str]:
     """Recursively download every object under remote_prefix into local_dir,
     mirroring its structure -- the download-side counterpart to
     upload_folder. Skips a file that already exists locally with nonzero
     size (same "cached" convention as download_if_missing).
+    force_redownload_paths, if given, is checked (against the path relative
+    to remote_prefix) before that skip -- when it returns True the file is
+    always re-downloaded even if a local copy already exists, for files
+    like trainer_state.json that get rewritten in place remotely (see
+    is_mutable_checkpoint_file) and so can't be trusted to still match a
+    previously-cached local copy.
 
     remote_prefix may already be a full key (e.g. as returned by
     find_latest_remote_run_dir, which already folds in `prefix`) -- pass
@@ -192,7 +222,8 @@ def download_folder(
             local_path = os.path.join(local_dir, *rel.split("/"))
             os.makedirs(os.path.dirname(local_path), exist_ok=True)
 
-            if os.path.exists(local_path) and os.path.getsize(local_path) > 0:
+            force = force_redownload_paths(rel) if force_redownload_paths else False
+            if not force and os.path.exists(local_path) and os.path.getsize(local_path) > 0:
                 LOG.info("s3_download_skipped_cached", bucket=bucket, key=key)
                 downloaded.append(local_path)
                 continue

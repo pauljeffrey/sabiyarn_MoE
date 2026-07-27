@@ -31,7 +31,12 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 from training.constant_tokens import MASK, assistant_token, end_of_text_token, system_token, user_token
 from training.label_masking import apply_label_mask
 from training.load_config import TrainConfig, load_train_config, sampling_weights
-from training.s3_utils import download_folder, find_latest_remote_run_dir, read_remote_json
+from training.s3_utils import (
+    download_folder,
+    find_latest_remote_run_dir,
+    is_mutable_checkpoint_file,
+    read_remote_json,
+)
 from training.training_attention_mask import build_document_causal_mask
 
 LOG = structlog.get_logger()
@@ -340,7 +345,14 @@ class Trainer:
                 # remote_run_prefix already folds in cfg.s3_prefix (it came
                 # straight from find_latest_remote_run_dir's listing), so
                 # pass prefix="" here to avoid applying it a second time.
-                download_folder(remote_run_prefix, local_run_dir, prefix="", **s3_kwargs)
+                # force_redownload_paths: trainer_state.json/resume_state
+                # are rewritten in place remotely on every push -- never
+                # trust a local copy already sitting under this run_dir
+                # name for those, even if one exists from an earlier run.
+                download_folder(
+                    remote_run_prefix, local_run_dir, prefix="",
+                    force_redownload_paths=is_mutable_checkpoint_file, **s3_kwargs,
+                )
 
                 meta_path = os.path.join(local_run_dir, "trainer_state.json")
                 if os.path.isfile(meta_path):

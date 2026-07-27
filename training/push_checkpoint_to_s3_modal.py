@@ -135,7 +135,7 @@ def push_checkpoint(
     dest_prefix: str = "checkpoints",
     override: bool = False,
 ) -> dict:
-    from training.s3_utils import upload_folder
+    from training.s3_utils import is_mutable_checkpoint_file, upload_folder
 
     local_dir = _resolve_checkpoint_dir(mode, folder)
     raw_cfg = _load_yaml_cfg()
@@ -146,6 +146,12 @@ def push_checkpoint(
     bucket = s3_cfg.get("s3_bucket_name") or os.environ["S3_BUCKET"]
 
     print(f"pushing {local_dir} -> s3://{bucket}/{remote_prefix}/...")
+    # trainer_state.json and resume_state/ are rewritten in place on every
+    # save -- always re-upload them regardless of --override, or a later
+    # push would silently skip them (their S3 key never changes) and leave
+    # the run's actual latest iter_num/optimizer state frozen at whatever
+    # existed the first time this run_dir was pushed, even as ckpt_N/
+    # folders for newer iters keep getting added correctly alongside them.
     uploaded = upload_folder(
         local_dir, remote_prefix,
         bucket=bucket,
@@ -154,6 +160,7 @@ def push_checkpoint(
         secret_key=os.environ["S3_SECRET_ACCESS_KEY"],
         prefix=str(s3_cfg.get("prefix", "")),
         override=override,
+        force_override_paths=is_mutable_checkpoint_file,
     )
     print(f"uploaded/verified {len(uploaded)} file(s)")
     return {
