@@ -654,22 +654,28 @@ class Trainer:
         return ce_loss
 
     # Matches the config the checkpoint was manually verified against outside
-    # this pipeline (plain single-GPU/CPU, no FSDP), except do_sample -- set
-    # to True (beam-sample decoding) since deterministic beam search
-    # (do_sample=False) is prone to repetitive-loop degeneration, especially
-    # early in training when the model's next-token distribution isn't yet
-    # sharply peaked. temperature/top_k/top_p only take effect once
-    # do_sample=True; they were inert under the original do_sample=False.
+    # this pipeline (plain single-GPU/CPU, no FSDP), with two changes:
+    #   - do_sample=True (was False): deterministic decoding is prone to
+    #     repetitive-loop degeneration, especially while the model's
+    #     next-token distribution isn't yet sharply peaked.
+    #   - num_beams=1 (was 5): num_beams>1 combined with do_sample=True is
+    #     NOT "no beam search" -- it's beam-sample decoding, which still runs
+    #     full beam search (multiple beams, cumulative-score pruning, KV-cache
+    #     reordering every step) and still exhibits beam search's well-known
+    #     mode-seeking/repetition-loop tendency, just with sampled token
+    #     choices layered on top. num_beams=1 is what actually turns beam
+    #     search off entirely, leaving plain top-k/top-p sampling.
+    #     length_penalty/early_stopping are beam-search-only knobs (they
+    #     govern beam score normalization/termination) -- dropped since
+    #     they're inert with num_beams=1.
     _GENERATION_CONFIG = dict(
         max_new_tokens=100,
-        num_beams=5,
+        num_beams=1,
         do_sample=True,
         temperature=0.99,
         top_k=50,
         top_p=0.95,
         repetition_penalty=4.0,
-        length_penalty=3.0,
-        early_stopping=True,
     )
 
     @torch.no_grad()
