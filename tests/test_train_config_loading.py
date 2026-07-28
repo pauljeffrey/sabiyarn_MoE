@@ -14,6 +14,41 @@ def test_load_train_config_reads_yaml_sections():
     assert cfg.process_one_file_at_a_time is True
 
 
+def test_use_loss_mask_and_last_step_read_from_yaml(tmp_path):
+    yaml_text = (
+        "training:\n"
+        "  use_loss_mask: false\n"
+        "  last_step: 1700\n"
+    )
+    path = tmp_path / "cfg.yaml"
+    path.write_text(yaml_text)
+    cfg = load_train_config(path)
+    assert cfg.use_loss_mask is False
+    assert cfg.last_step == 1700
+
+
+def test_use_loss_mask_defaults_true_when_absent(tmp_path):
+    path = tmp_path / "cfg.yaml"
+    path.write_text("training:\n  mode: pretrain\n")
+    cfg = load_train_config(path)
+    assert cfg.use_loss_mask is True
+
+
+def test_last_step_defaults_to_none_when_absent(tmp_path):
+    path = tmp_path / "cfg.yaml"
+    path.write_text("training:\n  mode: pretrain\n")
+    cfg = load_train_config(path)
+    assert cfg.last_step is None
+
+
+def test_last_step_blank_string_treated_as_none(tmp_path):
+    yaml_text = "training:\n  last_step: \"\"\n"
+    path = tmp_path / "cfg.yaml"
+    path.write_text(yaml_text)
+    cfg = load_train_config(path)
+    assert cfg.last_step is None
+
+
 def test_normalize_list_sections_tolerates_comment_lines_mid_block():
     text = (
         "data:\n"

@@ -184,6 +184,10 @@ class TrainConfig:
     compile_model: bool = False
     dtype: str = "bfloat16"
     use_cce: bool = False
+    # Whether to mask prompt/action-span (pretrain) or prompt-vs-response
+    # (SFT) tokens out of the loss at all -- see training/label_masking.py.
+    # False means every token contributes to the loss, completely unmasked.
+    use_loss_mask: bool = True
     init_from: str = "hf"  # hf | resume -- controls model weights only, see train_config.yaml
     resume_run_dir: Optional[str] = None  # explicit override; blank = auto-discover latest under out_dir
     # If True, skip the local-vs-S3 recency comparison in Trainer._setup_dirs
@@ -193,6 +197,17 @@ class TrainConfig:
     # S3 is the actual shared source of truth. Overridable per-invocation via
     # the FORCE_S3_RESUME env var (checked first) without editing the yaml.
     force_download_from_s3: bool = False
+    # Manual last-resort override: forces iter_num to this value regardless
+    # of what any local/S3 checkpoint's trainer_state.json says (even if
+    # none is found at all) -- for when a checkpoint's weights made it to
+    # HF but its matching training state never made it to S3 (e.g. a free
+    # Modal account running out of credit before the state could be
+    # pushed). Leave blank/None for normal auto-resume behavior. This is a
+    # ONE-TIME correction, not a floor: once set, EVERY restart forces
+    # iter_num back to this exact value, silently discarding any real
+    # progress made since -- clear it back to blank once checkpointing is
+    # confirmed working again.
+    last_step: Optional[int] = None
     out_dir: str = "out"
     eval_interval: int = 2000
     log_interval: int = 100
@@ -375,6 +390,7 @@ def load_train_config(path: Optional[str] = None) -> TrainConfig:
         compile_model=bool(training.get("compile", False)),
         dtype=mixed_precision,
         use_cce=bool(training.get("use_cce", False)),
+        use_loss_mask=bool(training.get("use_loss_mask", True)),
         init_from=str(training.get("init_from", "hf")),
         resume_run_dir=training.get("resume_run_dir"),
         force_download_from_s3=(
@@ -382,6 +398,7 @@ def load_train_config(path: Optional[str] = None) -> TrainConfig:
             if os.getenv("FORCE_S3_RESUME") is not None
             else bool(training.get("force_download_from_s3", False))
         ),
+        last_step=(int(training["last_step"]) if training.get("last_step") not in (None, "") else None),
         # TRAIN_OUT_DIR (set by modal_train.py to a path under the mounted Modal volume)
         # wins over the yaml so checkpoints persist and are visible to other containers
         # (eval, test_generation) instead of living in the training container's ephemeral disk.

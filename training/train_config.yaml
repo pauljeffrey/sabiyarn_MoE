@@ -31,6 +31,10 @@ training:
   compile : true  # use PyTorch 2.0 to compile the model to be faster
   display_model_output_iter : 128
   use_cce : false  # to use cut cross entropy or not
+  # Whether to mask prompt/action-span (pretrain) or prompt-vs-response (SFT)
+  # tokens out of the loss at all -- see training/label_masking.py. false
+  # means every token contributes to the loss, completely unmasked.
+  use_loss_mask: false
   scheduler: "cosine"
   block_size: 4096
   dtype: "bf16"
@@ -57,6 +61,16 @@ training:
   # S3 is the actual shared source of truth. Overridable per-invocation via
   # the FORCE_S3_RESUME env var (checked first) without editing this file.
   force_download_from_s3: false
+  # Manual last-resort override: forces iter_num to this value regardless of
+  # what any local/S3 checkpoint's trainer_state.json says (even if none is
+  # found at all) -- for when a checkpoint's weights made it to HF but its
+  # matching training state never made it to S3 (e.g. a free Modal account
+  # running out of credit before the state could be pushed). Leave blank for
+  # normal auto-resume behavior. This is a ONE-TIME correction, not a floor:
+  # once set, EVERY restart forces iter_num back to this exact value,
+  # silently discarding any real progress made since -- clear it back to
+  # blank once checkpointing is confirmed working again.
+  last_step: 1700
   mode: "pretrain"  # pretrain | sft
   hf_chkpt_path: "Aletheia-ng/SabiYarn_MoE_base"
   schedule_trainable_layers: false

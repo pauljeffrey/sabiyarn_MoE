@@ -566,6 +566,21 @@ class Trainer:
                 else:
                     LOG.info("resumed_training_state", path=resume_state_dir, iter=self.iter_num)
 
+        # Manual last-resort override -- forces iter_num regardless of
+        # whatever the block above found (or didn't find at all), for when
+        # a checkpoint's weights made it to HF but its matching training
+        # state never made it to S3. Applies unconditionally, not just as a
+        # fallback, per training.last_step's contract; see its definition
+        # in load_config.py for why this must be manually cleared afterward.
+        if self.cfg.last_step is not None:
+            LOG.warning(
+                "last_step_override", previous_iter_num=self.iter_num, forced_iter_num=self.cfg.last_step,
+                action="training.last_step is set in train_config.yaml -- clear it back to blank once "
+                       "checkpointing is confirmed working again, or every future restart will keep "
+                       "resetting iter_num to this same value and discard real progress made since.",
+            )
+            self.iter_num = self.cfg.last_step
+
     # ------------------------------------------------------------------
     # Data
     # ------------------------------------------------------------------
@@ -596,14 +611,17 @@ class Trainer:
         x = torch.stack([torch.from_numpy(data[i : i + sl].astype(np.int64)) for i in ix])
         y = torch.stack([torch.from_numpy(data[i + 1 : i + sl + 1].astype(np.int64)) for i in ix])
 
-        y = torch.stack([
-            apply_label_mask(
-                row.clone(), self.cfg.mode,
-                user_token=user_token, assistant_token=assistant_token,
-                system_token=system_token, mask=MASK,
-            )
-            for row in y
-        ])
+        if self.cfg.use_loss_mask:
+            y = torch.stack([
+                apply_label_mask(
+                    row.clone(), self.cfg.mode,
+                    user_token=user_token, assistant_token=assistant_token,
+                    system_token=system_token, mask=MASK,
+                )
+                for row in y
+            ])
+        # else: every token contributes to the loss, unmasked -- no prompt/
+        # action-span or SFT prompt-vs-response masking at all.
 
         x = x.to(self.device, non_blocking=True)
         y = y.to(self.device, non_blocking=True)
