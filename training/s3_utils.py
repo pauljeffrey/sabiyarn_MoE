@@ -233,6 +233,29 @@ def find_latest_remote_run_dir(
     return sorted(candidates)[-1]
 
 
+def list_immediate_subfolders(
+    remote_root: str,
+    *,
+    bucket: str,
+    endpoint: str,
+    access_key: str,
+    secret_key: str,
+    prefix: str = "",
+) -> list[str]:
+    """List "directories" (common prefixes) directly under remote_root --
+    e.g. every ckpt_N/ folder inside a run_dir. Returns full keys (each
+    ending in a trailing slash)."""
+    client = _s3_client(endpoint, access_key, secret_key)
+    root_key = f"{prefix.rstrip('/')}/{remote_root.strip('/')}/" if prefix else f"{remote_root.strip('/')}/"
+
+    out = []
+    paginator = client.get_paginator("list_objects_v2")
+    for page in paginator.paginate(Bucket=bucket, Prefix=root_key, Delimiter="/"):
+        for common in page.get("CommonPrefixes", []) or []:
+            out.append(common["Prefix"])
+    return out
+
+
 def download_folder(
     remote_prefix: str,
     local_dir: str,

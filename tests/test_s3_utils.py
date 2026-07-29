@@ -365,3 +365,36 @@ def test_delete_prefix_returns_empty_when_nothing_matches(monkeypatch):
         bucket="b", endpoint="e", access_key="a", secret_key="s",
     )
     assert deleted == []
+
+
+def test_list_immediate_subfolders_lists_only_direct_children(monkeypatch):
+    objects = {
+        "checkpoints/run1/ckpt_100/config.json": "{}",
+        "checkpoints/run1/ckpt_200/config.json": "{}",
+        "checkpoints/run1/ckpt_200/model.safetensors": "x",
+        "checkpoints/run1/resume_state/optimizer.bin": "y",
+        "checkpoints/run1/trainer_state.json": "{}",  # a file directly under run1, not a subfolder
+    }
+    fake = _FakeS3Client(objects=objects)
+    monkeypatch.setattr(s3_utils, "_s3_client", lambda *a, **k: fake)
+
+    folders = s3_utils.list_immediate_subfolders(
+        "checkpoints/run1",
+        bucket="b", endpoint="e", access_key="a", secret_key="s",
+    )
+    assert sorted(folders) == sorted([
+        "checkpoints/run1/ckpt_100/",
+        "checkpoints/run1/ckpt_200/",
+        "checkpoints/run1/resume_state/",
+    ])
+
+
+def test_list_immediate_subfolders_empty_when_none_exist(monkeypatch):
+    fake = _FakeS3Client(objects={})
+    monkeypatch.setattr(s3_utils, "_s3_client", lambda *a, **k: fake)
+
+    folders = s3_utils.list_immediate_subfolders(
+        "checkpoints/run1",
+        bucket="b", endpoint="e", access_key="a", secret_key="s",
+    )
+    assert folders == []

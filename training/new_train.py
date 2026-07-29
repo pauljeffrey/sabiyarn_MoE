@@ -32,10 +32,14 @@ from training.constant_tokens import MASK, assistant_token, end_of_text_token, s
 from training.label_masking import apply_label_mask
 from training.load_config import TrainConfig, load_train_config, sampling_weights
 from training.s3_utils import (
+    delete_prefix,
     download_folder,
     find_latest_remote_run_dir,
     is_mutable_checkpoint_file,
+    list_immediate_subfolders,
     read_remote_json,
+    upload_folder,
+    upload_if_absent,
 )
 from training.training_attention_mask import build_document_causal_mask
 
@@ -130,6 +134,18 @@ class Trainer:
         self.best_val = 1e9
         self._last_hf_push_loss = None  # val loss at the last successful HF push, if any
         self._last_hf_push_iter = 0
+        # Name (e.g. "ckpt_2400") of the checkpoint folder currently pushed
+        # to S3 for this run, if this process has pushed one yet -- lets
+        # _push_checkpoint_to_s3 delete it once a newer one uploads, so S3
+        # only ever holds the single latest checkpoint (see that method).
+        self._last_s3_pushed_ckpt_name = None
+        # True until the first S3 push this process actually runs: S3 may
+        # already hold ckpt_N folder(s) from before this process started
+        # (a prior run, or a manual full-history push via
+        # push_checkpoint_to_s3_modal.py) that _last_s3_pushed_ckpt_name
+        # above has no way to know about -- clean those up once, the first
+        # time, rather than assuming a clean slate.
+        self._s3_ckpt_cleanup_pending = True
         self._resume_dir = None  # set by _setup_dirs, used by _build_model/_prepare_for_training
         self._setup_accelerator()
         self._setup_dirs()
@@ -849,6 +865,64 @@ class Trainer:
         except Exception as exc:
             LOG.error("hf_checkpoint_upload_failed", repo=self.cfg.hf_chkpt_path, reason=str(exc))
 
+    def _push_checkpoint_to_s3(self, ckpt_dir: str) -> None:
+        """Pushes the checkpoint just saved locally (this ckpt_N's weights,
+        resume_state/, trainer_state.json) to S3 on every save, so state is
+        always recoverable even if this session gets torn down (e.g. a
+        free-tier Modal account running out of credit) before a manual
+        training/push_checkpoint_to_s3_modal.py push happens.
+
+        Unlike that manual script, this REPLACES IN PLACE rather than
+        accumulating history: once the new ckpt_N uploads successfully, the
+        previously-pushed one for this run is deleted from S3, so S3 only
+        ever holds a single checkpoint's weights per run (plus the always-
+        current trainer_state.json/resume_state) -- not a growing archive.
+        Master-only; skips silently if S3 isn't configured.
+        """
+        if not (self.cfg.s3_bucket and self.cfg.s3_endpoint and self.cfg.s3_access_key and self.cfg.s3_secret_key):
+            return
+
+        s3_kwargs = dict(
+            bucket=self.cfg.s3_bucket, endpoint=self.cfg.s3_endpoint,
+            access_key=self.cfg.s3_access_key, secret_key=self.cfg.s3_secret_key,
+        )
+        out_dir_name = os.path.basename(self.cfg.out_dir.rstrip("/"))
+        run_dir_name = os.path.basename(self.run_dir.rstrip("/"))
+        remote_root = f"checkpoints/{out_dir_name}/{run_dir_name}"
+        ckpt_name = os.path.basename(ckpt_dir.rstrip("/"))
+
+        try:
+            if self._s3_ckpt_cleanup_pending:
+                for folder in list_immediate_subfolders(remote_root, prefix=self.cfg.s3_prefix, **s3_kwargs):
+                    name = folder.rstrip("/").rsplit("/", 1)[-1]
+                    if name.startswith("ckpt_") and name != ckpt_name:
+                        delete_prefix(f"{remote_root}/{name}", prefix=self.cfg.s3_prefix, **s3_kwargs)
+                self._s3_ckpt_cleanup_pending = False
+
+            upload_folder(ckpt_dir, f"{remote_root}/{ckpt_name}", prefix=self.cfg.s3_prefix, **s3_kwargs)
+
+            resume_state_dir = os.path.join(self.run_dir, "resume_state")
+            if os.path.isdir(resume_state_dir):
+                upload_folder(
+                    resume_state_dir, f"{remote_root}/resume_state",
+                    prefix=self.cfg.s3_prefix, override=True, **s3_kwargs,
+                )
+            meta_path = os.path.join(self.run_dir, "trainer_state.json")
+            if os.path.isfile(meta_path):
+                upload_if_absent(
+                    meta_path, f"{remote_root}/trainer_state.json",
+                    prefix=self.cfg.s3_prefix, override=True, **s3_kwargs,
+                )
+
+            if self._last_s3_pushed_ckpt_name and self._last_s3_pushed_ckpt_name != ckpt_name:
+                delete_prefix(
+                    f"{remote_root}/{self._last_s3_pushed_ckpt_name}", prefix=self.cfg.s3_prefix, **s3_kwargs,
+                )
+            self._last_s3_pushed_ckpt_name = ckpt_name
+            LOG.info("s3_checkpoint_pushed", remote=f"{remote_root}/{ckpt_name}", iter=self.iter_num)
+        except Exception as exc:
+            LOG.error("s3_checkpoint_push_failed", error=str(exc))
+
     def _save(self, val_loss: float):
         # get_state_dict / save_state are collective under FSDP (all-gather
         # across ranks) — every rank must call them, not just master.
@@ -884,6 +958,8 @@ class Trainer:
 
         if push_now:
             self._push_checkpoint_to_hf(ckpt_dir)
+        if self.master:
+            self._push_checkpoint_to_s3(ckpt_dir)
 
     def _log_moe_stats(self) -> None:
         """Surfaces per-layer expert utilization (load) and average router
