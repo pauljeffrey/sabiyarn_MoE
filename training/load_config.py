@@ -188,7 +188,7 @@ class TrainConfig:
     # (SFT) tokens out of the loss at all -- see training/label_masking.py.
     # False means every token contributes to the loss, completely unmasked.
     use_loss_mask: bool = True
-    init_from: str = "hf"  # hf | resume -- controls model weights only, see train_config.yaml
+    init_from: str = "resume"  # hf | resume -- controls model weights only, see train_config.yaml
     resume_run_dir: Optional[str] = None  # explicit override; blank = auto-discover latest under out_dir
     # If True, skip the local-vs-S3 recency comparison in Trainer._setup_dirs
     # and always resume from S3 when it has any checkpoint -- useful when

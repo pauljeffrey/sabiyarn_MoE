@@ -1,6 +1,6 @@
 
 training: 
-  train_batch_size : 8
+  train_batch_size : 6
   # Local/vast.ai: checkpoints go directly under this path. On Modal
   # (training/modal_train.py), this name is instead used as a subdirectory
   # under the persistent "sabiyarn-data" volume -- checkpoints land at
@@ -8,13 +8,13 @@ training:
   # container's cwd -- so give each distinct experiment/config its own
   # out_dir to keep their checkpoint trees (and latest-checkpoint
   # auto-discovery) from colliding.
-  out_dir : "out"
-  eval_interval : 20
+  out_dir : "out_280M"
+  eval_interval : 120
   log_interval : 100
   eval_iters : 200
   eval_only : false  # if True, script exits right after the first eval
   always_save_checkpoint : false  # if True, always save a checkpoint after each eval
-  gradient_accumulation_steps : 40  # used to simulate larger batch sizes (was 5 * 8)
+  gradient_accumulation_steps : 20  # used to simulate larger batch sizes (was 5 * 8)
   decay_lr : True  # whether to decay the learning rate
   # _lr(it) in new_train.py is a pure function of the GLOBAL iter_num, not
   # "steps since this config changed" -- so warmup_iters must sit comfortably
@@ -38,6 +38,7 @@ training:
   scheduler: "cosine"
   block_size: 4096
   dtype: "bf16"
+  hf_push_interval: 100
   # init_from controls MODEL WEIGHTS only: "hf" pulls model.repo_name from the
   # HF Hub; "resume" loads the latest local checkpoint's weights instead (see
   # resume_run_dir below). Regardless of this setting, optimizer state,
@@ -70,7 +71,7 @@ training:
   # once set, EVERY restart forces iter_num back to this exact value,
   # silently discarding any real progress made since -- clear it back to
   # blank once checkpointing is confirmed working again.
-  last_step: 1700
+  last_step: 3100
   mode: "pretrain"  # pretrain | sft
   hf_chkpt_path: "Aletheia-ng/SabiYarn_MoE_base"
   schedule_trainable_layers: false
@@ -81,7 +82,7 @@ tokenizer:
   process_one_file_at_a_time: true
 
 model:
-  repo_name: Aletheia-ng/SabiYarn_MoE_translate_base
+  repo_name: Aletheia-ng/SabiYarn_MoE_base
   weights:
     freeze_experts_only: false
     freeze_pos_layer_only: false
@@ -120,7 +121,7 @@ data:
       - Aletheia-ng/tds-sft
   pretrain:
     - eng_train_data_path : "datasets/eng_training.bin"
-    - afr_train_data_path : "datasets/training.bin"
+    - afr_train_data_path : "datasets/training_cleaned.bin"
     # TEMPORARY for smoke testing: validation.bin doesn't exist in the S3
     # bucket. Pointing eval at an existing training bin just unblocks the
     # pipeline check -- this is NOT a real held-out eval set. Restore to
@@ -132,8 +133,8 @@ data:
     - eval_data_path: "sft_validation.bin"
   sampling:
     - use_scheduled_sampling: false
-    - afr_sampling_weight: 0.6
-    - eng_sampling_weight: 0.4
+    - afr_sampling_weight: 0.55
+    - eng_sampling_weight: 0.45
  
 
 # adamw optimizer
@@ -193,6 +194,5 @@ modal:
   # gpus_per_node to be the FULL device count Modal offers per physical host
   # for that type (see the clustered() note in training/modal_train.py).
   num_nodes: 1
-  gpus_per_node: 8
-  gpu_type: "L40S"  # 48 GB -- change freely, see the list above
-
+  gpus_per_node: 4
+  gpu_type: "A100-80GB"  # 48 GB -- change freely, see the list above
