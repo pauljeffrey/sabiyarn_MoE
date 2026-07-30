@@ -48,7 +48,7 @@ training:
   # step count/optimizer momentum from a prior local run while pulling fresh
   # weights, which is intentional for continuous pretraining across Modal
   # container restarts.
-  init_from: "hf"  # hf (HuggingFace hub) | resume (local ckpt)
+  init_from: "resume"  # hf (HuggingFace hub) | resume (local ckpt)
   # Optional explicit override; leave blank to auto-discover the most recent
   # matching run directory under training.out_dir (works the same on a Modal
   # Volume, a vast.ai instance's local disk, or your own machine -- purely a
@@ -71,9 +71,9 @@ training:
   # once set, EVERY restart forces iter_num back to this exact value,
   # silently discarding any real progress made since -- clear it back to
   # blank once checkpointing is confirmed working again.
-  last_step: 3100
+  last_step: 
   mode: "pretrain"  # pretrain | sft
-  hf_chkpt_path: "Aletheia-ng/SabiYarn_MoE_base"
+  hf_chkpt_path: "Aletheia-ng/SabiYarn_MoE-280M"
   schedule_trainable_layers: false
 
 tokenizer:
@@ -126,22 +126,22 @@ data:
     # bucket. Pointing eval at an existing training bin just unblocks the
     # pipeline check -- this is NOT a real held-out eval set. Restore to
     # "validation.bin" (or a real eval split) before actual training.
-    - eval_data_path: "datasets/eng_training.bin"
+    - eval_data_path: "datasets/validation.bin"
   sft:
     - eng_train_data_path : "datasets/eng_sft_training.bin"
     - afr_train_data_path : "datasets/nigerian_sft_training.bin"
     - eval_data_path: "sft_validation.bin"
   sampling:
     - use_scheduled_sampling: false
-    - afr_sampling_weight: 0.55
-    - eng_sampling_weight: 0.45
+    - afr_sampling_weight: 0.8
+    - eng_sampling_weight: 0.2
  
 
 # adamw optimizer
 optimizer:
   name : "adam"
   learning_rate : 1e-5  # was 3e-4 -- lowered; see training.min_lr's comment, must stay above it
-  max_iters : 5000  # total number of training iterations
+  max_iters : 25000  # total number of training iterations
   weight_decay : 1e-1
   beta1 : 0.9
   beta2 : 0.95
