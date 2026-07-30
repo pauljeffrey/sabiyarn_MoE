@@ -147,6 +147,13 @@ class Trainer:
         # time, rather than assuming a clean slate.
         self._s3_ckpt_cleanup_pending = True
         self._resume_dir = None  # set by _setup_dirs, used by _build_model/_prepare_for_training
+        # Skip checkpointing/HF-push on the very first eval this PROCESS
+        # runs -- on a resume, that eval lands at the same iter_num as the
+        # checkpoint we just loaded, and saving again would overwrite it
+        # before there's been any chance to inspect the resume (see
+        # _verify_resume_sanity) and abort if something looks wrong. Cleared
+        # after that first eval so every later one saves normally.
+        self._suppress_first_save = True
         self._setup_accelerator()
         self._setup_dirs()
         self._setup_wandb()
@@ -154,6 +161,7 @@ class Trainer:
         self._build_model()
         self._build_optimizer()
         self._prepare_for_training()
+        self._verify_resume_sanity()
 
     # ------------------------------------------------------------------
     # Setup
@@ -604,6 +612,72 @@ class Trainer:
     def _read_memmap(self, path: str) -> np.memmap:
         return np.memmap(path, dtype=np.uint16, mode="r")
 
+    def _sanity_batch(self):
+        """A FIXED, deterministic batch -- drawn via a fixed numpy seed
+        independent of the live torch RNG stream (which accelerator.load_state
+        touches on resume) -- so the same tokens get drawn every time this is
+        called, whether right before a save or right after a resume. Read
+        from eval_bin so it doesn't depend on the (dynamic, iter_num-driven)
+        train sampling ratio either.
+        """
+        rng = np.random.default_rng(1234567)
+        bs, sl = self.cfg.train_batch_size, self.cfg.block_size
+        data = self._read_memmap(self.eval_bin)
+        ix = rng.integers(0, len(data) - sl - 1, size=bs)
+        x = torch.stack([torch.from_numpy(data[i : i + sl].astype(np.int64)) for i in ix])
+        y = torch.stack([torch.from_numpy(data[i + 1 : i + sl + 1].astype(np.int64)) for i in ix])
+        return x.to(self.device, non_blocking=True), y.to(self.device, non_blocking=True)
+
+    @torch.no_grad()
+    def _sanity_loss(self) -> float:
+        """Loss on the fixed sanity batch -- a pure forward pass, no
+        gradient step, so it isolates the MODEL/WEIGHTS' functional
+        behavior from the optimizer entirely. Recorded at every save and
+        re-checked right after every resume (see _verify_resume_sanity) so
+        a mismatch directly proves a weight-loading bug, rather than
+        inferring it indirectly from training-loss trends. Collective
+        under FSDP -- every rank must call this, not just master.
+        """
+        self.model.eval()
+        x, y = self._sanity_batch()
+        loss = self._forward_loss(x, y)
+        self.model.train()
+        return self.accelerator.reduce(loss, reduction="mean").item()
+
+    def _verify_resume_sanity(self) -> None:
+        """Compares the fixed sanity-batch loss right now (weights loaded,
+        FSDP fully wrapped, optimizer resumed if applicable) against the
+        value recorded at the last save. A large delta is direct proof the
+        reloaded model is NOT functionally identical to what was saved,
+        despite resume reporting success elsewhere -- a real weight-loading
+        bug. A small delta proves the weights ARE fine, meaning any
+        observed post-resume loss spike is coming from somewhere else
+        entirely (optimizer dynamics, data, schedule), not corrupted state.
+        """
+        if not self._resume_dir:
+            return
+        meta_path = os.path.join(self._resume_dir, "trainer_state.json")
+        if not os.path.isfile(meta_path):
+            return
+        with open(meta_path, "r") as f:
+            meta = json.load(f)
+        saved_sanity_loss = meta.get("sanity_loss")
+        if saved_sanity_loss is None:
+            return
+
+        current = self._sanity_loss()
+        delta = current - saved_sanity_loss
+        log_fn = LOG.warning if abs(delta) > 0.1 else LOG.info
+        log_fn(
+            "resume_sanity_check",
+            saved_sanity_loss=saved_sanity_loss, current_sanity_loss=current, delta=delta,
+            interpretation=(
+                "large |delta| -> the reloaded model is NOT functionally identical to what was "
+                "saved (a real weight-loading bug); small |delta| -> weights are fine, any "
+                "post-resume loss spike is coming from elsewhere (optimizer dynamics, data, schedule)"
+            ),
+        )
+
     def _sampling_weights(self) -> tuple[float, float]:
         return sampling_weights(
             self.cfg.eng_sampling_weight,
@@ -930,6 +1004,12 @@ class Trainer:
         state_dict = self.accelerator.get_state_dict(self.model)
         ckpt_dir = os.path.join(self.run_dir, f"ckpt_{self.iter_num}")
 
+        # Also collective (see _sanity_loss) -- recorded so a future resume
+        # can directly verify the reloaded model is functionally identical
+        # to what's saved here, rather than inferring it from training-loss
+        # trends alone.
+        sanity_loss = self._sanity_loss()
+
         push_now = self.master and self._should_push_to_hf(val_loss)
 
         if self.master:
@@ -948,6 +1028,7 @@ class Trainer:
                     "iter_num": self.iter_num,
                     "best_val_loss": self.best_val,
                     "latest_ckpt": ckpt_dir,
+                    "sanity_loss": sanity_loss,
                     "last_hf_push_loss": self._last_hf_push_loss,
                     "last_hf_push_iter": self._last_hf_push_iter,
                 }, f)
@@ -1077,8 +1158,14 @@ class Trainer:
                 # but no longer gates whether a checkpoint is written.
                 # Pushing to the HF Hub remains selective (_should_push_to_hf).
                 self.best_val = min(self.best_val, losses["val"])
-                if self.iter_num > 0:
+                if self.iter_num > 0 and not self._suppress_first_save:
                     self._save(losses["val"])
+                elif self.master and self._suppress_first_save:
+                    LOG.info(
+                        "first_eval_save_suppressed", iter=self.iter_num, val_loss=losses["val"],
+                        note="not checkpointed/pushed -- inspect this eval and stop now if it looks wrong",
+                    )
+                self._suppress_first_save = False
 
             if self.iter_num == 0 and self.cfg.eval_only:
                 break
