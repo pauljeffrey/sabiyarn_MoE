@@ -194,5 +194,5 @@ modal:
   # gpus_per_node to be the FULL device count Modal offers per physical host
   # for that type (see the clustered() note in training/modal_train.py).
   num_nodes: 1
-  gpus_per_node: 4
-  gpu_type: "A100-80GB"  # 48 GB -- change freely, see the list above
+  gpus_per_node: 2
+  gpu_type: "L40S" #"A100-80GB"  # 48 GB -- change freely, see the list above
