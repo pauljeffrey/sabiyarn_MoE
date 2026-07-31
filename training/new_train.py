@@ -31,6 +31,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 from training.constant_tokens import MASK, assistant_token, end_of_text_token, system_token, user_token
 from training.label_masking import apply_label_mask
 from training.load_config import TrainConfig, load_train_config, sampling_weights
+from training.mfu import compute_mfu, model_flops_per_token, peak_flops_for_current_device
 from training.s3_utils import (
     delete_prefix,
     download_folder,
@@ -154,6 +155,11 @@ class Trainer:
         # _verify_resume_sanity) and abort if something looks wrong. Cleared
         # after that first eval so every later one saves normally.
         self._suppress_first_save = True
+        # Tracks the iter_num as of the last "step" log line, so the MFU/
+        # throughput window (see train()) always covers exactly the iterations
+        # actually elapsed since then, even for the very first log line (which
+        # only covers iter 0 itself, not a full log_interval window).
+        self._last_logged_iter = -1
         self._setup_accelerator()
         self._setup_dirs()
         self._setup_wandb()
@@ -506,6 +512,32 @@ class Trainer:
             self._load_checkpoint_weights(resume_weights, torch_dtype)
 
         _freeze_layers(self.model, self.cfg)
+
+        # Computed from the real (post from_pretrained) config -- expert_per_layer
+        # is only populated once the HF loading path runs (_prepare_config), so this
+        # must happen after from_pretrained above, not from train_config.yaml alone.
+        self._flops_per_token = model_flops_per_token(self.model.config, self.cfg.block_size)
+        self._peak_flops_per_gpu = peak_flops_for_current_device()
+        if self.master:
+            LOG.info(
+                "mfu_setup",
+                flops_per_token=self._flops_per_token,
+                gpu=torch.cuda.get_device_name(torch.cuda.current_device()) if torch.cuda.is_available() else "cpu/mps",
+                peak_tflops_per_gpu=(self._peak_flops_per_gpu / 1e12 if self._peak_flops_per_gpu else None),
+                note=(
+                    "flops_per_token counts EVERY expert per MoE layer (not just "
+                    "num_experts_per_tok) since MoE.forward computes all experts "
+                    "densely before top-k gather -- see training/mfu.py"
+                    if getattr(self.model.config, "use_moe", False) else None
+                ),
+            )
+            if self._peak_flops_per_gpu is None and torch.cuda.is_available():
+                LOG.warning(
+                    "mfu_peak_flops_unknown",
+                    gpu=torch.cuda.get_device_name(torch.cuda.current_device()),
+                    action="add this GPU to _GPU_PEAK_TFLOPS in training/mfu.py to get an mfu %; "
+                           "tflops_per_gpu will still be logged",
+                )
 
         if self.cfg.compile_model:
             if self.fsdp_plugin is not None:
@@ -1121,6 +1153,22 @@ class Trainer:
             LOG.warning("wandb_log_failed", error=str(exc))
             self.cfg.wandb_log = False
 
+    def _log_step_wandb(self, loss: float, tokens_per_sec: float, tflops_per_gpu: float, mfu: float | None) -> None:
+        if not self.cfg.wandb_log or not self.master:
+            return
+        try:
+            import wandb
+            log_dict = {
+                "train/loss": loss,
+                "train/tokens_per_sec": tokens_per_sec,
+                "train/tflops_per_gpu": tflops_per_gpu,
+            }
+            if mfu is not None:
+                log_dict["train/mfu"] = mfu
+            wandb.log(log_dict, step=self.iter_num)
+        except Exception as exc:
+            LOG.warning("wandb_step_log_failed", error=str(exc))
+
     def _sample_prompt(self, x: torch.Tensor, num_samples: int = 5) -> torch.Tensor:
         """Real token ids straight from the current batch -- up to num_samples
         rows (fewer if train_batch_size is smaller), passed to the model
@@ -1190,11 +1238,28 @@ class Trainer:
 
             if self.iter_num % self.cfg.log_interval == 0 and self.master:
                 dt = time.time() - t0
-                log_kwargs = {"iter": self.iter_num, "loss": last_loss.item(), "ms": dt * 1000}
+                iters_elapsed = max(1, self.iter_num - self._last_logged_iter)
+                self._last_logged_iter = self.iter_num
+                tokens_processed = (
+                    self.cfg.train_batch_size * self.cfg.block_size
+                    * self.cfg.gradient_accumulation_steps * self.world_size * iters_elapsed
+                )
+                tokens_per_sec = tokens_processed / dt if dt > 0 else 0.0
+                tflops_per_gpu, mfu = compute_mfu(
+                    self._flops_per_token, tokens_processed, dt, self.world_size, self._peak_flops_per_gpu,
+                )
+                log_kwargs = {
+                    "iter": self.iter_num, "loss": last_loss.item(), "ms": dt * 1000,
+                    "tokens_per_sec": round(tokens_per_sec, 1),
+                    "tflops_per_gpu": round(tflops_per_gpu, 2),
+                }
+                if mfu is not None:
+                    log_kwargs["mfu"] = round(mfu, 4)
                 if self.cfg.use_scheduled_sampling and len(self.train_bins) > 1:
                     eng_w, afr_w = self._sampling_weights()
                     log_kwargs.update(eng_sampling_weight=eng_w, afr_sampling_weight=afr_w)
                 LOG.info("step", **log_kwargs)
+                self._log_step_wandb(last_loss.item(), tokens_per_sec, tflops_per_gpu, mfu)
                 t0 = time.time()
 
             self.iter_num += 1
