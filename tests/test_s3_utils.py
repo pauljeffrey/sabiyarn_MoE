@@ -289,6 +289,8 @@ def test_is_mutable_checkpoint_file():
     assert s3_utils.is_mutable_checkpoint_file("trainer_state.json") is True
     assert s3_utils.is_mutable_checkpoint_file("resume_state/optimizer.bin") is True
     assert s3_utils.is_mutable_checkpoint_file("resume_state/random_states_0.pkl") is True
+    assert s3_utils.is_mutable_checkpoint_file("resume_state_best/optimizer.bin") is True
+    assert s3_utils.is_mutable_checkpoint_file("ckpt_best/model.safetensors") is True
     assert s3_utils.is_mutable_checkpoint_file("ckpt_100/config.json") is False
     assert s3_utils.is_mutable_checkpoint_file("ckpt_100/model.safetensors") is False
     assert s3_utils.is_mutable_checkpoint_file("not_trainer_state.json") is False

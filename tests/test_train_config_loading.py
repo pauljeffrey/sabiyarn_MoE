@@ -49,6 +49,20 @@ def test_last_step_blank_string_treated_as_none(tmp_path):
     assert cfg.last_step is None
 
 
+def test_resume_from_read_from_yaml(tmp_path):
+    path = tmp_path / "cfg.yaml"
+    path.write_text("training:\n  resume_from: best\n")
+    cfg = load_train_config(path)
+    assert cfg.resume_from == "best"
+
+
+def test_resume_from_defaults_to_latest_when_absent(tmp_path):
+    path = tmp_path / "cfg.yaml"
+    path.write_text("training:\n  mode: pretrain\n")
+    cfg = load_train_config(path)
+    assert cfg.resume_from == "latest"
+
+
 def test_normalize_list_sections_tolerates_comment_lines_mid_block():
     text = (
         "data:\n"

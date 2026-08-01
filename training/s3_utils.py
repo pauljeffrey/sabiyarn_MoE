@@ -24,8 +24,17 @@ def is_mutable_checkpoint_file(rel_path: str) -> bool:
     point and newer ckpt_N folders keep getting added correctly (since
     those have never-before-seen keys). Callers should force these to
     always be (re-)transferred regardless of the override/cache flag.
+
+    ckpt_best/ and resume_state_best/ are the same kind of fixed-name,
+    rewritten-in-place slot as resume_state/ -- unlike ckpt_N/, which is a
+    brand new immutable folder each save -- so they need the same treatment.
     """
-    return rel_path == "trainer_state.json" or rel_path.startswith("resume_state/")
+    return (
+        rel_path == "trainer_state.json"
+        or rel_path.startswith("resume_state/")
+        or rel_path.startswith("resume_state_best/")
+        or rel_path.startswith("ckpt_best/")
+    )
 
 
 def _s3_client(endpoint: str, access_key: str, secret_key: str):

@@ -55,6 +55,14 @@ training:
   # filesystem scan, no platform-specific logic -- as long as out_dir points
   # at somewhere that actually persists across restarts there).
   resume_run_dir: ""
+  # Two checkpoints are tracked per run: "latest" (ckpt_{iter_num}/
+  # resume_state, saved on every eval regardless of loss) and "best"
+  # (ckpt_best/resume_state_best, only updated when val loss improves on
+  # its own best). This picks which one to actually resume from -- "best"
+  # rewinds iter_num/the LR+sampling schedule to wherever that best eval
+  # happened, "latest" continues from wherever training last stopped even
+  # if loss had gotten worse since the best point.
+  resume_from: "latest"  # latest | best
   # If true, skip the local-vs-S3 recency comparison in Trainer._setup_dirs
   # and always resume from S3 when it has any checkpoint -- useful when
   # training across multiple Modal accounts/volumes where "local" state on

@@ -190,6 +190,13 @@ class TrainConfig:
     use_loss_mask: bool = True
     init_from: str = "resume"  # hf | resume -- controls model weights only, see train_config.yaml
     resume_run_dir: Optional[str] = None  # explicit override; blank = auto-discover latest under out_dir
+    # Which of the two tracked checkpoints within the resumed run_dir to
+    # resume from: "latest" (ckpt_{iter_num}/resume_state, saved on every
+    # eval regardless of loss) or "best" (ckpt_best/resume_state_best,
+    # only updated when val loss improves on its own best -- see
+    # Trainer._save). Also controls which iter_num/best_val get restored,
+    # since "best" rewinds to an earlier point in the LR/sampling schedule.
+    resume_from: str = "latest"  # latest | best
     # If True, skip the local-vs-S3 recency comparison in Trainer._setup_dirs
     # and always resume from S3 when it has any checkpoint -- useful when
     # training across multiple Modal accounts/volumes where "local" state on
@@ -393,6 +400,7 @@ def load_train_config(path: Optional[str] = None) -> TrainConfig:
         use_loss_mask=bool(training.get("use_loss_mask", True)),
         init_from=str(training.get("init_from", "hf")),
         resume_run_dir=training.get("resume_run_dir"),
+        resume_from=str(training.get("resume_from", "latest") or "latest"),
         force_download_from_s3=(
             os.getenv("FORCE_S3_RESUME").strip().lower() in ("1", "true", "yes")
             if os.getenv("FORCE_S3_RESUME") is not None

@@ -16,6 +16,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import shutil
 import time
 from datetime import datetime
 
@@ -135,6 +136,14 @@ class Trainer:
         self.best_val = 1e9
         self._last_hf_push_loss = None  # val loss at the last successful HF push, if any
         self._last_hf_push_iter = 0
+        # The separate, less-frequently-updated "best" checkpoint -- see
+        # _save's is_new_best handling and train_config.yaml's resume_from.
+        # ckpt_best/resume_state_best only get (re)written when an eval's
+        # val loss beats this run's own best so far, unlike the "latest"
+        # ckpt_{iter_num}/resume_state pair saved on every eval.
+        self._best_ckpt_dir = None
+        self._best_iter_num = 0
+        self._best_sanity_loss = None
         # Name (e.g. "ckpt_2400") of the checkpoint folder currently pushed
         # to S3 for this run, if this process has pushed one yet -- lets
         # _push_checkpoint_to_s3 delete it once a newer one uploads, so S3
@@ -162,6 +171,7 @@ class Trainer:
         self._last_logged_iter = -1
         self._setup_accelerator()
         self._setup_dirs()
+        self._backfill_ckpt_best()
         self._setup_wandb()
         self._setup_data()
         self._build_model()
@@ -275,6 +285,57 @@ class Trainer:
 
         if self.master:
             os.makedirs(self.run_dir, exist_ok=True)
+
+    def _backfill_ckpt_best(self) -> None:
+        """One-time migration for a run_dir saved before ckpt_best existed
+        (e.g. ckpt_7560, saved 2026-07-30): seeds ckpt_best/resume_state_best
+        from the current latest_ckpt/resume_state and records that in
+        trainer_state.json, so both are immediately valid, independent
+        resume targets (see resume_from) from this point forward -- rather
+        than ckpt_best silently staying absent until the next real
+        improvement. No-ops once best_ckpt is already recorded. Pushes the
+        seeded ckpt_best to S3 too, so a fresh account/volume resuming from
+        S3 sees it immediately, not just whichever account happens to run
+        the backfill locally.
+
+        Master does the actual I/O; every rank still calls this (and hits
+        the barrier at the end) so the rest of __init__ can safely assume
+        trainer_state.json is already backfilled on every rank by the time
+        _build_model/_prepare_for_training read it.
+        """
+        if self.master and self._resume_dir:
+            meta_path = os.path.join(self._resume_dir, "trainer_state.json")
+            if os.path.isfile(meta_path):
+                with open(meta_path, "r") as f:
+                    meta = json.load(f)
+                latest_ckpt = meta.get("latest_ckpt")
+                if not meta.get("best_ckpt") and latest_ckpt and os.path.isdir(latest_ckpt):
+                    best_ckpt_dir = os.path.join(self._resume_dir, "ckpt_best")
+                    shutil.copytree(latest_ckpt, best_ckpt_dir, dirs_exist_ok=True)
+
+                    resume_state_dir = os.path.join(self._resume_dir, "resume_state")
+                    resume_state_best_dir = os.path.join(self._resume_dir, "resume_state_best")
+                    if os.path.isdir(resume_state_dir):
+                        shutil.copytree(resume_state_dir, resume_state_best_dir, dirs_exist_ok=True)
+
+                    meta["best_ckpt"] = best_ckpt_dir
+                    meta["best_iter_num"] = meta.get("iter_num", 0)
+                    meta["best_sanity_loss"] = meta.get("sanity_loss")
+                    with open(meta_path, "w") as f:
+                        json.dump(meta, f)
+                    LOG.info(
+                        "ckpt_best_backfilled", path=best_ckpt_dir, iter=meta["best_iter_num"],
+                        note="seeded ckpt_best from latest_ckpt -- this run_dir predates best-checkpoint tracking",
+                    )
+                    # self.run_dir == self._resume_dir already (set by
+                    # _setup_dirs above), which _push_checkpoint_to_s3 reads.
+                    # iter_num isn't resumed until _prepare_for_training runs
+                    # later -- set it here too, just so this push's log line
+                    # reports the real iter instead of the init default (0).
+                    self.iter_num = meta.get("iter_num", 0)
+                    self._push_checkpoint_to_s3(latest_ckpt, is_new_best=True)
+
+        self.accelerator.wait_for_everyone()
 
     def _run_name_timestamp(self, run_name: str) -> str:
         """Strips the trailing `_{mode}` off a run dir name (`{timestamp}_{mode}`),
@@ -409,12 +470,16 @@ class Trainer:
                     with open(meta_path, "r") as f:
                         meta = json.load(f)
                     latest_ckpt = meta.get("latest_ckpt")
-                    if latest_ckpt:
-                        # latest_ckpt in the downloaded json is an absolute
-                        # path from wherever it was originally saved (e.g. a
-                        # different machine/volume) -- repoint it at this
-                        # machine's actual local copy.
-                        meta["latest_ckpt"] = os.path.join(local_run_dir, os.path.basename(latest_ckpt.rstrip("/")))
+                    best_ckpt = meta.get("best_ckpt")
+                    if latest_ckpt or best_ckpt:
+                        # latest_ckpt/best_ckpt in the downloaded json are
+                        # absolute paths from wherever they were originally
+                        # saved (e.g. a different machine/volume) -- repoint
+                        # them at this machine's actual local copies.
+                        if latest_ckpt:
+                            meta["latest_ckpt"] = os.path.join(local_run_dir, os.path.basename(latest_ckpt.rstrip("/")))
+                        if best_ckpt:
+                            meta["best_ckpt"] = os.path.join(local_run_dir, os.path.basename(best_ckpt.rstrip("/")))
                         with open(meta_path, "w") as f:
                             json.dump(meta, f)
                 LOG.info("resume_state_downloaded_from_s3", remote=remote_run_prefix, local=local_run_dir)
@@ -474,9 +539,10 @@ class Trainer:
 
     def _resolve_resume_weights_path(self) -> str | None:
         """The local model-weights directory to load from when
-        init_from=="resume": the latest_ckpt recorded in the resumed run's
-        trainer_state.json (see _setup_dirs for how _resume_dir itself is
-        found), if any checkpoint has actually been saved there yet."""
+        init_from=="resume": latest_ckpt or best_ckpt (per cfg.resume_from)
+        recorded in the resumed run's trainer_state.json (see _setup_dirs
+        for how _resume_dir itself is found), if that checkpoint has
+        actually been saved there yet."""
         if not self._resume_dir:
             return None
         meta_path = os.path.join(self._resume_dir, "trainer_state.json")
@@ -484,9 +550,16 @@ class Trainer:
             return None
         with open(meta_path, "r") as f:
             meta = json.load(f)
-        latest_ckpt = meta.get("latest_ckpt")
-        if latest_ckpt and os.path.isdir(latest_ckpt):
-            return latest_ckpt
+        ckpt_path = meta.get("best_ckpt") if self.cfg.resume_from == "best" else None
+        if self.cfg.resume_from == "best" and not ckpt_path:
+            LOG.warning(
+                "resume_from_best_unavailable", path=self._resume_dir,
+                reason="no best_ckpt recorded yet -- falling back to latest_ckpt",
+            )
+        if not ckpt_path:
+            ckpt_path = meta.get("latest_ckpt")
+        if ckpt_path and os.path.isdir(ckpt_path):
+            return ckpt_path
         return None
 
     def _build_model(self):
@@ -609,6 +682,7 @@ class Trainer:
         # restoring iter_num alone is what continues them correctly.
         if self._resume_dir:
             meta_path = os.path.join(self._resume_dir, "trainer_state.json")
+            resume_from_best = False
             if os.path.isfile(meta_path):
                 # iter_num/best_val/hf-push tracking are plain facts recorded
                 # at save time -- resume them unconditionally whenever
@@ -623,12 +697,25 @@ class Trainer:
                 # even though it was sitting right there in the same file.
                 with open(meta_path, "r") as f:
                     meta = json.load(f)
-                self.iter_num = meta.get("iter_num", 0)
+                resume_from_best = self.cfg.resume_from == "best" and bool(meta.get("best_ckpt"))
+                # "best" rewinds iter_num to wherever that best eval
+                # happened -- the LR/sampling schedule is a pure function
+                # of iter_num, so this genuinely resumes AT that earlier
+                # point, not just its weights with today's schedule value.
+                self.iter_num = (
+                    meta.get("best_iter_num", meta.get("iter_num", 0))
+                    if resume_from_best else meta.get("iter_num", 0)
+                )
                 self.best_val = meta.get("best_val_loss", 1e9)
+                self._best_ckpt_dir = meta.get("best_ckpt")
+                self._best_iter_num = meta.get("best_iter_num", self.iter_num)
+                self._best_sanity_loss = meta.get("best_sanity_loss")
                 self._last_hf_push_loss = meta.get("last_hf_push_loss")
                 self._last_hf_push_iter = meta.get("last_hf_push_iter", 0)
 
-            resume_state_dir = os.path.join(self._resume_dir, "resume_state")
+            resume_state_dir = os.path.join(
+                self._resume_dir, "resume_state_best" if resume_from_best else "resume_state",
+            )
             if os.path.isdir(resume_state_dir):
                 # accelerator.save_state/load_state captures optimizer state
                 # (and RNG generator state) for whatever was passed to
@@ -649,7 +736,10 @@ class Trainer:
                         action="continuing with a fresh optimizer state; iter_num/best_val still resumed from trainer_state.json",
                     )
                 else:
-                    LOG.info("resumed_training_state", path=resume_state_dir, iter=self.iter_num)
+                    LOG.info(
+                        "resumed_training_state", path=resume_state_dir, iter=self.iter_num,
+                        source="best" if resume_from_best else "latest",
+                    )
 
         # Manual last-resort override -- forces iter_num regardless of
         # whatever the block above found (or didn't find at all), for when
@@ -722,7 +812,8 @@ class Trainer:
             return
         with open(meta_path, "r") as f:
             meta = json.load(f)
-        saved_sanity_loss = meta.get("sanity_loss")
+        resume_from_best = self.cfg.resume_from == "best" and bool(meta.get("best_ckpt"))
+        saved_sanity_loss = meta.get("best_sanity_loss") if resume_from_best else meta.get("sanity_loss")
         if saved_sanity_loss is None:
             return
 
@@ -1000,7 +1091,7 @@ class Trainer:
         except Exception as exc:
             LOG.error("hf_checkpoint_upload_failed", repo=self.cfg.hf_chkpt_path, reason=str(exc))
 
-    def _push_checkpoint_to_s3(self, ckpt_dir: str) -> None:
+    def _push_checkpoint_to_s3(self, ckpt_dir: str, is_new_best: bool = False) -> None:
         """Pushes the checkpoint just saved locally (this ckpt_N's weights,
         resume_state/, trainer_state.json) to S3 on every save, so state is
         always recoverable even if this session gets torn down (e.g. a
@@ -1010,9 +1101,13 @@ class Trainer:
         Unlike that manual script, this REPLACES IN PLACE rather than
         accumulating history: once the new ckpt_N uploads successfully, the
         previously-pushed one for this run is deleted from S3, so S3 only
-        ever holds a single checkpoint's weights per run (plus the always-
-        current trainer_state.json/resume_state) -- not a growing archive.
-        Master-only; skips silently if S3 isn't configured.
+        ever holds a single "latest" checkpoint's weights per run (plus the
+        always-current trainer_state.json/resume_state) -- not a growing
+        archive. ckpt_best/resume_state_best are a SEPARATE, also
+        replace-in-place slot -- fixed names, so no explicit delete needed,
+        just overwrite -- only touched when is_new_best (a real improvement,
+        or the one-time _backfill_ckpt_best seed). Master-only; skips
+        silently if S3 isn't configured.
         """
         if not (self.cfg.s3_bucket and self.cfg.s3_endpoint and self.cfg.s3_access_key and self.cfg.s3_secret_key):
             return
@@ -1030,7 +1125,10 @@ class Trainer:
             if self._s3_ckpt_cleanup_pending:
                 for folder in list_immediate_subfolders(remote_root, prefix=self.cfg.s3_prefix, **s3_kwargs):
                     name = folder.rstrip("/").rsplit("/", 1)[-1]
-                    if name.startswith("ckpt_") and name != ckpt_name:
+                    # ckpt_best is a fixed-name slot maintained separately
+                    # below, not a numbered "latest" checkpoint -- exclude it
+                    # or this cleanup would delete it on the very next push.
+                    if name.startswith("ckpt_") and name != ckpt_name and name != "ckpt_best":
                         delete_prefix(f"{remote_root}/{name}", prefix=self.cfg.s3_prefix, **s3_kwargs)
                 self._s3_ckpt_cleanup_pending = False
 
@@ -1042,6 +1140,21 @@ class Trainer:
                     resume_state_dir, f"{remote_root}/resume_state",
                     prefix=self.cfg.s3_prefix, override=True, **s3_kwargs,
                 )
+
+            if is_new_best:
+                best_ckpt_dir = os.path.join(self.run_dir, "ckpt_best")
+                if os.path.isdir(best_ckpt_dir):
+                    upload_folder(
+                        best_ckpt_dir, f"{remote_root}/ckpt_best",
+                        prefix=self.cfg.s3_prefix, override=True, **s3_kwargs,
+                    )
+                resume_state_best_dir = os.path.join(self.run_dir, "resume_state_best")
+                if os.path.isdir(resume_state_best_dir):
+                    upload_folder(
+                        resume_state_best_dir, f"{remote_root}/resume_state_best",
+                        prefix=self.cfg.s3_prefix, override=True, **s3_kwargs,
+                    )
+
             meta_path = os.path.join(self.run_dir, "trainer_state.json")
             if os.path.isfile(meta_path):
                 upload_if_absent(
@@ -1054,16 +1167,20 @@ class Trainer:
                     f"{remote_root}/{self._last_s3_pushed_ckpt_name}", prefix=self.cfg.s3_prefix, **s3_kwargs,
                 )
             self._last_s3_pushed_ckpt_name = ckpt_name
-            LOG.info("s3_checkpoint_pushed", remote=f"{remote_root}/{ckpt_name}", iter=self.iter_num)
+            LOG.info(
+                "s3_checkpoint_pushed", remote=f"{remote_root}/{ckpt_name}",
+                iter=self.iter_num, is_new_best=is_new_best,
+            )
         except Exception as exc:
             LOG.error("s3_checkpoint_push_failed", error=str(exc))
 
-    def _save(self, val_loss: float):
+    def _save(self, val_loss: float, is_new_best: bool):
         # get_state_dict / save_state are collective under FSDP (all-gather
         # across ranks) — every rank must call them, not just master.
         unwrapped = self.accelerator.unwrap_model(self.model)
         state_dict = self.accelerator.get_state_dict(self.model)
         ckpt_dir = os.path.join(self.run_dir, f"ckpt_{self.iter_num}")
+        best_ckpt_dir = os.path.join(self.run_dir, "ckpt_best")
 
         # Also collective (see _sanity_loss) -- recorded so a future resume
         # can directly verify the reloaded model is functionally identical
@@ -1081,6 +1198,19 @@ class Trainer:
                 save_function=self.accelerator.save,
                 state_dict=state_dict,
             )
+            if is_new_best:
+                # Reuses the state_dict already gathered above -- another
+                # local write, no extra FSDP all-gather.
+                os.makedirs(best_ckpt_dir, exist_ok=True)
+                unwrapped.save_pretrained(
+                    best_ckpt_dir,
+                    is_main_process=True,
+                    save_function=self.accelerator.save,
+                    state_dict=state_dict,
+                )
+                self._best_ckpt_dir = best_ckpt_dir
+                self._best_iter_num = self.iter_num
+                self._best_sanity_loss = sanity_loss
             if push_now:
                 self._last_hf_push_loss = val_loss
                 self._last_hf_push_iter = self.iter_num
@@ -1088,20 +1218,32 @@ class Trainer:
                 json.dump({
                     "iter_num": self.iter_num,
                     "best_val_loss": self.best_val,
+                    "best_iter_num": self._best_iter_num,
                     "latest_ckpt": ckpt_dir,
+                    "best_ckpt": self._best_ckpt_dir,
                     "sanity_loss": sanity_loss,
+                    "best_sanity_loss": self._best_sanity_loss,
                     "last_hf_push_loss": self._last_hf_push_loss,
                     "last_hf_push_iter": self._last_hf_push_iter,
                 }, f)
-            LOG.info("checkpoint_saved", path=ckpt_dir, iter=self.iter_num)
+            LOG.info("checkpoint_saved", path=ckpt_dir, iter=self.iter_num, is_new_best=is_new_best)
 
         self.accelerator.save_state(os.path.join(self.run_dir, "resume_state"))
         self.accelerator.wait_for_everyone()
 
+        if self.master and is_new_best:
+            # Plain file copy, not a second collective save_state() call --
+            # resume_state/ just written above IS this exact iter's state,
+            # so copying it sideways is equivalent at a fraction of the cost.
+            resume_state_dir = os.path.join(self.run_dir, "resume_state")
+            resume_state_best_dir = os.path.join(self.run_dir, "resume_state_best")
+            if os.path.isdir(resume_state_dir):
+                shutil.copytree(resume_state_dir, resume_state_best_dir, dirs_exist_ok=True)
+
         if push_now:
             self._push_checkpoint_to_hf(ckpt_dir)
         if self.master:
-            self._push_checkpoint_to_s3(ckpt_dir)
+            self._push_checkpoint_to_s3(ckpt_dir, is_new_best=is_new_best)
 
     def _log_moe_stats(self) -> None:
         """Surfaces per-layer expert utilization (load) and average router
@@ -1230,13 +1372,17 @@ class Trainer:
                     LOG.info("eval", iter=self.iter_num, **losses)
                     self._maybe_log_wandb(losses, lr)
                     self._log_moe_stats()
-                # Checkpoint on every eval regardless of whether val loss
-                # improved -- best_val is still tracked (for metadata/logging),
-                # but no longer gates whether a checkpoint is written.
-                # Pushing to the HF Hub remains selective (_should_push_to_hf).
+                # Checkpoint ("latest") on every eval regardless of whether
+                # val loss improved. Whether it's ALSO a new best additionally
+                # gates a separate ckpt_best/resume_state_best save (see
+                # _save) -- must be computed before best_val is updated below,
+                # or every eval would trivially look like a "new best" against
+                # its own already-folded-in value. Pushing to the HF Hub
+                # remains selective (_should_push_to_hf).
+                is_new_best = losses["val"] < self.best_val
                 self.best_val = min(self.best_val, losses["val"])
                 if self.iter_num > 0 and not self._suppress_first_save:
-                    self._save(losses["val"])
+                    self._save(losses["val"], is_new_best)
                 elif self.master and self._suppress_first_save:
                     LOG.info(
                         "first_eval_save_suppressed", iter=self.iter_num, val_loss=losses["val"],
