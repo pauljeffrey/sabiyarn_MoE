@@ -1,0 +1,52 @@
+{%- for message in messages %}
+    {%- if loop.index0 == 0 %}
+        {{- bos_token }}
+    {%- endif %}
+
+    {# ===== SYSTEM MESSAGES ===== #}
+    {%- if message['role'] == 'system' %}
+        {{- "<|system|>" }}
+        {{- message['content'] }}
+        {{- eos_token }}
+
+    {# ===== USER MESSAGES ===== #}
+    {%- elif message['role'] == 'user' %}
+        {{- "<|user|>" }}
+        {{- message['content'] }}
+        {{- eos_token }}
+
+    {# ===== TOOL RESPONSES ===== #}
+    {%- elif message['role'] == 'tool' %}
+        {{- "<tool_result>" }}
+        {{- message['name'] ~ " " if message['name'] else "" }}
+        {{- message['content'] }}
+        {{- "</tool_result>" }}
+        {{- eos_token }}
+
+    {# ===== ASSISTANT MESSAGES — NORMAL OR WITH TOOL CALL ===== #}
+    {%- elif message['role'] == 'assistant' %}
+        {{- "<|assistant|>" }}
+
+        {# CASE 1 — assistant text only #}
+        {%- if 'tool_calls' not in message %}
+            {{- message['content'] }}
+            {{- eos_token }}
+
+        {# CASE 2 — assistant performs tool call #}
+        {%- else %}
+            {%- for tool_call in message['tool_calls'] %}
+                {{- "<tool_call>" }}
+                {{- tool_call['function']['name'] }}
+                {{- "\n" }}
+                {{- tool_call['function']['arguments'] | tojson }}
+                {{- "</tool_call>" }}
+                {{- eos_token }}
+            {%- endfor %}
+        {%- endif %}
+
+    {%- endif %}
+{%- endfor %}
+
+{%- if add_generation_prompt %}
+    {{- "<|assistant|>" }}
+{%- endif %}
