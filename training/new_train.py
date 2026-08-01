@@ -24,7 +24,7 @@ import numpy as np
 import structlog
 import torch
 from accelerate import Accelerator
-from accelerate.utils import FullyShardedDataParallelPlugin
+from accelerate.utils import DistributedType, FullyShardedDataParallelPlugin
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.optim import AdamW
 from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -216,6 +216,16 @@ class Trainer:
 
         fsdp_plugin = None
         if world_size_env > 1 and self.cfg.fsdp_sharding_strategy != "NO_SHARD":
+            # Accelerator.__init__ is documented to set this itself when a
+            # fsdp_plugin is passed, but a 2026-08-01 run read WORLD_SIZE=4
+            # correctly here (confirmed via distributed_env_check) yet still
+            # ended up DDP-wrapped -- root cause not pinned down (couldn't
+            # reproduce locally: this sandbox's networking blocks a real
+            # multi-process rendezvous to test against). Setting it directly
+            # ourselves, before construction, removes any dependency on
+            # Accelerate's internal ordering doing this at the right time
+            # relative to torch.distributed's own backend selection.
+            os.environ["ACCELERATE_USE_FSDP"] = "true"
             fsdp_plugin = FullyShardedDataParallelPlugin(
                 sharding_strategy=self.cfg.fsdp_sharding_strategy,
                 auto_wrap_policy="transformer_based_wrap",
@@ -250,6 +260,25 @@ class Trainer:
             fsdp_plugin=fsdp_plugin,
             gradient_accumulation_steps=self.cfg.gradient_accumulation_steps,
         )
+        LOG.info("distributed_type_resolved", distributed_type=str(self.accelerator.state.distributed_type))
+        if fsdp_plugin is not None and self.accelerator.state.distributed_type != DistributedType.FSDP:
+            # Fail loud and immediate rather than silently training under
+            # plain DDP: DDP replicates the full model + Adam optimizer
+            # state on every GPU instead of sharding it (what FSDP exists
+            # to avoid), and this model's per-GPU memory budget assumes that
+            # sharding -- a 2026-08-01 run that silently fell back to DDP
+            # this way OOM'd on its very first training step after ~5
+            # minutes of setup/S3 upload, burning real GPU time on a run
+            # that could never have worked. Better to know in the first
+            # second than after paying for that setup cost again.
+            raise RuntimeError(
+                f"Requested FSDP (fsdp_sharding_strategy={self.cfg.fsdp_sharding_strategy!r}, "
+                f"world_size={world_size_env}) but Accelerate resolved distributed_type="
+                f"{self.accelerator.state.distributed_type} instead of FSDP -- refusing to silently "
+                "continue under plain DDP, which will OOM (DDP doesn't shard model/optimizer state "
+                "across GPUs the way FSDP does). See distributed_env_check/distributed_type_resolved "
+                "log lines above for the actual env state Accelerate saw."
+            )
         self.device = self.accelerator.device
         self.master = self.accelerator.is_main_process
         self.world_size = self.accelerator.num_processes
