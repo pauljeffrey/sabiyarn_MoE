@@ -30,7 +30,7 @@ training:
   min_lr : 1e-6  # was 6e-5 -- that was learning_rate/5 for the old 3e-4 peak; now scaled to the new 1e-5 peak
   compile : true  # use PyTorch 2.0 to compile the model to be faster
   display_model_output_iter : 128
-  use_cce : true  # to use cut cross entropy or not
+  use_cce : false  # to use cut cross entropy or not
   # Whether to mask prompt/action-span (pretrain) or prompt-vs-response (SFT)
   # tokens out of the loss at all -- see training/label_masking.py. false
   # means every token contributes to the loss, completely unmasked.
@@ -82,7 +82,7 @@ tokenizer:
   process_one_file_at_a_time: true
 
 model:
-  repo_name: Aletheia-ng/SabiYarn_MoE_base
+  repo_name: Aletheia-ng/SabiYarn_MoE-280M #Aletheia-ng/SabiYarn_MoE_base
   weights:
     freeze_experts_only: false
     freeze_pos_layer_only: false
