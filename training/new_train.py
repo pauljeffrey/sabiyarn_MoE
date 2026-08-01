@@ -179,7 +179,27 @@ class Trainer:
     def _setup_accelerator(self):
         # Keep the effective global batch size (train_batch_size * world_size *
         # grad_accum_steps) invariant to world_size, same as the old DDP path.
-        world_size_env = int(os.environ.get("WORLD_SIZE", 1))
+        #
+        # Read with a fallback, not WORLD_SIZE alone: torchrun sets WORLD_SIZE
+        # for every rank it spawns, but a 2026-08-01 run (naijaai workspace,
+        # resuming ckpt_7560) read world_size_env<=1 here despite torchrun
+        # actually launching 4 processes (confirmed by
+        # self.accelerator.num_processes==4 later in that same run) --
+        # silently skipping FSDP and falling back to plain DDP, which broke
+        # resume_state loading (DDP expects "pytorch_model.bin"; the FSDP
+        # checkpoint only has "pytorch_model_fsdp.bin") and then crashed on
+        # torch.compile + DDP. LOCAL_WORLD_SIZE is torchrun's redundant
+        # signal for exactly this; logging both so a repeat is diagnosable
+        # directly instead of inferred after the fact from compile_skipped
+        # being absent.
+        raw_world_size = os.environ.get("WORLD_SIZE")
+        raw_local_world_size = os.environ.get("LOCAL_WORLD_SIZE")
+        LOG.info(
+            "distributed_env_check",
+            WORLD_SIZE=raw_world_size, LOCAL_WORLD_SIZE=raw_local_world_size,
+            RANK=os.environ.get("RANK"), LOCAL_RANK=os.environ.get("LOCAL_RANK"),
+        )
+        world_size_env = int(raw_world_size or raw_local_world_size or 1)
         if world_size_env > 1 and self.cfg.gradient_accumulation_steps % world_size_env == 0:
             self.cfg.gradient_accumulation_steps //= world_size_env
         self.cfg.gradient_accumulation_steps = max(1, self.cfg.gradient_accumulation_steps)
@@ -540,8 +560,17 @@ class Trainer:
                 )
 
         if self.cfg.compile_model:
-            if self.fsdp_plugin is not None:
-                LOG.warning("compile_skipped", reason="torch.compile + FSDP is unsupported/fragile")
+            if self.accelerator.num_processes > 1:
+                # Confirmed fragile under BOTH wrapping strategies, not just
+                # FSDP: a 2026-08-01 run that fell back to DDP (see
+                # _setup_accelerator) crashed torch._dynamo's DDPOptimizer
+                # graph-splitting pass with AttributeError: 'int' object has
+                # no attribute 'meta' on the very first backward pass.
+                LOG.warning(
+                    "compile_skipped",
+                    reason="torch.compile is unsupported/fragile under multi-process distributed "
+                           "training (FSDP or DDP) for this model",
+                )
             else:
                 self.model = torch.compile(self.model)
 
