@@ -13,6 +13,7 @@ Launch:
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import os
@@ -72,9 +73,10 @@ _FREEZE_PATTERNS = {
     "freeze_attn_layer_only": ("attn.",),
 }
 
-# Val-loss band (see Trainer._should_push_to_hf) within which loss is
-# considered "oscillating"/plateaued rather than having definitely moved.
-_HF_PUSH_LOSS_BAND = 0.25
+# Val-loss band (see Trainer._should_push_to_hf): push to HF whenever this
+# eval's val loss is within this band of what's already there -- i.e. it's
+# "commensurate" with the current HF checkpoint, not an anomalous spike.
+_HF_PUSH_LOSS_BAND = 0.4
 
 
 def _find_latest_run_dir(out_dir: str, mode: str) -> str | None:
@@ -144,6 +146,7 @@ class Trainer:
         self._best_ckpt_dir = None
         self._best_iter_num = 0
         self._best_sanity_loss = None
+        self._best_sanity_batch_hash = None
         # Name (e.g. "ckpt_2400") of the checkpoint folder currently pushed
         # to S3 for this run, if this process has pushed one yet -- lets
         # _push_checkpoint_to_s3 delete it once a newer one uploads, so S3
@@ -350,6 +353,7 @@ class Trainer:
                     meta["best_ckpt"] = best_ckpt_dir
                     meta["best_iter_num"] = meta.get("iter_num", 0)
                     meta["best_sanity_loss"] = meta.get("sanity_loss")
+                    meta["best_sanity_batch_hash"] = meta.get("sanity_batch_hash")
                     with open(meta_path, "w") as f:
                         json.dump(meta, f)
                     LOG.info(
@@ -739,6 +743,7 @@ class Trainer:
                 self._best_ckpt_dir = meta.get("best_ckpt")
                 self._best_iter_num = meta.get("best_iter_num", self.iter_num)
                 self._best_sanity_loss = meta.get("best_sanity_loss")
+                self._best_sanity_batch_hash = meta.get("best_sanity_batch_hash")
                 self._last_hf_push_loss = meta.get("last_hf_push_loss")
                 self._last_hf_push_iter = meta.get("last_hf_push_iter", 0)
 
@@ -792,6 +797,16 @@ class Trainer:
     def _read_memmap(self, path: str) -> np.memmap:
         return np.memmap(path, dtype=np.uint16, mode="r")
 
+    def _sanity_indices_and_data(self) -> tuple[np.memmap, np.ndarray]:
+        """The (data, indices) pair _sanity_batch/_sanity_batch_hash both
+        draw from -- factored out so the hash and the actual batch are
+        guaranteed to be computed from the exact same bytes."""
+        rng = np.random.default_rng(1234567)
+        bs, sl = self.cfg.train_batch_size, self.cfg.block_size
+        data = self._read_memmap(self.eval_bin)
+        ix = rng.integers(0, len(data) - sl - 1, size=bs)
+        return data, ix
+
     def _sanity_batch(self):
         """A FIXED, deterministic batch -- drawn via a fixed numpy seed
         independent of the live torch RNG stream (which accelerator.load_state
@@ -800,13 +815,29 @@ class Trainer:
         from eval_bin so it doesn't depend on the (dynamic, iter_num-driven)
         train sampling ratio either.
         """
-        rng = np.random.default_rng(1234567)
-        bs, sl = self.cfg.train_batch_size, self.cfg.block_size
-        data = self._read_memmap(self.eval_bin)
-        ix = rng.integers(0, len(data) - sl - 1, size=bs)
+        data, ix = self._sanity_indices_and_data()
+        sl = self.cfg.block_size
         x = torch.stack([torch.from_numpy(data[i : i + sl].astype(np.int64)) for i in ix])
         y = torch.stack([torch.from_numpy(data[i + 1 : i + sl + 1].astype(np.int64)) for i in ix])
         return x.to(self.device, non_blocking=True), y.to(self.device, non_blocking=True)
+
+    def _sanity_batch_hash(self) -> str:
+        """Content hash of the RAW TOKEN BYTES _sanity_batch draws, computed
+        independent of the model -- lets _verify_resume_sanity tell apart
+        "eval_bin itself differs from what was used at save time" (this
+        hash differs -- e.g. a different Modal account/volume's synced copy
+        of validation.bin) from "the file is identical but the model's
+        forward pass on it differs" (hash matches, sanity_loss doesn't --
+        THAT'S the real weight-loading bug signal). eval_bin is synced
+        per-account from S3 via download_if_missing/using_cached_file, with
+        no guarantee its bytes are identical across every account/volume
+        that's ever touched this run, so this check matters in exactly the
+        multi-account setup this training pipeline runs under.
+        """
+        data, ix = self._sanity_indices_and_data()
+        sl = self.cfg.block_size
+        raw = b"".join(data[i : i + sl + 1].tobytes() for i in ix)
+        return hashlib.sha256(raw).hexdigest()[:16]
 
     @torch.no_grad()
     def _sanity_loss(self) -> float:
@@ -833,6 +864,16 @@ class Trainer:
         bug. A small delta proves the weights ARE fine, meaning any
         observed post-resume loss spike is coming from somewhere else
         entirely (optimizer dynamics, data, schedule), not corrupted state.
+
+        BUT that interpretation only holds if the sanity batch itself is
+        the same underlying bytes both times -- eval_bin is synced
+        per-account from S3 (see _sync_data/download_if_missing), with no
+        guarantee it's byte-identical across every Modal account/volume
+        this run_dir has ever been resumed on. sanity_batch_hash checks
+        that directly: if it differs from what was recorded at save time,
+        a large delta just means "different underlying text", not a real
+        bug, and gets reported as such instead of the misleading default
+        interpretation.
         """
         if not self._resume_dir:
             return
@@ -843,20 +884,37 @@ class Trainer:
             meta = json.load(f)
         resume_from_best = self.cfg.resume_from == "best" and bool(meta.get("best_ckpt"))
         saved_sanity_loss = meta.get("best_sanity_loss") if resume_from_best else meta.get("sanity_loss")
+        saved_batch_hash = meta.get("best_sanity_batch_hash") if resume_from_best else meta.get("sanity_batch_hash")
         if saved_sanity_loss is None:
             return
 
         current = self._sanity_loss()
+        current_batch_hash = self._sanity_batch_hash()
         delta = current - saved_sanity_loss
-        log_fn = LOG.warning if abs(delta) > 0.1 else LOG.info
+        batch_matches = saved_batch_hash is None or current_batch_hash == saved_batch_hash
+        if not batch_matches:
+            interpretation = (
+                "sanity_batch_hash differs from the saved value -- eval_bin's CONTENT is not the "
+                "same as when this checkpoint was saved (likely a different Modal account/volume's "
+                "synced copy of the eval data), so this delta is NOT a valid weight-loading check: "
+                "it's comparing loss on different underlying text, not the same text through "
+                "different weights. Re-run once eval_bin is confirmed identical to get a real answer."
+            )
+            log_fn = LOG.warning
+        else:
+            interpretation = (
+                "sanity_batch_hash matches -- same underlying text both times, so this delta IS a "
+                "valid weight-loading check. large |delta| -> the reloaded model is NOT functionally "
+                "identical to what was saved (a real weight-loading bug); small |delta| -> weights "
+                "are fine, any post-resume loss spike is coming from elsewhere (optimizer dynamics, "
+                "data, schedule)"
+            )
+            log_fn = LOG.warning if abs(delta) > 0.1 else LOG.info
         log_fn(
             "resume_sanity_check",
             saved_sanity_loss=saved_sanity_loss, current_sanity_loss=current, delta=delta,
-            interpretation=(
-                "large |delta| -> the reloaded model is NOT functionally identical to what was "
-                "saved (a real weight-loading bug); small |delta| -> weights are fine, any "
-                "post-resume loss spike is coming from elsewhere (optimizer dynamics, data, schedule)"
-            ),
+            batch_hash_matches=batch_matches, saved_batch_hash=saved_batch_hash, current_batch_hash=current_batch_hash,
+            interpretation=interpretation,
         )
 
     def _sampling_weights(self) -> tuple[float, float]:
@@ -1050,25 +1108,22 @@ class Trainer:
         return out
 
     def _should_push_to_hf(self, val_loss: float) -> bool:
-        """Local checkpoints now save on every eval regardless of val loss
-        (see train()), but pushing every one of those to the HF Hub would be
-        wasteful. Push when:
-          - nothing has been pushed yet this run, or
-          - val loss has moved by more than _HF_PUSH_LOSS_BAND from the loss
-            at the last push (a real, decisive change worth recording), or
-          - hf_push_interval iters have elapsed since the last push AND loss
-            has stayed within that band the whole time (i.e. it's plateaued/
-            oscillating rather than trending) -- keeps the HF repo from going
-            stale during a long plateau without pushing on every single eval.
+        """Push to HF whenever this eval's val loss is "commensurate" with
+        what's already on HF -- within _HF_PUSH_LOSS_BAND of the loss at the
+        last push. This is a safety gate, not a throttle: local checkpoints
+        already save every eval regardless of loss (see train()); this only
+        decides whether THIS one is safe to publish. Refusing a push when
+        val_loss has spiked/diverged from the last push is exactly what
+        would have protected the HF repo from the post-resume loss spikes
+        chased earlier this session (e.g. 3.6 -> 7.5) -- a spike that large
+        is >> _HF_PUSH_LOSS_BAND, so it gets skipped instead of overwriting
+        a good checkpoint with a bad one.
         """
         if not self.cfg.hf_chkpt_path:
             return False
         if self._last_hf_push_loss is None:
             return True
-        moved = abs(val_loss - self._last_hf_push_loss) > _HF_PUSH_LOSS_BAND
-        if moved:
-            return True
-        return (self.iter_num - self._last_hf_push_iter) >= self.cfg.hf_push_interval
+        return abs(val_loss - self._last_hf_push_loss) <= _HF_PUSH_LOSS_BAND
 
     def _push_checkpoint_to_hf(self, ckpt_dir: str) -> None:
         if not self.cfg.hf_chkpt_path:
@@ -1216,6 +1271,10 @@ class Trainer:
         # to what's saved here, rather than inferring it from training-loss
         # trends alone.
         sanity_loss = self._sanity_loss()
+        # Cheap (no model/GPU involved) -- recorded alongside sanity_loss so
+        # a future resume can tell "eval_bin differs" apart from "weights
+        # differ" instead of assuming the latter (see _verify_resume_sanity).
+        sanity_batch_hash = self._sanity_batch_hash()
 
         push_now = self.master and self._should_push_to_hf(val_loss)
 
@@ -1240,6 +1299,7 @@ class Trainer:
                 self._best_ckpt_dir = best_ckpt_dir
                 self._best_iter_num = self.iter_num
                 self._best_sanity_loss = sanity_loss
+                self._best_sanity_batch_hash = sanity_batch_hash
             if push_now:
                 self._last_hf_push_loss = val_loss
                 self._last_hf_push_iter = self.iter_num
@@ -1251,7 +1311,9 @@ class Trainer:
                     "latest_ckpt": ckpt_dir,
                     "best_ckpt": self._best_ckpt_dir,
                     "sanity_loss": sanity_loss,
+                    "sanity_batch_hash": sanity_batch_hash,
                     "best_sanity_loss": self._best_sanity_loss,
+                    "best_sanity_batch_hash": self._best_sanity_batch_hash,
                     "last_hf_push_loss": self._last_hf_push_loss,
                     "last_hf_push_iter": self._last_hf_push_iter,
                 }, f)

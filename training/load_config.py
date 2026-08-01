@@ -222,10 +222,10 @@ class TrainConfig:
     display_model_output_iter: int = 0  # 0 disables periodic sample generation
     eval_only: bool = False
     always_save_checkpoint: bool = True
-    # Iters between HF Hub pushes while val loss is plateaued/oscillating
-    # within _HF_PUSH_LOSS_BAND of the loss at the last push -- a decisive
-    # move outside that band pushes immediately regardless of this interval
-    # (see Trainer._should_push_to_hf in training/new_train.py).
+    # No longer consulted by Trainer._should_push_to_hf (training/new_train.py):
+    # that now pushes on every eval whose val loss is within
+    # _HF_PUSH_LOSS_BAND of the last push, with no separate interval-based
+    # fallback. Left defined so existing yaml files with this key still load.
     hf_push_interval: int = 100
     hf_chkpt_path: Optional[str] = None
     seed: int = 42
