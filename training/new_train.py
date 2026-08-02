@@ -875,6 +875,20 @@ class Trainer:
         a large delta just means "different underlying text", not a real
         bug, and gets reported as such instead of the misleading default
         interpretation.
+
+        Also calls _sanity_loss() a SECOND time immediately after the
+        first, with zero real training steps elapsed in between (no
+        gradient step, no data touched, nothing that should change the
+        model at all): current_sanity_loss should equal repeat_sanity_loss
+        exactly if the forward pass is deterministic and fully "settled"
+        right after accelerator.prepare()/load_state(). A real
+        repeat_delta here -- even though nothing legitimately changed
+        between the two calls -- would be direct proof of some
+        non-determinism or lazy warm-up state (MoE router noise is
+        eval()-gated off so shouldn't be it, but FSDP/mixed-precision
+        internals settling on first use are a real category of this) that
+        could also be inflating (or fully explaining) the save-vs-resume
+        delta above, rather than the weights genuinely differing.
         """
         if not self._resume_dir:
             return
@@ -890,8 +904,10 @@ class Trainer:
             return
 
         current = self._sanity_loss()
+        current_repeat = self._sanity_loss()
         current_batch_hash = self._sanity_batch_hash()
         delta = current - saved_sanity_loss
+        repeat_delta = current_repeat - current
         batch_matches = saved_batch_hash is None or current_batch_hash == saved_batch_hash
         if not batch_matches:
             interpretation = (
@@ -901,19 +917,26 @@ class Trainer:
                 "it's comparing loss on different underlying text, not the same text through "
                 "different weights. Re-run once eval_bin is confirmed identical to get a real answer."
             )
-            log_fn = LOG.warning
+        elif abs(repeat_delta) > 0.01:
+            interpretation = (
+                "repeat_delta is non-negligible despite ZERO real training steps between the two "
+                "calls -- the forward pass itself is non-deterministic or some FSDP/mixed-precision "
+                "state hadn't settled on first use. That non-determinism could be inflating or fully "
+                "explaining the save-vs-resume delta too, rather than the weights actually differing."
+            )
         else:
             interpretation = (
-                "sanity_batch_hash matches -- same underlying text both times, so this delta IS a "
-                "valid weight-loading check. large |delta| -> the reloaded model is NOT functionally "
-                "identical to what was saved (a real weight-loading bug); small |delta| -> weights "
-                "are fine, any post-resume loss spike is coming from elsewhere (optimizer dynamics, "
-                "data, schedule)"
+                "sanity_batch_hash matches and repeat_delta is negligible (same forward pass twice in "
+                "a row, zero real steps between, agrees) -- so delta IS a valid weight-loading check. "
+                "large |delta| -> the reloaded model is NOT functionally identical to what was saved "
+                "(a real weight-loading bug); small |delta| -> weights are fine, any post-resume loss "
+                "spike is coming from elsewhere (optimizer dynamics, data, schedule)"
             )
-            log_fn = LOG.warning if abs(delta) > 0.1 else LOG.info
+        log_fn = LOG.warning if (not batch_matches or abs(repeat_delta) > 0.01 or abs(delta) > 0.1) else LOG.info
         log_fn(
             "resume_sanity_check",
             saved_sanity_loss=saved_sanity_loss, current_sanity_loss=current, delta=delta,
+            current_repeat_sanity_loss=current_repeat, repeat_delta=repeat_delta,
             batch_hash_matches=batch_matches, saved_batch_hash=saved_batch_hash, current_batch_hash=current_batch_hash,
             interpretation=interpretation,
         )
