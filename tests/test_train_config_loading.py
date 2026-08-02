@@ -63,6 +63,28 @@ def test_resume_from_defaults_to_latest_when_absent(tmp_path):
     assert cfg.resume_from == "latest"
 
 
+def test_reference_model_repo_read_from_yaml(tmp_path):
+    yaml_text = (
+        "model:\n"
+        "  reference_repo: \"Aletheia-ng/sabiyarn-ref\"\n"
+        "training:\n"
+        "  reference_weight_deviation_threshold: 0.05\n"
+    )
+    path = tmp_path / "cfg.yaml"
+    path.write_text(yaml_text)
+    cfg = load_train_config(path)
+    assert cfg.reference_model_repo == "Aletheia-ng/sabiyarn-ref"
+    assert cfg.reference_weight_deviation_threshold == 0.05
+
+
+def test_reference_model_repo_defaults_to_none_when_absent(tmp_path):
+    path = tmp_path / "cfg.yaml"
+    path.write_text("training:\n  mode: pretrain\n")
+    cfg = load_train_config(path)
+    assert cfg.reference_model_repo is None
+    assert cfg.reference_weight_deviation_threshold == 0.1
+
+
 def test_normalize_list_sections_tolerates_comment_lines_mid_block():
     text = (
         "data:\n"

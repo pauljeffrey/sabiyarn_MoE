@@ -181,6 +181,7 @@ class Trainer:
         self._build_optimizer()
         self._prepare_for_training()
         self._verify_resume_sanity()
+        self._verify_reference_weights()
 
     # ------------------------------------------------------------------
     # Setup
@@ -915,6 +916,68 @@ class Trainer:
             saved_sanity_loss=saved_sanity_loss, current_sanity_loss=current, delta=delta,
             batch_hash_matches=batch_matches, saved_batch_hash=saved_batch_hash, current_batch_hash=current_batch_hash,
             interpretation=interpretation,
+        )
+
+    def _verify_reference_weights(self) -> None:
+        """Last-line weight sanity check, run once at startup regardless of
+        init_from (resume from a checkpoint OR fresh weights from the HF
+        Hub) -- compares the just-loaded model's weights, tensor by tensor,
+        against a STATIC, manually-maintained reference checkpoint
+        (model.reference_repo). Catches a gross weight-loading failure
+        (silently falling back to random/base init, a corrupted checkpoint,
+        a wrong repo) that the loss-based checks above (_verify_resume_sanity)
+        might miss or misattribute to something else.
+
+        This repo is NOT auto-updated by training code -- refresh it
+        yourself periodically, or normal training progress will eventually
+        get flagged as "deviation" once real drift exceeds
+        reference_weight_deviation_threshold. No-ops if reference_model_repo
+        isn't set. Every rank independently downloads+loads the reference
+        (same tradeoff as _load_checkpoint_weights: more bandwidth/host RAM
+        per node, simpler and guaranteed-correct vs. a broadcast dance).
+        get_state_dict is collective under FSDP, so every rank must call it.
+        """
+        if not self.cfg.reference_model_repo:
+            return
+        try:
+            ref_model = AutoModelForCausalLM.from_pretrained(
+                self.cfg.reference_model_repo, trust_remote_code=True,
+            )
+        except Exception as exc:
+            LOG.warning("reference_weights_load_failed", repo=self.cfg.reference_model_repo, error=str(exc))
+            return
+        ref_state = ref_model.state_dict()
+        current_state = self.accelerator.get_state_dict(self.model)
+        del ref_model
+
+        if not self.master:
+            return
+
+        threshold = self.cfg.reference_weight_deviation_threshold
+        flagged = []
+        checked = 0
+        for name, ref_tensor in ref_state.items():
+            cur_tensor = current_state.get(name)
+            if cur_tensor is None or cur_tensor.shape != ref_tensor.shape:
+                continue
+            checked += 1
+            mad = (cur_tensor.detach().float().cpu() - ref_tensor.detach().float().cpu()).abs().mean().item()
+            if mad > threshold:
+                flagged.append((name, round(mad, 5)))
+
+        log_fn = LOG.warning if flagged else LOG.info
+        log_fn(
+            "reference_weight_check",
+            repo=self.cfg.reference_model_repo, layers_checked=checked, layers_flagged=len(flagged),
+            flagged=flagged[:20],  # cap so a mass-flag doesn't flood the log
+            threshold=threshold,
+            interpretation=(
+                "layers_flagged>0 -> those layers' mean-abs weight difference from the static "
+                "reference exceeds threshold -- could be a real loading bug (base/random weights, "
+                "wrong checkpoint) OR just genuine training progress since reference_model_repo was "
+                "last refreshed. Cross-check against resume_sanity_check and generation quality "
+                "before concluding it's a bug."
+            ),
         )
 
     def _sampling_weights(self) -> tuple[float, float]:

@@ -39,6 +39,11 @@ training:
   block_size: 4096
   dtype: "bf16"
   hf_push_interval: 100
+  # Mean absolute per-layer weight difference from model.reference_repo
+  # above which a layer gets flagged in the startup reference_weight_check
+  # log line (see Trainer._verify_reference_weights). No effect if
+  # model.reference_repo is blank.
+  reference_weight_deviation_threshold: 0.1
   # init_from controls MODEL WEIGHTS only: "hf" pulls model.repo_name from the
   # HF Hub; "resume" loads the latest local checkpoint's weights instead (see
   # resume_run_dir below). Regardless of this setting, optimizer state,
@@ -91,6 +96,10 @@ tokenizer:
 
 model:
   repo_name: Aletheia-ng/SabiYarn_MoE-280M #Aletheia-ng/SabiYarn_MoE_base
+  # Static, manually-maintained reference checkpoint for the last-line
+  # weight-deviation sanity check (see Trainer._verify_reference_weights) --
+  # NOT auto-updated by training code. Leave blank to disable the check.
+  reference_repo: "Aletheia-ng/sabiyarn-ref"
   weights:
     freeze_experts_only: false
     freeze_pos_layer_only: false

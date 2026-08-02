@@ -239,6 +239,18 @@ class TrainConfig:
     tokenizer_name: str = ""
     tokenizer_num_proc: int = 8
     process_one_file_at_a_time: bool = True
+    # Static, manually-maintained reference checkpoint for the last-line
+    # weight-deviation sanity check (see Trainer._verify_reference_weights)
+    # -- run once at startup regardless of init_from, comparing the
+    # just-loaded weights layer-by-layer against this repo's. NOT
+    # auto-updated by this codebase -- refresh it yourself periodically, or
+    # normal training progress will eventually get flagged as "deviation"
+    # once it exceeds reference_weight_deviation_threshold. Leave blank to
+    # disable the check entirely.
+    reference_model_repo: Optional[str] = None
+    # Mean absolute per-layer weight difference from reference_model_repo
+    # above which a layer gets flagged (see Trainer._verify_reference_weights).
+    reference_weight_deviation_threshold: float = 0.1
 
     # data
     datasets: List[str] = field(default_factory=list)
@@ -423,6 +435,10 @@ def load_train_config(path: Optional[str] = None) -> TrainConfig:
         master_addr=str(env.get("master_addr", "127.0.0.1")),
         master_port=str(env.get("master_port", "29500")),
         model_name=str(model_cfg.get("repo_name") or model_cfg.get("name", "")),
+        reference_model_repo=(model_cfg.get("reference_repo") or None),
+        reference_weight_deviation_threshold=float(
+            training.get("reference_weight_deviation_threshold", 0.1)
+        ),
         tokenizer_name=str(tokenizer.get("name", "")),
         tokenizer_num_proc=int(tokenizer.get("num_proc", 8)),
         process_one_file_at_a_time=bool(tokenizer.get("process_one_file_at_a_time", True)),
