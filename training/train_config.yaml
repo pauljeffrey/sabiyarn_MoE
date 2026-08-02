@@ -39,11 +39,14 @@ training:
   block_size: 4096
   dtype: "bf16"
   hf_push_interval: 100
-  # Mean absolute per-layer weight difference from model.reference_repo
-  # above which a layer gets flagged in the startup reference_weight_check
-  # log line (see Trainer._verify_reference_weights). No effect if
+  # Threshold on the parameter-count-weighted relative L2 norm across all
+  # layers vs. model.reference_repo -- above this, the whole model is
+  # flagged as suspiciously different in the startup reference_weight_check
+  # log line (see Trainer._verify_reference_weights). A fully-random/
+  # reinitialized model lands around sqrt(2) ~= 1.41; 0.5 sits well below
+  # that but above expected healthy training drift. No effect if
   # model.reference_repo is blank.
-  reference_weight_deviation_threshold: 0.1
+  reference_weight_deviation_threshold: 0.5
   # init_from controls MODEL WEIGHTS only: "hf" pulls model.repo_name from the
   # HF Hub; "resume" loads the latest local checkpoint's weights instead (see
   # resume_run_dir below). Regardless of this setting, optimizer state,

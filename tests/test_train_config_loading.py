@@ -82,7 +82,7 @@ def test_reference_model_repo_defaults_to_none_when_absent(tmp_path):
     path.write_text("training:\n  mode: pretrain\n")
     cfg = load_train_config(path)
     assert cfg.reference_model_repo is None
-    assert cfg.reference_weight_deviation_threshold == 0.1
+    assert cfg.reference_weight_deviation_threshold == 0.5
 
 
 def test_normalize_list_sections_tolerates_comment_lines_mid_block():

@@ -248,9 +248,14 @@ class TrainConfig:
     # once it exceeds reference_weight_deviation_threshold. Leave blank to
     # disable the check entirely.
     reference_model_repo: Optional[str] = None
-    # Mean absolute per-layer weight difference from reference_model_repo
-    # above which a layer gets flagged (see Trainer._verify_reference_weights).
-    reference_weight_deviation_threshold: float = 0.1
+    # Threshold on the parameter-count-weighted (not plain-averaged)
+    # relative L2 norm across all layers vs. reference_model_repo -- above
+    # this, the whole model is flagged as suspiciously different (see
+    # Trainer._verify_reference_weights). A fully-random/reinitialized
+    # model lands around sqrt(2) ~= 1.41; 0.5 sits well below that but
+    # above expected healthy training drift -- recalibrate from real
+    # observed values if it doesn't hold up in practice.
+    reference_weight_deviation_threshold: float = 0.5
 
     # data
     datasets: List[str] = field(default_factory=list)
@@ -437,7 +442,7 @@ def load_train_config(path: Optional[str] = None) -> TrainConfig:
         model_name=str(model_cfg.get("repo_name") or model_cfg.get("name", "")),
         reference_model_repo=(model_cfg.get("reference_repo") or None),
         reference_weight_deviation_threshold=float(
-            training.get("reference_weight_deviation_threshold", 0.1)
+            training.get("reference_weight_deviation_threshold", 0.5)
         ),
         tokenizer_name=str(tokenizer.get("name", "")),
         tokenizer_num_proc=int(tokenizer.get("num_proc", 8)),

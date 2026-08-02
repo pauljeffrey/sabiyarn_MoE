@@ -921,21 +921,41 @@ class Trainer:
     def _verify_reference_weights(self) -> None:
         """Last-line weight sanity check, run once at startup regardless of
         init_from (resume from a checkpoint OR fresh weights from the HF
-        Hub) -- compares the just-loaded model's weights, tensor by tensor,
-        against a STATIC, manually-maintained reference checkpoint
-        (model.reference_repo). Catches a gross weight-loading failure
-        (silently falling back to random/base init, a corrupted checkpoint,
-        a wrong repo) that the loss-based checks above (_verify_resume_sanity)
-        might miss or misattribute to something else.
+        Hub) -- compares the just-loaded model's weights against a STATIC,
+        manually-maintained reference checkpoint (model.reference_repo).
+        Catches a gross weight-loading failure (silently falling back to
+        random/base init, a corrupted checkpoint, a wrong repo) that the
+        loss-based checks above (_verify_resume_sanity) might miss or
+        misattribute to something else.
 
-        This repo is NOT auto-updated by training code -- refresh it
-        yourself periodically, or normal training progress will eventually
-        get flagged as "deviation" once real drift exceeds
-        reference_weight_deviation_threshold. No-ops if reference_model_repo
-        isn't set. Every rank independently downloads+loads the reference
-        (same tradeoff as _load_checkpoint_weights: more bandwidth/host RAM
-        per node, simpler and guaranteed-correct vs. a broadcast dance).
-        get_state_dict is collective under FSDP, so every rank must call it.
+        Per layer, computes relative L2 norm: ||current - reference|| /
+        ||reference|| -- scale-invariant, so a huge embedding matrix and a
+        tiny LayerNorm bias are judged on the same footing. These are then
+        reduced to ONE number via a parameter-count-weighted global L2 norm
+        (equivalent to flattening every checked tensor into one giant vector
+        and taking its relative L2 norm as a whole), NOT a plain average of
+        the per-layer ratios: a plain average would let a handful of small,
+        noisy tensors (whose ratios are naturally larger/less stable, since
+        they have little mass to average over) swing the result as much as
+        the big matrices that actually hold most of the model's parameters
+        -- weighting by element count is what makes "the model overall looks
+        different" mean the same thing regardless of how many tiny tensors
+        happen to be in the state dict. A fully-random/independently-
+        reinitialized model would land around a ratio of sqrt(2) ~= 1.41
+        (uncorrelated tensors of the same scale); THRESHOLD (0.5) sits well
+        below that but above the drift expected from healthy continued
+        training at this LR, so it should trip on catastrophic failures
+        without following normal training progress into false positives --
+        recalibrate from real observed values if it doesn't hold up.
+
+        model.reference_repo is NOT auto-updated by training code -- refresh
+        it yourself periodically, or normal training progress will
+        eventually push the ratio past reference_weight_deviation_threshold
+        too. No-ops if reference_model_repo isn't set. Every rank
+        independently downloads+loads the reference (same tradeoff as
+        _load_checkpoint_weights: more bandwidth/host RAM per node, simpler
+        and guaranteed-correct vs. a broadcast dance). get_state_dict is
+        collective under FSDP, so every rank must call it.
         """
         if not self.cfg.reference_model_repo:
             return
@@ -954,29 +974,41 @@ class Trainer:
             return
 
         threshold = self.cfg.reference_weight_deviation_threshold
-        flagged = []
+        per_layer = []
+        diff_sq_sum = 0.0
+        ref_sq_sum = 0.0
         checked = 0
         for name, ref_tensor in ref_state.items():
             cur_tensor = current_state.get(name)
             if cur_tensor is None or cur_tensor.shape != ref_tensor.shape:
                 continue
             checked += 1
-            mad = (cur_tensor.detach().float().cpu() - ref_tensor.detach().float().cpu()).abs().mean().item()
-            if mad > threshold:
-                flagged.append((name, round(mad, 5)))
+            ref_f = ref_tensor.detach().float().cpu()
+            diff_f = cur_tensor.detach().float().cpu() - ref_f
+            diff_sq = diff_f.pow(2).sum().item()
+            ref_sq = ref_f.pow(2).sum().item()
+            diff_sq_sum += diff_sq
+            ref_sq_sum += ref_sq
+            layer_rel_l2 = (diff_sq ** 0.5) / (ref_sq ** 0.5) if ref_sq > 0 else float("inf")
+            per_layer.append((name, round(layer_rel_l2, 5)))
+
+        aggregate_rel_l2 = (diff_sq_sum ** 0.5) / (ref_sq_sum ** 0.5) if ref_sq_sum > 0 else float("inf")
+        flagged = aggregate_rel_l2 > threshold
+        per_layer.sort(key=lambda item: item[1], reverse=True)
 
         log_fn = LOG.warning if flagged else LOG.info
         log_fn(
             "reference_weight_check",
-            repo=self.cfg.reference_model_repo, layers_checked=checked, layers_flagged=len(flagged),
-            flagged=flagged[:20],  # cap so a mass-flag doesn't flood the log
-            threshold=threshold,
+            repo=self.cfg.reference_model_repo, layers_checked=checked,
+            aggregate_rel_l2=round(aggregate_rel_l2, 5), threshold=threshold, flagged=flagged,
+            top_layers_by_deviation=per_layer[:10],  # highest-deviation layers, for pinpointing if flagged
             interpretation=(
-                "layers_flagged>0 -> those layers' mean-abs weight difference from the static "
-                "reference exceeds threshold -- could be a real loading bug (base/random weights, "
-                "wrong checkpoint) OR just genuine training progress since reference_model_repo was "
-                "last refreshed. Cross-check against resume_sanity_check and generation quality "
-                "before concluding it's a bug."
+                "aggregate_rel_l2 is a parameter-count-weighted relative L2 norm across every "
+                "matched layer (not a plain average) -- flagged=true means it exceeds threshold, "
+                "which could be a real loading bug (base/random weights, wrong checkpoint) OR just "
+                "genuine training progress since reference_model_repo was last refreshed. "
+                "top_layers_by_deviation shows where the deviation concentrates. Cross-check against "
+                "resume_sanity_check and generation quality before concluding it's a bug."
             ),
         )
 
