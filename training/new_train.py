@@ -752,6 +752,22 @@ class Trainer:
                 self._resume_dir, "resume_state_best" if resume_from_best else "resume_state",
             )
             if os.path.isdir(resume_state_dir):
+                # Bisects WHERE a post-resume sanity-loss gap gets introduced:
+                # accelerator.load_state() restores BOTH the FSDP model state
+                # AND the optimizer state together from resume_state (it's
+                # the one step common to every instance of the "loss jumps
+                # after resume" pattern chased across this whole session --
+                # always last, always after accelerator.prepare() has already
+                # FSDP-wrapped the model). Comparing sanity_loss right before
+                # vs. right after this specific call tells us definitively
+                # whether THIS is where the gap appears (pointing at a real
+                # bug in the FSDP full-state-dict save/restore round trip --
+                # note the FSDP.state_dict_type()/set_state_dict_type()
+                # deprecation warnings this exact call triggers every run)
+                # or whether it's already present beforehand (pointing at
+                # FSDP wrapping/mixed-precision itself, or the initial
+                # weights, instead).
+                pre_load_state_sanity_loss = self._sanity_loss()
                 # accelerator.save_state/load_state captures optimizer state
                 # (and RNG generator state) for whatever was passed to
                 # accelerator.prepare() -- self.optimizer here. This can fail
@@ -771,6 +787,23 @@ class Trainer:
                         action="continuing with a fresh optimizer state; iter_num/best_val still resumed from trainer_state.json",
                     )
                 else:
+                    post_load_state_sanity_loss = self._sanity_loss()
+                    load_state_delta = post_load_state_sanity_loss - pre_load_state_sanity_loss
+                    log_fn = LOG.warning if abs(load_state_delta) > 0.1 else LOG.info
+                    log_fn(
+                        "load_state_sanity_check",
+                        pre_load_state_sanity_loss=pre_load_state_sanity_loss,
+                        post_load_state_sanity_loss=post_load_state_sanity_loss,
+                        load_state_delta=load_state_delta,
+                        interpretation=(
+                            "large |load_state_delta| -> accelerator.load_state()'s model restoration "
+                            "(not the optimizer, not the initial weight load, not FSDP wrapping itself) "
+                            "is where the gap gets introduced -- a real bug in the FSDP full-state-dict "
+                            "save/restore round trip. small |load_state_delta| -> the gap (if any, see "
+                            "resume_sanity_check below) was already present before this call, so look at "
+                            "FSDP wrapping/mixed-precision or the initial weight source instead."
+                        ),
+                    )
                     LOG.info(
                         "resumed_training_state", path=resume_state_dir, iter=self.iter_num,
                         source="best" if resume_from_best else "latest",
