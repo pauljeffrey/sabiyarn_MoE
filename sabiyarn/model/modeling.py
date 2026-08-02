@@ -294,7 +294,19 @@ class MoE(nn.Module):
 
         logits = self.gate(x) # B, T, E
 
-        if self.training:
+        # torch.is_grad_enabled() as a second, unconditional gate: every
+        # eval/sanity-loss call site wraps in @torch.no_grad(), which is a
+        # global, always-correct signal -- unlike self.training, which
+        # depends on .eval()/.train() propagating correctly through the
+        # full module tree (FSDP wrapping, custom submodules) on every
+        # call. Router noise leaking into what's supposed to be a
+        # deterministic eval pass would meaningfully perturb expert
+        # selection (this noise is ~15-20% of the router logits' natural
+        # scale) without necessarily breaking generation, since generation
+        # only needs the top few candidates to stay reasonable -- exactly
+        # the kind of mismatch (high measured loss, still-coherent output)
+        # this codebase has been chasing.
+        if self.training and torch.is_grad_enabled():
             logits = logits + torch.randn_like(logits) * 1e-1
 
         
