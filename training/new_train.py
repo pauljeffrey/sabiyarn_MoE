@@ -1409,6 +1409,56 @@ class Trainer:
         except Exception as exc:
             LOG.error("s3_checkpoint_push_failed", error=str(exc))
 
+    def _save_roundtrip_check(self, ckpt_dir: str, live_sanity_loss: float) -> None:
+        """Tests a DIFFERENT hypothesis than _verify_resume_sanity: not "did
+        resume correctly reconstruct the saved state" but "did the SAVE
+        itself correctly capture what was live in memory." live_sanity_loss
+        (just computed via a real forward pass through the live, FSDP-
+        wrapped self.model) is compared against a forward pass through a
+        FRESH, plain (non-FSDP) reload of the checkpoint JUST written to
+        ckpt_dir -- same fixed sanity batch, same moment in time, no
+        elapsed training, no distribution drift possible. If these two
+        already disagree, that's direct proof get_state_dict()/
+        save_pretrained() aren't faithfully capturing the live model's
+        actual behavior, independent of anything resume-side. Master-only,
+        deliberately not collective/FSDP -- this is specifically checking
+        the plain, non-distributed reload path, matching how init_from
+        actually reloads checkpoints later.
+        """
+        dtype_map = {"bfloat16": torch.bfloat16, "float16": torch.float16, "float32": torch.float32}
+        torch_dtype = dtype_map.get(self.cfg.dtype, torch.bfloat16)
+        try:
+            verify_model = AutoModelForCausalLM.from_pretrained(
+                ckpt_dir, trust_remote_code=True, torch_dtype=torch_dtype,
+            ).to(self.device)
+            verify_model.eval()
+            x, y = self._sanity_batch()
+            attention_mask = build_document_causal_mask(x, end_of_text_token)
+            with torch.no_grad():
+                out = verify_model(input_ids=x, attention_mask=attention_mask, targets=y)
+                ce_loss = out.loss
+                _, lb_loss = verify_model.get_expert_utilization()
+                roundtrip_loss = (ce_loss + self.cfg.moe_aux_loss_weight * lb_loss if lb_loss is not None else ce_loss).item()
+            del verify_model
+        except Exception as exc:
+            LOG.warning("save_roundtrip_check_failed", path=ckpt_dir, error=str(exc))
+            return
+
+        delta = roundtrip_loss - live_sanity_loss
+        log_fn = LOG.warning if abs(delta) > 0.1 else LOG.info
+        log_fn(
+            "save_roundtrip_check",
+            live_sanity_loss=live_sanity_loss, roundtrip_sanity_loss=roundtrip_loss, delta=delta,
+            interpretation=(
+                "large |delta| -> save_pretrained/get_state_dict did NOT faithfully capture what was "
+                "live in self.model at save time -- the checkpoint written to disk is functionally "
+                "different from the model that computed live_sanity_loss, independent of resume, "
+                "distribution drift, or elapsed training entirely. small |delta| -> the save process "
+                "is faithful; any later resume-time gap comes from something else (data/schedule "
+                "drift, not the save itself)."
+            ),
+        )
+
     def _save(self, val_loss: float, is_new_best: bool):
         # get_state_dict / save_state are collective under FSDP (all-gather
         # across ranks) — every rank must call them, not just master.
@@ -1437,6 +1487,7 @@ class Trainer:
                 save_function=self.accelerator.save,
                 state_dict=state_dict,
             )
+            self._save_roundtrip_check(ckpt_dir, sanity_loss)
             if is_new_best:
                 # Reuses the state_dict already gathered above -- another
                 # local write, no extra FSDP all-gather.
