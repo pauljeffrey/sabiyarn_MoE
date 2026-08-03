@@ -1023,7 +1023,14 @@ class Trainer:
             LOG.warning("reference_weights_load_failed", repo=self.cfg.reference_model_repo, error=str(exc))
             return
         ref_state = ref_model.state_dict()
-        current_state = self.accelerator.get_state_dict(self.model)
+        # See _save's identical migration -- modern, non-deprecated
+        # FSDP1-and-FSDP2-unified API instead of accelerate's FSDP1 path
+        # through the legacy FSDP.state_dict_type() context manager.
+        from torch.distributed.checkpoint.state_dict import StateDictOptions, get_model_state_dict
+        current_state = get_model_state_dict(
+            self.model,
+            options=StateDictOptions(full_state_dict=True, broadcast_from_rank0=True, cpu_offload=True),
+        )
         del ref_model
 
         if not self.master:
@@ -1471,7 +1478,22 @@ class Trainer:
         # get_state_dict / save_state are collective under FSDP (all-gather
         # across ranks) — every rank must call them, not just master.
         unwrapped = self.accelerator.unwrap_model(self.model)
-        state_dict = self.accelerator.get_state_dict(self.model)
+        # Uses torch.distributed.checkpoint.state_dict.get_model_state_dict
+        # directly instead of self.accelerator.get_state_dict(self.model):
+        # for FSDP1 (what this codebase uses), accelerate's own
+        # get_state_dict internally goes through the legacy
+        # FSDP.state_dict_type()/FullStateDictConfig context-manager path --
+        # the exact API PyTorch's own FutureWarning on every run says is
+        # being deprecated in favor of this one. get_model_state_dict is the
+        # same modern, unified API accelerate ITSELF uses for FSDP2 (see
+        # accelerate.Accelerator.get_state_dict's source), and it explicitly
+        # supports FSDP1 modules too -- not a speculative fix, a direct
+        # migration off the one save-path API that's flagged as legacy.
+        from torch.distributed.checkpoint.state_dict import StateDictOptions, get_model_state_dict
+        state_dict = get_model_state_dict(
+            self.model,
+            options=StateDictOptions(full_state_dict=True, broadcast_from_rank0=True, cpu_offload=True),
+        )
         ckpt_dir = os.path.join(self.run_dir, f"ckpt_{self.iter_num}")
         best_ckpt_dir = os.path.join(self.run_dir, "ckpt_best")
 
