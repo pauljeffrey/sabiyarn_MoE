@@ -1430,7 +1430,15 @@ class Trainer:
         try:
             verify_model = AutoModelForCausalLM.from_pretrained(
                 ckpt_dir, trust_remote_code=True, torch_dtype=torch_dtype,
-            ).to(self.device)
+            )
+            # from_pretrained's torch_dtype cast isn't always exhaustive for
+            # every parameter (e.g. LayerNorm weights can be left in the
+            # checkpoint's original dtype -- see _build_model's identical
+            # comment) -- without this, mixed dtypes between e.g. bf16
+            # linear weights and fp32 LayerNorm weights crash matmul with
+            # "expected mat1 and mat2 to have the same dtype" (confirmed:
+            # every save this session hit exactly that until this fix).
+            verify_model = verify_model.to(torch_dtype).to(self.device)
             verify_model.eval()
             x, y = self._sanity_batch()
             attention_mask = build_document_causal_mask(x, end_of_text_token)
