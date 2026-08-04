@@ -18,11 +18,39 @@ except ImportError:
     from configuration import GPTJXMoEConfig
 
 from typing import List, Optional
+import contextlib
 import math
+import os
 
 import torch
 import torch.nn.functional as F
 from torch import nn
+
+try:
+    from torch.nn.attention import sdpa_kernel, SDPBackend
+    _HAS_SDPA_KERNEL_CONTROL = True
+except ImportError:
+    _HAS_SDPA_KERNEL_CONTROL = False
+
+# Diagnostic toggle: F.scaled_dot_product_attention below always receives a
+# CUSTOM boolean document-boundary mask (from build_document_causal_mask),
+# not the simple is_causal=True case. On CUDA, PyTorch auto-selects among
+# flash-attention/memory-efficient/math kernels, and custom boolean masks
+# are exactly the case that's historically had the most rough edges in the
+# optimized kernels. On CPU there's only ever the math backend -- which is
+# what every zero-GPU-cost local sanity check in this investigation ran
+# against (consistently ~4.0 loss on the same fixed batch that every real
+# GPU run consistently showed ~7.4 on, with data/weights/determinism/
+# load_state/DDP-vs-FSDP/precision all independently ruled out first). Set
+# FORCE_MATH_ATTENTION=1 to force the same math backend on GPU too, to
+# test directly whether that's the explanation.
+_FORCE_MATH_ATTENTION = os.environ.get("FORCE_MATH_ATTENTION", "0") == "1"
+
+
+def _sdpa_backend_context():
+    if _FORCE_MATH_ATTENTION and _HAS_SDPA_KERNEL_CONTROL:
+        return sdpa_kernel([SDPBackend.MATH])
+    return contextlib.nullcontext()
 
 
 # ---------------------------------------------------------------------------
@@ -154,22 +182,23 @@ class CausalSelfAttention(nn.Module):
         mask = _expand_attn_mask(attn_mask, T, total_len, self.n_heads, has_past, x.device)
 
         if self.flash:
-            if mask is not None:
-                y = F.scaled_dot_product_attention(
-                    q, k, v, attn_mask=mask,
-                    dropout_p=self.dropout if self.training else 0, is_causal=False,
-                )
-            elif not has_past:
-                y = F.scaled_dot_product_attention(
-                    q, k, v, attn_mask=None,
-                    dropout_p=self.dropout if self.training else 0, is_causal=True,
-                )
-            else:
-                causal = torch.tril(torch.ones(T, total_len, device=x.device, dtype=torch.bool))
-                y = F.scaled_dot_product_attention(
-                    q, k, v, attn_mask=causal.view(1, 1, T, total_len),
-                    dropout_p=self.dropout if self.training else 0, is_causal=False,
-                )
+            with _sdpa_backend_context():
+                if mask is not None:
+                    y = F.scaled_dot_product_attention(
+                        q, k, v, attn_mask=mask,
+                        dropout_p=self.dropout if self.training else 0, is_causal=False,
+                    )
+                elif not has_past:
+                    y = F.scaled_dot_product_attention(
+                        q, k, v, attn_mask=None,
+                        dropout_p=self.dropout if self.training else 0, is_causal=True,
+                    )
+                else:
+                    causal = torch.tril(torch.ones(T, total_len, device=x.device, dtype=torch.bool))
+                    y = F.scaled_dot_product_attention(
+                        q, k, v, attn_mask=causal.view(1, 1, T, total_len),
+                        dropout_p=self.dropout if self.training else 0, is_causal=False,
+                    )
         else:
             att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(self.head_dim))
             if mask is not None:
