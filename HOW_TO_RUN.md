@@ -107,6 +107,14 @@ torchrun --nnodes=<N> --node_rank=<0..N-1> --nproc_per_node=<gpus_per_node> \
 
 This is the generic path — it's what you'd run by hand on vast.ai or any other bare GPU boxes, one command per box.
 
+**Before your first run on a bare box**: unlike Modal (which syncs data onto the mounted volume before training starts), `new_train.py` only *checks* that the configured `.bin` files already exist locally — it never downloads them. Run this once first:
+
+```bash
+python -m data.prefetch_bins --mode pretrain
+```
+
+It prints `TRAIN_DATA_PATHS_LOCAL=...` / `VAL_DATA_PATH=...` lines — add those to your `.env` so `load_train_config` picks up the downloaded paths instead of `train_config.yaml`'s own (relative) ones, then run the `torchrun` command above.
+
 **On Modal** (real multi-node cluster via `modal.experimental.clustered`, topology fixed by `modal.num_nodes` / `modal.gpus_per_node` / `modal.gpu_type` in the yaml — edit the yaml and this picks it up on the next run):
 
 ```bash
