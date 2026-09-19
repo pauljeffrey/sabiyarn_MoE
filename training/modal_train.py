@@ -74,6 +74,7 @@ image = (
         "transformers>=4.55.0",
         "accelerate>=0.34.0",
         "wandb",
+        "mlflow",
         "structlog",
         "numpy",
         "omegaconf",
@@ -114,6 +115,10 @@ def _build_env(mode: str, override: bool) -> dict[str, str]:
     # colliding with each other's runs.
     env["TRAIN_OUT_DIR"] = os.path.join(DATA_DIR, CFG_OUT_DIR)
     env["OVERRIDE_DATA"] = "1" if override else "0"
+    # MLflow runs land on the same persistent volume as checkpoints (view them with
+    # `modal volume get sabiyarn-data mlruns ./mlruns` + `mlflow ui`), unless
+    # MLFLOW_TRACKING_URI is set in .env to point at a remote tracking server.
+    env.setdefault("MLFLOW_TRACKING_URI", f"file:{os.path.join(DATA_DIR, 'mlruns')}")
     return env
 
 
@@ -157,6 +162,15 @@ def _sync_data(env: dict[str, str]) -> None:
         env["VAL_DATA_PATH"] = local_eval
 
 
+def _run_and_commit(cmd: list[str], env: dict[str, str]) -> None:
+    """Run the training command, then flush volume writes (checkpoints, MLflow
+    runs) so they're visible outside this container even if training crashed."""
+    try:
+        subprocess.run(cmd, cwd="/app", env=env, check=True)
+    finally:
+        volume.commit()
+
+
 _common_kwargs = dict(
     image=image,
     gpu=GPU_SPEC,
@@ -189,7 +203,7 @@ def train_single_node(mode: str = "pretrain", override: bool = False):
         "-m", "training.new_train",
     ]
     print(f"[single node, {GPUS_PER_NODE} GPU(s)] launching: {' '.join(cmd)}")
-    subprocess.run(cmd, cwd="/app", env=env, check=True)
+    _run_and_commit(cmd, env)
     return True
 
 
@@ -225,7 +239,7 @@ if NUM_NODES > 1:
             "-m", "training.new_train",
         ]
         print(f"[node {rank}/{NUM_NODES}] launching: {' '.join(cmd)}")
-        subprocess.run(cmd, cwd="/app", env=env, check=True)
+        _run_and_commit(cmd, env)
         return True
 
 

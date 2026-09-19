@@ -61,6 +61,7 @@ image = (
         "transformers>=4.55.0",
         "accelerate>=0.34.0",
         "wandb",
+        "mlflow",
         "structlog",
         "numpy",
         "omegaconf",
@@ -96,6 +97,9 @@ def _build_env(mode: str, override: bool) -> dict[str, str]:
     env["TRAIN_MODE"] = mode
     env["TRAIN_OUT_DIR"] = os.path.join(DATA_DIR, CFG_OUT_DIR)
     env["OVERRIDE_DATA"] = "1" if override else "0"
+    # MLflow runs land on the same persistent volume as checkpoints, unless
+    # MLFLOW_TRACKING_URI is set in .env to point at a remote tracking server.
+    env.setdefault("MLFLOW_TRACKING_URI", f"file:{os.path.join(DATA_DIR, 'mlruns')}")
     return env
 
 
@@ -146,7 +150,10 @@ def train_single_node_ddp(mode: str = "pretrain", override: bool = False):
         "-m", "training.new_train_ddp",
     ]
     print(f"[single node, {GPUS_PER_NODE} GPU(s), DDP] launching: {' '.join(cmd)}")
-    subprocess.run(cmd, cwd="/app", env=env, check=True)
+    try:
+        subprocess.run(cmd, cwd="/app", env=env, check=True)
+    finally:
+        volume.commit()  # flush checkpoints + MLflow runs even if training crashed
     return True
 
 

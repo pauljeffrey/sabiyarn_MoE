@@ -281,6 +281,14 @@ class TrainConfig:
     wandb_run_name: str = "run"
     save_model_to_wandb: bool = False
 
+    # mlflow
+    mlflow_log: bool = False
+    mlflow_tracking_uri: Optional[str] = None  # MLFLOW_TRACKING_URI env wins; default ./mlruns
+    mlflow_experiment: str = "sabiyarn"
+    mlflow_run_name: Optional[str] = None  # falls back to "<wandb run_name>_<mode>"
+    mlflow_run_id: Optional[str] = None  # set (or MLFLOW_RUN_ID env) to continue an existing run after a resume
+    mlflow_log_system_metrics: bool = True  # GPU/CPU/mem utilisation charts
+
     # ddp / modal
     ddp_backend: str = "nccl"
     gpus_per_node: int = 1
@@ -345,6 +353,7 @@ def load_train_config(path: Optional[str] = None) -> TrainConfig:
     training = raw.get("training", {}) or {}
     optimizer = raw.get("optimizer", {}) or {}
     wandb_cfg = raw.get("wandb", {}) or {}
+    mlflow_cfg = raw.get("mlflow", {}) or {}
     data = raw.get("data", {}) or {}
     ddp = raw.get("ddp", {}) or {}
     accelerate = raw.get("accelerate", {}) or {}
@@ -463,6 +472,12 @@ def load_train_config(path: Optional[str] = None) -> TrainConfig:
         wandb_project=str(wandb_cfg.get("project", "sabiyarn")),
         wandb_run_name=str(wandb_cfg.get("run_name", "run")),
         save_model_to_wandb=bool(wandb_cfg.get("save_model_to_wandb", False)),
+        mlflow_log=bool(mlflow_cfg.get("log", False)),
+        mlflow_tracking_uri=mlflow_cfg.get("tracking_uri") or None,
+        mlflow_experiment=str(mlflow_cfg.get("experiment", "sabiyarn")),
+        mlflow_run_name=mlflow_cfg.get("run_name") or None,
+        mlflow_run_id=os.getenv("MLFLOW_RUN_ID") or mlflow_cfg.get("run_id") or None,
+        mlflow_log_system_metrics=bool(mlflow_cfg.get("log_system_metrics", True)),
         hf_chkpt_path=training.get("hf_chkpt_path") or None,
         hf_push_interval=int(training.get("hf_push_interval", 100)),
         ddp_backend=str(ddp.get("backend", "nccl")),

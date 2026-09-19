@@ -19,6 +19,7 @@ torch==2.8.0
 tqdm==4.67.1
 triton==3.4.0
 wandb==0.19.5
+mlflow>=2.16.0
 transformers==4.55.0
 safetensors==0.4.5
 psutil

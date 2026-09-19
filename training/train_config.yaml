@@ -125,6 +125,19 @@ wandb:
   save_model_to_wandb: true
   seed: 42
 
+# mlflow logging (works alongside wandb)
+# View the runs (run on the box, then ssh-tunnel port 5000 to your laptop):
+#   MLFLOW_ALLOW_FILE_STORE=true mlflow ui --backend-store-uri mlruns --host 0.0.0.0 --port 5000
+mlflow:
+  log: true
+  # Where runs are stored. The MLFLOW_TRACKING_URI env var overrides this.
+  # Leave null for ./mlruns (vast.ai); modal_train.py points it at the volume.
+  tracking_uri: null
+  experiment: sabiyarn-ablations
+  run_name: null            # null -> "<wandb.run_name>_<mode>"
+  run_id: null              # or MLFLOW_RUN_ID env: continue the same run after a resume
+  log_system_metrics: true  # GPU util/memory, CPU, RAM charts
+
 # data
 data: 
   pretrain_datasets: 

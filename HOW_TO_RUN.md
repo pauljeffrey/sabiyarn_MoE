@@ -126,6 +126,28 @@ modal run training/modal_train.py --mode sft --override
 
 Checkpoints save under `TRAIN_OUT_DIR` (set by `modal_train.py` to `/data/checkpoints`, on the same persistent Modal volume training reads its data from — survives container preemption and is what `test_generation.py` reads back), then push to `training.hf_chkpt_path` on Hugging Face Hub. Outside Modal (`python -m training.new_train` / bare `torchrun`), checkpoints save under `training.out_dir` from the yaml (default `out/`).
 
+**Experiment tracking (MLflow)** — on by default (`mlflow:` section of `train_config.yaml`, runs alongside wandb). Logged to the tracking store every `training.log_interval` iters / every eval: `train/loss` (CE + MoE aux, what's optimised), `train/ce_loss`, `train/bpb`, `train/ppl`, `train/grad_norm`, `lr`, `train/tokens_seen`, tokens/sec, TFLOPs, MFU, sampling weights, `eval/{train,val}_{loss,ce,bpb,ppl}`, `moe/*` router stats, plus GPU/CPU/RAM system metrics and the full config as params. **bpb** = bits per byte of decoded text (`CE_nats * tokens / (ln2 * bytes)`), so it's comparable across tokenizers; special tokens count as 0 bytes.
+
+- **vast.ai / bare box**: runs are written to `./mlruns` (override with `MLFLOW_TRACKING_URI` or `mlflow.tracking_uri`). Start the UI on the box and tunnel it:
+
+  ```bash
+  pip install -r requirements.txt   # includes mlflow
+  MLFLOW_ALLOW_FILE_STORE=true mlflow ui --backend-store-uri mlruns --host 0.0.0.0 --port 5000
+  # on your laptop:  ssh -N -L 5000:localhost:5000 -p <vast_ssh_port> root@<vast_ip>   ->  http://localhost:5000
+  ```
+
+- **Modal**: runs land on the `sabiyarn-data` volume under `mlruns/` (flushed on exit). Pull and browse them locally:
+
+  ```bash
+  modal volume get sabiyarn-data mlruns ./mlruns
+  MLFLOW_ALLOW_FILE_STORE=true mlflow ui --backend-store-uri ./mlruns
+  ```
+
+  To watch a Modal run live, put `MLFLOW_TRACKING_URI=http://<your-mlflow-server>:5000` in `.env` (forwarded into the container) instead.
+
+- After a resume, set `MLFLOW_RUN_ID=<id>` (shown in the `mlflow_started` log line) to append to the same run so the curves stay continuous.
+- Disable with `mlflow.log: false`.
+
 ---
 
 ## 3. Tests

@@ -34,6 +34,7 @@ from training.constant_tokens import MASK, assistant_token, end_of_text_token, s
 from training.label_masking import apply_label_mask
 from training.load_config import TrainConfig, load_train_config, sampling_weights
 from training.mfu import compute_mfu, model_flops_per_token, peak_flops_for_current_device
+from training.tracking import MlflowTracker, bits_per_byte, build_token_byte_lengths
 from training.s3_utils import (
     delete_prefix,
     download_folder,
@@ -47,6 +48,9 @@ from training.s3_utils import (
 from training.training_attention_mask import build_document_causal_mask
 
 LOG = structlog.get_logger()
+
+# Config fields never sent to experiment trackers (S3 keys live on TrainConfig).
+_SECRET_CFG_MARKERS = ("secret", "access_key", "token", "password")
 
 try:
     from cut_cross_entropy import linear_cross_entropy
@@ -172,10 +176,16 @@ class Trainer:
         # actually elapsed since then, even for the very first log line (which
         # only covers iter 0 itself, not a full log_interval window).
         self._last_logged_iter = -1
+        # MLflow tracking + the pieces bits-per-byte needs (see _target_stats).
+        self.tracker = MlflowTracker()
+        self._last_ce_loss = None   # CE-only loss (no MoE aux term) of the latest _forward_loss
+        self._last_grad_norm = None  # pre-clip global grad norm of the latest optimizer step
+        self._token_bytes = None    # id -> UTF-8 byte length lookup, built lazily on device
         self._setup_accelerator()
         self._setup_dirs()
         self._backfill_ckpt_best()
         self._setup_wandb()
+        self._setup_mlflow()
         self._setup_data()
         self._build_model()
         self._build_optimizer()
@@ -545,6 +555,41 @@ class Trainer:
         except Exception as exc:
             LOG.warning("wandb_init_failed", error=str(exc))
             self.cfg.wandb_log = False
+
+    def _setup_mlflow(self):
+        if not self.master or not self.cfg.mlflow_log:
+            return
+        run_name = self.cfg.mlflow_run_name or f"{self.cfg.wandb_run_name}_{self.cfg.mode}"
+        config_path = os.environ.get("TRAIN_CONFIG_PATH") or os.path.join(os.path.dirname(__file__), "train_config.yaml")
+        self.tracker.start(
+            tracking_uri=self.cfg.mlflow_tracking_uri,
+            experiment_name=self.cfg.mlflow_experiment,
+            run_name=run_name,
+            run_id=self.cfg.mlflow_run_id,
+            params={
+                **{k: v for k, v in vars(self.cfg).items() if not any(t in k.lower() for t in _SECRET_CFG_MARKERS)},
+                "world_size": self.world_size,
+            },
+            tags={"mode": self.cfg.mode},
+            log_system_metrics=self.cfg.mlflow_log_system_metrics,
+            artifacts=[config_path],
+        )
+
+    def _byte_table(self) -> torch.Tensor:
+        if self._token_bytes is None:
+            special = set(self.tokenizer.all_special_ids) | set(self.tokenizer.added_tokens_decoder.keys())
+            table = build_token_byte_lengths(self.tokenizer.get_vocab(), special)
+            self._token_bytes = torch.tensor(table, dtype=torch.int64, device=self.device)
+        return self._token_bytes
+
+    def _target_stats(self, y: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """(supervised token count, bytes those tokens decode to) for a target
+        batch -- the two denominators bits-per-byte needs. Masked positions
+        (MASK) count for neither; special tokens count 0 bytes."""
+        table = self._byte_table()
+        valid = y != MASK
+        ids = y.clamp(min=0, max=table.numel() - 1)  # ids past the tokenizer vocab hit the trailing 0 slot
+        return valid.sum(), (table[ids] * valid).sum()
 
     def _setup_data(self):
         if not self.cfg.train_data_paths:
@@ -1153,6 +1198,7 @@ class Trainer:
                 out = self.model(input_ids=x, attention_mask=attention_mask, targets=y)
             ce_loss = out.loss
 
+        self._last_ce_loss = ce_loss.detach()
         _, lb_loss = raw.get_expert_utilization()
         if lb_loss is not None:
             return ce_loss + self.cfg.moe_aux_loss_weight * lb_loss
@@ -1257,11 +1303,19 @@ class Trainer:
         local_iters = max(1, self.cfg.eval_iters // max(1, self.world_size))
         for split in ("train", "val"):
             losses = torch.zeros(local_iters, device=self.device)
+            # Running [sum of CE nats, supervised tokens, decoded bytes] for bits-per-byte.
+            totals = torch.zeros(3, device=self.device, dtype=torch.float64)
             for k in range(local_iters):
                 x, y = self.get_batch(split)
                 losses[k] = self._forward_loss(x, y)
+                n_tok, n_bytes = self._target_stats(y)
+                totals += torch.stack([self._last_ce_loss.double() * n_tok, n_tok.double(), n_bytes.double()])
             local_mean = losses.mean()
             out[split] = self.accelerator.reduce(local_mean, reduction="mean").item()
+            ce_total, tok_total, bytes_total = self.accelerator.reduce(totals, reduction="sum").tolist()
+            if tok_total > 0:
+                out[f"{split}_ce"] = ce_total / tok_total  # pure CE, without the MoE aux term in out[split]
+                out[f"{split}_bpb"] = bits_per_byte(out[f"{split}_ce"], tok_total, bytes_total)
         self.model.train()
         return out
 
@@ -1623,6 +1677,13 @@ class Trainer:
 
         LOG.info("moe_expert_stats", iter=self.iter_num, lb_loss=lb_loss_value, layers=layers)
 
+        if self.tracker.enabled:
+            m = {"moe/lb_loss": lb_loss_value}
+            for l in layers:
+                m[f"moe/layer{l['layer']}_max_util"] = l["max_util"]
+                m[f"moe/layer{l['layer']}_entropy"] = l["entropy"]
+            self.tracker.log_metrics(m, step=self.iter_num)
+
         if self.cfg.wandb_log:
             try:
                 import wandb
@@ -1646,6 +1707,39 @@ class Trainer:
         except Exception as exc:
             LOG.warning("wandb_log_failed", error=str(exc))
             self.cfg.wandb_log = False
+
+    def _log_eval_mlflow(self, losses: dict, lr: float) -> None:
+        m = {"lr": lr, "eval/train_loss": losses["train"], "eval/val_loss": losses["val"]}
+        for split in ("train", "val"):
+            ce = losses.get(f"{split}_ce")
+            m[f"eval/{split}_ce"] = ce
+            m[f"eval/{split}_bpb"] = losses.get(f"{split}_bpb")
+            m[f"eval/{split}_ppl"] = math.exp(min(ce, 50.0)) if ce is not None else None
+        self.tracker.log_metrics(m, step=self.iter_num)
+
+    def _log_step_mlflow(self, loss, last_y, lr, tokens_per_sec, tflops_per_gpu, mfu, log_kwargs) -> None:
+        if not self.tracker.enabled:
+            return
+        ce = self._last_ce_loss.item() if self._last_ce_loss is not None else None
+        n_tok, n_bytes = (t.item() for t in self._target_stats(last_y))
+        tokens_seen = (
+            (self.iter_num + 1) * self.cfg.train_batch_size * self.cfg.block_size
+            * self.cfg.gradient_accumulation_steps * self.world_size
+        )
+        self.tracker.log_metrics({
+            "train/loss": loss,  # CE + weighted MoE aux loss: what is actually optimised
+            "train/ce_loss": ce,
+            "train/bpb": bits_per_byte(ce, n_tok, n_bytes) if ce is not None else None,
+            "train/ppl": math.exp(min(ce, 50.0)) if ce is not None else None,
+            "train/grad_norm": float(self._last_grad_norm) if self._last_grad_norm is not None else None,
+            "lr": lr,
+            "train/tokens_seen": tokens_seen,
+            "train/tokens_per_sec": tokens_per_sec,
+            "train/tflops_per_gpu": tflops_per_gpu,
+            "train/mfu": mfu,
+            "train/eng_sampling_weight": log_kwargs.get("eng_sampling_weight"),
+            "train/afr_sampling_weight": log_kwargs.get("afr_sampling_weight"),
+        }, step=self.iter_num)
 
     def _log_step_wandb(self, loss: float, tokens_per_sec: float, tflops_per_gpu: float, mfu: float | None) -> None:
         if not self.cfg.wandb_log or not self.master:
@@ -1694,6 +1788,7 @@ class Trainer:
                 if self.master:
                     LOG.info("eval", iter=self.iter_num, **losses)
                     self._maybe_log_wandb(losses, lr)
+                    self._log_eval_mlflow(losses, lr)
                     self._log_moe_stats()
                 # Checkpoint ("latest") on every eval regardless of whether
                 # val loss improved. Whether it's ALSO a new best additionally
@@ -1728,9 +1823,10 @@ class Trainer:
                     loss = self._forward_loss(x, y)
                     self.accelerator.backward(loss)
                     if self.accelerator.sync_gradients and self.cfg.grad_clip > 0:
-                        self.accelerator.clip_grad_norm_(self.model.parameters(), self.cfg.grad_clip)
+                        self._last_grad_norm = self.accelerator.clip_grad_norm_(self.model.parameters(), self.cfg.grad_clip)
                     self.optimizer.step()
                     self.optimizer.zero_grad()
+                last_y = y
                 x, y = self.get_batch("train")
             last_loss = loss
 
@@ -1758,17 +1854,26 @@ class Trainer:
                     log_kwargs.update(eng_sampling_weight=eng_w, afr_sampling_weight=afr_w)
                 LOG.info("step", **log_kwargs)
                 self._log_step_wandb(last_loss.item(), tokens_per_sec, tflops_per_gpu, mfu)
+                self._log_step_mlflow(
+                    last_loss.item(), last_y, lr, tokens_per_sec, tflops_per_gpu, mfu, log_kwargs,
+                )
                 t0 = time.time()
 
             self.iter_num += 1
 
         if self.master:
             LOG.info("training_done", iter=self.iter_num)
+        self.tracker.end()
 
 
 def main():
     config = load_train_config()
-    Trainer(config).train()
+    trainer = Trainer(config)
+    try:
+        trainer.train()
+    except BaseException:
+        trainer.tracker.end(status="FAILED")  # no-op unless MLflow is active (master only)
+        raise
 
 
 if __name__ == "__main__":
