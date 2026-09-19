@@ -152,9 +152,9 @@ data:
     - afr_train_data_path : "datasets/nigerian_sft_training.bin"
     - eval_data_path: "sft_validation.bin"
   sampling:
-    - use_scheduled_sampling: false
-    - afr_sampling_weight: 0.80
-    - eng_sampling_weight: 0.20
+    - use_scheduled_sampling: true
+    - afr_sampling_weight: 0.45
+    - eng_sampling_weight: 0.55
  
 
 # adamw optimizer
