@@ -15,8 +15,8 @@ pip install -r requirements.txt
 | Variable | Used by | Purpose |
 |---|---|---|
 | `S3_ACCESS_KEY_ID`, `S3_SECRET_ACCESS_KEY` | `data/prepare.py`, `training/new_train.py` (via `training/s3_utils.py`) | download training bins before training, upload freshly prepared bins after `prepare.py` |
-| `HF_API_KEY` | `data/prepare.py`, `training/new_train.py`, `eval/eval.py` | read HF datasets, push checkpoints, load eval models |
-| `HF_TOKEN` / `HUGGING_FACE_HUB_TOKEN` | `training/new_train.py` | checked in addition to `HF_API_KEY` for checkpoint push |
+| `HF_API_KEY` | `data/prepare.py`, `eval/eval.py`, the notebooks' `huggingface-cli login` | **read** token: download HF datasets/models |
+| `HF_WRITE_TOKEN` / `HF_TOKEN` | `training/new_train.py`, `training/push_s3_checkpoint_to_hf.py`, `training/push_model_code_to_hf.py`, `training/tokenizer_training.ipynb` | **write** token: every upload to the Hub. The push paths check `HF_WRITE_TOKEN`, then `HF_TOKEN`, then `HUGGING_FACE_HUB_TOKEN`, then `HF_API_KEY` — a read-only token in the last slot fails the push with a 401, so keep a real write token in one of the first two |
 | `WANDB_API_KEY` | wandb SDK directly (no code change needed) | training run logging |
 | `MODAL_TOKEN_ID`, `MODAL_TOKEN_SECRET` | `modal` CLI/SDK | alternative to `modal token set` |
 
@@ -25,7 +25,7 @@ pip install -r requirements.txt
 **On Modal**, the same secrets are supplied via `modal.Secret.from_name(...)` instead of `.env` (the `.env` file is explicitly excluded from everything uploaded into Modal images). Create these once in your Modal workspace before running anything that references them:
 
 ```bash
-modal secret create hf-secret HF_API_KEY=<your-hf-token>
+modal secret create hf-secret HF_API_KEY=<your-hf-read-token> HF_WRITE_TOKEN=<your-hf-write-token>
 modal secret create wandb-secret WANDB_API_KEY=<your-wandb-key>
 modal secret create s3-secret S3_ACCESS_KEY_ID=<...> S3_SECRET_ACCESS_KEY=<...>
 ```
@@ -165,6 +165,7 @@ pytest tests/
 | `eval/modal_eval.py` | `modal run eval/modal_eval.py::run` | Runs `eval.run_all()` (topic classification, sentiment, NER) against `BeardedMonster/SabiYarn-125M-finetune`, logs to the `sabiyarn_v2` volume |
 | `test_generation.py` | `modal run test_generation.py::main` | Loads the most recently modified `ckpt_*` dir under `/data/checkpoints/` (the same volume `modal_train.py` writes to) via `AutoModelForCausalLM.from_pretrained(..., trust_remote_code=True)` and generates from a couple of default prompts. Pass `--checkpoint-dir <path>` to target a specific checkpoint instead of "latest" |
 | `inference/modal_hosting.py` | `modal deploy inference/modal_hosting.py` | Fixed for modal 1.5.1 (previously imported `Mount`/`build`/`gpu`, which no longer exist as top-level `modal.*` names); serves `BeardedMonster/SabiYarn-125M` behind a FastAPI `/predict` endpoint. Not otherwise changed/verified end-to-end — GPU-side behavior needs a real Modal deploy to confirm |
+| `training/push_s3_checkpoint_to_hf.py` | `python training/push_s3_checkpoint_to_hf.py` or `modal run training/push_s3_checkpoint_to_hf.py` | Downloads the latest checkpoint's weights (`ckpt_<iter>/`) from the newest S3 run dir under `checkpoints/<training.out_dir>/` and pushes them to `training.hf_chkpt_path`. `--best` pushes `ckpt_best/` instead; `--dry-run` only prints what it would push; `--run-dir`/`--repo`/`--mode` override the defaults. Needs `S3_ACCESS_KEY_ID`/`S3_SECRET_ACCESS_KEY` and `HF_TOKEN` in the env or `.env` |
 | `data/data_distribution.py` | `modal run data/data_distribution.py::run` | Dataset language/length distribution analysis + plots, writes to the `sabiyarn_data_dist` volume |
 | `data/prepare_data_for_tokenizer_training.py` | — | **Currently broken** — loads `./config/mistral_config.yaml`, which doesn't exist in this repo; needs a real config path or removal, out of scope of this pass |
 | `training/tokenizer_training.ipynb`, `data/tokenization (1).ipynb` | open in Jupyter, run cells top to bottom | Exploratory tokenizer-training notebooks; both now read HF tokens from env (`HF_API_KEY`/`HF_WRITE_TOKEN`) via `.env` instead of hardcoded values |

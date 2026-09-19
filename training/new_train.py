@@ -1343,9 +1343,10 @@ class Trainer:
         if not self.cfg.hf_chkpt_path:
             return
         token = (
-            os.environ.get("HF_TOKEN")
+            os.environ.get("HF_WRITE_TOKEN")
+            or os.environ.get("HF_TOKEN")
             or os.environ.get("HUGGING_FACE_HUB_TOKEN")
-            or os.environ.get("HF_API_KEY")
+            or os.environ.get("HF_API_KEY")  # last resort: the read token in some setups
         )
         if not token:
             LOG.warning(
