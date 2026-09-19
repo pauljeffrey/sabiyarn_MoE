@@ -288,6 +288,9 @@ class TrainConfig:
     mlflow_run_name: Optional[str] = None  # falls back to "<wandb run_name>_<mode>"
     mlflow_run_id: Optional[str] = None  # set (or MLFLOW_RUN_ID env) to continue an existing run after a resume
     mlflow_log_system_metrics: bool = True  # GPU/CPU/mem utilisation charts
+    mlflow_ui: bool = False  # launch `mlflow ui` in the background during training
+    mlflow_ui_host: str = "0.0.0.0"
+    mlflow_ui_port: int = 5000
 
     # ddp / modal
     ddp_backend: str = "nccl"
@@ -339,6 +342,11 @@ def sampling_weights(
     coeff = 0.5 * (1.0 - math.cos(math.pi * progress))  # 0 -> 1 over training
     eng_w = eng0 + (afr0 - eng0) * coeff
     return eng_w, 1.0 - eng_w
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    return default if raw is None else raw.strip().lower() in ("1", "true", "yes", "on")
 
 
 def load_train_config(path: Optional[str] = None) -> TrainConfig:
@@ -478,6 +486,9 @@ def load_train_config(path: Optional[str] = None) -> TrainConfig:
         mlflow_run_name=mlflow_cfg.get("run_name") or None,
         mlflow_run_id=os.getenv("MLFLOW_RUN_ID") or mlflow_cfg.get("run_id") or None,
         mlflow_log_system_metrics=bool(mlflow_cfg.get("log_system_metrics", True)),
+        mlflow_ui=_env_bool("MLFLOW_UI_ENABLED", bool((mlflow_cfg.get("ui", {}) or {}).get("enabled", False))),
+        mlflow_ui_host=str((mlflow_cfg.get("ui", {}) or {}).get("host", "0.0.0.0")),
+        mlflow_ui_port=int(os.getenv("MLFLOW_UI_PORT") or (mlflow_cfg.get("ui", {}) or {}).get("port", 5000)),
         hf_chkpt_path=training.get("hf_chkpt_path") or None,
         hf_push_interval=int(training.get("hf_push_interval", 100)),
         ddp_backend=str(ddp.get("backend", "nccl")),

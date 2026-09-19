@@ -66,3 +66,36 @@ def test_tracker_survives_bad_tracking_uri(monkeypatch):
     t.start(tracking_uri=None, experiment_name="x", run_name="r", run_id=None, params={})
     t.log_metrics({"a": 1.0}, step=0)  # must not raise whether or not start() succeeded
     t.end()
+
+
+def test_start_ui_serves_and_stops(tmp_path, monkeypatch):
+    import socket
+    import time
+    import urllib.request
+
+    pytest.importorskip("mlflow")
+    monkeypatch.delenv("MLFLOW_TRACKING_URI", raising=False)
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+    t = MlflowTracker()
+    assert t.start(tracking_uri=f"file:{tmp_path / 'mlruns'}", experiment_name="ui", run_name="r", run_id=None, params={})
+    assert t.start_ui("127.0.0.1", port)
+    try:
+        for _ in range(60):
+            try:
+                assert urllib.request.urlopen(f"http://127.0.0.1:{port}/", timeout=1).status == 200
+                break
+            except Exception:
+                time.sleep(0.5)
+        else:
+            pytest.fail("mlflow ui never came up")
+    finally:
+        t.end()
+    assert t._ui_proc is None
+
+
+def test_start_ui_skipped_for_remote_server():
+    t = MlflowTracker()
+    t.enabled, t.uri = True, "http://example.com:5000"
+    assert t.start_ui() is False

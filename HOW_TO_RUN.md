@@ -128,7 +128,7 @@ Checkpoints save under `TRAIN_OUT_DIR` (set by `modal_train.py` to `/data/checkp
 
 **Experiment tracking (MLflow)** — on by default (`mlflow:` section of `train_config.yaml`, runs alongside wandb). Logged to the tracking store every `training.log_interval` iters / every eval: `train/loss` (CE + MoE aux, what's optimised), `train/ce_loss`, `train/bpb`, `train/ppl`, `train/grad_norm`, `lr`, `train/tokens_seen`, tokens/sec, TFLOPs, MFU, sampling weights, `eval/{train,val}_{loss,ce,bpb,ppl}`, `moe/*` router stats, plus GPU/CPU/RAM system metrics and the full config as params. **bpb** = bits per byte of decoded text (`CE_nats * tokens / (ln2 * bytes)`), so it's comparable across tokenizers; special tokens count as 0 bytes.
 
-- **vast.ai / bare box**: runs are written to `./mlruns` (override with `MLFLOW_TRACKING_URI` or `mlflow.tracking_uri`). Start the UI on the box and tunnel it:
+- **vast.ai / bare box**: runs are written to `./mlruns` (override with `MLFLOW_TRACKING_URI` or `mlflow.tracking_uri`). With `mlflow.ui.enabled: true` (default; `MLFLOW_UI_ENABLED=0/1` and `MLFLOW_UI_PORT` override it) training itself serves the UI on port 5000 and stops it when the run ends, so you only need the tunnel. To run it by hand instead:
 
   ```bash
   pip install -r requirements.txt   # includes mlflow

@@ -574,6 +574,8 @@ class Trainer:
             log_system_metrics=self.cfg.mlflow_log_system_metrics,
             artifacts=[config_path],
         )
+        if self.cfg.mlflow_ui:
+            self.tracker.start_ui(self.cfg.mlflow_ui_host, self.cfg.mlflow_ui_port)
 
     def _byte_table(self) -> torch.Tensor:
         if self._token_bytes is None:

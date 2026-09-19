@@ -99,6 +99,7 @@ def _build_env(mode: str, override: bool) -> dict[str, str]:
     env["OVERRIDE_DATA"] = "1" if override else "0"
     # MLflow runs land on the same persistent volume as checkpoints, unless
     # MLFLOW_TRACKING_URI is set in .env to point at a remote tracking server.
+    env.setdefault("MLFLOW_UI_ENABLED", "0")  # a UI inside the container is unreachable
     env.setdefault("MLFLOW_TRACKING_URI", f"file:{os.path.join(DATA_DIR, 'mlruns')}")
     return env
 

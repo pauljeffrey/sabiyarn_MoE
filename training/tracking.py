@@ -16,8 +16,12 @@ View with:  MLFLOW_ALLOW_FILE_STORE=true mlflow ui --backend-store-uri <same uri
 
 from __future__ import annotations
 
+import atexit
 import math
 import os
+import socket
+import subprocess
+import sys
 from typing import Any, Iterable, Optional
 
 import structlog
@@ -81,6 +85,8 @@ class MlflowTracker:
     def __init__(self) -> None:
         self.enabled = False
         self._mlflow = None
+        self._ui_proc: Optional[subprocess.Popen] = None
+        self.uri: Optional[str] = None
 
     def start(
         self,
@@ -130,6 +136,7 @@ class MlflowTracker:
 
             self._mlflow = mlflow
             self.enabled = True
+            self.uri = uri
             LOG.info("mlflow_started", uri=uri, experiment=experiment_name, run_id=run.info.run_id)
             return True
         except Exception as exc:
@@ -151,7 +158,42 @@ class MlflowTracker:
         except Exception as exc:
             LOG.warning("mlflow_log_failed", error=str(exc))
 
+    def start_ui(self, host: str = "0.0.0.0", port: int = 5000) -> bool:
+        """Serve the MLflow UI from a background subprocess for the life of the run.
+
+        Only meaningful for a local store (directory / sqlite): with an http(s)
+        tracking URI there's already a server, so this is skipped. Stopped in
+        `end()` and at interpreter exit.
+        """
+        if not self.enabled or not self.uri or self.uri.startswith(("http://", "https://")):
+            return False
+        if self._ui_proc is not None:
+            return True
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            if sock.connect_ex(("127.0.0.1", port)) == 0:
+                LOG.warning("mlflow_ui_port_in_use", port=port, hint="set mlflow.ui.port or MLFLOW_UI_PORT")
+                return False
+        try:
+            self._ui_proc = subprocess.Popen(
+                [sys.executable, "-m", "mlflow", "ui", "--backend-store-uri", self.uri,
+                 "--host", host, "--port", str(port)],
+                env={**os.environ, "MLFLOW_ALLOW_FILE_STORE": "true"},
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+            atexit.register(self._stop_ui)
+            LOG.info("mlflow_ui_started", host=host, port=port, store=self.uri)
+            return True
+        except Exception as exc:
+            LOG.warning("mlflow_ui_failed", error=str(exc))
+            return False
+
+    def _stop_ui(self) -> None:
+        if self._ui_proc is not None and self._ui_proc.poll() is None:
+            self._ui_proc.terminate()
+        self._ui_proc = None
+
     def end(self, status: str = "FINISHED") -> None:
+        self._stop_ui()
         if not self.enabled:
             return
         try:
