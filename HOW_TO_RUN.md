@@ -15,8 +15,8 @@ pip install -r requirements.txt
 | Variable | Used by | Purpose |
 |---|---|---|
 | `S3_ACCESS_KEY_ID`, `S3_SECRET_ACCESS_KEY` | `data/prepare.py`, `training/new_train.py` (via `training/s3_utils.py`) | download training bins before training, upload freshly prepared bins after `prepare.py` |
-| `HF_API_KEY` | `data/prepare.py`, `training/new_train.py`, `eval/eval.py` | read HF datasets, push checkpoints, load eval models |
-| `HF_TOKEN` / `HUGGING_FACE_HUB_TOKEN` | `training/new_train.py` | checked in addition to `HF_API_KEY` for checkpoint push |
+| `HF_API_KEY` | `data/prepare.py`, `eval/eval.py`, the notebooks' `huggingface-cli login` | **read** token: download HF datasets/models |
+| `HF_WRITE_TOKEN` / `HF_TOKEN` | `training/new_train.py`, `training/push_s3_checkpoint_to_hf.py`, `training/push_model_code_to_hf.py`, `training/tokenizer_training.ipynb` | **write** token: every upload to the Hub. The push paths check `HF_WRITE_TOKEN`, then `HF_TOKEN`, then `HUGGING_FACE_HUB_TOKEN`, then `HF_API_KEY` — a read-only token in the last slot fails the push with a 401, so keep a real write token in one of the first two |
 | `WANDB_API_KEY` | wandb SDK directly (no code change needed) | training run logging |
 | `MODAL_TOKEN_ID`, `MODAL_TOKEN_SECRET` | `modal` CLI/SDK | alternative to `modal token set` |
 
@@ -25,7 +25,7 @@ pip install -r requirements.txt
 **On Modal**, the same secrets are supplied via `modal.Secret.from_name(...)` instead of `.env` (the `.env` file is explicitly excluded from everything uploaded into Modal images). Create these once in your Modal workspace before running anything that references them:
 
 ```bash
-modal secret create hf-secret HF_API_KEY=<your-hf-token>
+modal secret create hf-secret HF_API_KEY=<your-hf-read-token> HF_WRITE_TOKEN=<your-hf-write-token>
 modal secret create wandb-secret WANDB_API_KEY=<your-wandb-key>
 modal secret create s3-secret S3_ACCESS_KEY_ID=<...> S3_SECRET_ACCESS_KEY=<...>
 ```
@@ -86,6 +86,8 @@ Every training batch element is drawn from either the English or African bin, ch
 
 This only kicks in when both bins are present for the active `mode`; single-language runs (e.g. only one bin configured) ignore sampling weights.
 
+**Dry run / checkpoint sanity check** (`training.test_run: true` in `train_config.yaml`): loads the model and `model.reference_repo`, runs the weight-deviation check, then generates from 5 fixed prompts (one per pretraining language, ~20-30 words each, 150 new tokens) with **both** models under **both** `do_sample` and beam search, prints them side by side, then runs **one eval** — logging its train/val loss and the delta against the best val loss recorded in the checkpoint's `trainer_state.json` — and stops. No training step, and nothing is saved locally, uploaded to S3, or pushed to the Hub. Set it back to `false` to train. The prompts live in `Trainer._STARTUP_PROMPTS` (`training/new_train.py`); edit them freely. The comparison itself runs at the start of *every* launch — only the stop-afterwards part is gated on `test_run`.
+
 **Single GPU / CPU smoke test**: there's no CLI flag for `optimizer.max_iters` — temporarily lower it (and `training.eval_interval`) in `train_config.yaml` for a first smoke run, then restore it.
 
 ```bash
@@ -126,6 +128,28 @@ modal run training/modal_train.py --mode sft --override
 
 Checkpoints save under `TRAIN_OUT_DIR` (set by `modal_train.py` to `/data/checkpoints`, on the same persistent Modal volume training reads its data from — survives container preemption and is what `test_generation.py` reads back), then push to `training.hf_chkpt_path` on Hugging Face Hub. Outside Modal (`python -m training.new_train` / bare `torchrun`), checkpoints save under `training.out_dir` from the yaml (default `out/`).
 
+**Experiment tracking (MLflow)** — on by default (`mlflow:` section of `train_config.yaml`, runs alongside wandb). Logged to the tracking store every `training.log_interval` iters / every eval: `train/loss` (CE + MoE aux, what's optimised), `train/ce_loss`, `train/bpb`, `train/ppl`, `train/grad_norm`, `lr`, `train/tokens_seen`, tokens/sec, TFLOPs, MFU, sampling weights, `eval/{train,val}_{loss,ce,bpb,ppl}`, `moe/*` router stats, plus GPU/CPU/RAM system metrics and the full config as params. **bpb** = bits per byte of decoded text (`CE_nats * tokens / (ln2 * bytes)`), so it's comparable across tokenizers; special tokens count as 0 bytes.
+
+- **vast.ai / bare box**: runs are written to `./mlruns` (override with `MLFLOW_TRACKING_URI` or `mlflow.tracking_uri`). With `mlflow.ui.enabled: true` (default; `MLFLOW_UI_ENABLED=0/1` and `MLFLOW_UI_PORT` override it) training itself serves the UI on port 5000 and stops it when the run ends, so you only need the tunnel. To run it by hand instead:
+
+  ```bash
+  pip install -r requirements.txt   # includes mlflow
+  MLFLOW_ALLOW_FILE_STORE=true mlflow ui --backend-store-uri mlruns --host 0.0.0.0 --port 5000
+  # on your laptop:  ssh -N -L 5000:localhost:5000 -p <vast_ssh_port> root@<vast_ip>   ->  http://localhost:5000
+  ```
+
+- **Modal**: runs land on the `sabiyarn-data` volume under `mlruns/` (flushed on exit). Pull and browse them locally:
+
+  ```bash
+  modal volume get sabiyarn-data mlruns ./mlruns
+  MLFLOW_ALLOW_FILE_STORE=true mlflow ui --backend-store-uri ./mlruns
+  ```
+
+  To watch a Modal run live, put `MLFLOW_TRACKING_URI=http://<your-mlflow-server>:5000` in `.env` (forwarded into the container) instead.
+
+- After a resume, set `MLFLOW_RUN_ID=<id>` (shown in the `mlflow_started` log line) to append to the same run so the curves stay continuous.
+- Disable with `mlflow.log: false`.
+
 ---
 
 ## 3. Tests
@@ -143,6 +167,7 @@ pytest tests/
 | `eval/modal_eval.py` | `modal run eval/modal_eval.py::run` | Runs `eval.run_all()` (topic classification, sentiment, NER) against `BeardedMonster/SabiYarn-125M-finetune`, logs to the `sabiyarn_v2` volume |
 | `test_generation.py` | `modal run test_generation.py::main` | Loads the most recently modified `ckpt_*` dir under `/data/checkpoints/` (the same volume `modal_train.py` writes to) via `AutoModelForCausalLM.from_pretrained(..., trust_remote_code=True)` and generates from a couple of default prompts. Pass `--checkpoint-dir <path>` to target a specific checkpoint instead of "latest" |
 | `inference/modal_hosting.py` | `modal deploy inference/modal_hosting.py` | Fixed for modal 1.5.1 (previously imported `Mount`/`build`/`gpu`, which no longer exist as top-level `modal.*` names); serves `BeardedMonster/SabiYarn-125M` behind a FastAPI `/predict` endpoint. Not otherwise changed/verified end-to-end — GPU-side behavior needs a real Modal deploy to confirm |
+| `training/push_s3_checkpoint_to_hf.py` | `python training/push_s3_checkpoint_to_hf.py` or `modal run training/push_s3_checkpoint_to_hf.py` | Downloads the latest checkpoint's weights (`ckpt_<iter>/`) from the newest S3 run dir under `checkpoints/<training.out_dir>/` and pushes them to `training.hf_chkpt_path`. `--best` pushes `ckpt_best/` instead; `--dry-run` only prints what it would push; `--run-dir`/`--repo`/`--mode` override the defaults. Needs `S3_ACCESS_KEY_ID`/`S3_SECRET_ACCESS_KEY` and `HF_TOKEN` in the env or `.env` |
 | `data/data_distribution.py` | `modal run data/data_distribution.py::run` | Dataset language/length distribution analysis + plots, writes to the `sabiyarn_data_dist` volume |
 | `data/prepare_data_for_tokenizer_training.py` | — | **Currently broken** — loads `./config/mistral_config.yaml`, which doesn't exist in this repo; needs a real config path or removal, out of scope of this pass |
 | `training/tokenizer_training.ipynb`, `data/tokenization (1).ipynb` | open in Jupyter, run cells top to bottom | Exploratory tokenizer-training notebooks; both now read HF tokens from env (`HF_API_KEY`/`HF_WRITE_TOKEN`) via `.env` instead of hardcoded values |

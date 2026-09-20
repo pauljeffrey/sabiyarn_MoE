@@ -43,9 +43,10 @@ DEFAULT_FILES = ["modeling.py", "configuration.py"]
 
 def _resolve_token() -> str | None:
     return (
-        os.environ.get("HF_TOKEN")
+        os.environ.get("HF_WRITE_TOKEN")
+        or os.environ.get("HF_TOKEN")
         or os.environ.get("HUGGING_FACE_HUB_TOKEN")
-        or os.environ.get("HF_API_KEY")
+        or os.environ.get("HF_API_KEY")  # last resort: the read token in some setups
     )
 
 
@@ -82,7 +83,7 @@ def main() -> None:
     token = _resolve_token()
     if not token:
         raise SystemExit(
-            "No HF token found (checked HF_TOKEN, HUGGING_FACE_HUB_TOKEN, HF_API_KEY). "
+            "No HF token found (checked HF_WRITE_TOKEN, HF_TOKEN, HUGGING_FACE_HUB_TOKEN, HF_API_KEY). "
             "Set one in your environment or .env before pushing."
         )
 

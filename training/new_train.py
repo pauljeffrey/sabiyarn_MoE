@@ -34,6 +34,7 @@ from training.constant_tokens import MASK, assistant_token, end_of_text_token, s
 from training.label_masking import apply_label_mask
 from training.load_config import TrainConfig, load_train_config, sampling_weights
 from training.mfu import compute_mfu, model_flops_per_token, peak_flops_for_current_device
+from training.tracking import MlflowTracker, bits_per_byte, build_token_byte_lengths
 from training.s3_utils import (
     delete_prefix,
     download_folder,
@@ -47,6 +48,9 @@ from training.s3_utils import (
 from training.training_attention_mask import build_document_causal_mask
 
 LOG = structlog.get_logger()
+
+# Config fields never sent to experiment trackers (S3 keys live on TrainConfig).
+_SECRET_CFG_MARKERS = ("secret", "access_key", "token", "password")
 
 try:
     from cut_cross_entropy import linear_cross_entropy
@@ -172,16 +176,31 @@ class Trainer:
         # actually elapsed since then, even for the very first log line (which
         # only covers iter 0 itself, not a full log_interval window).
         self._last_logged_iter = -1
+        # MLflow tracking + the pieces bits-per-byte needs (see _target_stats).
+        self.tracker = MlflowTracker()
+        self._last_ce_loss = None   # CE-only loss (no MoE aux term) of the latest _forward_loss
+        self._last_grad_norm = None  # pre-clip global grad norm of the latest optimizer step
+        self._token_bytes = None    # id -> UTF-8 byte length lookup, built lazily on device
+        # The static reference checkpoint (model.reference_repo), kept on
+        # master between _verify_reference_weights and the startup
+        # generation comparison that reuses it, then dropped.
+        self._ref_model = None
         self._setup_accelerator()
         self._setup_dirs()
         self._backfill_ckpt_best()
         self._setup_wandb()
+        self._setup_mlflow()
         self._setup_data()
         self._build_model()
         self._build_optimizer()
         self._prepare_for_training()
         self._verify_resume_sanity()
         self._verify_reference_weights()
+        # Qualitative companion to the weight-deviation check above: what the
+        # two models actually GENERATE, before a single training step runs.
+        # When training.test_run is set, train() runs one eval after this and
+        # then stops, without saving or pushing anything (_test_run_eval).
+        self._startup_generation_comparison()
 
     # ------------------------------------------------------------------
     # Setup
@@ -336,6 +355,13 @@ class Trainer:
         trainer_state.json is already backfilled on every rank by the time
         _build_model/_prepare_for_training read it.
         """
+        if self.cfg.test_run:
+            # test_run promises nothing is written or pushed anywhere -- and
+            # this backfill both copies ckpt_best/resume_state_best locally
+            # AND pushes them to S3. Skipped entirely; it's a one-time
+            # migration that the next real run will do.
+            self.accelerator.wait_for_everyone()
+            return
         if self.master and self._resume_dir:
             meta_path = os.path.join(self._resume_dir, "trainer_state.json")
             if os.path.isfile(meta_path):
@@ -545,6 +571,43 @@ class Trainer:
         except Exception as exc:
             LOG.warning("wandb_init_failed", error=str(exc))
             self.cfg.wandb_log = False
+
+    def _setup_mlflow(self):
+        if not self.master or not self.cfg.mlflow_log:
+            return
+        run_name = self.cfg.mlflow_run_name or f"{self.cfg.wandb_run_name}_{self.cfg.mode}"
+        config_path = os.environ.get("TRAIN_CONFIG_PATH") or os.path.join(os.path.dirname(__file__), "train_config.yaml")
+        self.tracker.start(
+            tracking_uri=self.cfg.mlflow_tracking_uri,
+            experiment_name=self.cfg.mlflow_experiment,
+            run_name=run_name,
+            run_id=self.cfg.mlflow_run_id,
+            params={
+                **{k: v for k, v in vars(self.cfg).items() if not any(t in k.lower() for t in _SECRET_CFG_MARKERS)},
+                "world_size": self.world_size,
+            },
+            tags={"mode": self.cfg.mode},
+            log_system_metrics=self.cfg.mlflow_log_system_metrics,
+            artifacts=[config_path],
+        )
+        if self.cfg.mlflow_ui:
+            self.tracker.start_ui(self.cfg.mlflow_ui_host, self.cfg.mlflow_ui_port)
+
+    def _byte_table(self) -> torch.Tensor:
+        if self._token_bytes is None:
+            special = set(self.tokenizer.all_special_ids) | set(self.tokenizer.added_tokens_decoder.keys())
+            table = build_token_byte_lengths(self.tokenizer.get_vocab(), special)
+            self._token_bytes = torch.tensor(table, dtype=torch.int64, device=self.device)
+        return self._token_bytes
+
+    def _target_stats(self, y: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """(supervised token count, bytes those tokens decode to) for a target
+        batch -- the two denominators bits-per-byte needs. Masked positions
+        (MASK) count for neither; special tokens count 0 bytes."""
+        table = self._byte_table()
+        valid = y != MASK
+        ids = y.clamp(min=0, max=table.numel() - 1)  # ids past the tokenizer vocab hit the trailing 0 slot
+        return valid.sum(), (table[ids] * valid).sum()
 
     def _setup_data(self):
         if not self.cfg.train_data_paths:
@@ -1023,6 +1086,11 @@ class Trainer:
             LOG.warning("reference_weights_load_failed", repo=self.cfg.reference_model_repo, error=str(exc))
             return
         ref_state = ref_model.state_dict()
+        # Kept (master only) for _startup_generation_comparison below rather
+        # than reloaded there -- same weights, and a second from_pretrained
+        # would re-read the whole checkpoint for nothing.
+        if self.master:
+            self._ref_model = ref_model
         # See _save's identical migration -- modern, non-deprecated
         # FSDP1-and-FSDP2-unified API instead of accelerate's FSDP1 path
         # through the legacy FSDP.state_dict_type() context manager.
@@ -1153,6 +1221,7 @@ class Trainer:
                 out = self.model(input_ids=x, attention_mask=attention_mask, targets=y)
             ce_loss = out.loss
 
+        self._last_ce_loss = ce_loss.detach()
         _, lb_loss = raw.get_expert_utilization()
         if lb_loss is not None:
             return ce_loss + self.cfg.moe_aux_loss_weight * lb_loss
@@ -1173,14 +1242,77 @@ class Trainer:
     #     length_penalty/early_stopping are beam-search-only knobs (they
     #     govern beam score normalization/termination) -- dropped since
     #     they're inert with num_beams=1.
+    #   - top_k=40 (was 50): anywhere in 20-50 is reasonable here; 40 keeps
+    #     enough of the distribution for the model to still sound varied
+    #     across five languages, while trimming more of the low-probability
+    #     tail that a mid-training 280M model still puts mass on (that tail
+    #     is where most of the obvious "wrong language / nonsense token"
+    #     samples come from). 20 would be tighter but starts hiding genuine
+    #     diversity problems behind the truncation.
+    #   - repetition_penalty=1.15 (was 4.0): 4.0 is far outside the usual
+    #     1.05-1.3 range -- it divides the logit of every already-seen token
+    #     by 4, which at that strength doesn't just discourage loops, it
+    #     effectively forbids reusing common function words and punctuation,
+    #     so samples drift off-topic and off-language within a few dozen
+    #     tokens. That makes these samples useless as a read on the model:
+    #     they'd look broken whether or not the model is. 1.15 still damps
+    #     degenerate loops. This is display-only -- no effect on the loss,
+    #     gradients, or anything that gets checkpointed.
     _GENERATION_CONFIG = dict(
         max_new_tokens=100,
         num_beams=1,
         do_sample=True,
         temperature=0.99,
-        top_k=50,
+        top_k=40,
         top_p=0.95,
-        repetition_penalty=4.0,
+        repetition_penalty=1.15,
+    )
+
+    # One-off startup comparison (see _startup_generation_comparison), run
+    # once before training against model.reference_repo. Sampling reuses the
+    # exact training-time config above (same decoding the periodic
+    # display_model_output_iter samples use, just longer) so what you see
+    # here is what you'll see mid-run; beam search is the deterministic
+    # counterpart, with the sampling-only knobs dropped since they're inert
+    # under do_sample=False and transformers warns about them.
+    _STARTUP_MAX_NEW_TOKENS = 150
+    _STARTUP_SAMPLE_CONFIG = dict(_GENERATION_CONFIG, max_new_tokens=_STARTUP_MAX_NEW_TOKENS)
+    _STARTUP_BEAM_CONFIG = dict(
+        max_new_tokens=_STARTUP_MAX_NEW_TOKENS,
+        num_beams=5,
+        do_sample=False,
+        early_stopping=True,
+        length_penalty=1.0,
+        repetition_penalty=_GENERATION_CONFIG["repetition_penalty"],
+    )
+
+    # Five fixed prompts (~20-30 words each), one per major pretraining
+    # language, each opening with the language tag the data was tokenized
+    # with (see training/constant_tokens.py). Nothing downstream depends on
+    # these exact strings -- edit them freely to probe whatever you care
+    # about on a given run.
+    _STARTUP_PROMPTS = (
+        (
+            "<eng> The rapid growth of artificial intelligence research across Africa has opened new "
+            "opportunities for local startups and universities building language technology for their "
+            "own communities."
+        ),
+        (
+            "<yor> Ìjọba ìpínlẹ̀ Èkó sọ pé àwọn ọ̀nà tuntun yóò ṣí sílẹ̀ fún àwọn oníṣòwò kékeré, "
+            "kí ọrọ̀ ajé ìlú lè tẹ̀síwájú."
+        ),
+        (
+            "<ibo> Ndị ọchịchị steeti Anambra kwuru na ha ga-emezi ụzọ na ụlọ akwụkwọ dị n'ime obodo, "
+            "ka ụmụ akwụkwọ nwee ike ịga akwụkwọ n'udo."
+        ),
+        (
+            "<hau> Gwamnatin jihar Kano ta ce za ta gina sabbin hanyoyi da makarantu a ƙauyuka da dama, "
+            "domin inganta rayuwar manoma da yara."
+        ),
+        (
+            "<pcm> Plenty people for Lagos dey talk say the new transport policy go make traffic better, "
+            "but some drivers still dey complain well well."
+        ),
     )
 
     @torch.no_grad()
@@ -1195,8 +1327,9 @@ class Trainer:
         return ids
 
     @torch.no_grad()
-    def _generate_with_config(self, prompt_ids: torch.Tensor) -> torch.Tensor:
-        """Real GenerationMixin.generate() with _GENERATION_CONFIG, temporarily
+    def _generate_with_config(self, prompt_ids: torch.Tensor, gen_config: dict | None = None) -> torch.Tensor:
+        """Real GenerationMixin.generate() with _GENERATION_CONFIG (or an
+        explicit gen_config -- see _startup_generation_comparison), temporarily
         un-sharding parameters via FSDP.summon_full_params so generate()'s
         internal machinery (prepare_inputs_for_generation, beam search, etc.)
         sees ordinary full 2-D weight tensors instead of FSDP's flat shards --
@@ -1205,10 +1338,11 @@ class Trainer:
         context and call generate() together, matching FSDP's per-layer
         all-gather requirement."""
         pad_id = self.tokenizer.pad_token_id or self.tokenizer.eos_token_id
+        cfg = gen_config if gen_config is not None else self._GENERATION_CONFIG
         if self.fsdp_plugin is not None:
             with FSDP.summon_full_params(self.model, writeback=False, recurse=True):
-                return self.model.generate(prompt_ids, pad_token_id=pad_id, **self._GENERATION_CONFIG)
-        return self.model.generate(prompt_ids, pad_token_id=pad_id, **self._GENERATION_CONFIG)
+                return self.model.generate(prompt_ids, pad_token_id=pad_id, **cfg)
+        return self.model.generate(prompt_ids, pad_token_id=pad_id, **cfg)
 
     @torch.no_grad()
     def _log_sample_generation(self, prompt_ids: torch.Tensor, tag: str = "sample_generation"):
@@ -1248,6 +1382,108 @@ class Trainer:
         print("=" * 100 + "\n")
 
     @torch.no_grad()
+    def _generate_reference(self, prompt_ids: torch.Tensor, gen_config: dict) -> torch.Tensor | None:
+        """Generate from the static reference checkpoint (model.reference_repo,
+        loaded in _verify_reference_weights). Master-only and NOT collective:
+        this is a plain, unwrapped HF model, so no FSDP all-gather is
+        involved. Moved onto the training device on first use for speed,
+        falling back to CPU if there isn't room for it alongside the
+        training model."""
+        if self._ref_model is None:
+            return None
+        pad_id = self.tokenizer.pad_token_id or self.tokenizer.eos_token_id
+        try:
+            self._ref_model.to(self.device)
+            ids = prompt_ids.to(self.device)
+        except Exception as exc:
+            LOG.warning("reference_model_to_device_failed", error=str(exc), fallback="cpu")
+            self._ref_model.to("cpu")
+            ids = prompt_ids.to("cpu")
+        try:
+            return self._ref_model.generate(ids, pad_token_id=pad_id, **gen_config)
+        except Exception as exc:
+            LOG.warning("reference_generation_failed", error=str(exc))
+            return None
+
+    @torch.no_grad()
+    def _startup_generation_comparison(self) -> None:
+        """One-off, before the first training step: generate from
+        _STARTUP_PROMPTS with BOTH the model about to be trained and the
+        static reference checkpoint (model.reference_repo), under both
+        sampling and beam search, and print them side by side.
+
+        This is the qualitative counterpart to _verify_reference_weights'
+        single aggregate_rel_l2 number: that says how FAR the weights have
+        moved from the reference, this shows what that movement actually did
+        to the model's output -- real progress and a broken/mis-loaded
+        checkpoint can produce a similar deviation number, but they don't
+        read the same.
+
+        Generation with the training model is collective (FSDP all-gathers
+        per layer -- see _generate_with_config), so EVERY rank must run this
+        loop in lockstep; only master generates with the reference model and
+        If training.test_run is set, train() follows this with a single
+        eval and then stops without saving or pushing (see _test_run_eval).
+        """
+        modes = (
+            (f"do_sample (top_k={self._STARTUP_SAMPLE_CONFIG['top_k']}, "
+             f"top_p={self._STARTUP_SAMPLE_CONFIG['top_p']}, "
+             f"temperature={self._STARTUP_SAMPLE_CONFIG['temperature']})", self._STARTUP_SAMPLE_CONFIG),
+            (f"beam_search (num_beams={self._STARTUP_BEAM_CONFIG['num_beams']}, do_sample=False)",
+             self._STARTUP_BEAM_CONFIG),
+        )
+        trained_label = (
+            f"MODEL BEING TRAINED  [{self.cfg.model_name}"
+            f"{', resumed from ' + self.cfg.init_from if self.cfg.init_from else ''}, iter {self.iter_num}]"
+        )
+        ref_label = f"REFERENCE MODEL      [{self.cfg.reference_model_repo or 'not configured'}]"
+
+        self.model.eval()
+        if self.master:
+            header = " STARTUP GENERATION COMPARISON (before training) "
+            print(f"\n{header:#^110}")
+            print(f"# prompts: {len(self._STARTUP_PROMPTS)} | max_new_tokens: {self._STARTUP_MAX_NEW_TOKENS} "
+                  f"| test_run: {self.cfg.test_run}")
+            print(f"# {trained_label}")
+            print(f"# {ref_label}")
+            print("#" * 110)
+
+        for idx, prompt in enumerate(self._STARTUP_PROMPTS, 1):
+            prompt_ids = self.tokenizer(prompt, return_tensors="pt").input_ids.to(self.device)
+            prompt_len = prompt_ids.size(1)
+            if self.master:
+                print(f"\n{'=' * 110}")
+                print(f"=== PROMPT {idx}/{len(self._STARTUP_PROMPTS)} ({prompt_len} tokens)")
+                print(f"{'=' * 110}")
+                print(f"[PROMPT] {prompt}")
+
+            for mode_label, gen_config in modes:
+                # Collective -- every rank calls this, master and non-master alike.
+                try:
+                    trained_out = self._generate_with_config(prompt_ids, gen_config)
+                except Exception as exc:
+                    if self.master:
+                        LOG.warning("startup_generation_failed", prompt=idx, mode=mode_label, error=str(exc))
+                    trained_out = None
+                ref_out = self._generate_reference(prompt_ids, gen_config) if self.master else None
+
+                if not self.master:
+                    continue
+                print(f"\n--- PROMPT {idx} | DECODING: {mode_label} ---")
+                for label, out in ((trained_label, trained_out), (ref_label, ref_out)):
+                    if out is None:
+                        print(f"  [{label}]\n    <no output>")
+                        continue
+                    text = self.tokenizer.decode(out[0, prompt_len:], skip_special_tokens=False)
+                    print(f"  [{label}]\n    {text}")
+
+        if self.master:
+            print(f"\n{'#' * 110}\n")
+        self._ref_model = None  # free the reference model; only needed for this comparison
+        self.model.train()
+        self.accelerator.wait_for_everyone()
+
+    @torch.no_grad()
     def estimate_loss(self):
         """Every rank evaluates a shard of eval_iters and results are averaged
         via an all-reduce, so all ranks do equal work and stay in lockstep
@@ -1257,11 +1493,19 @@ class Trainer:
         local_iters = max(1, self.cfg.eval_iters // max(1, self.world_size))
         for split in ("train", "val"):
             losses = torch.zeros(local_iters, device=self.device)
+            # Running [sum of CE nats, supervised tokens, decoded bytes] for bits-per-byte.
+            totals = torch.zeros(3, device=self.device, dtype=torch.float64)
             for k in range(local_iters):
                 x, y = self.get_batch(split)
                 losses[k] = self._forward_loss(x, y)
+                n_tok, n_bytes = self._target_stats(y)
+                totals += torch.stack([self._last_ce_loss.double() * n_tok, n_tok.double(), n_bytes.double()])
             local_mean = losses.mean()
             out[split] = self.accelerator.reduce(local_mean, reduction="mean").item()
+            ce_total, tok_total, bytes_total = self.accelerator.reduce(totals, reduction="sum").tolist()
+            if tok_total > 0:
+                out[f"{split}_ce"] = ce_total / tok_total  # pure CE, without the MoE aux term in out[split]
+                out[f"{split}_bpb"] = bits_per_byte(out[f"{split}_ce"], tok_total, bytes_total)
         self.model.train()
         return out
 
@@ -1281,15 +1525,22 @@ class Trainer:
             return False
         if self._last_hf_push_loss is None:
             return True
-        return abs(val_loss - self._last_hf_push_loss) <= _HF_PUSH_LOSS_BAND
+        # One-sided on purpose: an eval whose loss IMPROVED on the last push
+        # is exactly what this repo should be publishing, however large the
+        # improvement. Only a regression beyond the band (a post-resume spike,
+        # a diverging run) is worth refusing -- the earlier abs() form also
+        # blocked big improvements, which silently starved the Hub repo of
+        # updates on precisely the runs that were going well.
+        return val_loss <= self._last_hf_push_loss + _HF_PUSH_LOSS_BAND
 
     def _push_checkpoint_to_hf(self, ckpt_dir: str) -> None:
         if not self.cfg.hf_chkpt_path:
             return
         token = (
-            os.environ.get("HF_TOKEN")
+            os.environ.get("HF_WRITE_TOKEN")
+            or os.environ.get("HF_TOKEN")
             or os.environ.get("HUGGING_FACE_HUB_TOKEN")
-            or os.environ.get("HF_API_KEY")
+            or os.environ.get("HF_API_KEY")  # last resort: the read token in some setups
         )
         if not token:
             LOG.warning(
@@ -1508,6 +1759,14 @@ class Trainer:
         sanity_batch_hash = self._sanity_batch_hash()
 
         push_now = self.master and self._should_push_to_hf(val_loss)
+        if self.master and self.cfg.hf_chkpt_path and not push_now:
+            # Otherwise a run that never publishes looks identical to one
+            # that does -- the skip was previously silent.
+            LOG.warning(
+                "hf_push_skipped", iter=self.iter_num, val_loss=val_loss,
+                last_push_loss=self._last_hf_push_loss, band=_HF_PUSH_LOSS_BAND,
+                reason="val loss regressed more than _HF_PUSH_LOSS_BAND beyond the last pushed checkpoint",
+            )
 
         if self.master:
             os.makedirs(ckpt_dir, exist_ok=True)
@@ -1623,6 +1882,13 @@ class Trainer:
 
         LOG.info("moe_expert_stats", iter=self.iter_num, lb_loss=lb_loss_value, layers=layers)
 
+        if self.tracker.enabled:
+            m = {"moe/lb_loss": lb_loss_value}
+            for l in layers:
+                m[f"moe/layer{l['layer']}_max_util"] = l["max_util"]
+                m[f"moe/layer{l['layer']}_entropy"] = l["entropy"]
+            self.tracker.log_metrics(m, step=self.iter_num)
+
         if self.cfg.wandb_log:
             try:
                 import wandb
@@ -1646,6 +1912,39 @@ class Trainer:
         except Exception as exc:
             LOG.warning("wandb_log_failed", error=str(exc))
             self.cfg.wandb_log = False
+
+    def _log_eval_mlflow(self, losses: dict, lr: float) -> None:
+        m = {"lr": lr, "eval/train_loss": losses["train"], "eval/val_loss": losses["val"]}
+        for split in ("train", "val"):
+            ce = losses.get(f"{split}_ce")
+            m[f"eval/{split}_ce"] = ce
+            m[f"eval/{split}_bpb"] = losses.get(f"{split}_bpb")
+            m[f"eval/{split}_ppl"] = math.exp(min(ce, 50.0)) if ce is not None else None
+        self.tracker.log_metrics(m, step=self.iter_num)
+
+    def _log_step_mlflow(self, loss, last_y, lr, tokens_per_sec, tflops_per_gpu, mfu, log_kwargs) -> None:
+        if not self.tracker.enabled:
+            return
+        ce = self._last_ce_loss.item() if self._last_ce_loss is not None else None
+        n_tok, n_bytes = (t.item() for t in self._target_stats(last_y))
+        tokens_seen = (
+            (self.iter_num + 1) * self.cfg.train_batch_size * self.cfg.block_size
+            * self.cfg.gradient_accumulation_steps * self.world_size
+        )
+        self.tracker.log_metrics({
+            "train/loss": loss,  # CE + weighted MoE aux loss: what is actually optimised
+            "train/ce_loss": ce,
+            "train/bpb": bits_per_byte(ce, n_tok, n_bytes) if ce is not None else None,
+            "train/ppl": math.exp(min(ce, 50.0)) if ce is not None else None,
+            "train/grad_norm": float(self._last_grad_norm) if self._last_grad_norm is not None else None,
+            "lr": lr,
+            "train/tokens_seen": tokens_seen,
+            "train/tokens_per_sec": tokens_per_sec,
+            "train/tflops_per_gpu": tflops_per_gpu,
+            "train/mfu": mfu,
+            "train/eng_sampling_weight": log_kwargs.get("eng_sampling_weight"),
+            "train/afr_sampling_weight": log_kwargs.get("afr_sampling_weight"),
+        }, step=self.iter_num)
 
     def _log_step_wandb(self, loss: float, tokens_per_sec: float, tflops_per_gpu: float, mfu: float | None) -> None:
         if not self.cfg.wandb_log or not self.master:
@@ -1671,6 +1970,48 @@ class Trainer:
         n = min(num_samples, x.size(0))
         return x[:n, :prompt_len]
 
+    def _test_run_eval(self) -> None:
+        """training.test_run: one eval, logged, then stop -- BEFORE anything
+        is written or published.
+
+        Runs after __init__ has already logged the two deviation checks
+        (_verify_resume_sanity's saved-vs-current sanity loss, and
+        _verify_reference_weights' aggregate_rel_l2 against
+        model.reference_repo) and the startup generation comparison. This
+        adds the actual val/train loss for the loaded checkpoint, plus how
+        it compares to the best_val_loss recorded in the checkpoint's own
+        trainer_state.json, and returns immediately.
+
+        Deliberately does NOT call _save: no ckpt_N/ or resume_state/
+        written locally, nothing uploaded to S3, nothing pushed to the HF
+        Hub. estimate_loss is collective, so every rank runs it.
+        """
+        losses = self.estimate_loss()
+        if self.master:
+            lr = self._lr(self.iter_num) if self.cfg.decay_lr else self.cfg.learning_rate
+            LOG.info("eval", iter=self.iter_num, **losses)
+            self._maybe_log_wandb(losses, lr)
+            self._log_eval_mlflow(losses, lr)
+            self._log_moe_stats()
+            # self.best_val is whatever the resumed trainer_state.json
+            # recorded (1e9 if this is a fresh run with no checkpoint).
+            resumed_best = self.best_val if self.best_val < 1e8 else None
+            LOG.info(
+                "test_run_complete",
+                iter=self.iter_num,
+                val_loss=losses["val"],
+                train_loss=losses["train"],
+                checkpoint_best_val_loss=resumed_best,
+                val_loss_delta_vs_checkpoint_best=(
+                    losses["val"] - resumed_best if resumed_best is not None else None
+                ),
+                note="training.test_run is true -- evaluated the loaded checkpoint and stopped. "
+                     "NOTHING was saved locally, pushed to S3, or pushed to the HF Hub. "
+                     "Set test_run: false to train. A positive delta just means this eval batch "
+                     "scored worse than the best eval recorded in the checkpoint's trainer_state.json.",
+            )
+        self.tracker.end()
+
     def train(self):
         if self.master:
             LOG.info("training_start", mode=self.cfg.mode, world_size=self.world_size)
@@ -1680,6 +2021,10 @@ class Trainer:
         # Sanity-check the loaded checkpoint (and FSDP wrapping) before
         # spending any real training time on it.
         self._log_sample_generation(self._sample_prompt(x), tag="startup_sample_generation")
+
+        if self.cfg.test_run:
+            self._test_run_eval()
+            return
 
         t0 = time.time()
         last_loss = None
@@ -1694,6 +2039,7 @@ class Trainer:
                 if self.master:
                     LOG.info("eval", iter=self.iter_num, **losses)
                     self._maybe_log_wandb(losses, lr)
+                    self._log_eval_mlflow(losses, lr)
                     self._log_moe_stats()
                 # Checkpoint ("latest") on every eval regardless of whether
                 # val loss improved. Whether it's ALSO a new best additionally
@@ -1728,9 +2074,10 @@ class Trainer:
                     loss = self._forward_loss(x, y)
                     self.accelerator.backward(loss)
                     if self.accelerator.sync_gradients and self.cfg.grad_clip > 0:
-                        self.accelerator.clip_grad_norm_(self.model.parameters(), self.cfg.grad_clip)
+                        self._last_grad_norm = self.accelerator.clip_grad_norm_(self.model.parameters(), self.cfg.grad_clip)
                     self.optimizer.step()
                     self.optimizer.zero_grad()
+                last_y = y
                 x, y = self.get_batch("train")
             last_loss = loss
 
@@ -1758,17 +2105,26 @@ class Trainer:
                     log_kwargs.update(eng_sampling_weight=eng_w, afr_sampling_weight=afr_w)
                 LOG.info("step", **log_kwargs)
                 self._log_step_wandb(last_loss.item(), tokens_per_sec, tflops_per_gpu, mfu)
+                self._log_step_mlflow(
+                    last_loss.item(), last_y, lr, tokens_per_sec, tflops_per_gpu, mfu, log_kwargs,
+                )
                 t0 = time.time()
 
             self.iter_num += 1
 
         if self.master:
             LOG.info("training_done", iter=self.iter_num)
+        self.tracker.end()
 
 
 def main():
     config = load_train_config()
-    Trainer(config).train()
+    trainer = Trainer(config)
+    try:
+        trainer.train()
+    except BaseException:
+        trainer.tracker.end(status="FAILED")  # no-op unless MLflow is active (master only)
+        raise
 
 
 if __name__ == "__main__":

@@ -89,6 +89,15 @@ training:
   # blank once checkpointing is confirmed working again.
   last_step: 
   mode: "pretrain"  # pretrain | sft
+  # Dry run: load the model + model.reference_repo, run the startup
+  # weight-deviation check AND the side-by-side generation comparison
+  # (5 prompts x {do_sample, beam search} x {this model, reference model},
+  # 150 new tokens each -- see Trainer._startup_generation_comparison), then
+  # run ONE eval, log its loss plus the delta against the best val loss
+  # recorded in the checkpoint's trainer_state.json, and STOP
+  # (Trainer._test_run_eval). No training step, and nothing saved locally,
+  # uploaded to S3, or pushed to the HF Hub. Set back to false to train.
+  test_run: true
   hf_chkpt_path: "Aletheia-ng/SabiYarn_MoE-280M"
   schedule_trainable_layers: false
 
@@ -124,6 +133,28 @@ wandb:
   run_name : ablation_1  # 'run' + str(time.time())
   save_model_to_wandb: true
   seed: 42
+
+# mlflow logging (works alongside wandb)
+mlflow:
+  log: true
+  # Where runs are stored. The MLFLOW_TRACKING_URI env var overrides this.
+  # Leave null for ./mlruns (vast.ai); modal_train.py points it at the volume.
+  tracking_uri: null
+  experiment: sabiyarn-ablations
+  run_name: null            # null -> "<wandb.run_name>_<mode>"
+  run_id: null              # or MLFLOW_RUN_ID env: continue the same run after a resume
+  log_system_metrics: true  # GPU util/memory, CPU, RAM charts
+  # Serve the MLflow UI from the training process itself (background subprocess,
+  # stopped when training ends). Equivalent to running:
+  #   MLFLOW_ALLOW_FILE_STORE=true mlflow ui --backend-store-uri mlruns --host 0.0.0.0 --port 5000
+  # Then tunnel the port from your laptop (vast.ai):
+  #   ssh -N -L 5000:localhost:5000 -p <vast_ssh_port> root@<vast_ip>  ->  http://localhost:5000
+  # Overrides: MLFLOW_UI_ENABLED=0/1, MLFLOW_UI_PORT. Skipped on Modal (container isn't reachable)
+  # and when tracking_uri is an http(s) server.
+  ui:
+    enabled: true
+    host: 0.0.0.0
+    port: 5000
 
 # data
 data: 

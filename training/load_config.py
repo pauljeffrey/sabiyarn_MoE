@@ -228,6 +228,14 @@ class TrainConfig:
     # fallback. Left defined so existing yaml files with this key still load.
     hf_push_interval: int = 100
     hf_chkpt_path: Optional[str] = None
+    # If True: load the model + model.reference_repo, run the deviation
+    # checks and the startup generation comparison
+    # (Trainer._startup_generation_comparison), run ONE eval, log its loss
+    # and how that compares to the checkpoint's own recorded best, and
+    # return (Trainer._test_run_eval). No training step, and nothing written
+    # locally or pushed to S3/HF -- a dry "is this checkpoint still healthy?"
+    # run.
+    test_run: bool = False
     seed: int = 42
     world_size: int = 1
     rank: int = 0
@@ -281,6 +289,17 @@ class TrainConfig:
     wandb_run_name: str = "run"
     save_model_to_wandb: bool = False
 
+    # mlflow
+    mlflow_log: bool = False
+    mlflow_tracking_uri: Optional[str] = None  # MLFLOW_TRACKING_URI env wins; default ./mlruns
+    mlflow_experiment: str = "sabiyarn"
+    mlflow_run_name: Optional[str] = None  # falls back to "<wandb run_name>_<mode>"
+    mlflow_run_id: Optional[str] = None  # set (or MLFLOW_RUN_ID env) to continue an existing run after a resume
+    mlflow_log_system_metrics: bool = True  # GPU/CPU/mem utilisation charts
+    mlflow_ui: bool = False  # launch `mlflow ui` in the background during training
+    mlflow_ui_host: str = "0.0.0.0"
+    mlflow_ui_port: int = 5000
+
     # ddp / modal
     ddp_backend: str = "nccl"
     gpus_per_node: int = 1
@@ -333,6 +352,11 @@ def sampling_weights(
     return eng_w, 1.0 - eng_w
 
 
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    return default if raw is None else raw.strip().lower() in ("1", "true", "yes", "on")
+
+
 def load_train_config(path: Optional[str] = None) -> TrainConfig:
     if path is None:
         path = os.environ.get(
@@ -345,6 +369,7 @@ def load_train_config(path: Optional[str] = None) -> TrainConfig:
     training = raw.get("training", {}) or {}
     optimizer = raw.get("optimizer", {}) or {}
     wandb_cfg = raw.get("wandb", {}) or {}
+    mlflow_cfg = raw.get("mlflow", {}) or {}
     data = raw.get("data", {}) or {}
     ddp = raw.get("ddp", {}) or {}
     accelerate = raw.get("accelerate", {}) or {}
@@ -463,8 +488,18 @@ def load_train_config(path: Optional[str] = None) -> TrainConfig:
         wandb_project=str(wandb_cfg.get("project", "sabiyarn")),
         wandb_run_name=str(wandb_cfg.get("run_name", "run")),
         save_model_to_wandb=bool(wandb_cfg.get("save_model_to_wandb", False)),
+        mlflow_log=bool(mlflow_cfg.get("log", False)),
+        mlflow_tracking_uri=mlflow_cfg.get("tracking_uri") or None,
+        mlflow_experiment=str(mlflow_cfg.get("experiment", "sabiyarn")),
+        mlflow_run_name=mlflow_cfg.get("run_name") or None,
+        mlflow_run_id=os.getenv("MLFLOW_RUN_ID") or mlflow_cfg.get("run_id") or None,
+        mlflow_log_system_metrics=bool(mlflow_cfg.get("log_system_metrics", True)),
+        mlflow_ui=_env_bool("MLFLOW_UI_ENABLED", bool((mlflow_cfg.get("ui", {}) or {}).get("enabled", False))),
+        mlflow_ui_host=str((mlflow_cfg.get("ui", {}) or {}).get("host", "0.0.0.0")),
+        mlflow_ui_port=int(os.getenv("MLFLOW_UI_PORT") or (mlflow_cfg.get("ui", {}) or {}).get("port", 5000)),
         hf_chkpt_path=training.get("hf_chkpt_path") or None,
         hf_push_interval=int(training.get("hf_push_interval", 100)),
+        test_run=bool(training.get("test_run", False)),
         ddp_backend=str(ddp.get("backend", "nccl")),
         gpus_per_node=int(modal_cfg.get("gpus_per_node", env.get("world_size", 1))),
         num_nodes=int(modal_cfg.get("num_nodes", 1)),
