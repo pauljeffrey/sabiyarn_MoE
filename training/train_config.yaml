@@ -97,6 +97,10 @@ training:
   # recorded in the checkpoint's trainer_state.json, and STOP
   # (Trainer._test_run_eval). No training step, and nothing saved locally,
   # uploaded to S3, or pushed to the HF Hub. Set back to false to train.
+  # Overridable per-invocation via the TEST_RUN env var (checked first), so
+  # you can do a dry run without editing this file:
+  #   TEST_RUN=1 python -m training.new_train     # dry run, whatever is set here
+  #   TEST_RUN=0 python -m training.new_train     # really train
   test_run: true
   hf_chkpt_path: "Aletheia-ng/SabiYarn_MoE-280M"
   schedule_trainable_layers: false

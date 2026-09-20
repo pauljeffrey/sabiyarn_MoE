@@ -228,6 +228,9 @@ class TrainConfig:
     # fallback. Left defined so existing yaml files with this key still load.
     hf_push_interval: int = 100
     hf_chkpt_path: Optional[str] = None
+    # Toggled in train_config.yaml (training.test_run), or per-invocation
+    # via the TEST_RUN env var (checked first, same pattern as
+    # force_download_from_s3/FORCE_S3_RESUME) so a dry run needs no yaml edit.
     # If True: load the model + model.reference_repo, run the deviation
     # checks and the startup generation comparison
     # (Trainer._startup_generation_comparison), run ONE eval, log its loss
@@ -499,7 +502,11 @@ def load_train_config(path: Optional[str] = None) -> TrainConfig:
         mlflow_ui_port=int(os.getenv("MLFLOW_UI_PORT") or (mlflow_cfg.get("ui", {}) or {}).get("port", 5000)),
         hf_chkpt_path=training.get("hf_chkpt_path") or None,
         hf_push_interval=int(training.get("hf_push_interval", 100)),
-        test_run=bool(training.get("test_run", False)),
+        test_run=(
+            os.getenv("TEST_RUN").strip().lower() in ("1", "true", "yes")
+            if os.getenv("TEST_RUN") is not None
+            else bool(training.get("test_run", False))
+        ),
         ddp_backend=str(ddp.get("backend", "nccl")),
         gpus_per_node=int(modal_cfg.get("gpus_per_node", env.get("world_size", 1))),
         num_nodes=int(modal_cfg.get("num_nodes", 1)),

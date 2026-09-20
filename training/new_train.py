@@ -1287,30 +1287,33 @@ class Trainer:
     )
 
     # Five fixed prompts (~20-30 words each), one per major pretraining
-    # language, each opening with the language tag the data was tokenized
-    # with (see training/constant_tokens.py). Nothing downstream depends on
-    # these exact strings -- edit them freely to probe whatever you care
-    # about on a given run.
+    # language. Deliberately PLAIN TEXT -- no <eng>/<yor>/<ibo>/... language
+    # tag, and no task tag either (see training/constant_tokens.py for the
+    # tags the data itself was tokenized with). So this probes the model
+    # cold, the way an untagged user prompt would arrive at inference; if
+    # the model only produces coherent text WITH its tags, that shows up
+    # here as visibly worse output rather than staying hidden. Nothing
+    # downstream depends on these exact strings -- edit them freely.
     _STARTUP_PROMPTS = (
         (
-            "<eng> The rapid growth of artificial intelligence research across Africa has opened new "
+            "The rapid growth of artificial intelligence research across Africa has opened new "
             "opportunities for local startups and universities building language technology for their "
             "own communities."
         ),
         (
-            "<yor> Ìjọba ìpínlẹ̀ Èkó sọ pé àwọn ọ̀nà tuntun yóò ṣí sílẹ̀ fún àwọn oníṣòwò kékeré, "
+            "Ìjọba ìpínlẹ̀ Èkó sọ pé àwọn ọ̀nà tuntun yóò ṣí sílẹ̀ fún àwọn oníṣòwò kékeré, "
             "kí ọrọ̀ ajé ìlú lè tẹ̀síwájú."
         ),
         (
-            "<ibo> Ndị ọchịchị steeti Anambra kwuru na ha ga-emezi ụzọ na ụlọ akwụkwọ dị n'ime obodo, "
+            "Ndị ọchịchị steeti Anambra kwuru na ha ga-emezi ụzọ na ụlọ akwụkwọ dị n'ime obodo, "
             "ka ụmụ akwụkwọ nwee ike ịga akwụkwọ n'udo."
         ),
         (
-            "<hau> Gwamnatin jihar Kano ta ce za ta gina sabbin hanyoyi da makarantu a ƙauyuka da dama, "
+            "Gwamnatin jihar Kano ta ce za ta gina sabbin hanyoyi da makarantu a ƙauyuka da dama, "
             "domin inganta rayuwar manoma da yara."
         ),
         (
-            "<pcm> Plenty people for Lagos dey talk say the new transport policy go make traffic better, "
+            "Plenty people for Lagos dey talk say the new transport policy go make traffic better, "
             "but some drivers still dey complain well well."
         ),
     )
