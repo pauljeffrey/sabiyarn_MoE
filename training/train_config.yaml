@@ -103,6 +103,10 @@ training:
   #   TEST_RUN=0 python -m training.new_train     # really train
   test_run: true
   hf_chkpt_path: "Aletheia-ng/SabiYarn_MoE-280M"
+  # Hand-written probe set (one {"lang","text"} per line), scored at every eval and
+  # logged as curated_eval / mlflow curated/*. Independent of the train/val bins:
+  # if its loss is far below train/val loss, suspect the bins, not the model.
+  curated_eval_path: "data/curated_eval.jsonl"  # blank to disable; CURATED_EVAL_PATH env overrides
   schedule_trainable_layers: false
 
 tokenizer:
