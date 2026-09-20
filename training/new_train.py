@@ -34,6 +34,7 @@ from training.constant_tokens import MASK, assistant_token, end_of_text_token, s
 from training.label_masking import apply_label_mask
 from training.load_config import TrainConfig, load_train_config, sampling_weights
 from training.mfu import compute_mfu, model_flops_per_token, peak_flops_for_current_device
+from training.curated_eval import CuratedTotals, build_sequence, load_curated_samples, resolve_path
 from training.tracking import MlflowTracker, bits_per_byte, build_token_byte_lengths
 from training.s3_utils import (
     delete_prefix,
@@ -1487,6 +1488,63 @@ class Trainer:
         self.accelerator.wait_for_everyone()
 
     @torch.no_grad()
+    def _curated_samples(self) -> list[dict]:
+        """Tokenized curated probe set (cached), or [] when disabled/missing."""
+        if getattr(self, "_curated_cache", None) is not None:
+            return self._curated_cache
+        self._curated_cache = []
+        if not self.cfg.curated_eval_path:
+            return self._curated_cache
+        repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        path = resolve_path(self.cfg.curated_eval_path, repo_root)
+        if not os.path.isfile(path):
+            LOG.warning("curated_eval_file_missing", path=path)
+            return self._curated_cache
+        eos, bos = self.tokenizer.eos_token_id, self.tokenizer.bos_token_id
+        for row in load_curated_samples(path):
+            ids = self.tokenizer.encode(row["text"], add_special_tokens=False)
+            self._curated_cache.append({"lang": row["lang"], "seq": build_sequence(ids, eos, bos)})
+        LOG.info("curated_eval_loaded", path=path, samples=len(self._curated_cache))
+        return self._curated_cache
+
+    @torch.no_grad()
+    def _curated_eval(self) -> dict | None:
+        """CE / bits-per-byte on the curated probe set, overall and per language.
+
+        One forward per passage (batch of 1) so short texts aren't diluted by
+        padding. Collective under FSDP: every rank runs the identical forwards,
+        so no reduce is needed and every rank gets the same numbers.
+        """
+        samples = self._curated_samples()
+        if not samples:
+            return None
+        self.model.eval()
+        totals = CuratedTotals()
+        # One fixed shape for every passage (padding masked out of the loss) so
+        # torch.compile, when enabled, compiles once instead of once per length.
+        width = -(-(max(len(s["seq"]) for s in samples) - 1) // 64) * 64
+        eos = self.tokenizer.eos_token_id
+        for sample in samples:
+            seq = sample["seq"]
+            pad = width - (len(seq) - 1)
+            x = torch.tensor([seq[:-1] + [eos] * pad], dtype=torch.long, device=self.device)
+            y = torch.tensor([seq[1:] + [MASK] * pad], dtype=torch.long, device=self.device)
+            self._forward_loss(x, y)
+            n_tok, n_bytes = self._target_stats(y)
+            totals.add(sample["lang"], self._last_ce_loss.item(), n_tok.item(), n_bytes.item())
+        self.model.train()
+        return totals.summary()
+
+    def _log_curated_eval(self, curated: dict | None) -> None:
+        if curated is None or not self.master:
+            return
+        LOG.info("curated_eval", iter=self.iter_num, **curated)
+        metrics = {"curated/ce": curated["overall"]["ce"], "curated/bpb": curated["overall"]["bpb"]}
+        for lang, stats in curated["by_language"].items():
+            metrics[f"curated/{lang}_ce"] = stats["ce"]
+            metrics[f"curated/{lang}_bpb"] = stats["bpb"]
+        self.tracker.log_metrics(metrics, step=self.iter_num)
+
     def estimate_loss(self):
         """Every rank evaluates a shard of eval_iters and results are averaged
         via an all-reduce, so all ranks do equal work and stay in lockstep
@@ -1990,6 +2048,7 @@ class Trainer:
         Hub. estimate_loss is collective, so every rank runs it.
         """
         losses = self.estimate_loss()
+        self._log_curated_eval(self._curated_eval())
         if self.master:
             lr = self._lr(self.iter_num) if self.cfg.decay_lr else self.cfg.learning_rate
             LOG.info("eval", iter=self.iter_num, **losses)
@@ -2039,6 +2098,7 @@ class Trainer:
 
             if self.iter_num % self.cfg.eval_interval == 0:
                 losses = self.estimate_loss()
+                self._log_curated_eval(self._curated_eval())
                 if self.master:
                     LOG.info("eval", iter=self.iter_num, **losses)
                     self._maybe_log_wandb(losses, lr)

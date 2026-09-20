@@ -239,6 +239,10 @@ class TrainConfig:
     # locally or pushed to S3/HF -- a dry "is this checkpoint still healthy?"
     # run.
     test_run: bool = False
+    # Small hand-curated multilingual probe set (see training/curated_eval.py),
+    # evaluated next to every train/val eval. Relative paths resolve against the
+    # repo root; blank disables it.
+    curated_eval_path: str = ""
     seed: int = 42
     world_size: int = 1
     rank: int = 0
@@ -501,6 +505,7 @@ def load_train_config(path: Optional[str] = None) -> TrainConfig:
         mlflow_ui_host=str((mlflow_cfg.get("ui", {}) or {}).get("host", "0.0.0.0")),
         mlflow_ui_port=int(os.getenv("MLFLOW_UI_PORT") or (mlflow_cfg.get("ui", {}) or {}).get("port", 5000)),
         hf_chkpt_path=training.get("hf_chkpt_path") or None,
+        curated_eval_path=str(os.getenv("CURATED_EVAL_PATH") or training.get("curated_eval_path", "") or ""),
         hf_push_interval=int(training.get("hf_push_interval", 100)),
         test_run=(
             os.getenv("TEST_RUN").strip().lower() in ("1", "true", "yes")
