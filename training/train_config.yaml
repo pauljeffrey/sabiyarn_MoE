@@ -93,8 +93,10 @@ training:
   # weight-deviation check AND the side-by-side generation comparison
   # (5 prompts x {do_sample, beam search} x {this model, reference model},
   # 150 new tokens each -- see Trainer._startup_generation_comparison), then
-  # STOP before the first training step. Nothing is trained, checkpointed or
-  # pushed to S3/HF. Set back to false for a real training run.
+  # run ONE eval, log its loss plus the delta against the best val loss
+  # recorded in the checkpoint's trainer_state.json, and STOP
+  # (Trainer._test_run_eval). No training step, and nothing saved locally,
+  # uploaded to S3, or pushed to the HF Hub. Set back to false to train.
   test_run: true
   hf_chkpt_path: "Aletheia-ng/SabiYarn_MoE-280M"
   schedule_trainable_layers: false

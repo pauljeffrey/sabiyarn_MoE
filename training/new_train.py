@@ -198,7 +198,8 @@ class Trainer:
         self._verify_reference_weights()
         # Qualitative companion to the weight-deviation check above: what the
         # two models actually GENERATE, before a single training step runs.
-        # train() stops right after this when training.test_run is set.
+        # When training.test_run is set, train() runs one eval after this and
+        # then stops, without saving or pushing anything (_test_run_eval).
         self._startup_generation_comparison()
 
     # ------------------------------------------------------------------
@@ -354,6 +355,13 @@ class Trainer:
         trainer_state.json is already backfilled on every rank by the time
         _build_model/_prepare_for_training read it.
         """
+        if self.cfg.test_run:
+            # test_run promises nothing is written or pushed anywhere -- and
+            # this backfill both copies ckpt_best/resume_state_best locally
+            # AND pushes them to S3. Skipped entirely; it's a one-time
+            # migration that the next real run will do.
+            self.accelerator.wait_for_everyone()
+            return
         if self.master and self._resume_dir:
             meta_path = os.path.join(self._resume_dir, "trainer_state.json")
             if os.path.isfile(meta_path):
@@ -1241,6 +1249,15 @@ class Trainer:
     #     is where most of the obvious "wrong language / nonsense token"
     #     samples come from). 20 would be tighter but starts hiding genuine
     #     diversity problems behind the truncation.
+    #   - repetition_penalty=1.15 (was 4.0): 4.0 is far outside the usual
+    #     1.05-1.3 range -- it divides the logit of every already-seen token
+    #     by 4, which at that strength doesn't just discourage loops, it
+    #     effectively forbids reusing common function words and punctuation,
+    #     so samples drift off-topic and off-language within a few dozen
+    #     tokens. That makes these samples useless as a read on the model:
+    #     they'd look broken whether or not the model is. 1.15 still damps
+    #     degenerate loops. This is display-only -- no effect on the loss,
+    #     gradients, or anything that gets checkpointed.
     _GENERATION_CONFIG = dict(
         max_new_tokens=100,
         num_beams=1,
@@ -1248,7 +1265,7 @@ class Trainer:
         temperature=0.99,
         top_k=40,
         top_p=0.95,
-        repetition_penalty=4.0,
+        repetition_penalty=1.15,
     )
 
     # One-off startup comparison (see _startup_generation_comparison), run
@@ -1281,15 +1298,15 @@ class Trainer:
             "own communities."
         ),
         (
-            "<yor> Ijoba ipinle Eko ti so pe awon ona tuntun yoo si sile fun awon onisowo kekere, ki oro "
-            "aje ilu le tesiwaju."
+            "<yor> Ìjọba ìpínlẹ̀ Èkó sọ pé àwọn ọ̀nà tuntun yóò ṣí sílẹ̀ fún àwọn oníṣòwò kékeré, "
+            "kí ọrọ̀ ajé ìlú lè tẹ̀síwájú."
         ),
         (
-            "<ibo> Ndi ochichi steeti Anambra kwuru na ha ga-emezi uzo na ulo akwukwo di n'ime obodo, ka "
-            "umu akwukwo nwee ike iga akwukwo n'udo."
+            "<ibo> Ndị ọchịchị steeti Anambra kwuru na ha ga-emezi ụzọ na ụlọ akwụkwọ dị n'ime obodo, "
+            "ka ụmụ akwụkwọ nwee ike ịga akwụkwọ n'udo."
         ),
         (
-            "<hau> Gwamnatin jihar Kano ta ce za ta gina sabbin hanyoyi da makarantu a kauyuka da dama, "
+            "<hau> Gwamnatin jihar Kano ta ce za ta gina sabbin hanyoyi da makarantu a ƙauyuka da dama, "
             "domin inganta rayuwar manoma da yara."
         ),
         (
@@ -1405,8 +1422,8 @@ class Trainer:
         Generation with the training model is collective (FSDP all-gathers
         per layer -- see _generate_with_config), so EVERY rank must run this
         loop in lockstep; only master generates with the reference model and
-        prints. If training.test_run is set, train() stops right after this
-        instead of training (see its early return).
+        If training.test_run is set, train() follows this with a single
+        eval and then stops without saving or pushing (see _test_run_eval).
         """
         modes = (
             (f"do_sample (top_k={self._STARTUP_SAMPLE_CONFIG['top_k']}, "
@@ -1953,6 +1970,48 @@ class Trainer:
         n = min(num_samples, x.size(0))
         return x[:n, :prompt_len]
 
+    def _test_run_eval(self) -> None:
+        """training.test_run: one eval, logged, then stop -- BEFORE anything
+        is written or published.
+
+        Runs after __init__ has already logged the two deviation checks
+        (_verify_resume_sanity's saved-vs-current sanity loss, and
+        _verify_reference_weights' aggregate_rel_l2 against
+        model.reference_repo) and the startup generation comparison. This
+        adds the actual val/train loss for the loaded checkpoint, plus how
+        it compares to the best_val_loss recorded in the checkpoint's own
+        trainer_state.json, and returns immediately.
+
+        Deliberately does NOT call _save: no ckpt_N/ or resume_state/
+        written locally, nothing uploaded to S3, nothing pushed to the HF
+        Hub. estimate_loss is collective, so every rank runs it.
+        """
+        losses = self.estimate_loss()
+        if self.master:
+            lr = self._lr(self.iter_num) if self.cfg.decay_lr else self.cfg.learning_rate
+            LOG.info("eval", iter=self.iter_num, **losses)
+            self._maybe_log_wandb(losses, lr)
+            self._log_eval_mlflow(losses, lr)
+            self._log_moe_stats()
+            # self.best_val is whatever the resumed trainer_state.json
+            # recorded (1e9 if this is a fresh run with no checkpoint).
+            resumed_best = self.best_val if self.best_val < 1e8 else None
+            LOG.info(
+                "test_run_complete",
+                iter=self.iter_num,
+                val_loss=losses["val"],
+                train_loss=losses["train"],
+                checkpoint_best_val_loss=resumed_best,
+                val_loss_delta_vs_checkpoint_best=(
+                    losses["val"] - resumed_best if resumed_best is not None else None
+                ),
+                note="training.test_run is true -- evaluated the loaded checkpoint and stopped. "
+                     "NOTHING was saved locally, pushed to S3, or pushed to the HF Hub. "
+                     "Set test_run: false to train. A positive delta just means this eval batch "
+                     "scored worse than the best eval recorded in the checkpoint's trainer_state.json.",
+            )
+        self.tracker.end()
+
     def train(self):
         if self.master:
             LOG.info("training_start", mode=self.cfg.mode, world_size=self.world_size)
@@ -1964,17 +2023,7 @@ class Trainer:
         self._log_sample_generation(self._sample_prompt(x), tag="startup_sample_generation")
 
         if self.cfg.test_run:
-            # training.test_run: the startup generation comparison + reference
-            # weight check in __init__ ARE the whole run -- stop before
-            # touching the optimizer, so nothing is trained, checkpointed or
-            # pushed. Set it back to false for a real run.
-            if self.master:
-                LOG.info(
-                    "test_run_complete", iter=self.iter_num,
-                    note="training.test_run is true -- stopping after the startup model/reference "
-                         "comparison, before any training step. Set test_run: false to train.",
-                )
-            self.tracker.end()
+            self._test_run_eval()
             return
 
         t0 = time.time()

@@ -228,11 +228,13 @@ class TrainConfig:
     # fallback. Left defined so existing yaml files with this key still load.
     hf_push_interval: int = 100
     hf_chkpt_path: Optional[str] = None
-    # If True, Trainer.__init__ still loads the model + model.reference_repo,
-    # runs the weight-deviation check and the startup generation comparison
-    # (see Trainer._startup_generation_comparison), and then train() returns
-    # immediately -- nothing is trained, checkpointed or pushed. A dry
-    # "does this checkpoint still generate sensible text?" run.
+    # If True: load the model + model.reference_repo, run the deviation
+    # checks and the startup generation comparison
+    # (Trainer._startup_generation_comparison), run ONE eval, log its loss
+    # and how that compares to the checkpoint's own recorded best, and
+    # return (Trainer._test_run_eval). No training step, and nothing written
+    # locally or pushed to S3/HF -- a dry "is this checkpoint still healthy?"
+    # run.
     test_run: bool = False
     seed: int = 42
     world_size: int = 1
