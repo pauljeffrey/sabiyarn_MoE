@@ -24,6 +24,24 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+try:  # torch >= 2.5
+    from torch.nn.attention.flex_attention import BlockMask, flex_attention as _flex_attention_raw
+except Exception:  # pragma: no cover - older torch: the dense-mask SDPA path is used instead
+    BlockMask, _flex_attention_raw = None, None
+
+_flex_attention_compiled = None
+
+
+def _flex_attention(q, k, v, block_mask):
+    """flex_attention needs torch.compile to be fused (uncompiled it materialises the full
+    score matrix); compile it once on CUDA, run it eagerly on CPU (tests only)."""
+    global _flex_attention_compiled
+    if q.is_cuda:
+        if _flex_attention_compiled is None:
+            _flex_attention_compiled = torch.compile(_flex_attention_raw, dynamic=False)
+        return _flex_attention_compiled(q, k, v, block_mask=block_mask)
+    return _flex_attention_raw(q, k, v, block_mask=block_mask)
+
 
 # ---------------------------------------------------------------------------
 # KV-cache helpers (transformers 4.x tuples vs 5.x Cache objects)
@@ -149,6 +167,16 @@ class CausalSelfAttention(nn.Module):
             k = torch.cat([past_k, k], dim=2)
             v = torch.cat([past_v, v], dim=2)
 
+        if BlockMask is not None and isinstance(attn_mask, BlockMask):
+            # Document-causal block mask (training/training_attention_mask.py): no (B,H,T,T)
+            # tensor exists; blocks that fall entirely across a document boundary are skipped.
+            if past_key_value is not None:
+                raise ValueError("BlockMask attention is for training/eval forward passes without a KV cache")
+            y = _flex_attention(q, k, v, attn_mask)
+            y = y.transpose(1, 2).contiguous().view(B, T, C)
+            y = self.resid_dropout(self.c_proj(y))
+            return (y, (k.detach(), v.detach())) if use_cache else y
+
         total_len = k.size(2)
         has_past = past_key_value is not None
         mask = _expand_attn_mask(attn_mask, T, total_len, self.n_heads, has_past, x.device)
@@ -218,7 +246,8 @@ class BlockJ(nn.Module):
                 num_experts=config.expert_count_for_layer(layer_idx),
                 emb_dim=config.n_embd,
                 moe_dim=config.moe_dim,
-                dropout=config.dropout
+                dropout=config.dropout,
+                sparse_dispatch=getattr(config, 'moe_sparse_dispatch', True),
             )
             self.use_moe = True
         else:
@@ -241,8 +270,9 @@ class BlockJ(nn.Module):
 class MoE(nn.Module):
     """Mixture-of-experts feed-forward block with top-k routing and GELU MLP experts."""
 
-    def __init__(self, num_experts_per_tok: int, num_experts: int, emb_dim: int, moe_dim: int, dropout: float = 0.0, dtype=torch.float32):
+    def __init__(self, num_experts_per_tok: int, num_experts: int, emb_dim: int, moe_dim: int, dropout: float = 0.0, dtype=torch.float32, sparse_dispatch: bool = True):
         super().__init__()
+        self.sparse_dispatch = sparse_dispatch
         self.k = int(num_experts_per_tok)
         self.E = int(num_experts)
         self.D = int(emb_dim)
@@ -259,6 +289,51 @@ class MoE(nn.Module):
         # Initialize parameters
         self._init_parameters()
 
+
+    def _dense_experts(self, x, selected, topk_probs):
+        """Original path: every expert processes every token, then the top-k outputs are gathered."""
+        B, T, _ = x.shape
+        # c_fc -> GELU -> c_proj, for ALL E experts: (B, T, E, H) then (B, T, E, D)
+        h = torch.einsum("btd,edh->bteh", x, self.fc_bank)
+        h = self.gelu(h)
+        y = torch.einsum("bteh,ehd->bted", h, self.proj_bank)
+        gather_idx = selected.view(B, T, -1, 1).expand(-1, -1, -1, self.D)  # B, T, K, D
+        y = torch.gather(y, dim=2, index=gather_idx)
+        return (y * topk_probs.unsqueeze(-1)).sum(dim=2)  # B, T, D
+
+    def _sparse_experts(self, x, selected, topk_probs):
+        """Same result, but expert e only runs on the tokens routed to it.
+
+        Flatten the (token, slot) assignments, sort them by expert so each expert's tokens are
+        contiguous, run each expert on just those rows, scale by the routing probability and
+        add the result back into the owning token's output row. With top-2 of 4 experts this
+        does half the expert matmuls and keeps half the expert activations for backward.
+        """
+        B, T, D = x.shape
+        k = selected.size(-1)
+        x_flat = x.reshape(-1, D)  # (N, D)
+        flat_expert = selected.reshape(-1)  # (N*k,) expert id of every assignment
+        flat_prob = topk_probs.reshape(-1)  # (N*k,) routing weight of every assignment
+        order = torch.argsort(flat_expert, stable=True)  # assignments grouped by expert
+        token_of = order // k  # owning token of each sorted assignment
+        prob_sorted = flat_prob[order]
+        counts = torch.bincount(flat_expert, minlength=self.E).tolist()  # one host sync per layer
+
+        out = None
+        start = 0
+        for e, n_e in enumerate(counts):
+            if n_e == 0:
+                continue
+            rows = token_of[start:start + n_e]
+            h = self.gelu(x_flat[rows] @ self.fc_bank[e])  # (n_e, H)
+            contrib = (h @ self.proj_bank[e]) * prob_sorted[start:start + n_e].unsqueeze(-1)  # (n_e, D)
+            if out is None:
+                out = contrib.new_zeros(x_flat.size(0), D)
+            out = out.index_add(0, rows, contrib)
+            start += n_e
+        if out is None:  # no tokens at all
+            out = x_flat.new_zeros(x_flat.size(0), D)
+        return out.view(B, T, D)
 
     def expert_utilization(self, logits):
         """Compute per-expert load and auxiliary load-balancing loss for training."""
@@ -313,22 +388,10 @@ class MoE(nn.Module):
         topk_logits, selected = logits.topk(self.k, dim=-1)
         topk_probs = F.softmax(topk_logits, dim=-1)
 
-        # Match MLP structure exactly: c_fc -> GELU -> c_proj
-        # Step 1: c_fc equivalent: x @ fc_bank -> (B, T, E, H)
-        h = torch.einsum("btd,edh->bteh", x, self.fc_bank)  # B, T, E, H
-        
-        # Step 2: GELU activation (matching MLP)
-        h = self.gelu(h)  # B, T, E, H
-        
-        # Step 3: c_proj equivalent: h @ proj_bank -> (B, T, E, D)
-        y = torch.einsum("bteh,ehd->bted", h, self.proj_bank)  # B, T, E, D
-        
-        # Step 4: Select top-k experts and combine
-        gather_idx = selected.view(B, T, -1, 1).expand(-1, -1, -1, self.D)  # B, T, K, D
-        y = torch.gather(y, dim=2, index=gather_idx)  # B, T, K, D
-        
-        # Step 5: Weighted sum of selected experts
-        y = (y * topk_probs.unsqueeze(-1)).sum(dim=2)  # B, T, D
+        if self.sparse_dispatch:
+            y = self._sparse_experts(x, selected, topk_probs)
+        else:
+            y = self._dense_experts(x, selected, topk_probs)
         
         # Step 6: Apply dropout like MLP
         y = self.dropout_layer(y)

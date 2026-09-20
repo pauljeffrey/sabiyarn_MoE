@@ -1,0 +1,5 @@
+# pip install -r requirements-train.txt -r requirements-eval.txt
+datasets>=4.0
+sacrebleu>=2.4
+# optional, only for --africomet:
+# unbabel-comet

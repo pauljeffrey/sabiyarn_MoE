@@ -32,7 +32,10 @@ def _tokenizer_name() -> str:
 def _load():
     from transformers import AutoTokenizer
 
-    return AutoTokenizer.from_pretrained(_tokenizer_name())
+    # trust_remote_code=True: without it a real terminal (vast.ai/tmux) gets an interactive
+    # "Do you wish to run the custom code? [y/N]" prompt on every rank and hangs; Modal only
+    # avoided it because there was no stdin.
+    return AutoTokenizer.from_pretrained(_tokenizer_name(), trust_remote_code=True)
 
 
 tokenizer = _load()

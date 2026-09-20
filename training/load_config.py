@@ -182,7 +182,33 @@ class TrainConfig:
     lr_decay_iters: int = 600_000
     min_lr: float = 6e-5
     compile_model: bool = False
-    dtype: str = "bfloat16"
+    dtype: str = "bfloat16"  # autocast/compute precision (accelerate mixed_precision)
+    # dtype the parameters (and therefore gradients + optimizer state) are HELD in.
+    # float32 = "master weights": bf16 autocast still does the math in bf16, but
+    # updates are applied in fp32. Pure-bf16 params silently drop updates smaller
+    # than bf16's ~0.4% resolution, which at small learning rates is most of them.
+    param_dtype: str = "float32"
+    # LR schedule shape: "wsd" | "linear" | "cosine" (see training/lr_schedule.py)
+    scheduler: str = "cosine"
+    wsd_decay_frac: float = 0.2
+    wsd_decay_shape: str = "sqrt"
+    # If > 0, max_iters is derived at startup from this token budget and the real
+    # tokens-per-step (batch * block * grad_accum * world size).
+    max_tokens: float = 0.0
+    # Optimizer: "adamw" | "muon" (Muon for hidden matrices + AdamW for the rest;
+    # DDP / single GPU only -- see training/muon.py). Muon uses the AdamW learning
+    # rate and weight decay unchanged (update-RMS matched to 0.2).
+    optimizer_name: str = "adamw"
+    muon_momentum: float = 0.95
+    muon_ns_steps: int = 5
+    muon_rms: float = 0.2
+    # Start the step counter / schedule / best-val tracking from 0 while still
+    # loading weights (init_from) and, when compatible, the optimizer state from the
+    # latest checkpoint. Writes to a NEW run dir. Applied once: a later restart that
+    # finds the new run resumes it normally.
+    fresh_start: bool = False
+    # Load Adam moments etc. from the checkpoint's resume_state when resuming.
+    resume_optimizer_state: bool = True
     use_cce: bool = False
     # Whether to mask prompt/action-span (pretrain) or prompt-vs-response
     # (SFT) tokens out of the loss at all -- see training/label_masking.py.
@@ -263,6 +289,21 @@ class TrainConfig:
     # once it exceeds reference_weight_deviation_threshold. Leave blank to
     # disable the check entirely.
     reference_model_repo: Optional[str] = None
+    # "local": build the model from this repo's sabiyarn/model/modeling.py (version-controlled,
+    # what the tests cover) and load only the WEIGHTS from model_name. "hub": download the
+    # modeling.py that lives next to the weights on the Hugging Face Hub (trust_remote_code) --
+    # which silently changes whenever someone pushes to that repo, and means edits to the local
+    # model code have no effect until pushed.
+    model_code: str = "local"
+    # "sparse": each expert only processes tokens routed to it (~k/E of the expert FLOPs).
+    # "dense": every expert runs on every token (the original path). Identical math.
+    moe_dispatch: str = "sparse"
+    # Document-causal attention (no cross-document attention in packed sequences):
+    #   "sdpa_mask": materialise a (B,1,T,T) boolean mask per batch, used by SDPA (works everywhere;
+    #                ~4-5 GiB/sample of activation memory and a slower kernel).
+    #   "flex":      FlexAttention block mask (torch >= 2.5): no T x T tensor, cross-document
+    #                blocks are skipped. Verify with a TEST_RUN first (see HOW_TO_RUN.md).
+    attention_impl: str = "sdpa_mask"
     # Threshold on the parameter-count-weighted (not plain-averaged)
     # relative L2 norm across all layers vs. reference_model_repo -- above
     # this, the whole model is flagged as suspiciously different (see
@@ -359,6 +400,15 @@ def sampling_weights(
     return eng_w, 1.0 - eng_w
 
 
+def _optimizer_name(raw: Any) -> str:
+    name = str(raw or "adamw").strip().lower()
+    if name in ("adam", "adamw"):
+        return "adamw"
+    if name == "muon":
+        return "muon"
+    raise ValueError(f"optimizer.name must be adamw or muon, got {raw!r}")
+
+
 def _env_bool(name: str, default: bool) -> bool:
     raw = os.getenv(name)
     return default if raw is None else raw.strip().lower() in ("1", "true", "yes", "on")
@@ -429,9 +479,11 @@ def load_train_config(path: Optional[str] = None) -> TrainConfig:
 
     return TrainConfig(
         mode=mode,
-        train_batch_size=int(training.get("train_batch_size", 8)),
+        # TRAIN_BATCH_SIZE / GRAD_ACCUM_STEPS override the yaml so a different GPU (which fits a
+        # different micro-batch) needs no file edit; keep batch * accum ~= 192 for the same global batch.
+        train_batch_size=int(os.getenv("TRAIN_BATCH_SIZE") or training.get("train_batch_size", 8)),
         block_size=int(training.get("block_size", 4096)),
-        gradient_accumulation_steps=_safe_int(training.get("gradient_accumulation_steps"), 40),
+        gradient_accumulation_steps=_safe_int(os.getenv("GRAD_ACCUM_STEPS") or training.get("gradient_accumulation_steps"), 40),
         max_iters=int(optimizer.get("max_iters", training.get("max_iters", 600_000))),
         learning_rate=float(optimizer.get("learning_rate", 3e-4)),
         weight_decay=float(optimizer.get("weight_decay", 0.1)),
@@ -440,6 +492,17 @@ def load_train_config(path: Optional[str] = None) -> TrainConfig:
         grad_clip=float(optimizer.get("grad_clip", 1.0)),
         moe_aux_loss_weight=float(optimizer.get("moe_aux_loss_weight", 0.01)),
         decay_lr=bool(training.get("decay_lr", True)),
+        param_dtype=str(training.get("param_dtype", "float32")).replace("bf16", "bfloat16").replace("fp32", "float32"),
+        scheduler=str(training.get("scheduler", "cosine")).lower(),
+        wsd_decay_frac=float(training.get("wsd_decay_frac", 0.2)),
+        wsd_decay_shape=str(training.get("wsd_decay_shape", "sqrt")).lower(),
+        max_tokens=float(optimizer.get("max_tokens", training.get("max_tokens", 0)) or 0),
+        optimizer_name=_optimizer_name(optimizer.get("name")),
+        muon_momentum=float(optimizer.get("muon_momentum", 0.95)),
+        muon_ns_steps=int(optimizer.get("muon_ns_steps", 5)),
+        muon_rms=float(optimizer.get("muon_rms", 0.2)),
+        fresh_start=_env_bool("FRESH_START", bool(training.get("fresh_start", False))),
+        resume_optimizer_state=bool(training.get("resume_optimizer_state", True)),
         warmup_iters=int(training.get("warmup_iters", 1500)),
         lr_decay_iters=int(training.get("lr_decay_iters", 600_000)),
         min_lr=float(training.get("min_lr", 6e-5)),
@@ -473,6 +536,9 @@ def load_train_config(path: Optional[str] = None) -> TrainConfig:
         master_port=str(env.get("master_port", "29500")),
         model_name=str(model_cfg.get("repo_name") or model_cfg.get("name", "")),
         reference_model_repo=(model_cfg.get("reference_repo") or None),
+        model_code=str(model_cfg.get("code", "local")).lower(),
+        moe_dispatch=str(model_cfg.get("moe_dispatch", "sparse")).lower(),
+        attention_impl=str(training.get("attention_impl", "sdpa_mask")).lower(),
         reference_weight_deviation_threshold=float(
             training.get("reference_weight_deviation_threshold", 0.5)
         ),

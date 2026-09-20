@@ -1,6 +1,28 @@
 import torch
 
 
+def build_document_block_mask(input_ids: torch.Tensor, eos_token_id: int):
+    """Same document-causal rule as build_document_causal_mask, as a flex_attention BlockMask.
+
+    No (B, 1, T, T) tensor is ever built: the mask is a function evaluated per block, and blocks
+    that lie entirely across a document boundary (or above the diagonal) are skipped by the
+    kernel. Needs torch >= 2.5. Use with the model's attention_mask argument.
+    """
+    from torch.nn.attention.flex_attention import create_block_mask
+
+    batch, seq_len = input_ids.shape
+    is_eos = input_ids == eos_token_id
+    doc_id = torch.cumsum(is_eos.long(), dim=1) - is_eos.long()  # eos stays in the doc it ends
+
+    def mask_mod(b, h, q_idx, kv_idx):
+        return (q_idx >= kv_idx) & (doc_id[b, q_idx] == doc_id[b, kv_idx])
+
+    return create_block_mask(
+        mask_mod, B=batch, H=None, Q_LEN=seq_len, KV_LEN=seq_len,
+        device=input_ids.device, _compile=input_ids.is_cuda,
+    )
+
+
 def build_document_causal_mask(input_ids: torch.Tensor, eos_token_id: int) -> torch.Tensor:
     """
     Boolean attention mask combining standard causal masking with

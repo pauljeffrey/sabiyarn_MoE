@@ -31,6 +31,7 @@ class GPTJXMoEConfig(PretrainedConfig):
         moe_dim: Optional[int] = None,
         expert_per_layer: Optional[Dict[str, int]] = None,
         tie_word_embeddings: bool = True,
+        moe_sparse_dispatch: bool = True,
         **kwargs,
     ):
         self.block_size = block_size
@@ -49,6 +50,10 @@ class GPTJXMoEConfig(PretrainedConfig):
         self.num_experts_per_tok = num_experts_per_tok
         self.moe_dim = moe_dim if moe_dim is not None else (4 * n_embd)
         self.tie_word_embeddings = tie_word_embeddings
+        # True: each expert only runs on the tokens routed to it (top-k of E). False: every expert
+        # runs on every token and the top-k results are gathered afterwards (the original path).
+        # Mathematically identical; sparse does ~k/E of the expert FLOPs and stores fewer activations.
+        self.moe_sparse_dispatch = moe_sparse_dispatch
         self.expert_per_layer = (
             {str(k): int(v) for k, v in expert_per_layer.items()} if expert_per_layer else None
         )

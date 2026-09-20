@@ -34,6 +34,8 @@ from training.constant_tokens import MASK, assistant_token, end_of_text_token, s
 from training.label_masking import apply_label_mask
 from training.load_config import TrainConfig, load_train_config, sampling_weights
 from training.mfu import compute_mfu, model_flops_per_token, peak_flops_for_current_device
+from training.lr_schedule import lr_at
+from training.muon import Muon, split_muon_params
 from training.curated_eval import CuratedTotals, build_sequence, load_curated_samples, resolve_path
 from training.tracking import MlflowTracker, bits_per_byte, build_token_byte_lengths
 from training.s3_utils import (
@@ -46,9 +48,20 @@ from training.s3_utils import (
     upload_folder,
     upload_if_absent,
 )
-from training.training_attention_mask import build_document_causal_mask
+from training.training_attention_mask import build_document_block_mask, build_document_causal_mask
 
 LOG = structlog.get_logger()
+
+def _wandb_has_credentials() -> bool:
+    if os.environ.get("WANDB_API_KEY"):
+        return True
+    try:
+        import netrc
+
+        return netrc.netrc().authenticators("api.wandb.ai") is not None
+    except Exception:
+        return False
+
 
 # Config fields never sent to experiment trackers (S3 keys live on TrainConfig).
 _SECRET_CFG_MARKERS = ("secret", "access_key", "token", "password")
@@ -186,7 +199,19 @@ class Trainer:
         # master between _verify_reference_weights and the startup
         # generation comparison that reuses it, then dropped.
         self._ref_model = None
+        # Tokens consumed by optimizer steps (not by eval), persisted in trainer_state.json.
+        # tokens_seen restarts at 0 on a fresh start; tokens_seen_offset carries the earlier runs' total
+        # so "lifetime" tokens (offset + tokens_seen) never resets. By-bin counts (eng / afr) are
+        # this rank's consumed micro-batches x world size, i.e. exact when ranks are symmetric.
+        self.tokens_seen = 0
+        self.tokens_seen_offset = 0
+        self.tokens_seen_by_bin: dict[str, int] = {}
+        self._tokens_seen_estimated = False
+        self._last_train_bin = None
+        self._fresh_start_active = False  # set by _setup_dirs: this process is the one-time step-0 restart
+        self._fresh_started = False  # persisted in trainer_state.json: this run dir began as a fresh start
         self._setup_accelerator()
+        self._resolve_max_iters()
         self._setup_dirs()
         self._backfill_ckpt_best()
         self._setup_wandb()
@@ -308,6 +333,63 @@ class Trainer:
         self.world_size = self.accelerator.num_processes
         torch.manual_seed(self.cfg.seed + self.accelerator.process_index)
 
+    def _tokens_per_step(self) -> int:
+        """Tokens consumed by one optimizer step across all ranks (accumulation already / world size)."""
+        return (
+            self.cfg.train_batch_size * self.cfg.block_size
+            * self.cfg.gradient_accumulation_steps * getattr(self, "world_size", 1)
+        )
+
+    def _resolve_max_iters(self) -> None:
+        """If training.max_tokens / optimizer.max_tokens is set, derive max_iters from
+        it using the REAL tokens per optimizer step (gradient_accumulation_steps has
+        already been divided by world size at this point), so the LR schedule and the
+        token budget can't drift apart through arithmetic slips."""
+        if self.cfg.max_tokens <= 0:
+            return
+        world = getattr(self, "world_size", 1)
+        tokens_per_step = self._tokens_per_step()
+        self.cfg.max_iters = max(1, math.ceil(self.cfg.max_tokens / tokens_per_step))
+        if self.master:
+            LOG.info(
+                "max_iters_from_token_budget", max_tokens=self.cfg.max_tokens,
+                tokens_per_step=tokens_per_step, max_iters=self.cfg.max_iters,
+                warmup_iters=self.cfg.warmup_iters, scheduler=self.cfg.scheduler,
+            )
+
+    def _load_lm(self, path, torch_dtype=None):
+        """Load a SabiYarn causal LM: model code from this repo (model_code: local) or from the
+        Hub next to the weights (model_code: hub); weights always come from `path`."""
+        kwargs = {} if torch_dtype is None else {"torch_dtype": torch_dtype}
+        if self.cfg.model_code == "local":
+            from sabiyarn.model.modeling import GPTJXMoEForCausalLM
+
+            return GPTJXMoEForCausalLM.from_pretrained(path, **kwargs)
+        return AutoModelForCausalLM.from_pretrained(path, trust_remote_code=True, **kwargs)
+
+    def _apply_model_options(self) -> None:
+        """Apply yaml model options that are not stored in checkpoints."""
+        sparse = self.cfg.moe_dispatch == "sparse"
+        n = 0
+        for module in self.model.modules():
+            if hasattr(module, "sparse_dispatch"):
+                module.sparse_dispatch = sparse
+                n += 1
+        self.model.config.moe_sparse_dispatch = sparse  # keeps mfu.py's FLOP accounting in step
+        if self.master:
+            LOG.info("model_options", model_code=self.cfg.model_code, moe_dispatch=self.cfg.moe_dispatch,
+                     moe_layers=n, attention_impl=self.cfg.attention_impl)
+
+    def _doc_attention_mask(self, x):
+        if self.cfg.attention_impl == "flex":
+            return build_document_block_mask(x, end_of_text_token)
+        return build_document_causal_mask(x, end_of_text_token)
+
+    def _param_torch_dtype(self):
+        return {"bfloat16": torch.bfloat16, "float16": torch.float16, "float32": torch.float32}.get(
+            self.cfg.param_dtype, torch.float32
+        )
+
     def _setup_dirs(self):
         # Training state (optimizer, iter_num, best_val, schedule progress --
         # see _prepare_for_training) always auto-resumes from the latest
@@ -329,7 +411,26 @@ class Trainer:
         else:
             self._resume_dir = self._resolve_resume_dir_local_or_s3()
 
-        if self._resume_dir:
+        if self._resume_dir and self.cfg.fresh_start:
+            resumed_meta_path = os.path.join(self._resume_dir, "trainer_state.json")
+            resumed_meta = {}
+            if os.path.isfile(resumed_meta_path):
+                with open(resumed_meta_path, "r") as f:
+                    resumed_meta = json.load(f)
+            if resumed_meta.get("fresh_started"):
+                # Already the run dir a previous fresh start created: resume it normally.
+                self._fresh_started = True
+                LOG.info("fresh_start_already_applied", path=self._resume_dir)
+            else:
+                self._fresh_start_active = self._fresh_started = True
+
+        if self._resume_dir and self._fresh_start_active:
+            # Weights/optimizer come from _resume_dir, but everything new is written to a
+            # NEW run dir so the old run's checkpoints and iteration numbers are untouched.
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+            self.run_dir = os.path.join(self.cfg.out_dir, f"{ts}_{self.cfg.mode}")
+            LOG.info("fresh_start_new_run_dir", loading_from=self._resume_dir, writing_to=self.run_dir)
+        elif self._resume_dir:
             self.run_dir = self._resume_dir
             LOG.info("found_existing_checkpoint_dir", path=self.run_dir)
         else:
@@ -363,7 +464,7 @@ class Trainer:
             # migration that the next real run will do.
             self.accelerator.wait_for_everyone()
             return
-        if self.master and self._resume_dir:
+        if self.master and self._resume_dir and not self._fresh_start_active:
             meta_path = os.path.join(self._resume_dir, "trainer_state.json")
             if os.path.isfile(meta_path):
                 with open(meta_path, "r") as f:
@@ -563,11 +664,19 @@ class Trainer:
             self.cfg.wandb_log = False
             return
 
+        if not _wandb_has_credentials():
+            # wandb.init() with no key opens an interactive login prompt on a real terminal,
+            # blocking the run at startup (Modal never hit this: no stdin, it just errored).
+            LOG.warning("wandb_skipped", reason="no WANDB_API_KEY or ~/.netrc entry; set one or wandb.log: false")
+            self.cfg.wandb_log = False
+            return
+
         try:
             wandb.init(
                 project=self.cfg.wandb_project,
                 name=f"{self.cfg.wandb_run_name}_{self.cfg.mode}",
-                config=vars(self.cfg),
+                # Never send credentials (S3 keys live on TrainConfig) to a third party.
+                config={k: v for k, v in vars(self.cfg).items() if not any(t in k.lower() for t in _SECRET_CFG_MARKERS)},
             )
         except Exception as exc:
             LOG.warning("wandb_init_failed", error=str(exc))
@@ -621,12 +730,14 @@ class Trainer:
         if missing:
             raise FileNotFoundError(
                 "Missing or empty training data files: "
-                f"{missing}. Prepare data first (e.g. `modal run data/prepare_modal.py`)."
+                f"{missing}. Download the bins first: `python -m data.prefetch_bins --mode {self.cfg.mode} --write-env` "
+                "(bare box / vast.ai), or `modal run data/prepare_modal.py` to build them (Modal)."
             )
 
         self.train_bins = self.cfg.train_data_paths
         self.eval_bin = self.cfg.eval_data_path
-        self.tokenizer = AutoTokenizer.from_pretrained(self.cfg.tokenizer_name)
+        # trust_remote_code=True: see training/constant_tokens.py (interactive prompt on a tty).
+        self.tokenizer = AutoTokenizer.from_pretrained(self.cfg.tokenizer_name, trust_remote_code=True)
         LOG.info(
             "data_ready",
             mode=self.cfg.mode,
@@ -661,8 +772,9 @@ class Trainer:
         return None
 
     def _build_model(self):
-        dtype_map = {"bfloat16": torch.bfloat16, "float16": torch.float16, "float32": torch.float32}
-        torch_dtype = dtype_map.get(self.cfg.dtype, torch.bfloat16)
+        # Parameters are held in cfg.param_dtype (fp32 master weights by default); bf16
+        # autocast (cfg.dtype) still runs the math in bf16. See TrainConfig.param_dtype.
+        torch_dtype = self._param_torch_dtype()
 
         # init_from controls MODEL WEIGHTS only -- optimizer/iter_num/best_val
         # always auto-resume separately regardless of this setting (see
@@ -689,9 +801,8 @@ class Trainer:
         # Every rank independently loads the full real checkpoint here (see
         # _setup_accelerator for why cpu_ram_efficient_loading/
         # sync_module_states aren't used despite the extra host RAM cost).
-        self.model = AutoModelForCausalLM.from_pretrained(
-            self.cfg.model_name, trust_remote_code=True, torch_dtype=torch_dtype,
-        )
+        self.model = self._load_lm(self.cfg.model_name, torch_dtype=torch_dtype)
+        self._apply_model_options()
         # from_pretrained's torch_dtype cast isn't always exhaustive for every
         # parameter (e.g. LayerNorm weights can be left in the checkpoint's
         # original dtype) -- FSDP's FlatParamHandle requires every parameter
@@ -752,14 +863,38 @@ class Trainer:
         already proven to work) purely to obtain its state dict, then
         discards that temporary model -- avoids hand-parsing the checkpoint's
         safetensors/bin shards directly."""
-        ckpt_model = AutoModelForCausalLM.from_pretrained(
-            ckpt_dir, trust_remote_code=True, torch_dtype=torch_dtype,
-        )
+        ckpt_model = self._load_lm(ckpt_dir, torch_dtype=torch_dtype)
         self.model.load_state_dict(ckpt_model.state_dict(), strict=True)
         del ckpt_model
         LOG.info("resume_checkpoint_weights_loaded", path=ckpt_dir)
 
     def _build_optimizer(self):
+        if self.cfg.optimizer_name == "muon":
+            if self.fsdp_plugin is not None:
+                raise ValueError(
+                    "optimizer.name: muon needs whole weight matrices, which FSDP shards away. Use DDP "
+                    "(torchrun -m training.new_train_ddp / modal_train_ddp.py) or a single GPU, or set "
+                    "optimizer.name: adamw."
+                )
+            n_embd = self.model.config.n_embd
+            muon, adam_2d, adam_1d = split_muon_params(self.model, n_embd)
+            wd = self.cfg.weight_decay
+            self.optimizer = Muon(
+                [
+                    {"params": muon, "use_muon": True, "weight_decay": wd},
+                    {"params": adam_2d, "use_muon": False, "weight_decay": wd},
+                    {"params": adam_1d, "use_muon": False, "weight_decay": 0.0},
+                ],
+                n_embd=n_embd, lr=self.cfg.learning_rate, weight_decay=wd,
+                momentum=self.cfg.muon_momentum, ns_steps=self.cfg.muon_ns_steps, rms=self.cfg.muon_rms,
+                betas=(self.cfg.beta1, self.cfg.beta2),
+            )
+            if self.master:
+                LOG.info(
+                    "optimizer_muon", muon_tensors=len(muon), muon_params=sum(p.numel() for p in muon),
+                    adamw_2d_tensors=len(adam_2d), adamw_1d_tensors=len(adam_1d),
+                )
+            return
         trainable = [p for p in self.model.parameters() if p.requires_grad]
         self.optimizer = AdamW(
             trainable,
@@ -781,6 +916,7 @@ class Trainer:
         if self._resume_dir:
             meta_path = os.path.join(self._resume_dir, "trainer_state.json")
             resume_from_best = False
+            restore_optimizer_state = self.cfg.resume_optimizer_state
             if os.path.isfile(meta_path):
                 # iter_num/best_val/hf-push tracking are plain facts recorded
                 # at save time -- resume them unconditionally whenever
@@ -795,6 +931,14 @@ class Trainer:
                 # even though it was sitting right there in the same file.
                 with open(meta_path, "r") as f:
                     meta = json.load(f)
+                saved_optimizer = meta.get("optimizer_name", "adamw")
+                if saved_optimizer != self.cfg.optimizer_name:
+                    # Moments/momentum from a different optimizer can't be reused.
+                    restore_optimizer_state = False
+                    LOG.info(
+                        "optimizer_state_not_restored", saved=saved_optimizer, current=self.cfg.optimizer_name,
+                        note="optimizer changed since this checkpoint; starting it fresh",
+                    )
                 resume_from_best = self.cfg.resume_from == "best" and bool(meta.get("best_ckpt"))
                 # "best" rewinds iter_num to wherever that best eval
                 # happened -- the LR/sampling schedule is a pure function
@@ -804,6 +948,16 @@ class Trainer:
                     meta.get("best_iter_num", meta.get("iter_num", 0))
                     if resume_from_best else meta.get("iter_num", 0)
                 )
+                # Token accounting: exact if the checkpoint recorded it, else estimated from iter_num
+                # x this run's tokens/step (older checkpoints; wrong if the batch size changed).
+                if meta.get("tokens_seen") is not None and not resume_from_best:
+                    self.tokens_seen = int(meta["tokens_seen"])
+                    self.tokens_seen_by_bin = {k: int(v) for k, v in meta.get("tokens_seen_by_bin", {}).items()}
+                else:
+                    self.tokens_seen = int(self.iter_num * meta.get("tokens_per_step", self._tokens_per_step()))
+                    self.tokens_seen_by_bin = {}
+                    self._tokens_seen_estimated = True
+                self.tokens_seen_offset = int(meta.get("tokens_seen_offset", 0))
                 self.best_val = meta.get("best_val_loss", 1e9)
                 self._best_ckpt_dir = meta.get("best_ckpt")
                 self._best_iter_num = meta.get("best_iter_num", self.iter_num)
@@ -815,7 +969,12 @@ class Trainer:
             resume_state_dir = os.path.join(
                 self._resume_dir, "resume_state_best" if resume_from_best else "resume_state",
             )
-            if os.path.isdir(resume_state_dir):
+            if not restore_optimizer_state:
+                LOG.info(
+                    "resume_state_skipped", path=resume_state_dir,
+                    note="optimizer/model restore from resume_state disabled; weights come from init_from, optimizer starts fresh",
+                )
+            elif os.path.isdir(resume_state_dir):
                 # Bisects WHERE a post-resume sanity-loss gap gets introduced:
                 # accelerator.load_state() restores BOTH the FSDP model state
                 # AND the optimizer state together from resume_state (it's
@@ -872,6 +1031,27 @@ class Trainer:
                         "resumed_training_state", path=resume_state_dir, iter=self.iter_num,
                         source="best" if resume_from_best else "latest",
                     )
+
+        if self._fresh_start_active:
+            # Weights and (if compatible) optimizer state are loaded; everything that
+            # tracks PROGRESS restarts: step counter (so warmup / LR schedule / scheduled
+            # sampling begin at 0) and the best-val / HF-push bookkeeping, which would
+            # otherwise compare a new run's high early losses against the old run's best.
+            LOG.warning(
+                "fresh_start", previous_iter_num=self.iter_num, previous_best_val=self.best_val,
+                note="training.fresh_start is set: iter_num=0, best_val/HF-push tracking reset, new run dir",
+            )
+            self.tokens_seen_offset += self.tokens_seen  # earlier runs' tokens live on as the lifetime offset
+            self.tokens_seen = 0
+            self.tokens_seen_by_bin = {}
+            self.iter_num = 0
+            self.best_val = 1e9
+            self._best_ckpt_dir = None
+            self._best_iter_num = 0
+            self._best_sanity_loss = None
+            self._best_sanity_batch_hash = None
+            self._last_hf_push_loss = None
+            self._last_hf_push_iter = 0
 
         # Manual last-resort override -- forces iter_num regardless of
         # whatever the block above found (or didn't find at all), for when
@@ -1080,9 +1260,7 @@ class Trainer:
         if not self.cfg.reference_model_repo:
             return
         try:
-            ref_model = AutoModelForCausalLM.from_pretrained(
-                self.cfg.reference_model_repo, trust_remote_code=True,
-            )
+            ref_model = self._load_lm(self.cfg.reference_model_repo)
         except Exception as exc:
             LOG.warning("reference_weights_load_failed", repo=self.cfg.reference_model_repo, error=str(exc))
             return
@@ -1153,7 +1331,7 @@ class Trainer:
             self.cfg.use_scheduled_sampling,
         )
 
-    def get_batch(self, split: str):
+    def get_batch(self, split: str, track: bool = False):
         if split == "train" and len(self.train_bins) > 1:
             # train_bins is [eng_train_data_path, afr_train_data_path], in that fixed
             # order (see load_config.load_train_config).
@@ -1161,6 +1339,8 @@ class Trainer:
             path = self.train_bins[0] if torch.rand(1).item() < eng_w else self.train_bins[1]
         else:
             path = self.train_bins[0] if split == "train" else self.eval_bin
+        if track:
+            self._last_train_bin = os.path.splitext(os.path.basename(path))[0]  # which bin fed the training batch
         data = self._read_memmap(path)
         bs, sl = self.cfg.train_batch_size, self.cfg.block_size
         ix = torch.randint(len(data) - sl - 1, (bs,))
@@ -1188,17 +1368,11 @@ class Trainer:
     # ------------------------------------------------------------------
 
     def _lr(self, it: int) -> float:
-        if it < self.cfg.warmup_iters:
-            return self.cfg.learning_rate * it / max(1, self.cfg.warmup_iters)
-        if it > self.cfg.lr_decay_iters:
-            return self.cfg.min_lr
-        decay = (it - self.cfg.warmup_iters) / max(1, self.cfg.lr_decay_iters - self.cfg.warmup_iters)
-        coeff = 0.5 * (1.0 + math.cos(math.pi * decay))
-        return self.cfg.min_lr + coeff * (self.cfg.learning_rate - self.cfg.min_lr)
+        return lr_at(it, self.cfg)
 
     def _forward_loss(self, x, y):
         raw = self.accelerator.unwrap_model(self.model)
-        attention_mask = build_document_causal_mask(x, end_of_text_token)
+        attention_mask = self._doc_attention_mask(x)
 
         if self.cfg.use_cce and HAS_CCE:
             with self.accelerator.autocast():
@@ -1522,7 +1696,7 @@ class Trainer:
         totals = CuratedTotals()
         # One fixed shape for every passage (padding masked out of the loss) so
         # torch.compile, when enabled, compiles once instead of once per length.
-        width = -(-(max(len(s["seq"]) for s in samples) - 1) // 64) * 64
+        width = -(-(max(len(s["seq"]) for s in samples) - 1) // 128) * 128  # flex block size is 128
         eos = self.tokenizer.eos_token_id
         for sample in samples:
             seq = sample["seq"]
@@ -1744,12 +1918,9 @@ class Trainer:
         the plain, non-distributed reload path, matching how init_from
         actually reloads checkpoints later.
         """
-        dtype_map = {"bfloat16": torch.bfloat16, "float16": torch.float16, "float32": torch.float32}
-        torch_dtype = dtype_map.get(self.cfg.dtype, torch.bfloat16)
+        torch_dtype = self._param_torch_dtype()
         try:
-            verify_model = AutoModelForCausalLM.from_pretrained(
-                ckpt_dir, trust_remote_code=True, torch_dtype=torch_dtype,
-            )
+            verify_model = self._load_lm(ckpt_dir, torch_dtype=torch_dtype)
             # from_pretrained's torch_dtype cast isn't always exhaustive for
             # every parameter (e.g. LayerNorm weights can be left in the
             # checkpoint's original dtype -- see _build_model's identical
@@ -1760,7 +1931,7 @@ class Trainer:
             verify_model = verify_model.to(torch_dtype).to(self.device)
             verify_model.eval()
             x, y = self._sanity_batch()
-            attention_mask = build_document_causal_mask(x, end_of_text_token)
+            attention_mask = self._doc_attention_mask(x)
             with torch.no_grad():
                 out = verify_model(input_ids=x, attention_mask=attention_mask, targets=y)
                 ce_loss = out.loss
@@ -1868,8 +2039,14 @@ class Trainer:
                     "best_sanity_batch_hash": self._best_sanity_batch_hash,
                     "last_hf_push_loss": self._last_hf_push_loss,
                     "last_hf_push_iter": self._last_hf_push_iter,
+                    "optimizer_name": self.cfg.optimizer_name,
+                    "fresh_started": self._fresh_started,
+                    "tokens_seen": self.tokens_seen,
+                    "tokens_seen_offset": self.tokens_seen_offset,
+                    "tokens_seen_by_bin": self.tokens_seen_by_bin,
+                    "tokens_per_step": self._tokens_per_step(),
                 }, f)
-            LOG.info("checkpoint_saved", path=ckpt_dir, iter=self.iter_num, is_new_best=is_new_best)
+            LOG.info("checkpoint_saved", path=ckpt_dir, iter=self.iter_num, is_new_best=is_new_best, tokens_seen=self.tokens_seen)
 
         self.accelerator.save_state(os.path.join(self.run_dir, "resume_state"))
         self.accelerator.wait_for_everyone()
@@ -1981,17 +2158,30 @@ class Trainer:
             m[f"eval/{split}_ce"] = ce
             m[f"eval/{split}_bpb"] = losses.get(f"{split}_bpb")
             m[f"eval/{split}_ppl"] = math.exp(min(ce, 50.0)) if ce is not None else None
+        m.update(self._token_metrics())
         self.tracker.log_metrics(m, step=self.iter_num)
+
+    def _token_log_fields(self) -> dict:
+        fields = {"tokens_seen": self.tokens_seen, "tokens_seen_b": round(self.tokens_seen / 1e9, 4)}
+        if self.tokens_seen_offset:
+            fields["lifetime_tokens_seen_b"] = round((self.tokens_seen_offset + self.tokens_seen) / 1e9, 4)
+        if len(self.tokens_seen_by_bin) > 1:
+            fields["tokens_seen_by_bin"] = dict(self.tokens_seen_by_bin)
+        return fields
+
+    def _token_metrics(self) -> dict:
+        m = {"train/tokens_seen": self.tokens_seen}
+        if self.tokens_seen_offset:
+            m["train/lifetime_tokens_seen"] = self.tokens_seen_offset + self.tokens_seen
+        for name, n in self.tokens_seen_by_bin.items():
+            m[f"train/tokens_seen_{name}"] = n
+        return m
 
     def _log_step_mlflow(self, loss, last_y, lr, tokens_per_sec, tflops_per_gpu, mfu, log_kwargs) -> None:
         if not self.tracker.enabled:
             return
         ce = self._last_ce_loss.item() if self._last_ce_loss is not None else None
         n_tok, n_bytes = (t.item() for t in self._target_stats(last_y))
-        tokens_seen = (
-            (self.iter_num + 1) * self.cfg.train_batch_size * self.cfg.block_size
-            * self.cfg.gradient_accumulation_steps * self.world_size
-        )
         self.tracker.log_metrics({
             "train/loss": loss,  # CE + weighted MoE aux loss: what is actually optimised
             "train/ce_loss": ce,
@@ -1999,10 +2189,11 @@ class Trainer:
             "train/ppl": math.exp(min(ce, 50.0)) if ce is not None else None,
             "train/grad_norm": float(self._last_grad_norm) if self._last_grad_norm is not None else None,
             "lr": lr,
-            "train/tokens_seen": tokens_seen,
+            **self._token_metrics(),
             "train/tokens_per_sec": tokens_per_sec,
             "train/tflops_per_gpu": tflops_per_gpu,
             "train/mfu": mfu,
+            "train/peak_mem_gib": log_kwargs.get("peak_mem_gib"),
             "train/eng_sampling_weight": log_kwargs.get("eng_sampling_weight"),
             "train/afr_sampling_weight": log_kwargs.get("afr_sampling_weight"),
         }, step=self.iter_num)
@@ -2051,7 +2242,7 @@ class Trainer:
         self._log_curated_eval(self._curated_eval())
         if self.master:
             lr = self._lr(self.iter_num) if self.cfg.decay_lr else self.cfg.learning_rate
-            LOG.info("eval", iter=self.iter_num, **losses)
+            LOG.info("eval", iter=self.iter_num, tokens_seen=self.tokens_seen, **losses)
             self._maybe_log_wandb(losses, lr)
             self._log_eval_mlflow(losses, lr)
             self._log_moe_stats()
@@ -2076,9 +2267,14 @@ class Trainer:
 
     def train(self):
         if self.master:
-            LOG.info("training_start", mode=self.cfg.mode, world_size=self.world_size)
+            LOG.info(
+                "training_start", mode=self.cfg.mode, world_size=self.world_size, iter=self.iter_num,
+                tokens_per_step=self._tokens_per_step(), max_iters=self.cfg.max_iters,
+                tokens_seen_estimated=self._tokens_seen_estimated, **self._token_log_fields(),
+            )
 
-        x, y = self.get_batch("train")
+        x, y = self.get_batch("train", track=True)
+        cur_bin = self._last_train_bin
 
         # Sanity-check the loaded checkpoint (and FSDP wrapping) before
         # spending any real training time on it.
@@ -2100,7 +2296,7 @@ class Trainer:
                 losses = self.estimate_loss()
                 self._log_curated_eval(self._curated_eval())
                 if self.master:
-                    LOG.info("eval", iter=self.iter_num, **losses)
+                    LOG.info("eval", iter=self.iter_num, tokens_seen=self.tokens_seen, **losses)
                     self._maybe_log_wandb(losses, lr)
                     self._log_eval_mlflow(losses, lr)
                     self._log_moe_stats()
@@ -2133,6 +2329,10 @@ class Trainer:
                 self._log_sample_generation(self._sample_prompt(x))
 
             for _ in range(self.cfg.gradient_accumulation_steps):
+                self.tokens_seen_by_bin[cur_bin] = (
+                    self.tokens_seen_by_bin.get(cur_bin, 0)
+                    + self.cfg.train_batch_size * self.cfg.block_size * self.world_size
+                )
                 with self.accelerator.accumulate(self.model):
                     loss = self._forward_loss(x, y)
                     self.accelerator.backward(loss)
@@ -2141,7 +2341,9 @@ class Trainer:
                     self.optimizer.step()
                     self.optimizer.zero_grad()
                 last_y = y
-                x, y = self.get_batch("train")
+                x, y = self.get_batch("train", track=True)
+                cur_bin = self._last_train_bin
+            self.tokens_seen += self._tokens_per_step()
             last_loss = loss
 
             if self.iter_num % self.cfg.log_interval == 0 and self.master:
@@ -2163,6 +2365,12 @@ class Trainer:
                 }
                 if mfu is not None:
                     log_kwargs["mfu"] = round(mfu, 4)
+                log_kwargs.update(self._token_log_fields())
+                if torch.cuda.is_available():
+                    # Peak allocated since the previous log line: how close train_batch_size is to
+                    # this GPU's limit. Raise the batch if it is far below, lower it before an OOM.
+                    log_kwargs["peak_mem_gib"] = round(torch.cuda.max_memory_allocated() / 2**30, 2)
+                    torch.cuda.reset_peak_memory_stats()
                 if self.cfg.use_scheduled_sampling and len(self.train_bins) > 1:
                     eng_w, afr_w = self._sampling_weights()
                     log_kwargs.update(eng_sampling_weight=eng_w, afr_sampling_weight=afr_w)
@@ -2176,7 +2384,7 @@ class Trainer:
             self.iter_num += 1
 
         if self.master:
-            LOG.info("training_done", iter=self.iter_num)
+            LOG.info("training_done", iter=self.iter_num, **self._token_log_fields())
         self.tracker.end()
 
 

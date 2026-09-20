@@ -44,6 +44,11 @@ def main() -> None:
              "use the printed env vars below rather than assuming train_config.yaml's "
              "own relative paths point here.",
     )
+    parser.add_argument(
+        "--write-env", action="store_true",
+        help="Write/replace TRAIN_DATA_PATHS_LOCAL and VAL_DATA_PATH in ./.env for you "
+             "(idempotent), instead of printing them to copy by hand.",
+    )
     args = parser.parse_args()
 
     os.environ["TRAIN_MODE"] = args.mode  # load_train_config reads this over yaml's training.mode
@@ -82,8 +87,21 @@ def main() -> None:
     print("training/new_train_ddp.py) -- load_config.py reads them over train_config.yaml's")
     print("own (relative) data paths, same override modal_train.py uses internally:")
     print()
-    print(f"TRAIN_DATA_PATHS_LOCAL={','.join(local_train)}")
-    print(f"VAL_DATA_PATH={local_eval}")
+    train_line = f"TRAIN_DATA_PATHS_LOCAL={','.join(local_train)}"
+    val_line = f"VAL_DATA_PATH={local_eval}"
+    print(train_line)
+    print(val_line)
+
+    if args.write_env:
+        env_path = ROOT / ".env"
+        kept = []
+        if env_path.exists():
+            kept = [
+                line for line in env_path.read_text().splitlines()
+                if not line.startswith(("TRAIN_DATA_PATHS_LOCAL=", "VAL_DATA_PATH="))
+            ]
+        env_path.write_text("\n".join(kept + [train_line, val_line]) + "\n")
+        print(f"\nwrote both lines to {env_path}")
 
 
 if __name__ == "__main__":

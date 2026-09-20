@@ -16,28 +16,41 @@ training:
   always_save_checkpoint : true  # if True, always save a checkpoint after each eval
   gradient_accumulation_steps : 32  # used to simulate larger batch sizes (was 5 * 8)
   decay_lr : True  # whether to decay the learning rate
-  # _lr(it) in new_train.py is a pure function of the GLOBAL iter_num, not
-  # "steps since this config changed" -- so warmup_iters must sit comfortably
-  # above wherever training currently is (~iter 1200 as of 2026-07-23) for a
-  # real ramp to actually happen after resuming, rather than warmup already
-  # being "in the past" the instant this takes effect. Re-check the actual
-  # latest iter_num before relaunching and raise this further if needed.
-  warmup_iters : 10  # was 20 -- deliberately short before; now a real ramp from ~current step
-  lr_decay_iters : 5000  # should be ~: max_iters per Chinchilla
-  # Must stay BELOW learning_rate (optimizer.learning_rate) or the cosine
-  # decay direction inverts (LR would rise toward min_lr instead of falling
-  # toward it). Kept at the same learning_rate/10 ratio used before.
-  min_lr : 1e-6  # was 6e-5 -- that was learning_rate/5 for the old 3e-4 peak; now scaled to the new 1e-5 peak
-  compile : true  # use PyTorch 2.0 to compile the model to be faster
+  # LR schedule (training/lr_schedule.py) is a pure function of iter_num. Recommended for a
+  # long token-budget run (see HOW_TO_RUN.md "Recommended hyperparameters" for the sources):
+  #   wsd    -- warmup, hold the peak, then cool down to min_lr over the last wsd_decay_frac of
+  #             max_iters. Any stable-phase checkpoint can be cooled down on its own, so you can
+  #             stop early (e.g. at 25B of a planned 50B tokens) without wasting the run.
+  #   linear -- straight decay from peak to min_lr at lr_decay_iters (min_lr: 0 = "decay to zero").
+  #   cosine -- cosine to min_lr at lr_decay_iters (the old default).
+  scheduler: "wsd"  # wsd | linear | cosine
+  wsd_decay_frac: 0.2  # fraction of max_iters spent cooling down (0.1-0.2)
+  wsd_decay_shape: "sqrt"  # sqrt = (1 - sqrt(t)) cooldown | linear | cosine
+  warmup_iters : 1000  # ~0.8B tokens at 786K tokens/step; typical range 0.1-2% of total steps
+  lr_decay_iters : 60000  # only used by scheduler: cosine / linear; wsd uses max_iters
+  min_lr : 0.0  # final LR. Must stay BELOW optimizer.learning_rate. 0 = decay to zero
+  # torch.compile only ever applied to single-GPU runs (multi-process runs skip it), and is untested
+  # on this MoE with the current torch/transformers -- a compile error would kill a rented run.
+  # Turn it on only after a short single-GPU trial.
+  compile : false
   display_model_output_iter : 128
   use_cce : false  # to use cut cross entropy or not
   # Whether to mask prompt/action-span (pretrain) or prompt-vs-response (SFT)
   # tokens out of the loss at all -- see training/label_masking.py. false
   # means every token contributes to the loss, completely unmasked.
   use_loss_mask: false
-  scheduler: "cosine"
   block_size: 4096
-  dtype: "bf16"
+  # Document-causal attention for packed sequences (no attention across </s> boundaries):
+  #   sdpa_mask -- a (B,1,T,T) boolean mask per batch; works everywhere, but costs ~4-5 GiB of
+  #                activation memory per sample and forces SDPA's slower masked kernel.
+  #   flex      -- FlexAttention block mask (torch >= 2.5): no T x T tensor, cross-document blocks
+  #                are skipped. Same result; verify with a TEST_RUN first (HOW_TO_RUN.md 2.9).
+  attention_impl: "sdpa_mask"
+  dtype: "bf16"  # autocast/compute precision
+  # dtype the parameters, gradients and optimizer state are HELD in. float32 = master weights
+  # (recommended): updates smaller than bf16's ~0.4% resolution are otherwise silently lost,
+  # which at small learning rates is most of them. Costs ~3 GiB/GPU, negligible vs activations.
+  param_dtype: "float32"
   hf_push_interval: 100
   # Threshold on the parameter-count-weighted relative L2 norm across all
   # layers vs. model.reference_repo -- above this, the whole model is
@@ -56,7 +69,7 @@ training:
   # step count/optimizer momentum from a prior local run while pulling fresh
   # weights, which is intentional for continuous pretraining across Modal
   # container restarts.
-  init_from: "hf"  # hf (HuggingFace hub) | resume (local ckpt)
+  init_from: "resume"  # hf (HuggingFace hub) | resume (local ckpt); use "resume" with fresh_start
   # Optional explicit override; leave blank to auto-discover the most recent
   # matching run directory under training.out_dir (works the same on a Modal
   # Volume, a vast.ai instance's local disk, or your own machine -- purely a
@@ -88,6 +101,13 @@ training:
   # silently discarding any real progress made since -- clear it back to
   # blank once checkpointing is confirmed working again.
   last_step: 
+  # Start at step 0 (warmup, LR schedule, scheduled sampling, best-val and HF-push tracking all
+  # restart) while still loading the latest checkpoint's weights and, if the optimizer is the
+  # same one, its state. Writes to a NEW run dir; applied once (a restart resumes the new run).
+  # Env override: FRESH_START=1. Note Adam's moments re-estimate in ~20 steps (beta2=0.95), so
+  # carrying them over saves little; set resume_optimizer_state: false to skip it.
+  fresh_start: true
+  resume_optimizer_state: true
   mode: "pretrain"  # pretrain | sft
   # Dry run: load the model + model.reference_repo, run the startup
   # weight-deviation check AND the side-by-side generation comparison
@@ -115,6 +135,13 @@ tokenizer:
   process_one_file_at_a_time: true
 
 model:
+  # local = build the network from this repo's sabiyarn/model/modeling.py and load only the weights
+  # from repo_name (reproducible, testable). hub = use the modeling.py stored on the Hub next to the
+  # weights (changes whenever someone pushes there; local edits have no effect until pushed).
+  code: local
+  # sparse = each expert only processes the tokens routed to it (~half the expert FLOPs and memory
+  # for top-2 of 4); dense = every expert processes every token. Identical math.
+  moe_dispatch: sparse
   repo_name: Aletheia-ng/SabiYarn_MoE-280M #Aletheia-ng/SabiYarn_MoE_base
   # Static, manually-maintained reference checkpoint for the last-line
   # weight-deviation sanity check (see Trainer._verify_reference_weights) --
@@ -196,14 +223,22 @@ data:
     - eng_sampling_weight: 0.55
  
 
-# adamw optimizer
+# optimizer
 optimizer:
-  name : "adam"
-  learning_rate : 1e-5  # was 3e-4 -- lowered; see training.min_lr's comment, must stay above it
-  max_iters : 30000  # total number of training iterations
+  # adamw | muon. Muon (hidden matrices) + AdamW (embeddings, norms, router) needs DDP or one
+  # GPU -- not FSDP -- and reuses the AdamW lr / weight_decay below unchanged. Independent
+  # benchmarks (Wen et al. 2025) find its edge over a well-tuned AdamW shrinking with scale and
+  # at high tokens-per-parameter, so A/B it on ~300M tokens before committing a long run.
+  name : "adamw"
+  learning_rate : 6e-4  # peak. ~4e-4..1e-3 is the range for 0.1-1B models; sweep {4e-4, 6e-4, 1e-3}
+  max_tokens : 50e9  # token budget -> max_iters is derived at startup from the real tokens/step
+  max_iters : 60000  # fallback if max_tokens is 0
   weight_decay : 1e-1
   beta1 : 0.9
   beta2 : 0.95
+  muon_momentum : 0.95
+  muon_ns_steps : 5
+  muon_rms : 0.2  # update RMS matched to AdamW (Moonlight); makes lr/wd transfer from AdamW
   grad_clip : 1.0  # clip gradients at this value, or disable if :: 0.0
   moe_aux_loss_weight: 0.015  # was 0.01 -- raised to push harder against router imbalance
 

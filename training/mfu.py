@@ -82,8 +82,13 @@ def model_flops_per_token(model_config, block_size: int) -> float:
 
     if use_moe:
         moe_dim = getattr(model_config, "moe_dim", 4 * D)
+        # Dense dispatch runs every expert on every token; sparse dispatch only the top-k.
+        k = int(getattr(model_config, "num_experts_per_tok", 2))
+        sparse = bool(getattr(model_config, "moe_sparse_dispatch", False))
         ffn_flops_per_layer = [
-            4 * D * moe_dim * model_config.expert_count_for_layer(i) for i in range(L)
+            4 * D * moe_dim * (min(k, model_config.expert_count_for_layer(i)) if sparse
+                               else model_config.expert_count_for_layer(i))
+            for i in range(L)
         ]
     else:
         ffn_flops_per_layer = [16 * D * D for _ in range(L)]
