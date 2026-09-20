@@ -181,6 +181,10 @@ class Trainer:
         self._last_ce_loss = None   # CE-only loss (no MoE aux term) of the latest _forward_loss
         self._last_grad_norm = None  # pre-clip global grad norm of the latest optimizer step
         self._token_bytes = None    # id -> UTF-8 byte length lookup, built lazily on device
+        # The static reference checkpoint (model.reference_repo), kept on
+        # master between _verify_reference_weights and the startup
+        # generation comparison that reuses it, then dropped.
+        self._ref_model = None
         self._setup_accelerator()
         self._setup_dirs()
         self._backfill_ckpt_best()
@@ -192,6 +196,10 @@ class Trainer:
         self._prepare_for_training()
         self._verify_resume_sanity()
         self._verify_reference_weights()
+        # Qualitative companion to the weight-deviation check above: what the
+        # two models actually GENERATE, before a single training step runs.
+        # train() stops right after this when training.test_run is set.
+        self._startup_generation_comparison()
 
     # ------------------------------------------------------------------
     # Setup
@@ -1070,6 +1078,11 @@ class Trainer:
             LOG.warning("reference_weights_load_failed", repo=self.cfg.reference_model_repo, error=str(exc))
             return
         ref_state = ref_model.state_dict()
+        # Kept (master only) for _startup_generation_comparison below rather
+        # than reloaded there -- same weights, and a second from_pretrained
+        # would re-read the whole checkpoint for nothing.
+        if self.master:
+            self._ref_model = ref_model
         # See _save's identical migration -- modern, non-deprecated
         # FSDP1-and-FSDP2-unified API instead of accelerate's FSDP1 path
         # through the legacy FSDP.state_dict_type() context manager.
@@ -1221,14 +1234,68 @@ class Trainer:
     #     length_penalty/early_stopping are beam-search-only knobs (they
     #     govern beam score normalization/termination) -- dropped since
     #     they're inert with num_beams=1.
+    #   - top_k=40 (was 50): anywhere in 20-50 is reasonable here; 40 keeps
+    #     enough of the distribution for the model to still sound varied
+    #     across five languages, while trimming more of the low-probability
+    #     tail that a mid-training 280M model still puts mass on (that tail
+    #     is where most of the obvious "wrong language / nonsense token"
+    #     samples come from). 20 would be tighter but starts hiding genuine
+    #     diversity problems behind the truncation.
     _GENERATION_CONFIG = dict(
         max_new_tokens=100,
         num_beams=1,
         do_sample=True,
         temperature=0.99,
-        top_k=50,
+        top_k=40,
         top_p=0.95,
         repetition_penalty=4.0,
+    )
+
+    # One-off startup comparison (see _startup_generation_comparison), run
+    # once before training against model.reference_repo. Sampling reuses the
+    # exact training-time config above (same decoding the periodic
+    # display_model_output_iter samples use, just longer) so what you see
+    # here is what you'll see mid-run; beam search is the deterministic
+    # counterpart, with the sampling-only knobs dropped since they're inert
+    # under do_sample=False and transformers warns about them.
+    _STARTUP_MAX_NEW_TOKENS = 150
+    _STARTUP_SAMPLE_CONFIG = dict(_GENERATION_CONFIG, max_new_tokens=_STARTUP_MAX_NEW_TOKENS)
+    _STARTUP_BEAM_CONFIG = dict(
+        max_new_tokens=_STARTUP_MAX_NEW_TOKENS,
+        num_beams=5,
+        do_sample=False,
+        early_stopping=True,
+        length_penalty=1.0,
+        repetition_penalty=_GENERATION_CONFIG["repetition_penalty"],
+    )
+
+    # Five fixed prompts (~20-30 words each), one per major pretraining
+    # language, each opening with the language tag the data was tokenized
+    # with (see training/constant_tokens.py). Nothing downstream depends on
+    # these exact strings -- edit them freely to probe whatever you care
+    # about on a given run.
+    _STARTUP_PROMPTS = (
+        (
+            "<eng> The rapid growth of artificial intelligence research across Africa has opened new "
+            "opportunities for local startups and universities building language technology for their "
+            "own communities."
+        ),
+        (
+            "<yor> Ijoba ipinle Eko ti so pe awon ona tuntun yoo si sile fun awon onisowo kekere, ki oro "
+            "aje ilu le tesiwaju."
+        ),
+        (
+            "<ibo> Ndi ochichi steeti Anambra kwuru na ha ga-emezi uzo na ulo akwukwo di n'ime obodo, ka "
+            "umu akwukwo nwee ike iga akwukwo n'udo."
+        ),
+        (
+            "<hau> Gwamnatin jihar Kano ta ce za ta gina sabbin hanyoyi da makarantu a kauyuka da dama, "
+            "domin inganta rayuwar manoma da yara."
+        ),
+        (
+            "<pcm> Plenty people for Lagos dey talk say the new transport policy go make traffic better, "
+            "but some drivers still dey complain well well."
+        ),
     )
 
     @torch.no_grad()
@@ -1243,8 +1310,9 @@ class Trainer:
         return ids
 
     @torch.no_grad()
-    def _generate_with_config(self, prompt_ids: torch.Tensor) -> torch.Tensor:
-        """Real GenerationMixin.generate() with _GENERATION_CONFIG, temporarily
+    def _generate_with_config(self, prompt_ids: torch.Tensor, gen_config: dict | None = None) -> torch.Tensor:
+        """Real GenerationMixin.generate() with _GENERATION_CONFIG (or an
+        explicit gen_config -- see _startup_generation_comparison), temporarily
         un-sharding parameters via FSDP.summon_full_params so generate()'s
         internal machinery (prepare_inputs_for_generation, beam search, etc.)
         sees ordinary full 2-D weight tensors instead of FSDP's flat shards --
@@ -1253,10 +1321,11 @@ class Trainer:
         context and call generate() together, matching FSDP's per-layer
         all-gather requirement."""
         pad_id = self.tokenizer.pad_token_id or self.tokenizer.eos_token_id
+        cfg = gen_config if gen_config is not None else self._GENERATION_CONFIG
         if self.fsdp_plugin is not None:
             with FSDP.summon_full_params(self.model, writeback=False, recurse=True):
-                return self.model.generate(prompt_ids, pad_token_id=pad_id, **self._GENERATION_CONFIG)
-        return self.model.generate(prompt_ids, pad_token_id=pad_id, **self._GENERATION_CONFIG)
+                return self.model.generate(prompt_ids, pad_token_id=pad_id, **cfg)
+        return self.model.generate(prompt_ids, pad_token_id=pad_id, **cfg)
 
     @torch.no_grad()
     def _log_sample_generation(self, prompt_ids: torch.Tensor, tag: str = "sample_generation"):
@@ -1294,6 +1363,108 @@ class Trainer:
             print(f"[INPUT]  {input_text}")
             print(f"[OUTPUT] {output_text}")
         print("=" * 100 + "\n")
+
+    @torch.no_grad()
+    def _generate_reference(self, prompt_ids: torch.Tensor, gen_config: dict) -> torch.Tensor | None:
+        """Generate from the static reference checkpoint (model.reference_repo,
+        loaded in _verify_reference_weights). Master-only and NOT collective:
+        this is a plain, unwrapped HF model, so no FSDP all-gather is
+        involved. Moved onto the training device on first use for speed,
+        falling back to CPU if there isn't room for it alongside the
+        training model."""
+        if self._ref_model is None:
+            return None
+        pad_id = self.tokenizer.pad_token_id or self.tokenizer.eos_token_id
+        try:
+            self._ref_model.to(self.device)
+            ids = prompt_ids.to(self.device)
+        except Exception as exc:
+            LOG.warning("reference_model_to_device_failed", error=str(exc), fallback="cpu")
+            self._ref_model.to("cpu")
+            ids = prompt_ids.to("cpu")
+        try:
+            return self._ref_model.generate(ids, pad_token_id=pad_id, **gen_config)
+        except Exception as exc:
+            LOG.warning("reference_generation_failed", error=str(exc))
+            return None
+
+    @torch.no_grad()
+    def _startup_generation_comparison(self) -> None:
+        """One-off, before the first training step: generate from
+        _STARTUP_PROMPTS with BOTH the model about to be trained and the
+        static reference checkpoint (model.reference_repo), under both
+        sampling and beam search, and print them side by side.
+
+        This is the qualitative counterpart to _verify_reference_weights'
+        single aggregate_rel_l2 number: that says how FAR the weights have
+        moved from the reference, this shows what that movement actually did
+        to the model's output -- real progress and a broken/mis-loaded
+        checkpoint can produce a similar deviation number, but they don't
+        read the same.
+
+        Generation with the training model is collective (FSDP all-gathers
+        per layer -- see _generate_with_config), so EVERY rank must run this
+        loop in lockstep; only master generates with the reference model and
+        prints. If training.test_run is set, train() stops right after this
+        instead of training (see its early return).
+        """
+        modes = (
+            (f"do_sample (top_k={self._STARTUP_SAMPLE_CONFIG['top_k']}, "
+             f"top_p={self._STARTUP_SAMPLE_CONFIG['top_p']}, "
+             f"temperature={self._STARTUP_SAMPLE_CONFIG['temperature']})", self._STARTUP_SAMPLE_CONFIG),
+            (f"beam_search (num_beams={self._STARTUP_BEAM_CONFIG['num_beams']}, do_sample=False)",
+             self._STARTUP_BEAM_CONFIG),
+        )
+        trained_label = (
+            f"MODEL BEING TRAINED  [{self.cfg.model_name}"
+            f"{', resumed from ' + self.cfg.init_from if self.cfg.init_from else ''}, iter {self.iter_num}]"
+        )
+        ref_label = f"REFERENCE MODEL      [{self.cfg.reference_model_repo or 'not configured'}]"
+
+        self.model.eval()
+        if self.master:
+            header = " STARTUP GENERATION COMPARISON (before training) "
+            print(f"\n{header:#^110}")
+            print(f"# prompts: {len(self._STARTUP_PROMPTS)} | max_new_tokens: {self._STARTUP_MAX_NEW_TOKENS} "
+                  f"| test_run: {self.cfg.test_run}")
+            print(f"# {trained_label}")
+            print(f"# {ref_label}")
+            print("#" * 110)
+
+        for idx, prompt in enumerate(self._STARTUP_PROMPTS, 1):
+            prompt_ids = self.tokenizer(prompt, return_tensors="pt").input_ids.to(self.device)
+            prompt_len = prompt_ids.size(1)
+            if self.master:
+                print(f"\n{'=' * 110}")
+                print(f"=== PROMPT {idx}/{len(self._STARTUP_PROMPTS)} ({prompt_len} tokens)")
+                print(f"{'=' * 110}")
+                print(f"[PROMPT] {prompt}")
+
+            for mode_label, gen_config in modes:
+                # Collective -- every rank calls this, master and non-master alike.
+                try:
+                    trained_out = self._generate_with_config(prompt_ids, gen_config)
+                except Exception as exc:
+                    if self.master:
+                        LOG.warning("startup_generation_failed", prompt=idx, mode=mode_label, error=str(exc))
+                    trained_out = None
+                ref_out = self._generate_reference(prompt_ids, gen_config) if self.master else None
+
+                if not self.master:
+                    continue
+                print(f"\n--- PROMPT {idx} | DECODING: {mode_label} ---")
+                for label, out in ((trained_label, trained_out), (ref_label, ref_out)):
+                    if out is None:
+                        print(f"  [{label}]\n    <no output>")
+                        continue
+                    text = self.tokenizer.decode(out[0, prompt_len:], skip_special_tokens=False)
+                    print(f"  [{label}]\n    {text}")
+
+        if self.master:
+            print(f"\n{'#' * 110}\n")
+        self._ref_model = None  # free the reference model; only needed for this comparison
+        self.model.train()
+        self.accelerator.wait_for_everyone()
 
     @torch.no_grad()
     def estimate_loss(self):
@@ -1337,7 +1508,13 @@ class Trainer:
             return False
         if self._last_hf_push_loss is None:
             return True
-        return abs(val_loss - self._last_hf_push_loss) <= _HF_PUSH_LOSS_BAND
+        # One-sided on purpose: an eval whose loss IMPROVED on the last push
+        # is exactly what this repo should be publishing, however large the
+        # improvement. Only a regression beyond the band (a post-resume spike,
+        # a diverging run) is worth refusing -- the earlier abs() form also
+        # blocked big improvements, which silently starved the Hub repo of
+        # updates on precisely the runs that were going well.
+        return val_loss <= self._last_hf_push_loss + _HF_PUSH_LOSS_BAND
 
     def _push_checkpoint_to_hf(self, ckpt_dir: str) -> None:
         if not self.cfg.hf_chkpt_path:
@@ -1565,6 +1742,14 @@ class Trainer:
         sanity_batch_hash = self._sanity_batch_hash()
 
         push_now = self.master and self._should_push_to_hf(val_loss)
+        if self.master and self.cfg.hf_chkpt_path and not push_now:
+            # Otherwise a run that never publishes looks identical to one
+            # that does -- the skip was previously silent.
+            LOG.warning(
+                "hf_push_skipped", iter=self.iter_num, val_loss=val_loss,
+                last_push_loss=self._last_hf_push_loss, band=_HF_PUSH_LOSS_BAND,
+                reason="val loss regressed more than _HF_PUSH_LOSS_BAND beyond the last pushed checkpoint",
+            )
 
         if self.master:
             os.makedirs(ckpt_dir, exist_ok=True)
@@ -1777,6 +1962,20 @@ class Trainer:
         # Sanity-check the loaded checkpoint (and FSDP wrapping) before
         # spending any real training time on it.
         self._log_sample_generation(self._sample_prompt(x), tag="startup_sample_generation")
+
+        if self.cfg.test_run:
+            # training.test_run: the startup generation comparison + reference
+            # weight check in __init__ ARE the whole run -- stop before
+            # touching the optimizer, so nothing is trained, checkpointed or
+            # pushed. Set it back to false for a real run.
+            if self.master:
+                LOG.info(
+                    "test_run_complete", iter=self.iter_num,
+                    note="training.test_run is true -- stopping after the startup model/reference "
+                         "comparison, before any training step. Set test_run: false to train.",
+                )
+            self.tracker.end()
+            return
 
         t0 = time.time()
         last_loss = None

@@ -89,6 +89,13 @@ training:
   # blank once checkpointing is confirmed working again.
   last_step: 
   mode: "pretrain"  # pretrain | sft
+  # Dry run: load the model + model.reference_repo, run the startup
+  # weight-deviation check AND the side-by-side generation comparison
+  # (5 prompts x {do_sample, beam search} x {this model, reference model},
+  # 150 new tokens each -- see Trainer._startup_generation_comparison), then
+  # STOP before the first training step. Nothing is trained, checkpointed or
+  # pushed to S3/HF. Set back to false for a real training run.
+  test_run: true
   hf_chkpt_path: "Aletheia-ng/SabiYarn_MoE-280M"
   schedule_trainable_layers: false
 

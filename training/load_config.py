@@ -228,6 +228,12 @@ class TrainConfig:
     # fallback. Left defined so existing yaml files with this key still load.
     hf_push_interval: int = 100
     hf_chkpt_path: Optional[str] = None
+    # If True, Trainer.__init__ still loads the model + model.reference_repo,
+    # runs the weight-deviation check and the startup generation comparison
+    # (see Trainer._startup_generation_comparison), and then train() returns
+    # immediately -- nothing is trained, checkpointed or pushed. A dry
+    # "does this checkpoint still generate sensible text?" run.
+    test_run: bool = False
     seed: int = 42
     world_size: int = 1
     rank: int = 0
@@ -491,6 +497,7 @@ def load_train_config(path: Optional[str] = None) -> TrainConfig:
         mlflow_ui_port=int(os.getenv("MLFLOW_UI_PORT") or (mlflow_cfg.get("ui", {}) or {}).get("port", 5000)),
         hf_chkpt_path=training.get("hf_chkpt_path") or None,
         hf_push_interval=int(training.get("hf_push_interval", 100)),
+        test_run=bool(training.get("test_run", False)),
         ddp_backend=str(ddp.get("backend", "nccl")),
         gpus_per_node=int(modal_cfg.get("gpus_per_node", env.get("world_size", 1))),
         num_nodes=int(modal_cfg.get("num_nodes", 1)),
