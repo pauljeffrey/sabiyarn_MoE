@@ -173,7 +173,7 @@ optimizer:
 ddp:
   rank : 0
   backend : "nccl"
-  use_dp: False
+  use_dp: false
 
 #Accelerate config
 accelerate:
