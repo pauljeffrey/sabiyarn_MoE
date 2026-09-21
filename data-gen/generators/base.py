@@ -138,9 +138,16 @@ class BatchRequestSpec:
         }
 
 
-def write_batch_and_manifest(task_name: str, specs: list[BatchRequestSpec]) -> tuple[Path, Path, int]:
-    batch_path = BATCH_INPUT_DIR / f"{task_name}.jsonl"
-    manifest_path = BATCH_INPUT_DIR / f"{task_name}.manifest.jsonl"
+def write_batch_and_manifest(
+    task_name: str, specs: list[BatchRequestSpec], out_dir: Path | None = None
+) -> tuple[Path, Path, int]:
+    """Write `<task>.jsonl` + `<task>.manifest.jsonl` into `out_dir` (default: the
+    configured batch-input dir). `out_dir` exists so tests and pilot runs can
+    write elsewhere without touching global settings."""
+    target_dir = Path(out_dir) if out_dir is not None else BATCH_INPUT_DIR
+    target_dir.mkdir(parents=True, exist_ok=True)
+    batch_path = target_dir / f"{task_name}.jsonl"
+    manifest_path = target_dir / f"{task_name}.manifest.jsonl"
 
     seen_ids: set[str] = set()
     with batch_path.open("w", encoding="utf-8") as bf, manifest_path.open("w", encoding="utf-8") as mf:

@@ -35,7 +35,8 @@ def _find_batch_files(tasks: list[str]) -> list[Path]:
     for task in tasks:
         # Matches both "<task>.jsonl" and split "<task>__partN.jsonl"
         files.extend(sorted(BATCH_INPUT_DIR.glob(f"{task}.jsonl")))
-        files.extend(sorted(BATCH_INPUT_DIR.glob(f"{task}__part*.jsonl")))
+        # exclude the side-car manifests, which would otherwise match `<task>__part*.jsonl`
+        files.extend(p for p in sorted(BATCH_INPUT_DIR.glob(f"{task}__part*.jsonl")) if not p.name.endswith(".manifest.jsonl"))
     return files
 
 

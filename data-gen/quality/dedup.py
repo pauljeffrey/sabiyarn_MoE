@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import hashlib
 import re
-from collections import defaultdict
+from collections import Counter, defaultdict
 from typing import Any, Iterable
 
 _WORD_RE = re.compile(r"\w+", re.UNICODE)
@@ -88,3 +88,85 @@ def find_duplicates(
                 kept_shingles.append((idx, shingles))
 
     return drop_indices, reasons
+
+
+# ---------------------------------------------------------------------------
+# Scalable variant for the corpus kinds (tens of thousands of records)
+# ---------------------------------------------------------------------------
+
+
+def _shingle_hashes(text: str, k: int) -> set[int]:
+    """Stable 64-bit hashes of word k-shingles (not `hash()`, which is salted per run)."""
+    return {
+        int.from_bytes(hashlib.blake2b(s.encode("utf-8"), digest_size=8).digest(), "big")
+        for s in _shingles(text, k)
+    }
+
+
+def find_near_duplicates(
+    records: list[dict[str, Any]],
+    *,
+    cell_key_fn,
+    text_fn,
+    near_dup_threshold: float = 0.8,
+    shingle_size: int = 5,
+    sketch_size: int = 48,
+    label: str = "cell",
+) -> tuple[set[int], dict[int, str]]:
+    """Same contract as `find_duplicates`, but sub-quadratic.
+
+    `find_duplicates` compares every record to every kept record in its cell,
+    which is fine for a few hundred records but hopeless for 6,000 per
+    language (or 72,000 across languages). Here each record keeps a bottom-k
+    "sketch" (its `sketch_size` smallest shingle hashes); an inverted index
+    over sketch elements proposes candidate pairs, and only candidates that
+    share enough sketch elements are verified with the exact Jaccard score.
+    For texts with fewer than `sketch_size` shingles the sketch is the whole
+    shingle set, so short-text results are exact. Earlier records win.
+    """
+    drop: set[int] = set()
+    reasons: dict[int, str] = {}
+
+    cells: dict[Any, list[int]] = defaultdict(list)
+    for idx, rec in enumerate(records):
+        cells[cell_key_fn(rec)].append(idx)
+
+    for cell, indices in cells.items():
+        seen_fp: dict[str, int] = {}
+        index: dict[int, list[int]] = defaultdict(list)  # sketch element -> kept record ids
+        kept_shingles: dict[int, set[int]] = {}
+        for idx in indices:
+            text = text_fn(records[idx])
+            fp = content_fingerprint(text)
+            if fp in seen_fp:
+                drop.add(idx)
+                reasons[idx] = f"exact duplicate of index {seen_fp[fp]} in {label} {cell!r}"
+                continue
+            seen_fp[fp] = idx
+
+            sh = _shingle_hashes(text, shingle_size)
+            sketch = sorted(sh)[:sketch_size]
+            dup_of = None
+            if sketch:
+                votes: Counter = Counter()
+                for h in sketch:
+                    for other in index.get(h, [])[-200:]:  # cap: ubiquitous shingles must not make this quadratic
+                        votes[other] += 1
+                need = max(1, int(0.25 * len(sketch)))
+                for other, c in votes.most_common(20):
+                    if c < need:
+                        break
+                    o = kept_shingles[other]
+                    union = len(sh | o)
+                    if union and len(sh & o) / union >= near_dup_threshold:
+                        dup_of = (other, len(sh & o) / union)
+                        break
+            if dup_of is not None:
+                drop.add(idx)
+                reasons[idx] = f"near-duplicate (jaccard={dup_of[1]:.2f}) of index {dup_of[0]} in {label} {cell!r}"
+                continue
+            kept_shingles[idx] = sh
+            for h in sketch:
+                index[h].append(idx)
+
+    return drop, reasons

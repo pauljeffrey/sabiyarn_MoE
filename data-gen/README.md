@@ -27,6 +27,10 @@ Fulah, Fulfulde.
 - **Translation** — translate between language pairs, phrased as a
   natural request rather than "translate X to Y".
 
+Also available: three larger, diversity-sampled dataset kinds (pretraining
+documents, Alpaca-style SFT, DPO preference pairs) for the 12 non-English
+languages with gpt-4o-mini — see [Corpus kinds](#corpus-kinds-pretraining-sft-alpaca-and-dpo-data--12-languages-gpt-4o-mini).
+
 ## Why it's built this way
 
 The generation model (GPT-4o via Structured Outputs) never writes the
@@ -34,14 +38,13 @@ final `<|system|>...<tool_call>...` text directly — it only returns typed
 JSON (validated by the API itself via a strict JSON schema). Python then
 deterministically assembles that JSON into `schemas.messages.Conversation`
 objects and renders them through **the tokenizer's actual
-`chat_template.jinja`** (copied verbatim into `templates/chat_template.jinja`,
+`chat_template.jinja`** (`templates/chat_template.jinja` — a byte-identical copy of the repo's canonical `sabiyarn/chat_template.jinja`, kept in step by `tests/test_chat_template.py` at the repo root; edit one, copy it over the other, and push it to the tokenizer repo;
 loaded with the same `trim_blocks=True, lstrip_blocks=True` Jinja2 settings
 `transformers` itself uses). This means:
 
 - The model can never get the special-token syntax wrong — it only has to
   produce valid JSON.
-- If the tokenizer's chat template ever changes, re-copy the new
-  `chat_template.jinja` from the tokenizer repo and every past batch of
+- If the chat template ever changes, update it as described above and every past batch of
   generated JSON re-renders correctly with zero regeneration.
 - RAG "retrieval" is always grounded in your real document text, never a
   paraphrase invented by the generation model.
@@ -202,18 +205,251 @@ for a native speaker review pass.
   hard drop) suspiciously low usage of a language's distinctive
   diacritics as a possible language-mismatch signal for spot-checking.
 
+## Corpus kinds: pretraining, SFT (Alpaca) and DPO data — 12 languages, gpt-4o-mini
+
+Three additional dataset kinds, generated with the OpenAI Batch API and
+Structured Outputs, for the **12 non-English languages only** (`yor hau ibo
+efi urh twi fon pcm ewe aka ful fuv`; English is never a target language):
+
+| kind | record | preset per language | preset total |
+|---|---|---|---|
+| `pretrain` | plain-text document: `title` + `text` | 4,000 | 48,000 |
+| `sft` | Alpaca: `instruction`, `input` (may be empty), `response` | 6,000 | 72,000 |
+| `dpo` | `instruction`, `input`, `chosen`, `rejected` (+ flaw metadata) | 1,500 | 18,000 |
+
+Default model is **gpt-4o-mini** (`model:` in each yaml, or `--model`). The
+emphasis is quality and diversity: a real coverage sampler (below) decides
+*what* every request is about; the model only writes the text.
+
+### Commands
+
+```bash
+cd data-gen
+
+# 0. Free: volume, tokens, dollars (no API calls). --per-language / --languages to try a pilot size.
+python run.py estimate                      # all three kinds, preset counts
+python run.py estimate --kind sft --per-language 200
+
+# 1. Free: write batch input + manifest (split into __partN files above 50,000 requests / ~190 MB)
+python run.py build --kind pretrain --config configs/pretrain.yaml
+python run.py build --kind sft      --config configs/sft.yaml
+python run.py build --kind dpo      --config configs/dpo.yaml
+python run.py build --kind sft --per-language 20 --languages yor,efi   # tiny pilot; --dry-run = estimate only
+
+# 2. Free: offline dress rehearsal (fake but structurally valid outputs; never real data)
+python run.py mock
+python run.py postprocess --kind all
+
+# 3. COSTS MONEY (dry run unless --confirm). Pilot first: build with --per-language 20 and read the outputs.
+python run.py submit --kind sft                # lists files/requests only
+python run.py submit --kind sft --confirm      # uploads + creates Batch jobs (needs OPENAI_API_KEY)
+python run.py fetch                            # polls; downloads completed batches to data/batch_output/
+
+# 4. Free: parse, validate, filter, dedup, write data/processed/{pretrain,sft,dpo}.jsonl + report
+python run.py postprocess --kind sft           # or --kind all
+
+# 5. OPTIONAL LLM judge (costs money to submit): score a sample (or all), then filter by score
+python run.py judge build --kind sft --fraction 0.2
+python run.py submit --tasks judge_sft --confirm
+python run.py fetch
+python run.py judge apply --kind sft --min language_correctness=4 --min fluency=3
+```
+
+Every script also runs directly (`python pipeline/build_corpus.py ...`,
+`pipeline/postprocess_corpus.py`, `pipeline/estimate.py`, `pipeline/judge.py`)
+and takes `--data-dir` to write somewhere other than `data/`. `--kind` on
+`build`/`postprocess` selects this corpus pipeline; the original six-task
+scripts are untouched. (Two small fixes to the shared scripts were needed for
+split files: `submit_batch.py` no longer mistakes `<kind>__partN.manifest.jsonl`
+for a batch input, and `fetch_results.py` names outputs after the source file
+so `sft__part0` / `sft__part1` do not overwrite each other. Behaviour for the
+original six tasks is identical.)
+
+**Batch queue limits.** OpenAI limits enqueued tokens per model by usage tier,
+and the preset volumes (54M / 81M / 23M input tokens) exceed what low tiers may
+queue at once. Use `--max-requests-per-file 5000` (or whatever fits your tier)
+and submit/fetch files one after another. Verify current limits in your account.
+
+### How the diversity sampler works (`sampling/`)
+
+LLMs asked for "a diverse example" collapse onto a handful of familiar topics,
+and independent random draws are lumpy (some sub-topics get 0 uses, others 15).
+So diversity is imposed from outside by a deterministic `CoverageSampler`
+(one instance per *(kind, language)*, seeded from `(seed, kind, language)`
+with the same scheme for every language, so every language gets identical
+coverage structure):
+
+* **Taxonomy** (`sampling/taxonomy.py`, hand-written): 59 domains
+  (agriculture, health, public health, law, finance & mobile money, energy,
+  Nollywood, proverbs, chieftaincy, ...) with 10-12 concrete sub-topics each,
+  **636 (domain, sub-topic) pairs**; 28 text genres, 7 registers, 14
+  audiences, 3 length buckets, 5 perspectives, 4 eras, 3 reading levels; for
+  SFT/DPO, 33 task types and 12 rejection (flaw) types.
+* **Primary key = (domain, sub-topic)**: cycle through a *shuffled list of all
+  pairs* before repeating any, reshuffle each cycle. After N draws every pair
+  was used `floor(N/636)` or `ceil(N/636)` times. With 4,000 documents per
+  language, each pair appears 6-7 times.
+* **Secondary attributes** (genre or task, register, audience, length bucket,
+  perspective, era, difficulty, instruction style, rejection type, locale):
+  **least-used-first** against target weights — pick the compatible value
+  minimising `(count+1)/weight`, ties broken by the seeded RNG. Counts track
+  the targets to within a few draws; a value starved by compatibility rules
+  accumulates a deficit and wins the next time it is legal.
+* **Compatibility rules** are data (domain tags vs. genre/audience/era/task
+  requirements): no product description of a historical empire, no "news
+  report" on mathematics, sermons only for faith topics, `poor_translation`
+  only for translation tasks, `wrong_label` only for classification, etc.
+* **Locale** (`sampling/locales.py`): each language has 13-20 real places and
+  a country (currency, everyday realities) plus local given names for
+  fictional characters — Yoruba: Lagos, Ibadan, Ogun, Osun, Benin Republic;
+  Hausa: Kano, Kaduna, Sokoto, Niger Republic; Twi/Akan: Kumasi, Accra, Ashanti,
+  Akuapem; Ewe: Volta Region, Togo; Fon: Cotonou, Abomey, Ouidah; Efik: Calabar,
+  Cross River; Urhobo: Warri, Effurun, Delta State; Fulfulde: Adamawa, Sokoto,
+  Cameroon; Fulah: Senegal, Guinea, Mali; Pidgin: Nigeria broadly.
+* **Auditable**: the sampled tuple is stored in every manifest line
+  (`context.attributes`); `build` prints a requested-coverage audit table and
+  `postprocess` reports coverage of the *kept* records per language (dropping
+  is not uniform, low-resource languages lose more). `sampling.sampler.coverage_report`
+  gives counts per value, normalised entropy and max/min ratio.
+
+### Editing the yaml presets (`configs/{pretrain,sft,dpo}.yaml`)
+
+* `samples_per_language`: `default` plus all 12 languages listed explicitly
+  (equal by default). Change any number; the loader rejects `eng`/unknown codes.
+* `attribute_weights`: target shares per genre/task, register, audience, length
+  bucket, ... `0` disables a value; unknown names are rejected. Defaults live
+  in the taxonomy; the yaml shows them so you can edit in place.
+* `domain_group_weights`: 1.0 = every pair equally often, 2.0 = that group's
+  pairs twice per cycle, 0 = exclude the group.
+* `quality`, `dedup`, `judge`: thresholds (see below). Only listed keys change.
+* Volume presets and their estimated Batch cost are documented next to the
+  numbers in each file. Prices live in **one** place, `config/settings.py`
+  (`BATCH_PRICING_USD_PER_M_TOKENS`, marked *verify current pricing*).
+
+### Output formats (`data/processed/`)
+
+```jsonc
+// pretrain.jsonl
+{"id": "pretrain__yor__00042__base", "language": "yor", "text": "...", "title": "...", "domain": "agriculture_crops",
+ "subtopic": "yam mound farming and storing yams", "genre": "how_to_guide", "register": "semi_formal", "audience": "farmers_rural",
+ "locale": "Abeokuta, Ogun State", "length_bucket": "medium", "perspective": "second_person", "era": "contemporary",
+ "difficulty": "basic", "n_words": 311}
+
+// sft.jsonl  (messages/text rendered through the real chat template; user = instruction [+ "\n\n" + input])
+{"id": "sft__hau__00007__base", "language": "hau", "task": "summarization", "domain": "...", "subtopic": "...",
+ "instruction": "...", "input": "...", "response": "...", "messages": [{"role": "system", ...}, {"role": "user", ...}, {"role": "assistant", ...}],
+ "text": "<s><|system|>...", "confidence": "high", "register": "...", "instruction_style": "...", "response_length": "...", "difficulty": "...", "locale": "..."}
+
+// dpo.jsonl
+{"id": "dpo__ibo__00003__base", "language": "ibo", "task": "...", "domain": "...", "instruction": "...", "input": "",
+ "prompt_messages": [{"role": "system", ...}, {"role": "user", ...}], "chosen": "...", "rejected": "...",
+ "rejection_type": "ignores_constraint", "chosen_confidence": "high", ...}
+```
+
+`processed/<kind>.judged.jsonl` (judge stage) adds `judge_scores`.
+`data/reports/<kind>_summary.json` has, per language: generated/kept, drop
+reasons (first reason per dropped record plus all reason hits), soft-warning
+counts, per-domain and per-task/genre counts, and coverage entropy / max-min
+ratio of the kept records, plus a few example ids per drop reason to inspect.
+
+### Quality filters (all local, no API)
+
+Applied in `quality/corpus_filters.py`; each drop is counted by reason.
+
+* **Parse/schema**: API error, refusal object, invalid JSON, schema mismatch, missing output.
+* **Length**: min/max words (pretrain, relative to the requested bucket) or chars (SFT/DPO fields).
+* **Repetition**: repeated word 4-gram ratio, repeated line/sentence ratio, single-token domination.
+* **English leakage**: share of English function words, with a higher tolerance for `pcm` (which shares vocabulary; a stricter word list is used) and none for the English side of translation tasks.
+* **Meta text / placeholders / refusals**: "Here is...", "As an AI...", `[...]`, `[name]`, `{{x}}`, code fences, English refusals (allowed only for the `safe_decline` task and for `unhelpful_refusal` rejected answers); markdown headings in pretraining text.
+* **Script sanity**: mostly non-Latin letters or U+FFFD = drop; missing distinctive diacritics/letters = *soft warning* counted in the report (`no_distinctive_chars:<field>`), never a drop.
+* **Confidence**: `confidence == low` / `chosen_confidence == low` and pretrain `language_self_check == false` dropped.
+* **DPO**: chosen != rejected (after normalisation), both non-empty, `rejection_type` echo matches the sampled one, rejected in the same language (except `wrong_language`), length ratio bounds (skipped for length-related flaws), refusal only tolerated where it is the flaw.
+* **Dedup** (`quality/dedup.py::find_near_duplicates`, sketch + inverted index, sub-quadratic): exact + near-duplicate (word-shingle Jaccard) within each language, then across the 12 languages of the same kind; earliest index wins.
+
+### Cost estimate (Batch API, gpt-4o-mini)
+
+From `python run.py estimate` (prompt sizes measured on real requests; output sizes from the sampled length
+buckets). Tokens per word were **measured with tiktoken `o200k_base`** (the gpt-4o-mini tokenizer) on the real
+sentences in `data/curated_eval.jsonl`: eng 1.11, hau 1.61, ibo 1.83, pcm 1.13, yor 2.31. The estimator uses those
+values rounded up (hau 1.8, ibo 2.0, yor 2.5, pcm 1.35); the languages with no measured sample (twi/aka 2.4, ful/fuv
+2.4, efi/urh 2.7, ewe 2.9, fon 3.0) are extrapolated and deliberately higher. Real spend is expected at or a little
+below the estimate.
+
+| kind | requests | input tokens | output tokens | est. USD |
+|---|---|---|---|---|
+| pretrain (4,000 x 12) | 48,000 | ~54.0M | ~40.2M | ~$16.1 |
+| sft (6,000 x 12) | 72,000 | ~80.5M | ~30.3M | ~$15.1 |
+| dpo (1,500 x 12) | 18,000 | ~23.1M | ~11.3M | ~$5.1 |
+| **all** | **138,000** | | | **~$36.4** |
+
+Range: ≈ $32 if the unmeasured languages tokenize like the measured ones, ≈ $43 with the old, more pessimistic
+multipliers (3.0-3.4 tokens/word). Input tokens dominate the uncertainty for SFT/DPO: they are measured, not
+estimated. Add ~5-10% for requests that fail validation but are still billed. Pricing: $0.075 / $0.30 per 1M
+input/output tokens (Batch; standard is $0.15 / $0.60), verified against OpenAI's pricing page on 2026-09-21 —
+re-check before a big run and edit `config/settings.py`. Optional judging adds roughly one short request per judged
+record.
+
+### Limitations (please read)
+
+* **gpt-4o-mini is materially weaker than gpt-4o in low-resource languages.**
+  Expect noticeably worse fluency, orthography, invented words and factual
+  slips in **Efik, Urhobo, Fon, Ewe and Fulah/Fulfulde** (and Nigerian
+  Fulfulde), and mediocre-but-usable output in Yoruba/Igbo/Hausa/Twi/Akan.
+  Local filters catch gross failures only; they cannot judge grammar. If budget
+  allows, generate the low-resource languages with a stronger model
+  (`--model gpt-4o-2024-08-06`, edit `model:`; the price table already has it).
+* **A native-speaker spot check of a sample per language is essential** before
+  training — e.g. 50-100 records per language and kind, focusing on the
+  low-resource ones, using the per-language reports and judge pass rates to
+  decide how much to trust each language. Drop or down-weight languages that fail.
+* **The LLM judge is a triage signal, not ground truth**: the same weak model
+  scoring text it cannot write well is lenient on exactly the languages that
+  need scrutiny. Use a stronger judge model for a sample and compare pass rates.
+* **Synthetic pretraining text should be a small, filtered supplement mixed
+  with real corpora, not a replacement.** Model-written text is more uniform
+  and cleaner than real text, can carry the generator's subtle errors, and
+  training on it at scale risks reinforcing them (model-collapse-style
+  effects). Mix it with real web/book/news data in these languages and keep its
+  share modest.
+* **Synthetic DPO with injected flaws is off-policy**: the rejected answers are
+  what a strong model *imagines* a weak one says, not what your SFT model
+  actually generates, so gains can be narrow (language fidelity, constraint
+  following) and may not transfer. For on-policy preference data later, sample
+  several answers from your SFT model per prompt and rank them with a judge
+  (or, for translation, a metric such as AfriCOMET), keeping confident pairs.
+* Factual content is only as good as the model's knowledge; prompts push
+  hedged, general statements and forbid invented statistics/quotes, but some
+  errors will remain. The `safe_decline` and proverb tasks are especially
+  worth reviewing by native speakers.
+
+### Tests
+
+```bash
+data-gen/.venv/bin/python -m pytest data-gen/tests -q      # no network, no API key needed
+```
+
+Covers taxonomy integrity, sampler balance/determinism/compatibility, yaml
+presets, request building (strict schemas, unique ids, English never a
+target), the quality filters on hand-made bad records, offline build -> mock
+-> postprocess -> stats loops for each kind (plus file splitting, judge
+build/apply, CLI wiring and the original six-task smoke flow), and the cost
+estimator.
+
 ## Layout
 
 ```
-config/            language roster + global settings (volume, model, weights)
+config/            language roster + global settings (volume, model, pricing), corpus_config.py (yaml loader)
+configs/           pretrain.yaml / sft.yaml / dpo.yaml presets (counts, weights, quality thresholds)
+sampling/          taxonomy.py (domains, genres, ...), locales.py, sampler.py (CoverageSampler)
 schemas/           Message/Conversation models, tool defs, strict-schema helpers
-templates/          chat_template.jinja (verbatim copy from the tokenizer)
+templates/          chat_template.jinja (copy of sabiyarn/chat_template.jinja; drift-tested)
 rendering/          deterministic Conversation -> training text
 documents/          chunker + sample docs + your own corpus/
-generators/         one module per task, each building BatchRequestSpec lists
-pipeline/           build_batch / submit_batch / fetch_results / postprocess
-quality/            validators + dedup
-stats/              run summary reporting
+generators/         one module per task, each building BatchRequestSpec lists; pretrain.py, sft_tasks.py, dpo.py for the corpus kinds
+pipeline/           build_batch / submit_batch / fetch_results / postprocess; build_corpus / estimate / postprocess_corpus / judge for the corpus kinds
+quality/            validators + dedup + corpus_filters
+stats/              run summary reporting (report.py, corpus_report.py)
 scripts/            mock_generate.py (free pipeline test, no API calls)
+tests/              pytest suite (offline)
 run.py              convenience dispatcher for all of the above
 ```

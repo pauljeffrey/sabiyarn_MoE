@@ -59,14 +59,17 @@ def main() -> None:
         if args.check_only or batch.status != "completed":
             continue
 
-        out_path = BATCH_OUTPUT_DIR / f"{entry['task']}.output.jsonl"
+        # Name outputs after the *source file* stem (== task for unsplit runs) so
+        # split runs (`sft__part0`, `sft__part1`) do not overwrite each other.
+        stem = Path(entry.get("source_file", f"{entry['task']}.jsonl")).stem
+        out_path = BATCH_OUTPUT_DIR / f"{stem}.output.jsonl"
         if batch.output_file_id:
             content = client.files.content(batch.output_file_id)
             out_path.write_bytes(content.read())
             print(f"  wrote {out_path}")
 
         if batch.error_file_id:
-            err_path = BATCH_OUTPUT_DIR / f"{entry['task']}.errors.jsonl"
+            err_path = BATCH_OUTPUT_DIR / f"{stem}.errors.jsonl"
             content = client.files.content(batch.error_file_id)
             err_path.write_bytes(content.read())
             print(f"  wrote {err_path} (request-level errors -- review these)")

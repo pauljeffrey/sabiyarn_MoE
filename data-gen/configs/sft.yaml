@@ -1,0 +1,134 @@
+# SFT (Alpaca-style: instruction / input / response) via the OpenAI Batch API
+#
+# Edit this file, then:  python run.py estimate --kind sft
+#                        python run.py build --kind sft --config configs/sft.yaml
+# Unknown keys are rejected on load (typos fail loudly).
+
+kind: sft
+model: gpt-4o-mini   # weaker than gpt-4o in low-resource languages -- see README
+temperature: 0.9
+max_tokens: 2000
+seed: 20240612
+
+# COST ESTIMATE (Batch API, gpt-4o-mini prices in config/settings.py -- verify current pricing):
+#   see `python run.py estimate --kind sft`;  ~$17.3 total for the preset (about $1.1-1.5 per language; ~81M input + ~38M output tokens)
+samples_per_language:
+  default: 6000   # examples per language; 12 languages => 72,000 requests (split into 2 batch files)
+  yor: 6000
+  hau: 6000
+  ibo: 6000
+  efi: 6000
+  urh: 6000
+  twi: 6000
+  fon: 6000
+  pcm: 6000
+  ewe: 6000
+  aka: 6000
+  ful: 6000
+  fuv: 6000
+
+# System prompt used when rendering `messages`/`text` (short multilingual-assistant prompt).
+system_prompt: "You are a helpful multilingual assistant for speakers of West African languages. Reply in the language the user writes in, clearly and accurately."
+
+domain_group_weights:   # 1.0 = every (domain, sub-topic) pair used equally often; 2.0 = twice as often; 0 = exclude group
+  culture_arts: 1.0
+  economy: 1.0
+  environment: 1.0
+  health: 1.0
+  knowledge: 1.0
+  livelihoods: 1.0
+  people: 1.0
+  society: 1.0
+  tech_infrastructure: 1.0
+
+attribute_weights:
+  task:   # relative share of each task type
+    open_qa: 1.3
+    factual_qa: 1.0
+    reading_comprehension: 1.0
+    summarization: 1.0
+    title_generation: 0.8
+    keyword_extraction: 0.8
+    translation_en_to_lang: 1.2
+    translation_lang_to_en: 1.2
+    paraphrase: 0.9
+    formality_rewrite: 0.9
+    grammar_correction: 0.8
+    text_classification: 1.0
+    ner_extraction: 0.8
+    info_extraction_json: 0.9
+    sentence_completion: 0.7
+    creative_story: 0.9
+    creative_poem: 0.7
+    letter_email_drafting: 1.0
+    explanation_howto: 1.1
+    brainstorming_list: 0.8
+    math_word_problem: 1.0
+    statistics_simple: 0.7
+    commonsense_reasoning: 0.8
+    logical_reasoning: 0.6
+    dialogue_continuation: 0.8
+    proverb_explanation: 0.7
+    data_to_text: 0.7
+    format_constrained: 1.0
+    safe_decline: 0.6
+    advice: 1.0
+    text_simplification: 0.7
+    question_generation: 0.6
+    compare_contrast: 0.7
+  register:   # how the user writes the request
+    formal: 1.0
+    semi_formal: 1.4
+    conversational: 1.4
+    colloquial: 0.8
+  instruction_style:
+    direct_command: 1.0
+    polite_request: 1.0
+    question_form: 1.0
+    terse_keywords: 0.6
+    context_first: 0.9
+    constraint_included: 0.8
+  response_length:
+    brief: 0.25
+    short: 0.35
+    medium: 0.28
+    long: 0.12
+  difficulty:
+    basic: 0.4
+    general: 0.45
+    advanced: 0.15
+
+quality:
+  max_repetition_ratio: 0.25   # share of repeated word 4-grams; above this = degenerate repetition
+  max_repeated_line_ratio: 0.35   # share of duplicated lines/sentences
+  max_top_token_share: 0.3   # one token making up more than this share of a 30+ word text
+  max_english_ratio: 0.15   # share of tokens that are common English stopwords (English-leak filter)
+  max_english_ratio_by_language: {pcm: 0.3}   # per-language override; pcm (Nigerian Pidgin) legitimately shares vocabulary (uses a stricter word list too)
+  min_english_check_tokens: 8   # texts shorter than this are not leak-checked (too noisy)
+  max_non_latin_ratio: 0.2   # share of non-Latin letters => wrong script
+  drop_low_confidence: true   # drop records the model itself marked confidence=low
+  drop_meta_text: true   # drop 'Here is...', 'As an AI', [...] placeholders, code fences, refusals
+  min_instruction_chars: 6
+  max_instruction_chars: 1500
+  max_input_chars: 5000
+  min_response_chars: 1
+  max_response_chars: 6000
+
+dedup:
+  near_dup_threshold: 0.8   # word-shingle Jaccard at/above which a later record is dropped
+  shingle_size: 5
+  within_language: true
+  cross_language: true   # also dedup across the 12 languages of this kind
+
+judge:   # optional stage, see pipeline/judge.py
+  model: gpt-4o-mini   # a stronger judge (e.g. gpt-4o) is more reliable for low-resource languages
+  temperature: 0.0
+  max_tokens: 300
+  sample_fraction: 0.2   # share of records judged per language (1.0 = all)
+  min_scores:
+    language_correctness: 4
+    fluency: 3
+    factuality: 3
+    instruction_following: 3
+    usefulness: 3
+  drop_unjudged: false   # records outside the judged sample are kept unless true

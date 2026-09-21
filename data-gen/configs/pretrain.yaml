@@ -1,0 +1,151 @@
+# Pretraining documents (plain text) via the OpenAI Batch API
+#
+# Edit this file, then:  python run.py estimate --kind pretrain
+#                        python run.py build --kind pretrain --config configs/pretrain.yaml
+# Unknown keys are rejected on load (typos fail loudly).
+
+kind: pretrain
+model: gpt-4o-mini   # weaker than gpt-4o in low-resource languages (efi, urh, fon, ewe, ful, fuv) -- see README
+temperature: 0.9
+max_tokens: 3000    # long bucket = up to ~700 words x ~3.4 tokens/word
+seed: 20240611      # same seed scheme for every language => identical coverage structure
+
+# COST ESTIMATE (Batch API, gpt-4o-mini prices in config/settings.py -- verify current pricing):
+#   see `python run.py estimate --kind pretrain`;  ~$19.2 total for the preset (about $1.1-1.8 per language; ~54M input + ~51M output tokens at the conservative tokens-per-word multipliers)
+samples_per_language:
+  default: 4000   # documents per language; 12 languages => 48,000 requests
+  yor: 4000
+  hau: 4000
+  ibo: 4000
+  efi: 4000
+  urh: 4000
+  twi: 4000
+  fon: 4000
+  pcm: 4000
+  ewe: 4000
+  aka: 4000
+  ful: 4000
+  fuv: 4000
+
+domain_group_weights:   # 1.0 = every (domain, sub-topic) pair used equally often; 2.0 = twice as often; 0 = exclude group
+  culture_arts: 1.0
+  economy: 1.0
+  environment: 1.0
+  health: 1.0
+  knowledge: 1.0
+  livelihoods: 1.0
+  people: 1.0
+  society: 1.0
+  tech_infrastructure: 1.0
+
+attribute_weights:   # target shares; least-used-first keeps the marginal counts on these targets. 0 disables a value.
+  genre:
+    news_report: 1.0
+    explainer: 1.0
+    blog_post: 1.0
+    dialogue: 1.0
+    letter: 1.0
+    short_story: 1.0
+    how_to_guide: 1.0
+    faq: 1.0
+    encyclopedia_entry: 1.0
+    opinion_piece: 1.0
+    interview: 1.0
+    speech: 1.0
+    radio_script: 1.0
+    forum_post: 1.0
+    product_description: 1.0
+    lecture_notes: 1.0
+    folktale: 1.0
+    poem_song_lyrics: 1.0
+    personal_narrative: 1.0
+    public_notice: 1.0
+    review: 1.0
+    case_study: 1.0
+    sermon_devotional: 1.0
+    social_media_thread: 1.0
+    meeting_minutes: 1.0
+    textbook_passage: 1.0
+    advice_column: 1.0
+    profile_feature: 1.0
+  register:
+    formal: 1.0
+    semi_formal: 1.4
+    conversational: 1.4
+    colloquial: 0.8
+    technical: 0.6
+    literary: 0.6
+    child_friendly: 0.4
+  audience:
+    general_public: 1.6
+    secondary_students: 1.0
+    university_students: 0.7
+    children: 0.5
+    teenagers: 0.8
+    young_adults: 1.0
+    professionals: 0.6
+    small_business_owners: 0.8
+    farmers_rural: 0.8
+    parents: 0.8
+    elders: 0.5
+    women_groups: 0.6
+    community_leaders: 0.5
+    newcomers_migrants: 0.4
+  length_bucket:   # short 120-220 / medium 250-420 / long 450-700 words
+    short: 0.35
+    medium: 0.45
+    long: 0.2
+  perspective:
+    first_person: 0.25
+    second_person: 0.15
+    third_person: 0.35
+    collective_we: 0.15
+    dialogic: 0.1
+  era:
+    contemporary: 0.6
+    traditional_heritage: 0.15
+    historical: 0.1
+    generational_contrast: 0.15
+  difficulty:
+    basic: 0.4
+    general: 0.45
+    advanced: 0.15
+  # locale: uniform over each language's pool in sampling/locales.py (not overridable per language here)
+
+quality:
+  max_repetition_ratio: 0.25   # share of repeated word 4-grams; above this = degenerate repetition
+  max_repeated_line_ratio: 0.35   # share of duplicated lines/sentences
+  max_top_token_share: 0.3   # one token making up more than this share of a 30+ word text
+  max_english_ratio: 0.15   # share of tokens that are common English stopwords (English-leak filter)
+  max_english_ratio_by_language: {pcm: 0.3}   # per-language override; pcm (Nigerian Pidgin) legitimately shares vocabulary (uses a stricter word list too)
+  min_english_check_tokens: 8   # texts shorter than this are not leak-checked (too noisy)
+  max_non_latin_ratio: 0.2   # share of non-Latin letters => wrong script
+  drop_low_confidence: true   # drop records the model itself marked confidence=low
+  drop_meta_text: true   # drop 'Here is...', 'As an AI', [...] placeholders, code fences, refusals
+  min_words: 60   # absolute minimum words
+  max_words: 1100   # absolute maximum words
+  bucket_min_ratio: 0.5   # need at least this fraction of the requested length bucket's lower bound
+  bucket_max_ratio: 2.0   # at most this multiple of the bucket's upper bound
+  min_title_chars: 3
+  max_title_chars: 200
+  drop_on_self_check_false: true   # drop documents where the model set language_self_check=false
+  drop_markdown_headings: true   # no markdown headings in pretraining text
+
+dedup:
+  near_dup_threshold: 0.8   # word-shingle Jaccard at/above which a later record is dropped
+  shingle_size: 5
+  within_language: true
+  cross_language: true   # also dedup across the 12 languages of this kind
+
+judge:   # optional stage, see pipeline/judge.py
+  model: gpt-4o-mini   # a stronger judge (e.g. gpt-4o) is more reliable for low-resource languages
+  temperature: 0.0
+  max_tokens: 300
+  sample_fraction: 0.2   # share of records judged per language (1.0 = all)
+  min_scores:
+    language_correctness: 4
+    fluency: 3
+    factuality: 3
+    instruction_following: 3
+    usefulness: 3
+  drop_unjudged: false   # records outside the judged sample are kept unless true
