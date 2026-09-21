@@ -110,7 +110,17 @@ def _expand_attn_mask(attn_mask, query_len, total_len, n_heads, has_past, device
                 f"Unsupported attention_mask shape {attn_mask.shape}; "
                 f"expected (B, {query_len}) or (B, {total_len})"
             )
-        attn_mask = attn_mask.view(b, 1, 1, total_len).expand(b, 1, query_len, total_len)
+        # A 2D mask is a *padding* mask (B, keys): it says which keys exist, not who may see whom. It must
+        # be combined with the causal mask, otherwise every query sees every later token (future leakage
+        # in prefill / batched generate). Query i sits at absolute position past_len + i.
+        past_len = total_len - query_len
+        causal = torch.ones(query_len, total_len, device=device, dtype=torch.bool).tril(diagonal=past_len)
+        pad = attn_mask.view(b, 1, 1, total_len)
+        attn_mask = pad & causal.view(1, 1, query_len, total_len)
+        # A left-padded query row has no visible key at all -> softmax over all -inf gives NaN. Let such
+        # rows fall back to plain causal attention; their output is never used.
+        empty = ~attn_mask.any(dim=-1, keepdim=True)
+        attn_mask = attn_mask | (empty & causal.view(1, 1, query_len, total_len))
         attn_mask = attn_mask.expand(-1, n_heads, -1, -1)
     elif attn_mask.dim() == 4:
         if attn_mask.size(-2) != query_len:
@@ -635,8 +645,7 @@ class GPTJXMoEForCausalLM(PreTrainedModel, GenerationMixin):
                 f"Cannot forward sequence of length {total_len}, block size is {self.config.block_size}"
             )
 
-        pos_1d = pos[0] if pos.dim() == 2 else pos
-        pos_emb = self.transformer.wpe(pos_1d)
+        pos_emb = self.transformer.wpe(pos)  # (t,) -> (t, C); per-row (b, t) -> (b, t, C)
         if pos_emb.dim() == 2:
             pos_emb = pos_emb.unsqueeze(0).expand(b, -1, -1)
 
