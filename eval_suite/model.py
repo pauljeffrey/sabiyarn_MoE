@@ -17,6 +17,8 @@ from typing import Optional
 
 import torch
 
+from sabiyarn.chat import use_sabiyarn_chat_template
+
 STOP_STRINGS = ("</s>", "<translate>", "<classify>", "<NER>", "<|user|>", "<|assistant|>")
 
 
@@ -29,6 +31,7 @@ class ModelRunner:
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
         dtype = torch.bfloat16 if self.device.startswith("cuda") else torch.float32
         self.tok = AutoTokenizer.from_pretrained(tokenizer_name, trust_remote_code=True, token=token)
+        use_sabiyarn_chat_template(self.tok)  # the Hub tokenizer's copy can be stale; --style chat must match SFT data
         if model_code == "local":
             from sabiyarn.model.modeling import GPTJXMoEForCausalLM
 
