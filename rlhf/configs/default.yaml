@@ -1,0 +1,55 @@
+# AfriCOMET-guided translation RL for SabiYarn.   see HOW_TO_RUN.md ("AfriCOMET RL")
+#   1) (optional) python rlhf/scripts/run_sft.py                        warm-start on the translation data
+#   2) python rlhf/scripts/run_rlhf.py model_path=outputs/translate-sft/final
+#   3) python -m eval_suite.run --model outputs/rlhf/final --tasks translation --style chat --africomet masakhane/africomet-stl
+# Every key is an RLConfig field (rl/config.py); override with RL_<FIELD>=... or key=value on the command line.
+algo: rl
+
+model:
+  model_path: Aletheia-ng/SabiYarn_MoE-280M       # was google/gemma-3-270m-it; use outputs/translate-sft/final after SFT
+  tokenizer: BeardedMonster/SabiYarn-32k
+  model_code: local
+  param_dtype: float32
+  moe_dispatch: sparse
+
+data:
+  dataset_id: Aletheia-ng/tds-sft                  # instruction / input / response columns
+  dataset_split: train
+  max_samples: 10000                               # prompts for RL (SFT: raise it, e.g. RL_MAX_SAMPLES=50000)
+  eval_samples: 200
+  max_prompt_len: 320
+  max_seq_len: 512
+
+train:
+  batch_size: 2                                    # prompts per GPU per micro-step ...
+  grad_accum_steps: 4                              # ... x this = prompts per optimizer step per GPU (8), x group_size samples
+  epochs: 1
+  max_steps: 1000
+  learning_rate: 1.0e-6                            # RL: 5e-7 .. 2e-6
+  warmup_ratio: 0.1
+  scheduler: cosine
+  grad_clip: 1.0
+  mixed_precision: bf16
+  eval_every: 100
+  save_every: 250
+  log_every: 5
+
+rl:
+  group_size: 4                                    # completions per prompt (advantage = reward - group mean)
+  max_new_tokens: 128
+  temperature: 1.0
+  top_p: 1.0
+  kl_coef: 0.05                                    # raise it if the reward climbs while chrF++/BLEU (eval_suite) fall
+  advantage_std_norm: true
+  rl_micro_batch: 16
+  reward: africomet                                # africomet | chrf
+  reward_id: masakhane/africomet-stl
+  reward_python: null                              # e.g. .venv-comet/bin/python  (unbabel-comet needs transformers<5)
+  reward_batch_size: 16
+  reward_gpu: true
+
+output:
+  out_dir: outputs/rlhf
+  hf_push_repo_id: null                            # e.g. Aletheia-ng/SabiYarn_MoE-280M-translate (HF_WRITE_TOKEN in .env)
+  mlflow: true
+  mlflow_experiment: sabiyarn-translate-rl

@@ -1,0 +1,52 @@
+# Post-training preset: DPO on data-gen's dpo.jsonl.  python -m rl.run     (torchrun ... -m rl.run for N GPUs)
+# Every key is an RLConfig field (rl/config.py); override any of them as RL_<FIELD>=value or `key=value` on the
+# command line. Sections are only for readability.
+algo: dpo
+
+model:
+  model_path: Aletheia-ng/SabiYarn_MoE-280M   # a checkpoint dir (out_280M/<run>/ckpt_best) or a Hub id: the policy's start
+  tokenizer: BeardedMonster/SabiYarn-32k
+  model_code: local          # local = sabiyarn/model/*.py from this repo (sparse MoE, flex) | hub
+  param_dtype: float32       # fp32 master weights + bf16 autocast, as in training/
+  moe_dispatch: sparse
+  reference_path: null       # null = frozen copy of the starting policy
+
+data:
+  data_path: data-gen/data/processed/dpo.jsonl    # or dataset_id: <hub dataset with the same columns>
+  languages: []              # e.g. [yor, hau]; empty = all
+  max_samples: 0
+  eval_samples: 500
+  max_prompt_len: 512
+  max_seq_len: 1024
+
+train:
+  batch_size: 4              # pairs per GPU per micro-step  ->  8 sequences (chosen + rejected) per forward
+  grad_accum_steps: 4        # effective batch = 4 x 4 x n_gpus pairs
+  epochs: 1
+  max_steps: 0
+  learning_rate: 5.0e-7      # DPO: 1e-7 .. 1e-6. A ~300M model tolerates the top of that range.
+  min_lr: 0.0
+  warmup_ratio: 0.1
+  scheduler: cosine
+  weight_decay: 0.0
+  grad_clip: 1.0
+  mixed_precision: bf16
+  eval_every: 100
+  save_every: 500
+  log_every: 10
+
+dpo:
+  beta: 0.1                  # 0.05 .. 0.5; lower = allowed to move further from the reference
+  dpo_loss: sigmoid          # sigmoid | ipo | hinge
+  label_smoothing: 0.0
+  length_normalize: false
+  sft_alpha: 0.0             # try 0.1 if chosen log-probs fall during training
+
+output:
+  out_dir: outputs/dpo
+  hf_push_repo_id: null      # e.g. Aletheia-ng/SabiYarn_MoE-280M-dpo  (needs HF_WRITE_TOKEN in .env)
+  s3_prefix: null
+  mlflow: true
+  mlflow_tracking_uri: null  # MLFLOW_TRACKING_URI wins; modal_rl.py points it at the volume
+  mlflow_experiment: sabiyarn-posttraining
+  run_name: null

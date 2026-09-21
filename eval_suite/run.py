@@ -22,8 +22,25 @@ ALL_TASKS = ["translation", "topic", "sentiment", "ner", "mmlu"]
 
 
 def make_africomet(model_name: str, batch_size: int = 16):
-    """Optional reference-based AfriCOMET score (needs `pip install unbabel-comet`). Also the metric
-    you would use as an RL reward; report it next to chrF++ so reward hacking shows up as a gap."""
+    """Optional reference-based AfriCOMET score. Also the metric you would use as an RL reward; report it next
+    to chrF++ so reward hacking shows up as a gap.
+
+    `unbabel-comet` pins transformers<5 and cannot share this environment (requirements.txt). Point
+    AFRICOMET_PYTHON at a Python that has it (python -m venv .venv-comet && .venv-comet/bin/pip install
+    unbabel-comet) and it is scored in a subprocess (rl/comet_worker.py); otherwise it is imported directly."""
+    python = os.environ.get("AFRICOMET_PYTHON")
+    if python:
+        from rl.rewards import CometWorkerReward
+
+        worker = CometWorkerReward(python, model_name, batch_size, use_gpu=True)
+
+        def score(srcs, hyps, refs):
+            items = [{"source": s, "reference": r} for s, r in zip(srcs, refs)]
+            vals = worker(items, list(hyps))
+            return sum(vals) / max(len(vals), 1)  # system score = mean segment score
+
+        return score
+
     from comet import download_model, load_from_checkpoint
 
     import torch
