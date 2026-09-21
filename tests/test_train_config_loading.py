@@ -97,3 +97,20 @@ def test_normalize_list_sections_tolerates_comment_lines_mid_block():
     parsed = yaml.safe_load(_normalize_list_sections(text))
     assert parsed["data"]["pretrain"]["eng_train_data_path"] == "a.bin"
     assert parsed["data"]["pretrain"]["eval_data_path"] == "b.bin"
+
+
+def test_ddp_enabled_selects_strategy(monkeypatch):
+    from training.load_config import _resolve_distributed
+    monkeypatch.delenv("DISTRIBUTED", raising=False)
+    assert _resolve_distributed({"enabled": True}, {}) == "ddp"
+    assert _resolve_distributed({"enabled": False}, {"distributed": "ddp"}) == "fsdp"
+    assert _resolve_distributed({}, {"distributed": "fsdp"}) == "fsdp"   # legacy key still honoured
+    assert _resolve_distributed({}, {}) == "ddp"
+    monkeypatch.setenv("DISTRIBUTED", "FSDP")
+    assert _resolve_distributed({"enabled": True}, {}) == "fsdp"          # env wins
+
+
+def test_yaml_default_is_ddp_bf16(monkeypatch):
+    monkeypatch.delenv("DISTRIBUTED", raising=False)
+    cfg = load_train_config("training/train_config.yaml")
+    assert cfg.distributed == "ddp" and cfg.mixed_precision in ("bf16", "bfloat16")

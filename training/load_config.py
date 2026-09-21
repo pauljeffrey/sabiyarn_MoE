@@ -323,6 +323,9 @@ class TrainConfig:
     use_scheduled_sampling: bool = False
     eng_sampling_weight: float = 0.5
     afr_sampling_weight: float = 0.5
+    # Optional piecewise-linear schedule [(progress in [0,1], afr_weight), ...]. When set (and
+    # use_scheduled_sampling is on) it replaces the default cosine swap; eng = 1 - afr.
+    sampling_schedule: tuple = ()
 
     # s3
     s3_endpoint: Optional[str] = None
@@ -356,6 +359,10 @@ class TrainConfig:
 
     # accelerate / fsdp
     fsdp_sharding_strategy: str = "FULL_SHARD"  # NO_SHARD | SHARD_GRAD_OP | FULL_SHARD | HYBRID_SHARD
+    # "ddp": plain DistributedDataParallel (every GPU holds the whole model; the right choice for a
+    # ~300M model and required for Muon). "fsdp": shard model/optimizer state per
+    # fsdp_sharding_strategy. Env override: DISTRIBUTED.
+    distributed: str = "ddp"
     gradient_clipping: float = 1.0
 
     # weight-freeze policy
@@ -375,26 +382,62 @@ class TrainConfig:
         return self.mode.lower() == "pretrain"
 
 
+def parse_sampling_schedule(raw: Any) -> tuple:
+    """Validate `data.sampling.schedule`: [[progress, afr_weight], ...] -> sorted tuple of floats.
+
+    Progress is the fraction of the run (iter_num / max_iters); afr_weight is the share of each batch
+    drawn from the African bin at that point (English gets 1 - afr_weight). Weights are interpolated
+    linearly between knots and held flat before the first / after the last knot.
+    """
+    if not raw:
+        return ()
+    knots = []
+    for k in raw:
+        if not isinstance(k, (list, tuple)) or len(k) != 2:
+            raise ValueError(f"data.sampling.schedule entries must be [progress, afr_weight], got {k!r}")
+        p, w = float(k[0]), float(k[1])
+        if not (0.0 <= p <= 1.0) or not (0.0 <= w <= 1.0):
+            raise ValueError(f"data.sampling.schedule knot {k!r}: progress and afr_weight must be in [0, 1]")
+        knots.append((p, w))
+    knots.sort()
+    if len({p for p, _ in knots}) != len(knots):
+        raise ValueError("data.sampling.schedule has duplicate progress values")
+    return tuple(knots)
+
+
 def sampling_weights(
     eng_weight: float,
     afr_weight: float,
     iter_num: int,
     max_iters: int,
     use_scheduled_sampling: bool,
+    schedule: tuple = (),
 ) -> tuple[float, float]:
     """(eng_weight, afr_weight) for picking between the eng/afr training bins.
 
-    Fixed mode holds the configured preset (normalized to sum to 1) for the whole
-    run. Scheduled mode starts at that preset and cosine-anneals toward the
-    swapped ratio by max_iters -- early training leans on whichever language
-    starts heavier (typically English, for linguistic grounding) and gradually
-    shifts sampling weight onto the other as training progresses.
+    Fixed mode holds the configured preset (normalized to sum to 1) for the whole run.
+    Scheduled mode with a `schedule` follows its piecewise-linear afr_weight curve over
+    progress = iter_num / max_iters. Scheduled mode without one cosine-anneals from the preset
+    toward the swapped ratio by max_iters. Either way it is a pure function of iter_num, so every
+    rank computes the same weights and a resumed run continues exactly where it left off.
     """
     total = eng_weight + afr_weight
     eng0, afr0 = (0.5, 0.5) if total <= 0 else (eng_weight / total, afr_weight / total)
     if not use_scheduled_sampling:
         return eng0, afr0
     progress = min(1.0, iter_num / max(1, max_iters))
+    if schedule:
+        if progress <= schedule[0][0]:
+            afr_w = schedule[0][1]
+        elif progress >= schedule[-1][0]:
+            afr_w = schedule[-1][1]
+        else:
+            afr_w = schedule[-1][1]
+            for (p0, w0), (p1, w1) in zip(schedule, schedule[1:]):
+                if p0 <= progress <= p1:
+                    afr_w = w0 + (w1 - w0) * (progress - p0) / (p1 - p0)
+                    break
+        return 1.0 - afr_w, afr_w
     coeff = 0.5 * (1.0 - math.cos(math.pi * progress))  # 0 -> 1 over training
     eng_w = eng0 + (afr0 - eng0) * coeff
     return eng_w, 1.0 - eng_w
@@ -412,6 +455,21 @@ def _optimizer_name(raw: Any) -> str:
 def _env_bool(name: str, default: bool) -> bool:
     raw = os.getenv(name)
     return default if raw is None else raw.strip().lower() in ("1", "true", "yes", "on")
+
+
+def _resolve_distributed(ddp: dict, accelerate: dict) -> str:
+    """"ddp" | "fsdp". Precedence: env DISTRIBUTED > `ddp.enabled` (true=DDP, false=FSDP) >
+    legacy `accelerate.distributed` > "ddp"."""
+    env = os.getenv("DISTRIBUTED")
+    if env:
+        return env.strip().lower()
+    if ddp.get("enabled") is not None:
+        return "ddp" if _env_bool_value(ddp["enabled"]) else "fsdp"
+    return str(accelerate.get("distributed", "ddp")).lower()
+
+
+def _env_bool_value(v) -> bool:
+    return v if isinstance(v, bool) else str(v).strip().lower() in ("1", "true", "yes", "on")
 
 
 def load_train_config(path: Optional[str] = None) -> TrainConfig:
@@ -552,6 +610,7 @@ def load_train_config(path: Optional[str] = None) -> TrainConfig:
         use_scheduled_sampling=bool(sampling_cfg.get("use_scheduled_sampling", False)),
         eng_sampling_weight=float(sampling_cfg.get("eng_sampling_weight", 0.5)),
         afr_sampling_weight=float(sampling_cfg.get("afr_sampling_weight", 0.5)),
+        sampling_schedule=parse_sampling_schedule(sampling_cfg.get("schedule")),
         s3_endpoint=s3.get("s3_endpoint") or os.getenv("S3_ENDPOINT"),
         s3_bucket=s3.get("s3_bucket_name") or os.getenv("S3_BUCKET"),
         s3_access_key=s3.get("s3_access_key_id") or os.getenv("S3_ACCESS_KEY_ID"),
@@ -583,6 +642,7 @@ def load_train_config(path: Optional[str] = None) -> TrainConfig:
         num_nodes=int(modal_cfg.get("num_nodes", 1)),
         mixed_precision=mixed_precision,
         fsdp_sharding_strategy=str(accelerate.get("fsdp_sharding_strategy", "FULL_SHARD")).upper(),
+        distributed=_resolve_distributed(ddp, accelerate),
         gradient_clipping=float(accelerate.get("gradient_clipping", training.get("grad_clip", 1.0))),
         freeze_experts_only=bool(weights_cfg.get("freeze_experts_only", False)),
         freeze_pos_layer_only=bool(weights_cfg.get("freeze_pos_layer_only", False)),

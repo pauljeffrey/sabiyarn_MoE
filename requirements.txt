@@ -1,28 +1,57 @@
-accelerate>=0.34.0
-bitsandbytes==0.45.1
-datasets==4.0.0 #3.2.0
-fairscale==0.4.13
-# fastapi==0.115.8
-fire==0.7.0
-huggingface_hub==0.34.4
+# One requirements file for everything: training (vast.ai / bare box / Modal images), the eval suite,
+# data prep and tests.   pip install -r requirements.txt
+#
+# Chosen for sabiyarn/model/modeling.py + configuration.py:
+#   * transformers 5.x API: `_tied_weights_keys` as a dict, `all_tied_weights_keys`,
+#     `mark_tied_weights_as_initialized(loading_info)`, `get_expanded_tied_weights_keys`. The file
+#     says "4.x-5.x" but is written against 5.x, and every checkpoint was saved by 5.14.1 (see
+#     config.json's transformers_version) -- pinned exactly so a rented box behaves like the run
+#     that produced the weights.
+#   * torch >= 2.8: FlexAttention (torch.nn.attention.flex_attention, needs >= 2.5 and is far more
+#     robust from 2.7 on), scaled_dot_product_attention with explicit masks, bf16 autocast.
+#   * huggingface_hub is deliberately NOT pinned: transformers 5 requires 1.x (the old 0.34 pin
+#     conflicts), and datasets/tokenizers/safetensors follow from it.
+#
+# torch is a normal requirement, but on a rented GPU box prefer an image that already ships a CUDA
+# build of torch >= 2.8 -- the constraint is then already satisfied and nothing large is downloaded.
+torch>=2.8.0
+transformers==5.14.1
+accelerate>=1.10.0,<2
+safetensors>=0.5.0
+huggingface_hub
+tokenizers
+numpy>=1.26
+PyYAML>=6.0
+omegaconf>=2.3
 python-dotenv
-modal==1.5.1
-numpy==2.1.2
-omegaconf==2.3.0
-pydantic==2.10.6
-pynvml==12.0.0
-PyYAML==6.0.2
-sentencepiece==0.2.0
-setuptools==75.8.0
-structlog==25.1.0
-torch==2.8.0
-tqdm==4.67.1
-triton==3.4.0
-wandb==0.19.5
-mlflow>=2.16.0
-transformers==4.55.0
-safetensors==0.4.5
+structlog>=24.1
+tqdm
+boto3>=1.34
+
+# experiment tracking (mlflow's system metrics need psutil, and nvidia-ml-py for GPU stats)
+mlflow>=2.16
+wandb>=0.19
 psutil
-GPUtil
-lmdb==1.7.3
-boto3>=1.34.0
+nvidia-ml-py
+
+# data prep, eval_suite (translation metrics), rl/ (chrF reward) and the legacy eval/eval.py
+datasets>=4.0
+sacrebleu>=2.4
+scikit-learn
+
+# launching runs on Modal from your laptop (`modal run ...`); not needed on a vast.ai box
+modal>=1.5
+
+# tests: pytest tests/
+pytest
+
+# optional, not installed by default:
+#   unbabel-comet   -> AfriCOMET (eval_suite --africomet, rlhf/ + rl/ `reward: africomet`). NOT installable here:
+#                      it pins transformers<5, huggingface_hub<1 and numpy<2, which conflicts with the
+#                      transformers==5.14.1 above. Put it in its own virtualenv and point `reward_python` at it
+#                      (rl/comet_worker.py talks to it over a pipe; see HOW_TO_RUN.md "AfriCOMET RL"):
+#                          python -m venv .venv-comet && .venv-comet/bin/pip install unbabel-comet
+#                      (rlhf/requirements.txt's peft, bitsandbytes, sentencepiece and protobuf are not needed:
+#                       the 300M model is fully fine-tuned and its tokenizer is byte-level BPE.)
+#   fairscale       -> legacy sabiyarn/generation.py only
+#   fastapi pydantic-> inference/modal_hosting.py only

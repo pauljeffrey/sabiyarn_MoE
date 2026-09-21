@@ -12,7 +12,7 @@ References
     decay unchanged instead of needing its own sweep.
 
 Not compatible with FSDP: Newton-Schulz needs the full matrix, and FSDP hands
-each rank a flat shard. Use DDP (training/new_train_ddp.py) or one GPU.
+each rank a flat shard. Use DDP (`ddp.enabled: true`) or one GPU.
 """
 
 from __future__ import annotations

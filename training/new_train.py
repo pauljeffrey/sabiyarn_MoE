@@ -32,10 +32,12 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from training.constant_tokens import MASK, assistant_token, end_of_text_token, system_token, user_token
 from training.label_masking import apply_label_mask
+from sabiyarn.hub import register_local_model_code  # noqa: F401  (re-exported for tests)
 from training.load_config import TrainConfig, load_train_config, sampling_weights
 from training.mfu import compute_mfu, model_flops_per_token, peak_flops_for_current_device
 from training.lr_schedule import lr_at
 from training.muon import Muon, split_muon_params
+from training.data_sampler import MixedBlockSampler, n_blocks_for, read_blocks
 from training.curated_eval import CuratedTotals, build_sequence, load_curated_samples, resolve_path
 from training.tracking import MlflowTracker, bits_per_byte, build_token_byte_lengths
 from training.s3_utils import (
@@ -264,7 +266,9 @@ class Trainer:
         self.cfg.gradient_accumulation_steps = max(1, self.cfg.gradient_accumulation_steps)
 
         fsdp_plugin = None
-        if world_size_env > 1 and self.cfg.fsdp_sharding_strategy != "NO_SHARD":
+        # DDP is the default (cfg.distributed); FSDP only when explicitly requested. With no
+        # fsdp_plugin, Accelerate wraps a multi-process run in plain DDP.
+        if world_size_env > 1 and self.cfg.distributed == "fsdp" and self.cfg.fsdp_sharding_strategy != "NO_SHARD":
             # Accelerator.__init__ is documented to set this itself when a
             # fsdp_plugin is passed, but a 2026-08-01 run read WORLD_SIZE=4
             # correctly here (confirmed via distributed_env_check) yet still
@@ -340,6 +344,35 @@ class Trainer:
             * self.cfg.gradient_accumulation_steps * getattr(self, "world_size", 1)
         )
 
+    def _build_samplers(self) -> None:
+        """No-repeat epoch samplers (training/data_sampler.py): one global stream per training bin,
+        each cut into non-overlapping block_size windows and reshuffled every epoch, identical on
+        every rank and split across ranks. Two extra fixed samplers give evals the SAME blocks every
+        time (the old evals drew fresh random windows, so eval curves carried sampling noise)."""
+        sl, bs = self.cfg.block_size, self.cfg.train_batch_size
+        rank = self.accelerator.process_index
+        names = [os.path.splitext(os.path.basename(p))[0] for p in self.train_bins]
+        blocks = [n_blocks_for(len(self._read_memmap(p)), sl) for p in self.train_bins]
+        eval_name = os.path.splitext(os.path.basename(self.eval_bin))[0]
+        eval_blocks = n_blocks_for(len(self._read_memmap(self.eval_bin)), sl)
+        common = dict(batch_size=bs, world_size=self.world_size, rank=rank)
+        self.sampler = MixedBlockSampler(names, blocks, seed=self.cfg.seed, **common)
+        self._eval_train_sampler = MixedBlockSampler(names, blocks, seed=self.cfg.seed + 1, **common)
+        self._eval_val_sampler = MixedBlockSampler([eval_name], [eval_blocks], seed=self.cfg.seed + 2, **common)
+        if self.master:
+            LOG.info(
+                "data_blocks", block_size=sl,
+                bins={n: {"blocks": b, "tokens_b": round(b * sl / 1e9, 3)} for n, b in zip(names, blocks)},
+                eval_blocks=eval_blocks,
+            )
+
+    def _bin_weights(self) -> tuple[float, ...]:
+        if len(self.train_bins) == 1:
+            return (1.0,)
+        if len(self.train_bins) == 2:
+            return self._sampling_weights()
+        return tuple([1.0 / len(self.train_bins)] * len(self.train_bins))
+
     def _resolve_max_iters(self) -> None:
         """If training.max_tokens / optimizer.max_tokens is set, derive max_iters from
         it using the REAL tokens per optimizer step (gradient_accumulation_steps has
@@ -364,6 +397,7 @@ class Trainer:
         if self.cfg.model_code == "local":
             from sabiyarn.model.modeling import GPTJXMoEForCausalLM
 
+            register_local_model_code()
             return GPTJXMoEForCausalLM.from_pretrained(path, **kwargs)
         return AutoModelForCausalLM.from_pretrained(path, trust_remote_code=True, **kwargs)
 
@@ -738,6 +772,7 @@ class Trainer:
         self.eval_bin = self.cfg.eval_data_path
         # trust_remote_code=True: see training/constant_tokens.py (interactive prompt on a tty).
         self.tokenizer = AutoTokenizer.from_pretrained(self.cfg.tokenizer_name, trust_remote_code=True)
+        self._build_samplers()
         LOG.info(
             "data_ready",
             mode=self.cfg.mode,
@@ -872,8 +907,8 @@ class Trainer:
         if self.cfg.optimizer_name == "muon":
             if self.fsdp_plugin is not None:
                 raise ValueError(
-                    "optimizer.name: muon needs whole weight matrices, which FSDP shards away. Use DDP "
-                    "(torchrun -m training.new_train_ddp / modal_train_ddp.py) or a single GPU, or set "
+                    "optimizer.name: muon needs whole weight matrices, which FSDP shards away. Set "
+                    "ddp.enabled: true (the default) or use a single GPU, or set "
                     "optimizer.name: adamw."
                 )
             n_embd = self.model.config.n_embd
@@ -958,6 +993,18 @@ class Trainer:
                     self.tokens_seen_by_bin = {}
                     self._tokens_seen_estimated = True
                 self.tokens_seen_offset = int(meta.get("tokens_seen_offset", 0))
+                # Data position: continue mid-epoch instead of replaying batches already trained on.
+                # Not restored for a fresh start (new run, new epoch 0), for resume-from-best (its
+                # data position wasn't recorded), or for checkpoints from before this sampler existed.
+                if meta.get("sampler") and not resume_from_best and not self._fresh_start_active:
+                    skipped = self.sampler.load_state_dict(meta["sampler"])
+                    LOG.info("sampler_state_restored", epochs=self.sampler.epochs_done(), reset_bins=skipped)
+                else:
+                    LOG.info(
+                        "sampler_state_fresh",
+                        reason="fresh_start" if self._fresh_start_active else (
+                            "resume_from_best" if resume_from_best else "checkpoint has no sampler state"),
+                    )
                 self.best_val = meta.get("best_val_loss", 1e9)
                 self._best_ckpt_dir = meta.get("best_ckpt")
                 self._best_iter_num = meta.get("best_iter_num", self.iter_num)
@@ -1329,23 +1376,37 @@ class Trainer:
             self.iter_num,
             self.cfg.max_iters,
             self.cfg.use_scheduled_sampling,
+            self.cfg.sampling_schedule,
         )
 
+    def _eval_bin_weights(self) -> tuple[float, ...]:
+        """Fixed (iteration-independent) mixture for the train-loss probe, so successive evals score
+        the same blocks and the curve stays comparable while the training mixture is scheduled."""
+        n = len(self.train_bins)
+        if n == 2:
+            return sampling_weights(self.cfg.eng_sampling_weight, self.cfg.afr_sampling_weight, 0, 1, False)
+        return tuple([1.0 / n] * n)
+
     def get_batch(self, split: str, track: bool = False):
-        if split == "train" and len(self.train_bins) > 1:
-            # train_bins is [eng_train_data_path, afr_train_data_path], in that fixed
-            # order (see load_config.load_train_config).
-            eng_w, _ = self._sampling_weights()
-            path = self.train_bins[0] if torch.rand(1).item() < eng_w else self.train_bins[1]
-        else:
-            path = self.train_bins[0] if split == "train" else self.eval_bin
+        """One micro-batch for this rank.
+
+        track=True is the TRAINING draw: the next blocks of the persistent no-repeat epoch stream
+        (each block used once per epoch, reshuffled per epoch, state saved in trainer_state.json).
+        track=False is the EVAL draw: a fixed set of blocks (split "train" mixes the training bins,
+        "val" uses the eval bin); estimate_loss resets these samplers so every eval scores the same
+        windows and never advances the training stream.
+        """
         if track:
-            self._last_train_bin = os.path.splitext(os.path.basename(path))[0]  # which bin fed the training batch
-        data = self._read_memmap(path)
-        bs, sl = self.cfg.train_batch_size, self.cfg.block_size
-        ix = torch.randint(len(data) - sl - 1, (bs,))
-        x = torch.stack([torch.from_numpy(data[i : i + sl].astype(np.int64)) for i in ix])
-        y = torch.stack([torch.from_numpy(data[i + 1 : i + sl + 1].astype(np.int64)) for i in ix])
+            b, ids = self.sampler.next_batch(self._bin_weights())
+            path, self._last_train_bin = self.train_bins[b], self.sampler.names[b]
+        elif split == "train":
+            b, ids = self._eval_train_sampler.next_batch(self._eval_bin_weights())
+            path = self.train_bins[b]
+        else:
+            _, ids = self._eval_val_sampler.next_batch((1.0,))
+            path = self.eval_bin
+        x_np, y_np = read_blocks(self._read_memmap(path), ids, self.cfg.block_size)
+        x, y = torch.from_numpy(x_np), torch.from_numpy(y_np)
 
         if self.cfg.use_loss_mask:
             y = torch.stack([
@@ -1520,7 +1581,9 @@ class Trainer:
         if self.fsdp_plugin is not None:
             with FSDP.summon_full_params(self.model, writeback=False, recurse=True):
                 return self.model.generate(prompt_ids, pad_token_id=pad_id, **cfg)
-        return self.model.generate(prompt_ids, pad_token_id=pad_id, **cfg)
+        # DDP: every rank already holds the full model, but DistributedDataParallel does not
+        # forward .generate() ("no attribute 'generate'"), so call it on the unwrapped module.
+        return self.accelerator.unwrap_model(self.model).generate(prompt_ids, pad_token_id=pad_id, **cfg)
 
     @torch.no_grad()
     def _log_sample_generation(self, prompt_ids: torch.Tensor, tag: str = "sample_generation"):
@@ -1730,6 +1793,7 @@ class Trainer:
             losses = torch.zeros(local_iters, device=self.device)
             # Running [sum of CE nats, supervised tokens, decoded bytes] for bits-per-byte.
             totals = torch.zeros(3, device=self.device, dtype=torch.float64)
+            (self._eval_train_sampler if split == "train" else self._eval_val_sampler).reset()  # same blocks every eval
             for k in range(local_iters):
                 x, y = self.get_batch(split)
                 losses[k] = self._forward_loss(x, y)
@@ -2045,6 +2109,7 @@ class Trainer:
                     "tokens_seen_offset": self.tokens_seen_offset,
                     "tokens_seen_by_bin": self.tokens_seen_by_bin,
                     "tokens_per_step": self._tokens_per_step(),
+                    "sampler": self.sampler.state_dict(),
                 }, f)
             LOG.info("checkpoint_saved", path=ckpt_dir, iter=self.iter_num, is_new_best=is_new_best, tokens_seen=self.tokens_seen)
 
@@ -2167,6 +2232,8 @@ class Trainer:
             fields["lifetime_tokens_seen_b"] = round((self.tokens_seen_offset + self.tokens_seen) / 1e9, 4)
         if len(self.tokens_seen_by_bin) > 1:
             fields["tokens_seen_by_bin"] = dict(self.tokens_seen_by_bin)
+        if getattr(self, "sampler", None) is not None:
+            fields["epochs_by_bin"] = self.sampler.epochs_done()
         return fields
 
     def _token_metrics(self) -> dict:
@@ -2175,6 +2242,9 @@ class Trainer:
             m["train/lifetime_tokens_seen"] = self.tokens_seen_offset + self.tokens_seen
         for name, n in self.tokens_seen_by_bin.items():
             m[f"train/tokens_seen_{name}"] = n
+        if getattr(self, "sampler", None) is not None:
+            for name, e in self.sampler.epochs_done().items():
+                m[f"train/epoch_{name}"] = e
         return m
 
     def _log_step_mlflow(self, loss, last_y, lr, tokens_per_sec, tflops_per_gpu, mfu, log_kwargs) -> None:

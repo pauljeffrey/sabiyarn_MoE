@@ -219,8 +219,14 @@ data:
     - eval_data_path: "sft_validation.bin"
   sampling:
     - use_scheduled_sampling: true
-    - afr_sampling_weight: 0.45
+    - afr_sampling_weight: 0.45   # start mixture (and the fixed mixture when use_scheduled_sampling is false)
     - eng_sampling_weight: 0.55
+    # Optional: piecewise-linear African-share schedule, [[progress, afr_weight], ...], progress =
+    # step / max_iters; English gets 1 - afr_weight. Interpolated linearly, flat outside the knots.
+    # Omit it to get the default cosine swap of the two weights above. Rank-identical and resumable
+    # (a pure function of the step). Example: 45% African for the first 30% of the run, ramp to 65% by
+    # 70%, hold: schedule: [[0.0, 0.45], [0.3, 0.45], [0.7, 0.65], [1.0, 0.65]]
+    - schedule: [[0.0, 0.45], [0.3, 0.45], [0.7, 0.65], [1.0, 0.65]]
  
 
 # optimizer
@@ -243,8 +249,11 @@ optimizer:
   moe_aux_loss_weight: 0.015  # was 0.01 -- raised to push harder against router imbalance
 
 
-# DDP settings
+# Distributed strategy. `enabled: true` = plain DDP (every GPU holds the whole model; the right choice for a
+# ~300M model whose training state is ~5 GiB, and required for Muon). `enabled: false` = FSDP, sharded per
+# accelerate.fsdp_sharding_strategy. Env override: DISTRIBUTED=ddp|fsdp. Same setting drives modal_train.py.
 ddp:
+  enabled: true
   rank : 0
   backend : "nccl"
   use_dp: false
@@ -252,7 +261,9 @@ ddp:
 #Accelerate config
 accelerate:
   mixed_precision: "bf16"
-  fsdp_sharding_strategy: "NO_SHARD" #"FULL_SHARD"  # NO_SHARD | SHARD_GRAD_OP | FULL_SHARD | HYBRID_SHARD
+  # Which strategy is decided by `ddp.enabled` above (legacy: `distributed: ddp|fsdp` here is only read when
+  # ddp.enabled is absent).
+  fsdp_sharding_strategy: "FULL_SHARD"  # only used when distributed: fsdp. NO_SHARD | SHARD_GRAD_OP | FULL_SHARD | HYBRID_SHARD
   gradient_clipping: 1.0
 
 env:

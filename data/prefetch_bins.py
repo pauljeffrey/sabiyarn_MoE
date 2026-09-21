@@ -83,8 +83,8 @@ def main() -> None:
     )
     print(f"done: train={local_train} eval={local_eval}")
     print()
-    print("Add these lines to your .env before running training/new_train.py (or")
-    print("training/new_train_ddp.py) -- load_config.py reads them over train_config.yaml's")
+    print("Add these lines to your .env before running training/new_train.py --")
+    print("load_config.py reads them over train_config.yaml's")
     print("own (relative) data paths, same override modal_train.py uses internally:")
     print()
     train_line = f"TRAIN_DATA_PATHS_LOCAL={','.join(local_train)}"

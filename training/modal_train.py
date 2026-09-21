@@ -67,34 +67,23 @@ NODE_CPU = max(16, 8 * GPUS_PER_NODE)
 _training_cfg = _raw_cfg.get("training", {}) or {}
 CFG_OUT_DIR = str(_training_cfg.get("out_dir", "checkpoints"))
 
+# Same dependency set as a bare vast.ai box (requirements.txt): one source of truth, so a Modal run
+# uses the same transformers/accelerate/torch versions as the run that produced the checkpoints.
 image = (
     modal.Image.debian_slim(python_version="3.11")
-    .pip_install(
-        "torch>=2.4.0",
-        "transformers>=4.55.0",
-        "accelerate>=0.34.0",
-        "wandb",
-        "mlflow",
-        "structlog",
-        "numpy",
-        "omegaconf",
-        "pyyaml",
-        "boto3",
-        "datasets",
-        "huggingface_hub",
-        "python-dotenv",
-        "lmdb",
-        "bitsandbytes",
-        "psutil",
-    )
+    .pip_install_from_requirements(str(ROOT / "requirements.txt"))
     .add_local_dir(
         str(ROOT), remote_path="/app",
         ignore=[
-            ".git", "__pycache__", "*.pyc", "out/", ".env",
-            # Local-only dev state: Modal installs its own deps via pip_install
-            # above, and .venv can contain Unix-style symlinks (e.g. from uv)
-            # that Windows can't read when walking the directory to upload it.
-            ".venv", ".pytest_cache", ".claude",
+            ".git", "**/__pycache__", "*.pyc", ".env",
+            # Local-only dev state. Modal installs its own deps from requirements.txt above, and a
+            # virtualenv can contain symlinks (e.g. from uv) that break the upload walk. Patterns
+            # are matched at any depth ("**/") -- a bare ".venv" only matches the top level, so
+            # data-gen/.venv used to be uploaded with every launch.
+            "**/.venv", ".pytest_cache", ".claude",
+            # Run outputs and downloaded data: large, regenerated, and not needed in the container
+            # (the volume holds checkpoints/bins; MLflow runs live on the volume too).
+            "out/", "out_*/", "mlruns/", "eval_results/", "data/bins/", "data-gen/data/", "*.bin",
         ],
     )
 )
