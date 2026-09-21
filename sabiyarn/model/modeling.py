@@ -702,9 +702,13 @@ class GPTJXMoEForCausalLM(PreTrainedModel, GenerationMixin):
         if use_cache is not None:
             model_inputs["use_cache"] = use_cache
 
+        if position_ids is None and attention_mask is not None and attention_mask.dim() == 2:
+            # Positions are learned and absolute, so a LEFT-padded batch must count only real tokens:
+            # pads get position 0 (never attended to), the first real token gets 0.
+            position_ids = (attention_mask.long().cumsum(-1) - 1).clamp(min=0)
         if position_ids is not None:
             if has_cache:
-                position_ids = position_ids[:, -1].unsqueeze(-1)
+                position_ids = position_ids[:, -1:]
             model_inputs["position_ids"] = position_ids
         elif has_cache:
             model_inputs["position_ids"] = torch.tensor(

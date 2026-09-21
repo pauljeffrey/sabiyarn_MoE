@@ -66,3 +66,19 @@ def test_kv_cache_decode_matches_full_forward_with_mask():
     step = m(x[:, -1:], attention_mask=torch.ones(1, 9, dtype=torch.long), past_key_values=pre.past_key_values,
              use_cache=True).logits[:, -1]
     torch.testing.assert_close(step, full, atol=1e-5, rtol=1e-4)
+
+
+@torch.no_grad()
+def test_left_padded_batched_generate_matches_single_sequence_generate():
+    """Batched sampling for RL: left-padded rows must generate exactly what each prompt does alone."""
+    for kv in (False, True):
+        m = _model(kv=kv)
+        m.generation_config.pad_token_id = 0
+        prompts = [torch.randint(1, 64, (n,)) for n in (3, 6, 5)]
+        singles = [m.generate(p[None], max_new_tokens=6, do_sample=False, use_cache=kv)[0, len(p):] for p in prompts]
+        width = max(len(p) for p in prompts)
+        ids = torch.stack([torch.cat([torch.zeros(width - len(p), dtype=torch.long), p]) for p in prompts])
+        mask = torch.stack([torch.cat([torch.zeros(width - len(p)), torch.ones(len(p))]).long() for p in prompts])
+        batched = m.generate(ids, attention_mask=mask, max_new_tokens=6, do_sample=False, use_cache=kv)[:, width:]
+        for row, single in zip(batched, singles):
+            assert row.tolist() == single.tolist(), f"use_cache={kv}"
