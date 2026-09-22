@@ -107,6 +107,11 @@ def _build_env(mode: str, override: bool) -> dict[str, str]:
     # MLflow runs land on the same persistent volume as checkpoints (view them with
     # `modal volume get sabiyarn-data mlruns ./mlruns` + `mlflow ui`), unless
     # MLFLOW_TRACKING_URI is set in .env to point at a remote tracking server.
+    # Let the allocator grow one expandable segment instead of a pool of
+    # fixed-size blocks, so memory freed at one size (e.g. the startup
+    # generation's KV cache) is reusable at another. Cheap insurance against
+    # fragmentation OOMs; override in .env if you need to compare.
+    env.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
     env.setdefault("MLFLOW_UI_ENABLED", "0")  # a UI inside the container is unreachable
     env.setdefault("MLFLOW_TRACKING_URI", f"file:{os.path.join(DATA_DIR, 'mlruns')}")
     return env

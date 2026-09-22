@@ -888,6 +888,7 @@ class Trainer:
                 )
 
         self._apply_activation_checkpointing()
+        self._cuda_memory_checkpoint("after_model_build")
 
         if self.cfg.compile_model:
             if self.accelerator.num_processes > 1:
@@ -1080,6 +1081,7 @@ class Trainer:
 
     def _prepare_for_training(self):
         self.model, self.optimizer = self.accelerator.prepare(self.model, self.optimizer)
+        self._cuda_memory_checkpoint("after_accelerator_prepare")
 
         # Always attempt to resume optimizer state / iter_num / best_val from
         # the latest checkpoint (self._resume_dir, found in _setup_dirs),
@@ -1591,7 +1593,22 @@ class Trainer:
                 # raw.lm_head.weight is always the full tensor already --
                 # no gathering needed.
                 weight = raw.lm_head.weight
-                ce_loss = linear_cross_entropy(hidden, weight, y, shift=False, ignore_index=MASK)
+                # cut_cross_entropy's fused kernels require bf16/fp16 for BOTH
+                # the hidden states and the lm_head weight -- its backward
+                # asserts on it ("Backwards requires embeddings to be bf16 or
+                # fp16"). This call sits OUTSIDE the autocast region above (it
+                # is not an autocast-aware op, and autocast would not touch
+                # the weight anyway, since autocast casts activations rather
+                # than parameters), so with param_dtype: float32 -- fp32
+                # master weights, the recommended setting -- both arrive fp32
+                # and every step dies in backward. Casting here is what makes
+                # use_cce compatible with fp32 master weights instead of the
+                # two settings silently excluding each other; autograd routes
+                # the gradients back through the cast to the fp32 parameters.
+                cce_dtype = torch.float16 if self.cfg.dtype == "float16" else torch.bfloat16
+                ce_loss = linear_cross_entropy(
+                    hidden.to(cce_dtype), weight.to(cce_dtype), y, shift=False, ignore_index=MASK,
+                )
         else:
             with self.accelerator.autocast():
                 out = self.model(input_ids=x, attention_mask=attention_mask, targets=y)
@@ -2530,6 +2547,14 @@ class Trainer:
             return
 
         t0 = time.time()
+        # Anchor the throughput window at the iter training actually STARTS
+        # from, not the -1 sentinel: on a resumed run the first step log
+        # otherwise divides the window's seconds by (iter_num + 1) elapsed
+        # iterations instead of the handful really done in it, reporting
+        # (observed on a resume at iter 17250) 7.2M tokens/sec, 11,046
+        # TFLOPS and 8837% MFU -- numbers that look like a throughput
+        # triumph on the one log line people read first.
+        self._last_logged_iter = self.iter_num
         last_loss = None
 
         while self.iter_num <= self.cfg.max_iters:
