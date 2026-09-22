@@ -12,12 +12,10 @@ from sabiyarn.model.modeling import GPTJXMoEForCausalLM
 
 def _model(use_moe=False, kv=False):
     torch.manual_seed(0)
+    # num_experts is a per-model int; a per-layer layout goes in expert_per_layer (as the real config does).
     cfg = GPTJXMoEConfig(
-        block_size=32, vocab_size=64, n_layer=2, n_heads=2, n_embd=8,
-        use_moe=use_moe, use_kv_cache=kv, num_experts=[2, 2] if use_moe else None,
-        num_experts_per_tok=2, moe_dim=16,
-    ) if use_moe else GPTJXMoEConfig(
-        block_size=32, vocab_size=64, n_layer=2, n_heads=2, n_embd=8, use_moe=False, use_kv_cache=kv,
+        block_size=32, vocab_size=64, n_layer=2, n_heads=2, n_embd=8, use_moe=use_moe, use_kv_cache=kv,
+        num_experts=4, num_experts_per_tok=2, moe_dim=16, expert_per_layer={"0": 2, "1": 4},
     )
     return GPTJXMoEForCausalLM(cfg).eval()
 
@@ -82,3 +80,17 @@ def test_left_padded_batched_generate_matches_single_sequence_generate():
         batched = m.generate(ids, attention_mask=mask, max_new_tokens=6, do_sample=False, use_cache=kv)[:, width:]
         for row, single in zip(batched, singles):
             assert row.tolist() == single.tolist(), f"use_cache={kv}"
+
+
+def test_model_builds_in_bf16_without_fp32_leftovers():
+    """from_pretrained(dtype=bf16) builds under torch.set_default_dtype; MoE weights must follow it (a hard-coded
+    float32 made bf16 loading crash with 'expected m1 and m2 to have the same dtype')."""
+    old = torch.get_default_dtype()
+    torch.set_default_dtype(torch.bfloat16)
+    try:
+        m = _model(use_moe=True)
+    finally:
+        torch.set_default_dtype(old)
+    assert {p.dtype for p in m.parameters()} == {torch.bfloat16}
+    with torch.no_grad():
+        assert torch.isfinite(m(torch.randint(0, 64, (1, 6))).logits.float()).all()

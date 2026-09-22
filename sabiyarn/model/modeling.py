@@ -280,7 +280,9 @@ class BlockJ(nn.Module):
 class MoE(nn.Module):
     """Mixture-of-experts feed-forward block with top-k routing and GELU MLP experts."""
 
-    def __init__(self, num_experts_per_tok: int, num_experts: int, emb_dim: int, moe_dim: int, dropout: float = 0.0, dtype=torch.float32, sparse_dispatch: bool = True):
+    def __init__(self, num_experts_per_tok: int, num_experts: int, emb_dim: int, moe_dim: int, dropout: float = 0.0, dtype=None, sparse_dispatch: bool = True):
+        # dtype=None follows torch's default dtype, which from_pretrained(dtype=...) sets while building the model;
+        # a hard-coded float32 here left the experts fp32 next to bf16 attention and crashed bf16 loading.
         super().__init__()
         self.sparse_dispatch = sparse_dispatch
         self.k = int(num_experts_per_tok)
