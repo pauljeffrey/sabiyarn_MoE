@@ -1,6 +1,6 @@
 
 training: 
-  train_batch_size : 6
+  train_batch_size : 8
   # Local/vast.ai: checkpoints go directly under this path. On Modal
   # (training/modal_train.py), this name is instead used as a subdirectory
   # under the persistent "sabiyarn-data" volume -- checkpoints land at
@@ -69,7 +69,7 @@ training:
   # step count/optimizer momentum from a prior local run while pulling fresh
   # weights, which is intentional for continuous pretraining across Modal
   # container restarts.
-  init_from: "resume"  # hf (HuggingFace hub) | resume (local ckpt); use "resume" with fresh_start
+  init_from: "hf"  # hf (HuggingFace hub) | resume (local ckpt); use "resume" with fresh_start
   # Optional explicit override; leave blank to auto-discover the most recent
   # matching run directory under training.out_dir (works the same on a Modal
   # Volume, a vast.ai instance's local disk, or your own machine -- purely a
@@ -229,7 +229,7 @@ data:
     # Omit it to get the default cosine swap of the two weights above. Rank-identical and resumable
     # (a pure function of the step). Example: 45% African for the first 30% of the run, ramp to 65% by
     # 70%, hold: schedule: [[0.0, 0.45], [0.3, 0.45], [0.7, 0.65], [1.0, 0.65]]
-    - schedule: [[0.0, 0.45], [0.3, 0.45], [0.7, 0.65], [1.0, 0.95]]
+    - schedule: [[0.0, 0.45], [0.2, 0.55], [0.4, 0.65], [0.6, 0.75], [0.8, 0.85], [1.0, 0.95]]
  
 
 # optimizer
@@ -238,7 +238,7 @@ optimizer:
   # GPU -- not FSDP -- and reuses the AdamW lr / weight_decay below unchanged. Independent
   # benchmarks (Wen et al. 2025) find its edge over a well-tuned AdamW shrinking with scale and
   # at high tokens-per-parameter, so A/B it on ~300M tokens before committing a long run.
-  name : "adamw"
+  name : "muon" #"adamw"
   learning_rate : 6e-4  # peak. ~4e-4..1e-3 is the range for 0.1-1B models; sweep {4e-4, 6e-4, 1e-3}
   max_tokens : 50e9  # token budget -> max_iters is derived at startup from the real tokens/step
   max_iters : 60000  # fallback if max_tokens is 0
