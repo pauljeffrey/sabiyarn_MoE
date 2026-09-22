@@ -32,7 +32,7 @@ training:
   # torch.compile only ever applied to single-GPU runs (multi-process runs skip it), and is untested
   # on this MoE with the current torch/transformers -- a compile error would kill a rented run.
   # Turn it on only after a short single-GPU trial.
-  compile : true
+  compile : false
   display_model_output_iter : 128
   use_cce : true  # to use cut cross entropy or not
   # Whether to mask prompt/action-span (pretrain) or prompt-vs-response (SFT)
