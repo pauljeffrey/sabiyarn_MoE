@@ -1552,6 +1552,9 @@ class Trainer:
             "Plenty people for Lagos dey talk say the new transport policy go make traffic better, "
             "but some drivers still dey complain well well."
         ),
+        # Very short, open-ended English stub: the hardest case for a partly-trained model. A healthy
+        # checkpoint continues it as a sentence; degenerate repetition or tag spam shows up immediately.
+        "Technology is ",
     )
 
     @torch.no_grad()
