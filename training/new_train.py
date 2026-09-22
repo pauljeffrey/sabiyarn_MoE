@@ -884,6 +884,8 @@ class Trainer:
                            "tflops_per_gpu will still be logged",
                 )
 
+        self._apply_activation_checkpointing()
+
         if self.cfg.compile_model:
             if self.accelerator.num_processes > 1:
                 # Confirmed fragile under BOTH wrapping strategies, not just
@@ -898,6 +900,86 @@ class Trainer:
                 )
             else:
                 self.model = torch.compile(self.model)
+
+    def _apply_activation_checkpointing(self) -> None:
+        """Wrap every transformer block in non-reentrant activation
+        checkpointing (training.gradient_checkpointing) -- the single
+        biggest lever on activation memory, which at block_size 4096
+        dominates everything else.
+
+        Instead of keeping every intermediate tensor inside a block alive
+        from forward until backward, each block keeps only its input and
+        recomputes its interior during backward: activation memory drops
+        from O(n_layer) to roughly O(1) block's worth, at the cost of one
+        extra forward pass (~25-30% slower steps). That trade buys back
+        several GiB here, so it's what makes a larger micro-batch fit on a
+        smaller card.
+
+        Applied to the raw module tree BEFORE accelerator.prepare, so DDP/
+        FSDP wraps already-checkpointed blocks.
+
+        Deliberately NOT model.gradient_checkpointing_enable(): the model
+        class advertises supports_gradient_checkpointing = True, but its
+        forward (sabiyarn/model/modeling.py's `for i, block in
+        enumerate(self.transformer.h)` loop) never calls
+        _gradient_checkpointing_func, so that HF flag is a silent no-op
+        here -- it would set an attribute nothing reads and save nothing.
+        torch's apply_activation_checkpointing wraps the block modules
+        themselves, which needs no cooperation from the model code (and so
+        no change to the modeling.py served from the Hub via
+        trust_remote_code). If it ever matches zero modules it says so
+        loudly rather than pretending to have helped.
+        """
+        if not self.cfg.gradient_checkpointing:
+            return
+        import functools
+
+        from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
+            CheckpointImpl,
+            apply_activation_checkpointing,
+            checkpoint_wrapper,
+        )
+
+        blocks = getattr(getattr(self.model, "transformer", None), "h", None)
+        if not blocks:
+            LOG.warning(
+                "activation_checkpointing_skipped",
+                reason="could not find model.transformer.h to identify the per-layer block class",
+            )
+            return
+        block_types = tuple({type(b) for b in blocks})
+
+        wrapped = 0
+
+        def check_fn(module) -> bool:
+            nonlocal wrapped
+            if isinstance(module, block_types):
+                wrapped += 1
+                return True
+            return False
+
+        apply_activation_checkpointing(
+            self.model,
+            # NO_REENTRANT: reentrant checkpointing needs
+            # find_unused_parameters under DDP and interacts badly with
+            # frozen params (see _freeze_layers); non-reentrant is the
+            # supported default in modern torch.
+            checkpoint_wrapper_fn=functools.partial(
+                checkpoint_wrapper, checkpoint_impl=CheckpointImpl.NO_REENTRANT,
+            ),
+            check_fn=check_fn,
+        )
+        log_fn = LOG.info if wrapped else LOG.warning
+        log_fn(
+            "activation_checkpointing",
+            blocks_wrapped=wrapped,
+            block_types=[t.__name__ for t in block_types],
+            expected=len(blocks),
+            note=("recomputing each block in backward -- expect ~25-30% slower steps for several GiB "
+                  "less activation memory" if wrapped else
+                  "matched ZERO modules -- gradient_checkpointing is ON but saving nothing; "
+                  "check the block class in sabiyarn/model/modeling.py"),
+        )
 
     def _load_checkpoint_weights(self, ckpt_dir: str, torch_dtype) -> None:
         """Overlays self.model's weights (already built from the HF Hub

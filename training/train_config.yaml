@@ -35,6 +35,13 @@ training:
   compile : false
   display_model_output_iter : 128
   use_cce : true  # to use cut cross entropy or not
+  # Recompute each transformer block during backward instead of holding its interior in memory
+  # (Trainer._apply_activation_checkpointing). At block_size 4096 activations dominate the
+  # footprint -- roughly 0.5 MiB per token per layer in bf16, i.e. ~13 GiB for a 6 x 4096
+  # micro-batch across 12 layers -- and this cuts that to about one block's worth, for ~25-30%
+  # slower steps. Turn it on when you OOM, before shrinking the micro-batch: a bigger batch with
+  # recomputation usually beats a tiny batch without it. Env override: GRADIENT_CHECKPOINTING=1/0.
+  gradient_checkpointing: false
   # Whether to mask prompt/action-span (pretrain) or prompt-vs-response (SFT)
   # tokens out of the loss at all -- see training/label_masking.py. false
   # means every token contributes to the loss, completely unmasked.

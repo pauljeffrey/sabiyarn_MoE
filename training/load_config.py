@@ -210,6 +210,12 @@ class TrainConfig:
     # Load Adam moments etc. from the checkpoint's resume_state when resuming.
     resume_optimizer_state: bool = True
     use_cce: bool = False
+    # Recompute each transformer block's interior during backward instead of
+    # keeping it alive from forward (Trainer._apply_activation_checkpointing).
+    # The biggest single lever on activation memory -- which at block_size
+    # 4096 dominates the footprint -- for ~25-30% slower steps. Env override:
+    # GRADIENT_CHECKPOINTING=1/0.
+    gradient_checkpointing: bool = False
     # Whether to mask prompt/action-span (pretrain) or prompt-vs-response
     # (SFT) tokens out of the loss at all -- see training/label_masking.py.
     # False means every token contributes to the loss, completely unmasked.
@@ -567,6 +573,11 @@ def load_train_config(path: Optional[str] = None) -> TrainConfig:
         compile_model=bool(training.get("compile", False)),
         dtype=mixed_precision,
         use_cce=bool(training.get("use_cce", False)),
+        gradient_checkpointing=(
+            os.getenv("GRADIENT_CHECKPOINTING").strip().lower() in ("1", "true", "yes")
+            if os.getenv("GRADIENT_CHECKPOINTING") is not None
+            else bool(training.get("gradient_checkpointing", False))
+        ),
         use_loss_mask=bool(training.get("use_loss_mask", True)),
         init_from=str(training.get("init_from", "hf")),
         resume_run_dir=training.get("resume_run_dir"),
