@@ -111,7 +111,7 @@ training:
   mode: "pretrain"  # pretrain | sft
   # Dry run: load the model + model.reference_repo, run the startup
   # weight-deviation check AND the side-by-side generation comparison
-  # (5 prompts x {do_sample, beam search} x {this model, reference model},
+  # (6 prompts x {sampling, greedy} x {this model, reference model},
   # 150 new tokens each -- see Trainer._startup_generation_comparison), then
   # run ONE eval, log its loss plus the delta against the best val loss
   # recorded in the checkpoint's trainer_state.json, and STOP

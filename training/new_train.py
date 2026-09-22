@@ -1476,23 +1476,30 @@ class Trainer:
     #   - do_sample=True (was False): deterministic decoding is prone to
     #     repetitive-loop degeneration, especially while the model's
     #     next-token distribution isn't yet sharply peaked.
-    #   - num_beams=1 (was 5): num_beams>1 combined with do_sample=True is
-    #     NOT "no beam search" -- it's beam-sample decoding, which still runs
-    #     full beam search (multiple beams, cumulative-score pruning, KV-cache
-    #     reordering every step) and still exhibits beam search's well-known
-    #     mode-seeking/repetition-loop tendency, just with sampled token
-    #     choices layered on top. num_beams=1 is what actually turns beam
-    #     search off entirely, leaving plain top-k/top-p sampling.
-    #     length_penalty/early_stopping are beam-search-only knobs (they
-    #     govern beam score normalization/termination) -- dropped since
-    #     they're inert with num_beams=1.
-    #   - top_k=40 (was 50): anywhere in 20-50 is reasonable here; 40 keeps
-    #     enough of the distribution for the model to still sound varied
-    #     across five languages, while trimming more of the low-probability
-    #     tail that a mid-training 280M model still puts mass on (that tail
-    #     is where most of the obvious "wrong language / nonsense token"
-    #     samples come from). 20 would be tighter but starts hiding genuine
-    #     diversity problems behind the truncation.
+    #   - num_beams=1 (was 5): num_beams>1 with do_sample=True is NOT "no
+    #     beam search" -- it is beam-SAMPLE decoding, which still runs full
+    #     beam search (cumulative-score pruning, KV-cache reordering through
+    #     _reorder_cache every step) with sampled choices layered on top, and
+    #     still shows beam search's mode-seeking/repetition-loop tendency.
+    #     Measured on Aletheia-ng/SabiYarn_MoE-280M, 6 startup prompts x 60
+    #     new tokens, with repetition_penalty=1.15 already applied
+    #     (fraction of repeated 4-grams / distinct-2, lower / higher better):
+    #         sample      num_beams=1    0.000 / 1.000
+    #         beam-sample num_beams=3    0.482 / 0.455
+    #         beam        num_beams=5    0.591 / 0.376
+    #     At 3 beams nearly half the output was repeated 4-grams ("the use of
+    #     the term to describe the use of the term to describe ..."), so beam
+    #     search costs ~3-5x the decode compute to produce samples that tell
+    #     you less about the model. Re-measure before raising this again.
+    #   - top_k=25 (was 40, originally 50): tighter truncation of the
+    #     low-probability tail a mid-training 280M model still puts mass on
+    #     (that tail is where most of the obvious "wrong language / nonsense
+    #     token" samples come from). The tighter this gets, the more it can
+    #     hide genuine diversity problems behind the truncation rather than
+    #     showing them to you.
+    # eos_token_id is NOT set here -- _generate_with_config supplies it from
+    # the tokenizer, since config.json on the Hub carries no eos_token_id and
+    # generation would otherwise never stop before max_new_tokens.
     #   - repetition_penalty=1.15 (was 4.0): 4.0 is far outside the usual
     #     1.05-1.3 range -- it divides the logit of every already-seen token
     #     by 4, which at that strength doesn't just discourage loops, it
@@ -1507,7 +1514,7 @@ class Trainer:
         num_beams=1,
         do_sample=True,
         temperature=0.99,
-        top_k=40,
+        top_k=25,
         top_p=0.95,
         repetition_penalty=1.15,
     )
@@ -1517,16 +1524,18 @@ class Trainer:
     # exact training-time config above (same decoding the periodic
     # display_model_output_iter samples use, just longer) so what you see
     # here is what you'll see mid-run; beam search is the deterministic
-    # counterpart, with the sampling-only knobs dropped since they're inert
-    # under do_sample=False and transformers warns about them.
+    # counterpart -- GREEDY, not beam search: it is reproducible across runs
+    # (so a model-vs-reference difference is a real difference, not sampling
+    # noise) without beam search's repetition loops, which on these weights
+    # made 59% of the 5-beam output repeated 4-grams. The sampling-only knobs
+    # are dropped since they're inert under do_sample=False and transformers
+    # warns about them.
     _STARTUP_MAX_NEW_TOKENS = 150
     _STARTUP_SAMPLE_CONFIG = dict(_GENERATION_CONFIG, max_new_tokens=_STARTUP_MAX_NEW_TOKENS)
-    _STARTUP_BEAM_CONFIG = dict(
+    _STARTUP_GREEDY_CONFIG = dict(
         max_new_tokens=_STARTUP_MAX_NEW_TOKENS,
-        num_beams=5,
+        num_beams=1,
         do_sample=False,
-        early_stopping=True,
-        length_penalty=1.0,
         repetition_penalty=_GENERATION_CONFIG["repetition_penalty"],
     )
 
@@ -1588,7 +1597,11 @@ class Trainer:
         context and call generate() together, matching FSDP's per-layer
         all-gather requirement."""
         pad_id = self.tokenizer.pad_token_id or self.tokenizer.eos_token_id
-        cfg = gen_config if gen_config is not None else self._GENERATION_CONFIG
+        # The Hub config.json carries no eos_token_id, so generation_config has none either and
+        # generate() would run to max_new_tokens no matter what the model emits. Take it from the
+        # tokenizer instead, which is the authority on what </s> is.
+        cfg = dict(gen_config if gen_config is not None else self._GENERATION_CONFIG)
+        cfg.setdefault("eos_token_id", self.tokenizer.eos_token_id)
         if self.fsdp_plugin is not None:
             with FSDP.summon_full_params(self.model, writeback=False, recurse=True):
                 return self.model.generate(prompt_ids, pad_token_id=pad_id, **cfg)
@@ -1652,7 +1665,11 @@ class Trainer:
             self._ref_model.to("cpu")
             ids = prompt_ids.to("cpu")
         try:
-            return self._ref_model.generate(ids, pad_token_id=pad_id, **gen_config)
+            # Same eos as the trained model gets (see _generate_with_config), or the two sides of the
+            # comparison would stop on different criteria.
+            ref_cfg = dict(gen_config)
+            ref_cfg.setdefault("eos_token_id", self.tokenizer.eos_token_id)
+            return self._ref_model.generate(ids, pad_token_id=pad_id, **ref_cfg)
         except Exception as exc:
             LOG.warning("reference_generation_failed", error=str(exc))
             return None
@@ -1662,7 +1679,7 @@ class Trainer:
         """One-off, before the first training step: generate from
         _STARTUP_PROMPTS with BOTH the model about to be trained and the
         static reference checkpoint (model.reference_repo), under both
-        sampling and beam search, and print them side by side.
+        sampling and greedy decoding, and print them side by side.
 
         This is the qualitative counterpart to _verify_reference_weights'
         single aggregate_rel_l2 number: that says how FAR the weights have
@@ -1681,8 +1698,7 @@ class Trainer:
             (f"do_sample (top_k={self._STARTUP_SAMPLE_CONFIG['top_k']}, "
              f"top_p={self._STARTUP_SAMPLE_CONFIG['top_p']}, "
              f"temperature={self._STARTUP_SAMPLE_CONFIG['temperature']})", self._STARTUP_SAMPLE_CONFIG),
-            (f"beam_search (num_beams={self._STARTUP_BEAM_CONFIG['num_beams']}, do_sample=False)",
-             self._STARTUP_BEAM_CONFIG),
+            ("greedy (num_beams=1, do_sample=False)", self._STARTUP_GREEDY_CONFIG),
         )
         trained_label = (
             f"MODEL BEING TRAINED  [{self.cfg.model_name}"
