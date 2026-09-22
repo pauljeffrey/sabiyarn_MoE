@@ -380,8 +380,17 @@ python -m rl.run                                                    # DPO on dat
 torchrun --standalone --nproc_per_node=2 -m rl.run                  # DDP on 2 GPUs
 python -m rl.run learning_rate=1e-6 max_steps=200 out_dir=outputs/dpo-test   # key=value overrides (or RL_<FIELD>=... env vars)
 python -m rl.run --algo sft --config rl/config.yaml data_path=data-gen/data/processed/sft.jsonl learning_rate=1e-5
-modal run rl/modal_rl.py --config rl/config.yaml                    # same thing on Modal (volume paths: /data/...)
+modal run rl/modal_rl.py                                            # same thing on Modal (DPO)
+modal run rl/modal_rl.py --config rlhf/configs/default.yaml         # AfriCOMET RL on Modal (comet image)
+modal run rl/modal_rl.py --overrides "model_path=/data/out_280M/<run>/ckpt_best max_steps=100"
 ```
+
+On Modal the launcher uses the same GPU shape (`modal:` in `train_config.yaml`), volume and `.env` secrets as
+training. It also **uploads a local `data_path` to the volume** first (`data-gen/data/` is excluded from the image),
+points `out_dir` and MLflow at `/data`, and fails locally — before any GPU time — if `model_path` is a local
+directory the container could not see. Start from a training checkpoint with
+`model_path=/data/<training.out_dir>/<run>/ckpt_best` (`modal volume ls sabiyarn-data` to find it), and collect
+results with `modal volume get sabiyarn-data rl/ ./rl_out`.
 
 **DPO** (`rl/dpo.py`): loss `-log σ(β[(log π(chosen)−log ref(chosen)) − (log π(rejected)−log ref(rejected))])`; variants `dpo_loss: ipo | hinge`, `label_smoothing`, `length_normalize`, `sft_alpha` (NLL on chosen, stops likelihoods drifting down). The reference is a frozen copy of the start weights. Policy and reference are scored in eval mode (no MoE router noise), so **step 1 must log `train/loss ≈ 0.6931` and `train/init_logratio_absmax ≈ 0`**; if not, the two models differ (wrong `reference_path`, dtype, code). Watch `eval/reward_accuracy` and `train/reward_margin`; accuracy → 1.0 within a few hundred steps means the pairs are separable by surface cues (length, language, refusals) rather than quality. data-gen's rejected answers are *off-policy* (a model was asked to write a flawed answer), so keep `beta` moderate (0.1) and the learning rate small (5e-7).
 
@@ -390,14 +399,14 @@ modal run rl/modal_rl.py --config rl/config.yaml                    # same thing
 **AfriCOMET RL** (`rlhf/`, your translation task on top of `rl/`):
 
 ```bash
-python -m venv .venv-comet && .venv-comet/bin/pip install unbabel-comet          # AfriCOMET's own environment (see below)
+python -m venv --system-site-packages .venv-comet && .venv-comet/bin/pip install -r rlhf/requirements.txt   # see below
 python rlhf/scripts/run_sft.py                                                    # optional warm-start on Aletheia-ng/tds-sft
 RL_REWARD_PYTHON=.venv-comet/bin/python python rlhf/scripts/run_rlhf.py model_path=outputs/translate-sft/final
 python rlhf/scripts/run_rlhf.py reward=chrf max_steps=20                          # cheap smoke test without COMET
 python -m eval_suite.run --model outputs/rlhf/final --tasks translation --style chat --africomet masakhane/africomet-stl   # with AFRICOMET_PYTHON=.venv-comet/bin/python
 ```
 
-Why a second environment: `unbabel-comet` pins `transformers<5`, `huggingface_hub<1`, `numpy<2`, which cannot coexist with the `transformers==5.14.1` this repo's model code needs. `rl/comet_worker.py` runs in that environment and talks to the trainer over a pipe (one worker per GPU rank); nothing else changes. `rlhf/configs/default.yaml` now starts from `Aletheia-ng/SabiYarn_MoE-280M` (was `google/gemma-3-270m-it`). AfriCOMET is a **learned, reference-based** metric: optimising it hard finds its blind spots. Keep `kl_coef` on, and judge progress on chrF++/BLEU from `eval_suite` (not used as a reward) and by reading samples. If the reward rises while chrF++ falls, raise `kl_coef` or stop earlier.
+Why a second environment: `unbabel-comet` pins `transformers<5`, `huggingface_hub<1`, `numpy<2`, which cannot coexist with the `transformers==5.14.1` this repo's model code needs. Its pins live in **`rlhf/requirements.txt`** — install them into their own virtualenv, never next to the root `requirements.txt`. `--system-site-packages` reuses the torch you already have (~2.5 GB saved). `rl/comet_worker.py` runs in that environment and talks to the trainer over a pipe (one worker per GPU rank); nothing else changes. On Modal, `modal run rl/modal_rl.py --config rlhf/configs/default.yaml` builds that venv into the image automatically and wires `reward_python` to it. `rlhf/configs/default.yaml` now starts from `Aletheia-ng/SabiYarn_MoE-280M` (was `google/gemma-3-270m-it`). AfriCOMET is a **learned, reference-based** metric: optimising it hard finds its blind spots. Keep `kl_coef` on, and judge progress on chrF++/BLEU from `eval_suite` (not used as a reward) and by reading samples. If the reward rises while chrF++ falls, raise `kl_coef` or stop earlier.
 
 **Batched generation and padding.** Positions are learned and absolute, so left-padded batches need per-row positions; `generate()` now derives them from the attention mask (regression-tested against one-prompt-at-a-time generation). A 2D `attention_mask` is now combined with the causal mask — earlier versions let padded/masked forward passes (including `generate()` prefill with an all-ones mask) attend to future tokens, so **re-run evals of anything generated with a 2D mask on older code**. Training itself (no mask, or the document mask) was never affected.
 
