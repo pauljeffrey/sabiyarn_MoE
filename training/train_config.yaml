@@ -121,7 +121,7 @@ training:
   # you can do a dry run without editing this file:
   #   TEST_RUN=1 python -m training.new_train     # dry run, whatever is set here
   #   TEST_RUN=0 python -m training.new_train     # really train
-  test_run: true
+  test_run: false
   hf_chkpt_path: "Aletheia-ng/SabiYarn_MoE-280M"
   # Hand-written probe set (one {"lang","text"} per line), scored at every eval and
   # logged as curated_eval / mlflow curated/*. Independent of the train/val bins:
@@ -238,7 +238,7 @@ optimizer:
   # GPU -- not FSDP -- and reuses the AdamW lr / weight_decay below unchanged. Independent
   # benchmarks (Wen et al. 2025) find its edge over a well-tuned AdamW shrinking with scale and
   # at high tokens-per-parameter, so A/B it on ~300M tokens before committing a long run.
-  name : "muon" #"adamw"
+  name : "adamw"
   learning_rate : 6e-4  # peak. ~4e-4..1e-3 is the range for 0.1-1B models; sweep {4e-4, 6e-4, 1e-3}
   max_tokens : 50e9  # token budget -> max_iters is derived at startup from the real tokens/step
   max_iters : 60000  # fallback if max_tokens is 0
@@ -256,7 +256,7 @@ optimizer:
 # ~300M model whose training state is ~5 GiB, and required for Muon). `enabled: false` = FSDP, sharded per
 # accelerate.fsdp_sharding_strategy. Env override: DISTRIBUTED=ddp|fsdp. Same setting drives modal_train.py.
 ddp:
-  enabled: true
+  enabled: false
   backend : "nccl"
   # rank/use_dp are NOT read by load_config.py -- torchrun sets RANK/LOCAL_RANK itself, and
   # nn.DataParallel is not supported (it is single-process and slower than DDP). Kept only so old
@@ -305,5 +305,5 @@ modal:
   # gpus_per_node to be the FULL device count Modal offers per physical host
   # for that type (see the clustered() note in training/modal_train.py).
   num_nodes: 1
-  gpus_per_node: 1 #4
+  gpus_per_node: 4
   gpu_type: "A100-80GB"  # 48 GB -- change freely, see the list above
