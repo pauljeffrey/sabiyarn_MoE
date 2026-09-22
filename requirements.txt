@@ -42,6 +42,12 @@ scikit-learn
 # launching runs on Modal from your laptop (`modal run ...`); not needed on a vast.ai box
 modal>=1.5
 
+# training.use_cce: fuses lm_head + cross-entropy so the (B, T, 52050) logits tensor is never materialized
+# (~2.5 GiB per micro-batch at block_size 4096). Triton kernels, so Linux + an Ampere-or-newer GPU; the import
+# is optional and guarded (training/new_train.py logs use_cce_ignored_package_missing if it is absent), and on
+# macOS it installs but cannot run. Set training.use_cce: false to skip it entirely.
+cut-cross-entropy>=25.1.1; platform_system == "Linux"
+
 # tests: pytest tests/
 pytest
 

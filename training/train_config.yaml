@@ -32,9 +32,9 @@ training:
   # torch.compile only ever applied to single-GPU runs (multi-process runs skip it), and is untested
   # on this MoE with the current torch/transformers -- a compile error would kill a rented run.
   # Turn it on only after a short single-GPU trial.
-  compile : false
+  compile : true
   display_model_output_iter : 128
-  use_cce : false  # to use cut cross entropy or not
+  use_cce : true  # to use cut cross entropy or not
   # Whether to mask prompt/action-span (pretrain) or prompt-vs-response (SFT)
   # tokens out of the loss at all -- see training/label_masking.py. false
   # means every token contributes to the loss, completely unmasked.
@@ -45,7 +45,7 @@ training:
   #                activation memory per sample and forces SDPA's slower masked kernel.
   #   flex      -- FlexAttention block mask (torch >= 2.5): no T x T tensor, cross-document blocks
   #                are skipped. Same result; verify with a TEST_RUN first (HOW_TO_RUN.md 2.9).
-  attention_impl: "sdpa_mask"
+  attention_impl: "flex" #"sdpa_mask"
   dtype: "bf16"  # autocast/compute precision
   # dtype the parameters, gradients and optimizer state are HELD in. float32 = master weights
   # (recommended): updates smaller than bf16's ~0.4% resolution are otherwise silently lost,
@@ -106,7 +106,7 @@ training:
   # same one, its state. Writes to a NEW run dir; applied once (a restart resumes the new run).
   # Env override: FRESH_START=1. Note Adam's moments re-estimate in ~20 steps (beta2=0.95), so
   # carrying them over saves little; set resume_optimizer_state: false to skip it.
-  fresh_start: true
+  fresh_start: false
   resume_optimizer_state: true
   mode: "pretrain"  # pretrain | sft
   # Dry run: load the model + model.reference_repo, run the startup
@@ -138,7 +138,7 @@ model:
   # local = build the network from this repo's sabiyarn/model/modeling.py and load only the weights
   # from repo_name (reproducible, testable). hub = use the modeling.py stored on the Hub next to the
   # weights (changes whenever someone pushes there; local edits have no effect until pushed).
-  code: local
+  code: hub #local
   # sparse = each expert only processes the tokens routed to it (~half the expert FLOPs and memory
   # for top-2 of 4); dense = every expert processes every token. Identical math.
   moe_dispatch: sparse
@@ -208,15 +208,18 @@ data:
   pretrain:
     - eng_train_data_path : "datasets/eng_training.bin"
     - afr_train_data_path : "datasets/training_cleaned.bin"
-    # TEMPORARY for smoke testing: validation.bin doesn't exist in the S3
-    # bucket. Pointing eval at an existing training bin just unblocks the
-    # pipeline check -- this is NOT a real held-out eval set. Restore to
-    # "validation.bin" (or a real eval split) before actual training.
-    - eval_data_path: "datasets/validation.bin"
+    # All three exist in the bucket (verified 2026-09-21 against
+    # https://usc1.contabostorage.com/<account>:sabiyarn-dataset/datasets/):
+    #   eng_training.bin     24.5 GB  ~13.1B tokens   (3.21M blocks of 4096)
+    #   training_cleaned.bin 44.3 GB  ~23.8B tokens   (5.80M blocks)
+    #   validation.bin        3.3 GB   ~1.8B tokens   (438K blocks)
+    # One eval pass reads eval_iters x train_batch_size = 1,200 fixed blocks (~4.9M tokens),
+    # i.e. the same ~0.3% of validation.bin every time, so eval loss is comparable across steps.
+    - eval_data_path: "datasets/validation.bin" 
   sft:
     - eng_train_data_path : "datasets/eng_sft_training.bin"
     - afr_train_data_path : "datasets/nigerian_sft_training.bin"
-    - eval_data_path: "sft_validation.bin"
+    - eval_data_path: "datasets/sft_validation.bin"
   sampling:
     - use_scheduled_sampling: true
     - afr_sampling_weight: 0.45   # start mixture (and the fixed mixture when use_scheduled_sampling is false)
@@ -226,7 +229,7 @@ data:
     # Omit it to get the default cosine swap of the two weights above. Rank-identical and resumable
     # (a pure function of the step). Example: 45% African for the first 30% of the run, ramp to 65% by
     # 70%, hold: schedule: [[0.0, 0.45], [0.3, 0.45], [0.7, 0.65], [1.0, 0.65]]
-    - schedule: [[0.0, 0.45], [0.3, 0.45], [0.7, 0.65], [1.0, 0.65]]
+    - schedule: [[0.0, 0.45], [0.3, 0.45], [0.7, 0.65], [1.0, 0.95]]
  
 
 # optimizer
@@ -254,9 +257,12 @@ optimizer:
 # accelerate.fsdp_sharding_strategy. Env override: DISTRIBUTED=ddp|fsdp. Same setting drives modal_train.py.
 ddp:
   enabled: true
-  rank : 0
   backend : "nccl"
-  use_dp: false
+  # rank/use_dp are NOT read by load_config.py -- torchrun sets RANK/LOCAL_RANK itself, and
+  # nn.DataParallel is not supported (it is single-process and slower than DDP). Kept only so old
+  # copies of this file still parse; setting use_dp has no effect.
+  rank : 0
+  use_dp: true
 
 #Accelerate config
 accelerate:

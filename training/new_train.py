@@ -412,7 +412,15 @@ class Trainer:
         self.model.config.moe_sparse_dispatch = sparse  # keeps mfu.py's FLOP accounting in step
         if self.master:
             LOG.info("model_options", model_code=self.cfg.model_code, moe_dispatch=self.cfg.moe_dispatch,
-                     moe_layers=n, attention_impl=self.cfg.attention_impl)
+                     moe_layers=n, attention_impl=self.cfg.attention_impl, use_cce=self.cfg.use_cce and HAS_CCE)
+            if self.cfg.use_cce and not HAS_CCE:
+                # Silently falling back would bill a whole run for a memory saving that never happened.
+                LOG.warning(
+                    "use_cce_ignored_package_missing",
+                    hint="training.use_cce is true but `cut_cross_entropy` is not installed; the run falls back "
+                         "to materializing full (B, T, vocab) logits. pip install cut-cross-entropy (it is in "
+                         "requirements.txt), or set use_cce: false to silence this.",
+                )
 
     def _doc_attention_mask(self, x):
         if self.cfg.attention_impl == "flex":
