@@ -13,6 +13,7 @@ Launch:
 
 from __future__ import annotations
 
+import gc
 import hashlib
 import json
 import math
@@ -222,8 +223,10 @@ class Trainer:
         self._build_model()
         self._build_optimizer()
         self._prepare_for_training()
+        self._cuda_memory_checkpoint("after_model_prepare")
         self._verify_resume_sanity()
         self._verify_reference_weights()
+        self._cuda_memory_checkpoint("after_reference_weight_check", release=True)
         # Qualitative companion to the weight-deviation check above: what the
         # two models actually GENERATE, before a single training step runs.
         # When training.test_run is set, train() runs one eval after this and
@@ -900,6 +903,53 @@ class Trainer:
                 )
             else:
                 self.model = torch.compile(self.model)
+
+    def _cuda_memory_checkpoint(self, phase: str, release: bool = False) -> None:
+        """Log this rank's CUDA memory at a named startup phase, optionally
+        releasing cached blocks first.
+
+        The startup sequence before the first training step is not free:
+        _verify_reference_weights loads a SECOND full model (fp32, every
+        rank), _startup_generation_comparison moves it onto the GPU and
+        generates from both models with a float32 KV cache
+        (config.kv_cache_dtype), and under FSDP summon_full_params
+        all-gathers unsharded parameters. None of that is leaked -- Python
+        frees it and the blocks go back to torch's caching allocator -- but
+        they go back as CACHED blocks of whatever sizes generation happened
+        to need. Training's first step then asks for a few large contiguous
+        blocks, and an allocator holding plenty of free-but-fragmented cache
+        can fail that request: the classic "tried to allocate 104 MiB" OOM
+        with gigabytes apparently free.
+
+        release=True runs gc.collect() + empty_cache() (every rank -- this
+        is per-process state, not a collective) so those blocks go back to
+        the driver and the next phase starts from a clean allocator. The
+        logged numbers make this visible instead of theoretical: watch
+        reserved_gib vs allocated_gib -- a large gap is cache, and a large
+        gap that survives a release is fragmentation worth acting on.
+        """
+        if not torch.cuda.is_available():
+            return
+        if release:
+            gc.collect()
+            torch.cuda.empty_cache()
+        if not self.master:
+            return
+        gib = 2 ** 30
+        allocated = torch.cuda.memory_allocated() / gib
+        reserved = torch.cuda.memory_reserved() / gib
+        total = torch.cuda.get_device_properties(torch.cuda.current_device()).total_memory / gib
+        LOG.info(
+            "cuda_memory",
+            phase=phase,
+            released=release,
+            allocated_gib=round(allocated, 2),
+            reserved_gib=round(reserved, 2),
+            cached_unused_gib=round(reserved - allocated, 2),
+            peak_allocated_gib=round(torch.cuda.max_memory_allocated() / gib, 2),
+            total_gib=round(total, 2),
+            headroom_gib=round(total - reserved, 2),
+        )
 
     def _apply_activation_checkpointing(self) -> None:
         """Wrap every transformer block in non-reentrant activation
@@ -1829,9 +1879,17 @@ class Trainer:
 
         if self.master:
             print(f"\n{'#' * 110}\n")
-        self._ref_model = None  # free the reference model; only needed for this comparison
+        # Move it off the GPU before dropping the reference, so its blocks
+        # are released now rather than whenever Python gets round to it.
+        if self._ref_model is not None:
+            try:
+                self._ref_model.to("cpu")
+            except Exception as exc:
+                LOG.warning("reference_model_offload_failed", error=str(exc))
+        self._ref_model = None
         self.model.train()
         self.accelerator.wait_for_everyone()
+        self._cuda_memory_checkpoint("after_startup_generation", release=True)
 
     @torch.no_grad()
     def _curated_samples(self) -> list[dict]:
@@ -2458,6 +2516,14 @@ class Trainer:
         # Sanity-check the loaded checkpoint (and FSDP wrapping) before
         # spending any real training time on it.
         self._log_sample_generation(self._sample_prompt(x), tag="startup_sample_generation")
+
+        # Everything above (two model loads, generation with a float32 KV
+        # cache, any summon_full_params all-gather) is done with. Hand its
+        # cached blocks back before the first step asks for large contiguous
+        # ones, and reset the peak so step logs measure training alone.
+        self._cuda_memory_checkpoint("before_first_training_step", release=True)
+        if torch.cuda.is_available():
+            torch.cuda.reset_peak_memory_stats()
 
         if self.cfg.test_run:
             self._test_run_eval()
