@@ -1,13 +1,20 @@
 
 training: 
-  # Micro-batch per GPU. Swept on a 22 GiB A10 at block_size 4096 with use_cce +
-  # gradient_checkpointing (2026-09-22), peak memory / tokens-per-sec:
-  #   6 -> 7.73 GiB / 21.8K     12 -> 10.83 GiB / 24.5K
-  #  16 -> 12.89 GiB / 24.8K    24 -> 17.02 GiB / 24.9K
-  # Throughput plateaus at 12 (16 buys +1.4% for +2 GiB, 24 buys +1.6% for +6 GiB), so 12 is
-  # the pick: ~98% of peak throughput with ~11 GiB spare on a 24 GB card. Peak memory is
-  # linear in the batch, about 4.6 + 0.52 x batch GiB, if you need to size a different card.
-  # Batch 6 with checkpointing OFF still OOM'd at 22 GiB, so that flag is not optional here.
+  # Micro-batch per GPU. Swept on one A100-80GB (79 GiB usable) at block_size 4096 with
+  # use_cce, 50 iterations each -- peak memory / tokens-per-sec / MFU:
+  #   batch 12, checkpointing ON  -> 10.83 GiB /  65.8K / 0.325
+  #   batch 12, checkpointing OFF -> 37.60 GiB /  92.2K / 0.456   <- this config
+  #   batch 16, checkpointing OFF -> 48.43 GiB /  91.4K / 0.452
+  #   batch 24, checkpointing OFF -> 70.10 GiB /  93.6K / 0.463
+  #   batch 24, checkpointing ON  -> 17.02 GiB /  71.6K / 0.354
+  #   batch 48, checkpointing ON  -> 29.40 GiB /  69.6K / 0.344
+  # Once checkpointing is off, throughput is flat from 12 to 24 (91-94K), so batch buys nothing
+  # above 12 -- batch 24 is +1.5% for 70 of 79 GiB, leaving no room for the eval pass, the
+  # startup generation, or fragmentation over a long run. 12 sits at 48% of the card.
+  # On a smaller card, peak with checkpointing ON is about 4.6 + 0.52 x batch GiB (measured on
+  # an A10: 7.73 GiB at 6, 10.83 at 12, 12.89 at 16, 17.02 at 24).
+  # batch x gradient_accumulation_steps must stay 192 AND leave accumulation divisible by the
+  # GPU count, so the legal batches on 4 GPUs are 12, 16, 24 and 48.
   train_batch_size : 12
   # Local/vast.ai: checkpoints go directly under this path. On Modal
   # (training/modal_train.py), this name is instead used as a subdirectory
@@ -22,7 +29,11 @@ training:
   eval_iters : 200
   eval_only : false  # if True, script exits right after the first eval
   always_save_checkpoint : true  # if True, always save a checkpoint after each eval
-  gradient_accumulation_steps : 16  # 12 x 16 = 192 -> same 786K-token global batch as 6 x 32
+  # GLOBAL, not per GPU: new_train.py divides this by the world size, but ONLY when it divides
+  # evenly -- keep it a multiple of your GPU count or each GPU silently runs the full count and
+  # the global batch multiplies. 16 / 4 GPUs = 4 micro-steps each -> 12 x 4096 x 4 x 4 = 786,432
+  # tokens per optimizer step, the same global batch the learning rate was chosen for.
+  gradient_accumulation_steps : 16
   decay_lr : True  # whether to decay the learning rate
   # LR schedule (training/lr_schedule.py) is a pure function of iter_num. Recommended for a
   # long token-budget run (see HOW_TO_RUN.md "Recommended hyperparameters" for the sources):
@@ -51,7 +62,13 @@ training:
   # Trainer._apply_activation_checkpointing). ~25-30% slower steps, several GiB less activation
   # memory. With this plus use_cce, a batch-6 x 4096 step peaked at 7.73 GiB on a 22 GiB A10;
   # without them the same step tried to allocate 19.5+ GiB and OOM'd. Env: GRADIENT_CHECKPOINTING=1/0.
-  gradient_checkpointing: true
+  # FALSE for 80 GB cards. Recomputing each block costs ~40% throughput (92.2K -> 65.8K
+  # tokens/sec, measured above) to save memory an A100-80GB does not need: batch 12 peaks at
+  # 37.6 GiB of 79 without it. This is the ONE setting here that is specific to the card -- on
+  # anything under ~48 GiB per GPU set it back to true, or the step wants 37.6 GiB and OOMs.
+  # (On a 22 GiB A10, batch 6 OOM'd with this off and fit in 7.73 GiB with it on.)
+  # Env override without editing this file: GRADIENT_CHECKPOINTING=1/0.
+  gradient_checkpointing: false
   # Whether to mask prompt/action-span (pretrain) or prompt-vs-response (SFT)
   # tokens out of the loss at all -- see training/label_masking.py. false
   # means every token contributes to the loss, completely unmasked.
