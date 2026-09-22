@@ -17,9 +17,15 @@ def build_document_block_mask(input_ids: torch.Tensor, eos_token_id: int):
     def mask_mod(b, h, q_idx, kv_idx):
         return (q_idx >= kv_idx) & (doc_id[b, q_idx] == doc_id[b, kv_idx])
 
+    # NOT _compile=True. That flag routes through `torch.compile(create_block_mask)(mask_mod, ...)`, and
+    # `mask_mod` is a fresh closure over a fresh `doc_id` every micro-batch, so Dynamo sees a new function
+    # object each call and recompiles -- up to gradient_accumulation_steps times per optimizer step, each
+    # compiled graph holding GPU memory. (It is also deprecated in torch 2.x and slated for removal.)
+    # Uncompiled construction transiently materializes a (B, 1, T, T) bool grid -- 134 MB at B=8, T=4096 --
+    # which is bounded and freed immediately. The attention kernel itself is still compiled and still never
+    # builds a T x T tensor; that is where the memory saving actually comes from (see modeling._flex_attention).
     return create_block_mask(
-        mask_mod, B=batch, H=None, Q_LEN=seq_len, KV_LEN=seq_len,
-        device=input_ids.device, _compile=input_ids.is_cuda,
+        mask_mod, B=batch, H=None, Q_LEN=seq_len, KV_LEN=seq_len, device=input_ids.device,
     )
 
 
