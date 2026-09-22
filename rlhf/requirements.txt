@@ -1,0 +1,32 @@
+# AfriCOMET reward model -- a SEPARATE environment, never installed next to the root requirements.txt.
+#
+# `unbabel-comet` pins transformers<5, huggingface_hub<1 and numpy<2. The SabiYarn model code is written
+# against transformers 5.x (root requirements.txt pins 5.14.1), so the two cannot share one environment:
+# installing comet next to it silently downgrades transformers and breaks the model class.
+#
+# Instead, comet lives in its own virtualenv and is driven over a pipe by rl/comet_worker.py; the trainer
+# stays on transformers 5. Point `reward_python` (or RL_REWARD_PYTHON / AFRICOMET_PYTHON) at that venv's
+# python and nothing else changes.
+#
+#   # --system-site-packages reuses the torch already installed in the main environment (~2.5 GB saved);
+#   # the pins below are installed INTO the venv and shadow the outer transformers/numpy for this process only.
+#   python -m venv --system-site-packages .venv-comet
+#   .venv-comet/bin/pip install -r rlhf/requirements.txt
+#
+#   # then, for training:
+#   python rlhf/scripts/run_rlhf.py reward_python=.venv-comet/bin/python
+#   # and for evaluation:
+#   AFRICOMET_PYTHON=.venv-comet/bin/python python -m eval_suite.run --model <ckpt> --africomet masakhane/africomet-stl
+#
+# On Modal this venv is baked into the image by rl/modal_rl.py (the `comet` image) -- nothing to do by hand.
+# Verify a built venv with:  .venv-comet/bin/python -m rl.comet_worker --help
+#
+# If torch is NOT already present (a bare box with no main install), drop --system-site-packages and pip
+# will pull its own CPU/CUDA torch build, which comet supports from 1.6 up.
+
+unbabel-comet>=2.2.0,<3
+
+# Pulled in by unbabel-comet, listed here so a resolver failure is obvious rather than mysterious:
+#   transformers>=4.17,<5   huggingface-hub>=0.19.3,<1   numpy>=1.20,<2   protobuf>=4.24.4,<5
+#   pytorch-lightning>=2,<3   torchmetrics>=0.10.2,<0.11   sentencepiece>=0.2,<0.3   sacrebleu>=2,<3
+#   entmax>=1.1,<2   jsonargparse==3.13.1   scipy>=1.5.4,<2   pandas>=1.4.1

@@ -58,6 +58,7 @@ def main() -> None:
         help=f"Filenames under sabiyarn/model/ to push (default: {DEFAULT_FILES})",
     )
     parser.add_argument("--confirm", action="store_true", help="Actually upload. Without this, only prints a preview.")
+    parser.add_argument("--message", default=None, help="Commit message for the Hub commit (default: describes the files pushed).")
     args = parser.parse_args()
 
     paths = []
@@ -97,8 +98,7 @@ def main() -> None:
             repo_id=args.repo,
             repo_type="model",
             token=token,
-            commit_message=f"Update {p.name}: gate MoE router noise on torch.is_grad_enabled() too, "
-                            "not just self.training",
+            commit_message=args.message or f"Update {p.name} from sabiyarn/model/{p.name}",
         )
         print(f"Pushed {p.name} -> {args.repo}")
 
