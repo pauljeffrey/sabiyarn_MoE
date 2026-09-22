@@ -14,7 +14,7 @@ training:
   eval_iters : 200
   eval_only : false  # if True, script exits right after the first eval
   always_save_checkpoint : true  # if True, always save a checkpoint after each eval
-  gradient_accumulation_steps : 32  # used to simulate larger batch sizes (was 5 * 8)
+  gradient_accumulation_steps : 16  # used to simulate larger batch sizes (was 5 * 8)
   decay_lr : True  # whether to decay the learning rate
   # LR schedule (training/lr_schedule.py) is a pure function of iter_num. Recommended for a
   # long token-budget run (see HOW_TO_RUN.md "Recommended hyperparameters" for the sources):
