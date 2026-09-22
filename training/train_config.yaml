@@ -1,6 +1,6 @@
 
 training: 
-  train_batch_size : 8
+  train_batch_size : 6
   # Local/vast.ai: checkpoints go directly under this path. On Modal
   # (training/modal_train.py), this name is instead used as a subdirectory
   # under the persistent "sabiyarn-data" volume -- checkpoints land at
@@ -34,7 +34,7 @@ training:
   # Turn it on only after a short single-GPU trial.
   compile : false
   display_model_output_iter : 128
-  use_cce : true  # to use cut cross entropy or not
+  use_cce : false  # to use cut cross entropy or not
   # Whether to mask prompt/action-span (pretrain) or prompt-vs-response (SFT)
   # tokens out of the loss at all -- see training/label_masking.py. false
   # means every token contributes to the loss, completely unmasked.
