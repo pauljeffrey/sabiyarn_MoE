@@ -283,14 +283,15 @@ optimizer:
   # benchmarks (Wen et al. 2025) find its edge over a well-tuned AdamW shrinking with scale and
   # at high tokens-per-parameter, so A/B it on ~300M tokens before committing a long run.
   name : "adamw"
-  # 5e-5, NOT the 6e-4 the literature gives for a 300M model: that figure is for training from
-  # scratch. This checkpoint's whole history was trained at 1e-5, and running it at 6e-4 diverged
-  # on 2026-09-23 -- val loss 3.38 -> 3.78 -> 4.56 -> 5.58 -> 7.79 over ~1000 iters, with step
-  # loss swinging 3.2 <-> 7.1 and reference weight drift going 0.00073 -> 0.36 (one attention
-  # matrix hit 1.71). 5e-5 is 5x the rate this model actually converged under, which is a real
-  # increase without being a different regime. Raise it later only after a few hundred stable
-  # iters, and watch eval val: flat-or-falling is fine, oscillating by >0.5 is the warning.
-  learning_rate : 5e-5
+  # 1e-5: the rate this checkpoint actually trained under for its whole history. The literature's
+  # 6e-4 for a 300M model assumes training FROM SCRATCH; applied to an already-converged
+  # checkpoint it diverged on 2026-09-23 -- val 3.38 -> 3.78 -> 4.56 -> 5.58 -> 7.79 over ~1000
+  # iters, step loss swinging 3.2 <-> 7.1, reference weight drift 0.00073 -> 0.36 (one attention
+  # matrix at 1.71) and the layer-0 MoE router collapsed onto one expert. Note there is no real
+  # warmup available on a resume at a high iter_num (see warmup_iters), so the first step lands
+  # near the peak: the peak itself has to be safe, which is the reason for matching the model's
+  # own history rather than splitting the difference.
+  learning_rate : 1e-5
   max_tokens : 50e9  # token budget -> max_iters is derived at startup from the real tokens/step
   max_iters : 60000  # fallback if max_tokens is 0
   weight_decay : 1e-1
