@@ -45,7 +45,14 @@ training:
   scheduler: "wsd"  # wsd | linear | cosine
   wsd_decay_frac: 0.2  # fraction of max_iters spent cooling down (0.1-0.2)
   wsd_decay_shape: "sqrt"  # sqrt = (1 - sqrt(t)) cooldown | linear | cosine
-  warmup_iters : 1000  # ~0.8B tokens at 786K tokens/step; typical range 0.1-2% of total steps
+  # _lr() is a pure function of the GLOBAL iter_num and the ramp is measured from iter 0, so on a
+  # resume at 17400 this buys far less than it looks: measured, lr(17400) = 4.73e-5 of the 5e-5
+  # peak (94.6%) and it reaches peak at 18400. It is NOT a 1000-step ramp from zero -- there is no
+  # way to get one at a high iter_num without either fresh_start: true (resets iter_num to 0, so
+  # warmup_iters 1000 applies properly, at the cost of restarting the token-budget accounting) or
+  # a warmup_iters around 2x the resume iter (e.g. 34800 -> starts at 50% of peak). Kept modest
+  # here because the real protection is the lower peak: 5e-5 is 12x below the 6e-4 that diverged.
+  warmup_iters : 18400
   lr_decay_iters : 60000  # only used by scheduler: cosine / linear; wsd uses max_iters
   min_lr : 0.0  # final LR. Must stay BELOW optimizer.learning_rate. 0 = decay to zero
   # torch.compile only ever applied to single-GPU runs (multi-process runs skip it), and is untested
@@ -103,7 +110,7 @@ training:
   # step count/optimizer momentum from a prior local run while pulling fresh
   # weights, which is intentional for continuous pretraining across Modal
   # container restarts.
-  init_from: "hf"  # hf (HuggingFace hub) | resume (local ckpt); use "resume" with fresh_start
+  init_from: "resume"  # local checkpoint weights, per resume_from below (was "hf")
   # Optional explicit override; leave blank to auto-discover the most recent
   # matching run directory under training.out_dir (works the same on a Modal
   # Volume, a vast.ai instance's local disk, or your own machine -- purely a
@@ -117,7 +124,10 @@ training:
   # rewinds iter_num/the LR+sampling schedule to wherever that best eval
   # happened, "latest" continues from wherever training last stopped even
   # if loss had gotten worse since the best point.
-  resume_from: "latest"  # latest | best
+  # "best" = ckpt_best, iter 17400, val 3.3837 -- the last good state before the 6e-4 divergence.
+  # "latest" is ckpt_18450 at val 7.79 and must NOT be resumed. Resuming best also rewinds
+  # iter_num to 17400 and loads resume_state_best, so the optimizer matches the weights.
+  resume_from: "best"  # latest | best
   # If true, skip the local-vs-S3 recency comparison in Trainer._setup_dirs
   # and always resume from S3 when it has any checkpoint -- useful when
   # training across multiple Modal accounts/volumes where "local" state on
@@ -273,7 +283,14 @@ optimizer:
   # benchmarks (Wen et al. 2025) find its edge over a well-tuned AdamW shrinking with scale and
   # at high tokens-per-parameter, so A/B it on ~300M tokens before committing a long run.
   name : "adamw"
-  learning_rate : 6e-4  # peak. ~4e-4..1e-3 is the range for 0.1-1B models; sweep {4e-4, 6e-4, 1e-3}
+  # 5e-5, NOT the 6e-4 the literature gives for a 300M model: that figure is for training from
+  # scratch. This checkpoint's whole history was trained at 1e-5, and running it at 6e-4 diverged
+  # on 2026-09-23 -- val loss 3.38 -> 3.78 -> 4.56 -> 5.58 -> 7.79 over ~1000 iters, with step
+  # loss swinging 3.2 <-> 7.1 and reference weight drift going 0.00073 -> 0.36 (one attention
+  # matrix hit 1.71). 5e-5 is 5x the rate this model actually converged under, which is a real
+  # increase without being a different regime. Raise it later only after a few hundred stable
+  # iters, and watch eval val: flat-or-falling is fine, oscillating by >0.5 is the warning.
+  learning_rate : 5e-5
   max_tokens : 50e9  # token budget -> max_iters is derived at startup from the real tokens/step
   max_iters : 60000  # fallback if max_tokens is 0
   weight_decay : 1e-1
