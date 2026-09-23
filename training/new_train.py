@@ -1966,6 +1966,15 @@ class Trainer:
             metrics[f"curated/{lang}_bpb"] = stats["bpb"]
         self.tracker.log_metrics(metrics, step=self.iter_num)
 
+    # Without this, every eval iteration builds an autograd graph that
+    # losses[k] below then keeps alive, so eval_iters worth of activations
+    # pile up with no backward to free them: at batch 12 x 4096 and
+    # gradient_checkpointing off that is ~33 GiB per iteration, and all four
+    # ranks OOM'd at 77.90 GiB inside the third one, before the first
+    # training step. Every other eval helper here is decorated; this one lost
+    # it in a rewrite (it was present at a94ab5a) and the sweeps never caught
+    # it because they set eval_interval high enough that no eval ever ran.
+    @torch.no_grad()
     def estimate_loss(self):
         """Every rank evaluates a shard of eval_iters and results are averaged
         via an all-reduce, so all ranks do equal work and stay in lockstep
@@ -1980,7 +1989,7 @@ class Trainer:
             (self._eval_train_sampler if split == "train" else self._eval_val_sampler).reset()  # same blocks every eval
             for k in range(local_iters):
                 x, y = self.get_batch(split)
-                losses[k] = self._forward_loss(x, y)
+                losses[k] = self._forward_loss(x, y).detach()
                 n_tok, n_bytes = self._target_stats(y)
                 totals += torch.stack([self._last_ce_loss.double() * n_tok, n_tok.double(), n_bytes.double()])
             local_mean = losses.mean()
