@@ -23,7 +23,7 @@
       "name": "Yoruba",
       "tier": "medium",
       "samples": 40000,
-      "guidance": "Tone marks and under-dots are mandatory and meaning-bearing: ọ ẹ ṣ and the diacritics."
+      "guidance": "Tone marks and under-dots are mandatory and meaning-bearing: ọ ẹ ṣ plus diacritics."
     },
     "hau": {
       "code": "hau",
@@ -39,40 +39,12 @@
       "samples": 40000,
       "guidance": "Dotted vowels ị ọ ụ and the nasal ṅ are required."
     },
-    "urh": {
-      "code": "urh",
-      "name": "Urhobo",
-      "tier": "low",
-      "samples": 30000,
-      "guidance": "Very low-resource. Prefer short, concrete sentences over ambitious prose."
-    },
-    "efi": {
-      "code": "efi",
-      "name": "Efik",
-      "tier": "low",
-      "samples": 30000,
-      "guidance": "Very low-resource. Watch for drift into Ibibio."
-    },
     "twi": {
       "code": "twi",
       "name": "Twi (Akan)",
       "tier": "medium",
       "samples": 30000,
-      "guidance": "Use ɛ and ɔ. Keep Asante Twi consistent within a document."
-    },
-    "ewe": {
-      "code": "ewe",
-      "name": "Ewe",
-      "tier": "low",
-      "samples": 30000,
-      "guidance": "Uses ɖ ƒ ŋ ɣ ʋ and tone marks."
-    },
-    "fon": {
-      "code": "fon",
-      "name": "Fon",
-      "tier": "low",
-      "samples": 30000,
-      "guidance": "Uses ɖ ɛ ɔ and tone marks. Do not drift into French."
+      "guidance": "Use ɛ and ɔ. Keep Asante Twi consistent within a sample."
     },
     "aka": {
       "code": "aka",
@@ -81,12 +53,40 @@
       "samples": 30000,
       "guidance": "Closely related to Twi; keep them distinguishable."
     },
+    "efi": {
+      "code": "efi",
+      "name": "Efik",
+      "tier": "low",
+      "samples": 30000,
+      "guidance": "Very low-resource. Watch for drift into Ibibio. Prefer short concrete sentences."
+    },
+    "urh": {
+      "code": "urh",
+      "name": "Urhobo",
+      "tier": "low",
+      "samples": 30000,
+      "guidance": "Very low-resource. Prefer short, concrete sentences over ambitious prose."
+    },
+    "fon": {
+      "code": "fon",
+      "name": "Fon",
+      "tier": "low",
+      "samples": 30000,
+      "guidance": "Uses ɖ ɛ ɔ and tone marks. Do not drift into French."
+    },
+    "ewe": {
+      "code": "ewe",
+      "name": "Ewe",
+      "tier": "low",
+      "samples": 30000,
+      "guidance": "Uses ɖ ƒ ŋ ɣ ʋ and tone marks."
+    },
     "ful": {
       "code": "ful",
       "name": "Fulah",
       "tier": "low",
       "samples": 30000,
-      "guidance": "Uses ɓ ɗ ƴ ŋ. Adlam script is NOT used here -- Latin only."
+      "guidance": "Uses ɓ ɗ ƴ ŋ. Latin script only -- not Adlam."
     },
     "fuv": {
       "code": "fuv",
@@ -153,8 +153,8 @@
         "</tool_call>"
       ],
       "tool_result": [
-        "<tool_result>",
-        "</tool_result>"
+        "<tool_response>",
+        "</tool_response>"
       ],
       "lang_markers": {
         "input": "<|input_lang|>",
@@ -174,6 +174,7 @@
         "<|JSON|>",
         "<|code|>",
         "<|plan|>",
+        "<|analyze|>",
         "<|recommend|>",
         "<|explain|>",
         "<|debug|>",
@@ -208,8 +209,7 @@
         "question": "<question>"
       },
       "_warnings": [
-        "The chat template emits <tool_result>...</tool_result>, which is NOT in the tokenizer's special vocabulary and therefore costs ~5 byte-BPE tokens per tag. The tokenizer DOES have <tool_response> (52037) and </tool_response> (52038) as single tokens. Either change the template to emit <tool_response>, or add <tool_result> to the tokenizer -- but decide BEFORE generating, because the choice is baked into every generated sample.",
-        "Token 52043 is '|analyze|>' -- it is missing its leading '<'. Do not use it in task plans; use <|explain|> or <|plan|> instead until the tokenizer is fixed."
+        "Tokenizer ids 52050-52115 are ABOVE the model's vocab_size (52050), so they can never be embedded. That range holds <|hate|> and ~65 other-language tags. Do not use them until the embedding is resized; <toxic> (52008) is in range and is what the toxicity task uses."
       ]
     },
     "output": "plain prose, no markup",
@@ -222,5 +222,10 @@
       "title",
       "text"
     ]
+  },
+  "yield_by_tier": {
+    "high": 0.92,
+    "medium": 0.85,
+    "low": 0.72
   }
 }

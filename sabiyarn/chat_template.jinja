@@ -14,10 +14,10 @@
         {{- eos_token -}}
     {# ===== TOOL RESPONSES ===== #}
     {%- elif message['role'] == 'tool' %}
-        {{- "<tool_result>" -}}
+        {{- "<tool_response>" -}}
         {{- message['name'] ~ " " if message['name'] else "" -}}
         {{- message['content'] -}}
-        {{- "</tool_result>" -}}
+        {{- "</tool_response>" -}}
         {{- eos_token -}}
     {# ===== ASSISTANT MESSAGES — NORMAL OR WITH TOOL CALL ===== #}
     {%- elif message['role'] == 'assistant' %}

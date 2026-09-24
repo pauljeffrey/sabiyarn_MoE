@@ -55,13 +55,13 @@ SPECIAL_TOKENS = {
     "think": ["<think>", "</think>"],
     "task_plan": ["<task_plan>", "</task_plan>"],
     "tool_call": ["<tool_call>", "</tool_call>"],
-    "tool_result": ["<tool_result>", "</tool_result>"],
+    "tool_result": ["<tool_response>", "</tool_response>"],
     "lang_markers": {"input": "<|input_lang|>", "target": "<|target_lang|>"},
     "response": "<response>",
     "context": ["<context>", "</context>"],
     "task_plan_verbs": [
         "<|chat|>", "<|generate|>", "<|edit|>", "<|data_extract|>", "<|math|>", "<|JSON|>", "<|code|>",
-        "<|plan|>", "<|recommend|>", "<|explain|>", "<|debug|>", "<|RAG|>",
+        "<|plan|>", "<|analyze|>", "<|recommend|>", "<|explain|>", "<|debug|>", "<|RAG|>",
         "<summarize>", "<translate>", "<classify>", "<NER>", "<identify>", "<qa>",
     ],
     "domain_flags": [
@@ -74,13 +74,9 @@ SPECIAL_TOKENS = {
         "title": "<title>", "headline": "<headline>", "summary": "<summary>", "question": "<question>",
     },
     "_warnings": [
-        "The chat template emits <tool_result>...</tool_result>, which is NOT in the tokenizer's special "
-        "vocabulary and therefore costs ~5 byte-BPE tokens per tag. The tokenizer DOES have <tool_response> "
-        "(52037) and </tool_response> (52038) as single tokens. Either change the template to emit "
-        "<tool_response>, or add <tool_result> to the tokenizer -- but decide BEFORE generating, because "
-        "the choice is baked into every generated sample.",
-        "Token 52043 is '|analyze|>' -- it is missing its leading '<'. Do not use it in task plans; use "
-        "<|explain|> or <|plan|> instead until the tokenizer is fixed.",
+        "Tokenizer ids 52050-52115 are ABOVE the model's vocab_size (52050), so they can never be embedded. "
+        "That range holds <|hate|> and ~65 other-language tags. Do not use them until the embedding is "
+        "resized; <toxic> (52008) is in range and is what the toxicity task uses.",
     ],
 }
 
@@ -92,10 +88,20 @@ ASSISTANT_FORMAT = {
                    "<task_plan>{verbs}</task_plan><|target_lang|>{tgt}<response>{text}"),
     "tool_call": "<|input_lang|>{src}<think>{reasoning}</think><tool_call>{name}\n{arguments_json}</tool_call>",
     "notes": (
-        "src/tgt are language tags like <yor>. verbs are one or more task_plan verbs. A turn that calls a "
-        "tool emits ONLY the tool_call form (no <response>); the tool result comes back as a separate "
-        "role='tool' message and the assistant then speaks again. Reasoning inside <think> is written in "
-        "the TARGET language, short (1-3 sentences), and never restates the question."
+        "src/tgt are language tags like <yor>; for translation they differ and must match the real "
+        "direction. A turn that calls a tool emits ONLY the tool_call form (no <response>); the tool result "
+        "comes back as a separate role='tool' message and the assistant then speaks again. "
+        "<think> IS ALWAYS IN ENGLISH, regardless of the conversation language -- it is the model's internal "
+        "scratchpad, English keeps it short and consistent across all 13 languages, and it is never shown to "
+        "the user. The <response> is always in the target language. "
+        "<task_plan> is a PLAN, not a label: for a multi-step turn it lists the verbs in the order they will "
+        "be carried out (e.g. <|RAG|><|analyze|><|explain|>), so the model learns to commit to a sequence "
+        "before executing it."
+    ),
+    "confidence": (
+        "Every generated sample carries `confidence`, a float in [0, 1]: the generating model's own estimate "
+        "that the sample is correct AND fluent in the target language. Low-confidence samples are kept but "
+        "flagged, so a filter threshold can be chosen after inspection rather than guessed up front."
     ),
 }
 
@@ -107,27 +113,43 @@ ASSISTANT_FORMAT = {
 # present only to keep the model's English from decaying.
 # ---------------------------------------------------------------------------
 
-_LANGS = [
-    # code   name                tier      pretrain   sft     rl    guidance
-    ("pcm", "Nigerian Pidgin",   "high",     60000, 12000, 3000, "English-lexified creole. Keep it genuinely Pidgin, not English with dropped copulas."),
-    ("yor", "Yoruba",            "medium",   40000,  8000, 2000, "Tone marks and under-dots are mandatory and meaning-bearing: ọ ẹ ṣ and the diacritics."),
-    ("hau", "Hausa",             "medium",   40000,  8000, 2000, "Use hooked letters ɓ ɗ ƙ and the apostrophe in 'y correctly."),
-    ("ibo", "Igbo",              "medium",   40000,  8000, 2000, "Dotted vowels ị ọ ụ and the nasal ṅ are required."),
-    ("urh", "Urhobo",            "low",      30000,  5000, 1200, "Very low-resource. Prefer short, concrete sentences over ambitious prose."),
-    ("efi", "Efik",              "low",      30000,  5000, 1200, "Very low-resource. Watch for drift into Ibibio."),
-    ("twi", "Twi (Akan)",        "medium",   30000,  5000, 1200, "Use ɛ and ɔ. Keep Asante Twi consistent within a document."),
-    ("ewe", "Ewe",               "low",      30000,  5000, 1200, "Uses ɖ ƒ ŋ ɣ ʋ and tone marks."),
-    ("fon", "Fon",               "low",      30000,  5000, 1200, "Uses ɖ ɛ ɔ and tone marks. Do not drift into French."),
-    ("aka", "Akan",              "medium",   30000,  5000, 1200, "Closely related to Twi; keep them distinguishable."),
-    ("ful", "Fulah",             "low",      30000,  5000, 1200, "Uses ɓ ɗ ƴ ŋ. Adlam script is NOT used here -- Latin only."),
-    ("fuv", "Nigerian Fulfulde", "low",      30000,  5000, 1200, "Nigerian variety specifically, distinct from Pular/Fuuta."),
-    ("eng", "English",           "high",     15000,  3000,  800, "Plain, concrete English. No flowery register."),
-]
+VOLUMES_DIR = Path(__file__).resolve().parent / "volumes"
+
+# Language metadata that is NOT a volume (tier + orthography traps). Counts live in volumes/<kind>.yaml so
+# they can be retuned without touching code.
+_LANG_META = {
+    "pcm": ("Nigerian Pidgin", "high", "English-lexified creole. Keep it genuinely Pidgin, not English with dropped copulas."),
+    "yor": ("Yoruba", "medium", "Tone marks and under-dots are mandatory and meaning-bearing: ọ ẹ ṣ plus diacritics."),
+    "hau": ("Hausa", "medium", "Use hooked letters ɓ ɗ ƙ and the apostrophe in 'y correctly."),
+    "ibo": ("Igbo", "medium", "Dotted vowels ị ọ ụ and the nasal ṅ are required."),
+    "twi": ("Twi (Akan)", "medium", "Use ɛ and ɔ. Keep Asante Twi consistent within a sample."),
+    "aka": ("Akan", "medium", "Closely related to Twi; keep them distinguishable."),
+    "efi": ("Efik", "low", "Very low-resource. Watch for drift into Ibibio. Prefer short concrete sentences."),
+    "urh": ("Urhobo", "low", "Very low-resource. Prefer short, concrete sentences over ambitious prose."),
+    "fon": ("Fon", "low", "Uses ɖ ɛ ɔ and tone marks. Do not drift into French."),
+    "ewe": ("Ewe", "low", "Uses ɖ ƒ ŋ ɣ ʋ and tone marks."),
+    "ful": ("Fulah", "low", "Uses ɓ ɗ ƴ ŋ. Latin script only -- not Adlam."),
+    "fuv": ("Nigerian Fulfulde", "low", "Nigerian variety specifically, distinct from Pular/Fuuta."),
+    "eng": ("English", "high", "Plain, concrete English. No flowery register."),
+}
 
 
-def _languages(idx: int) -> list[LanguageSpec]:
-    return [LanguageSpec(code=c, name=n, tier=t, samples=row[idx], guidance=g)
-            for row in _LANGS for c, n, t, g in [(row[0], row[1], row[2], row[6])]]
+def _load_volumes(kind: str) -> tuple[dict[str, int], dict[str, float]]:
+    import yaml
+    raw = yaml.safe_load((VOLUMES_DIR / f"{kind}.yaml").read_text(encoding="utf-8")) or {}
+    counts = raw.get("samples_per_language") or {}
+    unknown = set(counts) - set(_LANG_META)
+    if unknown:
+        raise SystemExit(f"volumes/{kind}.yaml: unknown language(s) {sorted(unknown)}")
+    return counts, (raw.get("yield_by_tier") or {})
+
+
+def _languages(kind: str) -> tuple[list[LanguageSpec], dict[str, float]]:
+    counts, yields = _load_volumes(kind)
+    langs = [LanguageSpec(code=c, name=_LANG_META[c][0], tier=_LANG_META[c][1],
+                          samples=n, guidance=_LANG_META[c][2])
+             for c, n in counts.items()]
+    return langs, yields
 
 
 # ---------------------------------------------------------------------------
@@ -137,97 +159,130 @@ def _languages(idx: int) -> list[LanguageSpec]:
 # as important to train on as the happy path.
 # ---------------------------------------------------------------------------
 
+def _t(name, description, props, required, returns, failures, domains):
+    return ToolSpec(name=name, description=description,
+                    parameters={"type": "object", "properties": props, "required": required},
+                    returns=returns, failure_modes=failures)
+
+
+_STR = {"type": "string"}
+_INT = {"type": "integer"}
+
+# Tool catalogue. Deliberately broad in KIND (retrieval, computation, storage, domain lookup, actions) and
+# narrow in overlap: a 306M model has to learn tool SELECTION, and two tools that sound alike make that
+# impossible. Each conversation sees only 4-7 of these, of which 2-3 are deliberately irrelevant.
 TOOLS = [
-    ToolSpec(
-        name="search_internet",
-        description="Search the public internet for information the assistant does not already know. Use for "
-                    "named products, companies, people, places, events, or any technical term the assistant "
-                    "has not encountered. Returns short text snippets.",
-        parameters={"type": "object", "properties": {
-            "query": {"type": "string", "description": "A short search query, in English, 2-8 words."}},
-            "required": ["query"]},
-        returns="2-4 snippets of 1-3 sentences each, sometimes with a source name. Often partial, sometimes stale.",
-        failure_modes=["no results at all", "results about a different sense of the word",
-                       "results that mention the term but never define it"],
-    ),
-    ToolSpec(
-        name="search_documents",
-        description="Search the documents supplied in this conversation for passages relevant to a query. Use "
-                    "this before answering any question about a supplied document. Does NOT search the internet.",
-        parameters={"type": "object", "properties": {
-            "query": {"type": "string", "description": "What to look for, in the document's language."},
-            "top_k": {"type": "integer", "description": "How many passages to return (1-5). Default 3."}},
-            "required": ["query"]},
-        returns="Verbatim passages from the supplied document, each with a rough location.",
-        failure_modes=["the document genuinely does not discuss it", "passages are topically near but do not answer"],
-    ),
-    ToolSpec(
-        name="lookup_health_guidance",
-        description="Look up plain-language public-health guidance on a symptom, condition, medicine or "
-                    "prevention topic. Use for any health question before answering. Not a diagnosis.",
-        parameters={"type": "object", "properties": {
-            "topic": {"type": "string", "description": "Symptom, condition or medicine, in English."}},
-            "required": ["topic"]},
-        returns="Guidance paragraphs: what it is, warning signs, what to do at home, when to go to a clinic.",
-        failure_modes=["topic too vague to match", "guidance covers adults but the question was about an infant"],
-    ),
-    ToolSpec(
-        name="calculate",
-        description="Evaluate an arithmetic expression. Use for any calculation rather than doing it mentally.",
-        parameters={"type": "object", "properties": {
-            "expression": {"type": "string", "description": "e.g. '4500 * 12 - 3000'"}}, "required": ["expression"]},
-        returns="The numeric result.",
-        failure_modes=["malformed expression", "division by zero"],
-    ),
-    ToolSpec(
-        name="get_exchange_rate",
-        description="Get the current exchange rate between two currencies, by ISO code.",
-        parameters={"type": "object", "properties": {
-            "base": {"type": "string", "description": "e.g. 'NGN'"},
-            "quote": {"type": "string", "description": "e.g. 'USD'"}}, "required": ["base", "quote"]},
-        returns="A rate and the timestamp it was quoted at.",
-        failure_modes=["unknown currency code", "rate unavailable for that pair"],
-    ),
-    ToolSpec(
-        name="get_current_datetime",
-        description="Get the current date, time and timezone. Use whenever the answer depends on today's date.",
-        parameters={"type": "object", "properties": {
-            "timezone": {"type": "string", "description": "IANA zone, e.g. 'Africa/Lagos'. Optional."}}, "required": []},
-        returns="ISO timestamp and timezone name.",
-        failure_modes=["unknown timezone name"],
-    ),
-    ToolSpec(
-        name="send_message",
-        description="Send a text message on the user's behalf. Only call this after the user has clearly asked "
-                    "for the message to be sent, and confirm the recipient and wording first if either is unclear.",
-        parameters={"type": "object", "properties": {
-            "recipient": {"type": "string", "description": "Name or phone number."},
-            "body": {"type": "string", "description": "The message text, in the user's language."}},
-            "required": ["recipient", "body"]},
-        returns="Delivery confirmation, or an error.",
-        failure_modes=["recipient not found", "network failure", "ambiguous recipient (two contacts match)"],
-    ),
-    ToolSpec(
-        name="set_reminder",
-        description="Create a reminder for the user at a specific time.",
-        parameters={"type": "object", "properties": {
-            "when": {"type": "string", "description": "ISO datetime, or a plain phrase like 'tomorrow 07:00'."},
-            "text": {"type": "string", "description": "What to remind the user about."}},
-            "required": ["when", "text"]},
-        returns="Confirmation with the resolved absolute time.",
-        failure_modes=["time in the past", "unparseable time phrase"],
-    ),
-    ToolSpec(
-        name="translate_text",
-        description="Translate text between the languages this assistant supports. Use only when the user asks "
-                    "for a translation the assistant is not confident producing itself.",
-        parameters={"type": "object", "properties": {
-            "text": {"type": "string"},
-            "target_language": {"type": "string", "description": "Language code, e.g. 'yor'."}},
-            "required": ["text", "target_language"]},
-        returns="The translated text.",
-        failure_modes=["unsupported language code", "input too long"],
-    ),
+    # -- retrieval
+    _t("search_internet", "Search the public internet for information the assistant does not already know. "
+       "Use for named products, companies, people, places, events, or any technical term it has not met.",
+       {"query": {**_STR, "description": "Short search query in English, 2-8 words."}}, ["query"],
+       "2-4 snippets of 1-3 sentences, sometimes with a source name. Often partial, sometimes stale.",
+       ["no results", "results about a different sense of the word", "mentions the term but never defines it"],
+       ["all"]),
+    _t("search_documents", "Search the documents supplied in this conversation for relevant passages. Use "
+       "before answering any question about a supplied document. Does NOT search the internet.",
+       {"query": {**_STR, "description": "What to look for."},
+        "top_k": {**_INT, "description": "1-5, default 3."}}, ["query"],
+       "Verbatim passages from the supplied document with a rough location.",
+       ["the document does not discuss it", "passages are topically near but do not answer"], ["all"]),
+    # -- databases
+    _t("search_db", "Search a structured table by free text or field filters. Use when the user asks about "
+       "stored records: customers, stock, patients, students, transactions.",
+       {"table": {**_STR, "description": "e.g. 'inventory', 'patients', 'transactions'."},
+        "query": {**_STR, "description": "Free text or 'field=value' filters."},
+        "limit": _INT}, ["table", "query"],
+       "Matching rows as JSON objects, newest first, with a total match count.",
+       ["table does not exist", "zero matching rows", "more matches than the limit returned"],
+       ["economy", "livelihoods", "health", "society"]),
+    _t("db_get_record", "Fetch one record from a table by its id.",
+       {"table": _STR, "record_id": _STR}, ["table", "record_id"],
+       "The full record as JSON, or a not-found error.",
+       ["id does not exist", "id belongs to a different table"], ["economy", "health", "society"]),
+    _t("db_insert_record", "Save a new record to a table. Only call this after the user has confirmed the "
+       "values, and echo back what was saved.",
+       {"table": _STR, "record": {"type": "object", "description": "Field/value pairs to store."}},
+       ["table", "record"],
+       "The stored record with its new id and a timestamp.",
+       ["required field missing", "duplicate of an existing record", "write rejected: read-only table"],
+       ["economy", "livelihoods", "health"]),
+    # -- computation
+    _t("calculate", "Evaluate an arithmetic expression. Use for any calculation instead of doing it mentally.",
+       {"expression": {**_STR, "description": "e.g. '4500 * 12 - 3000'"}}, ["expression"],
+       "The numeric result.", ["malformed expression", "division by zero"], ["all"]),
+    _t("run_statistics", "Compute a summary statistic over a list of numbers: mean, median, mode, min, max, "
+       "sum, standard deviation, percentage change, or correlation between two lists.",
+       {"operation": {**_STR, "description": "mean|median|mode|min|max|sum|stdev|pct_change|correlation"},
+        "data": {"type": "array", "items": {"type": "number"}},
+        "data2": {"type": "array", "items": {"type": "number"},
+                  "description": "Second series, for correlation only."}}, ["operation", "data"],
+       "The statistic, plus n and the unit where obvious.",
+       ["fewer than 2 values for stdev/correlation", "series of unequal length", "non-numeric value in data"],
+       ["knowledge", "economy", "health", "environment"]),
+    _t("convert_units", "Convert between units of length, mass, volume, area, temperature or currency-free "
+       "quantities like bags and tonnes.",
+       {"value": {"type": "number"}, "from_unit": _STR, "to_unit": _STR}, ["value", "from_unit", "to_unit"],
+       "The converted value with both units named.",
+       ["unknown unit", "incompatible dimensions (mass to length)"], ["livelihoods", "economy", "knowledge"]),
+    _t("get_exchange_rate", "Get the current exchange rate between two currencies by ISO code.",
+       {"base": {**_STR, "description": "e.g. 'NGN'"}, "quote": {**_STR, "description": "e.g. 'USD'"}},
+       ["base", "quote"], "A rate and the timestamp it was quoted at.",
+       ["unknown currency code", "rate unavailable for that pair"], ["economy"]),
+    # -- domain lookups
+    _t("lookup_health_guidance", "Look up plain-language public-health guidance on a symptom, condition, "
+       "medicine or prevention topic. Use for any health question before answering. Not a diagnosis.",
+       {"topic": {**_STR, "description": "Symptom, condition or medicine, in English."}}, ["topic"],
+       "What it is, warning signs, home care, and when to go to a clinic.",
+       ["topic too vague to match", "guidance is for adults but the question was about an infant"], ["health"]),
+    _t("find_health_facility", "Find clinics, hospitals or pharmacies near a place, optionally filtered by "
+       "the service needed.",
+       {"location": _STR, "service": {**_STR, "description": "e.g. 'antenatal', 'dialysis', 'pharmacy'."}},
+       ["location"], "Facility names with distance, opening hours and whether the service is offered.",
+       ["no facilities found for that service", "location too vague"], ["health"]),
+    _t("lookup_crop_guidance", "Look up agricultural guidance for a crop or livestock problem: planting "
+       "times, pests, diseases, storage.",
+       {"crop": _STR, "issue": {**_STR, "description": "e.g. 'leaf spots', 'when to plant', 'storage rot'."}},
+       ["crop"], "Practical steps, with local seasons where relevant.",
+       ["crop not covered", "guidance assumes irrigation the user does not have"],
+       ["livelihoods", "environment"]),
+    _t("get_market_prices", "Get recent prices for a commodity at a named market.",
+       {"commodity": {**_STR, "description": "e.g. 'maize', 'tomatoes', 'cement'."}, "market": _STR},
+       ["commodity"], "Recent price per unit with the date and market name.",
+       ["no data for that market", "prices are weeks stale", "unit differs from what the user assumed"],
+       ["economy", "livelihoods"]),
+    _t("get_weather_forecast", "Get the weather forecast for a location.",
+       {"location": _STR, "days": {**_INT, "description": "1-7, default 3."}}, ["location"],
+       "Daily forecast: rain chance, temperature range, wind.",
+       ["location not recognised", "forecast only available for 2 of the requested days"],
+       ["environment", "livelihoods"]),
+    _t("get_transport_route", "Find how to travel between two places: route, rough fare, duration.",
+       {"origin": _STR, "destination": _STR}, ["origin", "destination"],
+       "Route options with rough fare and travel time.",
+       ["no route found", "fare is out of date"], ["society", "economy"]),
+    _t("lookup_legal_info", "Look up plain-language information about a law, right or official procedure.",
+       {"topic": {**_STR, "description": "e.g. 'tenancy notice period', 'registering a business'."},
+        "country": _STR}, ["topic"],
+       "Plain-language summary with the relevant authority named. Not legal advice.",
+       ["topic not covered for that country", "summary is generic where the user needed specifics"],
+       ["society"]),
+    _t("get_current_datetime", "Get the current date, time and timezone. Use whenever the answer depends on "
+       "today's date.", {"timezone": {**_STR, "description": "IANA zone, e.g. 'Africa/Lagos'."}}, [],
+       "ISO timestamp and timezone name.", ["unknown timezone name"], ["all"]),
+    # -- actions
+    _t("send_message", "Send a text message on the user's behalf. Only after the user has clearly asked, and "
+       "confirm recipient and wording first if either is unclear.",
+       {"recipient": {**_STR, "description": "Name or phone number."},
+        "body": {**_STR, "description": "The message text, in the user's language."}}, ["recipient", "body"],
+       "Delivery confirmation, or an error.",
+       ["recipient not found", "network failure", "two contacts match the name"], ["all"]),
+    _t("set_reminder", "Create a reminder for the user at a specific time.",
+       {"when": {**_STR, "description": "ISO datetime or a phrase like 'tomorrow 07:00'."}, "text": _STR},
+       ["when", "text"], "Confirmation with the resolved absolute time.",
+       ["time in the past", "unparseable time phrase"], ["all"]),
+    _t("translate_text", "Translate text between the languages this assistant supports. Use only when the "
+       "assistant is not confident producing the translation itself.",
+       {"text": _STR, "target_language": {**_STR, "description": "Language code, e.g. 'yor'."}},
+       ["text", "target_language"], "The translated text.",
+       ["unsupported language code", "input too long"], ["all"]),
 ]
 
 # ---------------------------------------------------------------------------
@@ -240,115 +295,164 @@ TOOLS = [
 # the model worth talking to in the first place.
 # ---------------------------------------------------------------------------
 
+def _task(name, tags, share, description, plan=(), flags=(), tools=False, think=False, langs=None, notes=""):
+    return TaskSpec(name, list(tags), description, share=share, task_plan=list(plan),
+                    domain_flags=list(flags), uses_tools=tools, requires_think=think,
+                    languages=langs, notes=notes)
+
+
+# Every tag in schemas.seed.TAGS gets its own task, so each is separately countable, auditable and
+# holdable-out. The three knowledge-boundary behaviours total ~22% -- the largest block -- because they are
+# the point of the project and the hardest thing to teach.
 SFT_TASKS = [
-    TaskSpec("tool_search_answer", ["tool-calling", "knowledge-boundary", "qa"],
-             "User asks about something the assistant plainly has not learned (a product, company, acronym, "
-             "recent event, technical term). The assistant thinks -- noting it does not recognise it -- calls "
-             "search_internet with a tight query, reads the snippets, and answers in the user's language, "
-             "attributing what it found. It must NOT pretend prior familiarity.",
-             share=10.0, task_plan=["<|explain|>"], uses_tools=True, requires_think=True),
-    TaskSpec("no_tool_admit_unknown", ["knowledge-boundary", "qa"],
-             "Same as tool_search_answer, but the system prompt offers NO tool that could help (or no tools at "
-             "all). The assistant thinks, concludes it neither knows nor can look it up, and says so plainly and "
-             "briefly in the user's language. It offers what general reasoning it can (e.g. what kind of thing "
-             "the name looks like) without inventing facts, and does not apologise at length.",
-             share=7.0, task_plan=["<|chat|>"], uses_tools=False, requires_think=True),
-    TaskSpec("retrieval_insufficient", ["insufficient-context", "rag", "tool-calling"],
-             "The assistant calls a tool, and the result does NOT answer the question -- empty, about a different "
-             "sense of the term, or topically adjacent. The assistant must notice this in <think>, say that what "
-             "it found does not answer the question, and stop. Optionally one re-query with a better term, then "
-             "admit it if that also fails. Inventing an answer from an irrelevant snippet is the exact failure "
-             "this task exists to prevent.",
-             share=7.0, task_plan=["<|explain|>"], uses_tools=True, requires_think=True),
-    TaskSpec("rag_document_qa", ["rag", "extractive-qa", "tool-calling"],
-             "A document is supplied. The user asks about it. The assistant calls search_documents, grounds its "
-             "answer in the returned passages, and quotes or cites where the answer came from. Asked something "
-             "the document does not cover, it says so rather than drawing on general knowledge.",
-             share=9.0, task_plan=["<|RAG|>"], uses_tools=True, requires_think=True),
-    TaskSpec("action_tool_use", ["tool-calling"],
-             "The user asks for an action: send a message, set a reminder, check a rate, compute something. The "
-             "assistant confirms any ambiguous parameter in words FIRST, then emits the call, then reports the "
-             "result. Includes cases where the tool fails and the assistant explains the failure plainly.",
-             share=7.0, task_plan=["<|plan|>"], uses_tools=True, requires_think=True),
-    TaskSpec("world_knowledge_qa", ["qa", "multi-turn-chat"],
-             "Everyday how-and-why questions a curious 16-year-old could answer unaided: why bread rises, how a "
-             "generator makes electricity, why the harmattan is dusty, how interest on a loan works, why boiling "
-             "water makes it safe. Concrete, mechanism-first, no tools, no hedging. This is the general "
-             "understanding the whole design rests on.",
-             share=13.0, task_plan=["<|explain|>"], uses_tools=False, requires_think=False),
-    TaskSpec("health_education", ["health-education"],
-             "Explaining a condition, medicine or prevention measure in plain language: what it is, how it "
-             "spreads or develops, how it is prevented. Accurate, non-alarmist, locally grounded (malaria, "
-             "typhoid, sickle cell, hypertension, immunisation).",
-             share=6.0, task_plan=["<|explain|>"], domain_flags=["<|is_medical|>"], requires_think=False),
-    TaskSpec("health_advice", ["health-advice", "tool-calling"],
-             "A user describes a non-urgent symptom and asks what to do. The assistant calls "
-             "lookup_health_guidance, then gives practical home-care steps AND explicit signs that mean going to "
-             "a clinic. It never diagnoses, never names a prescription dose, and never discourages seeking care.",
-             share=5.0, task_plan=["<|recommend|>"], domain_flags=["<|is_medical|>"],
-             uses_tools=True, requires_think=True),
-    TaskSpec("health_triage", ["health-triaging"],
-             "A user describes symptoms that may be serious. The assistant's job is to sort urgency: go now, go "
-             "today, watch at home. Danger signs must be stated concretely (a child too weak to drink, bleeding "
-             "in pregnancy, chest pain with breathlessness, a convulsion). Always errs toward seeking care.",
-             share=4.0, task_plan=["<|recommend|>"], domain_flags=["<|is_medical|>"], requires_think=True),
-    TaskSpec("financial_analysis", ["financial-analysis", "tool-calling"],
-             "Small-trader and household money questions: margin on a sack of rice, whether a loan is worth it, "
-             "daily contribution savings, converting currency. Uses calculate/get_exchange_rate rather than "
-             "arithmetic in its head, and shows the working.",
-             share=4.0, task_plan=["<|math|>", "<|explain|>"], domain_flags=["<|is_financial|>"], uses_tools=True),
-    TaskSpec("structured_output", ["structured-output"],
-             "Return strictly-valid JSON matching a schema stated in the prompt -- extracting fields from a "
-             "passage, or formatting an answer. Emits the JSON and nothing else around it.",
-             share=5.0, task_plan=["<|JSON|>", "<|data_extract|>"]),
-    TaskSpec("translation", ["translation"],
-             "Translate between any supported pair, including into and out of English. Preserve register, names "
-             "and numbers. Both directions appear.",
-             share=6.0, task_plan=["<translate>"]),
-    TaskSpec("summarization", ["summarization"],
-             "Condense a passage to its substance. Both same-language and cross-language (summarise this English "
-             "text in Hausa) appear.",
-             share=5.0, task_plan=["<summarize>"]),
-    TaskSpec("classification_suite", ["topic-classification", "sentiment-analysis", "intent-detection",
-                                      "toxicity-spam-detection", "language-identification"],
-             "Short labelling exchanges: topic, sentiment, user intent, toxicity/spam, and which language a "
-             "snippet is in. The answer is the label, optionally with one clause of justification -- never an "
-             "essay. Uses the matching label token.",
-             share=6.0, task_plan=["<classify>", "<identify>"]),
-    TaskSpec("token_labelling", ["ner", "pos-tagging"],
-             "Named-entity recognition and part-of-speech tagging over a sentence in the target language, "
-             "returned as aligned token/tag pairs.",
-             share=3.0, task_plan=["<NER>"]),
-    TaskSpec("rephrasing_and_writing", ["text-rephrasing", "content-writing"],
-             "Rewrite for register, length or clarity; or compose something short and real -- a market notice, a "
-             "condolence message, a school announcement, a radio advert.",
-             share=5.0, task_plan=["<|edit|>", "<|generate|>"]),
-    TaskSpec("general_chat", ["multi-turn-chat"],
-             "Ordinary conversational turns that glue a session together: greetings, follow-ups, clarifying "
-             "questions, changing the subject. Keeps the model from sounding like a task-executor only.",
-             share=3.0, task_plan=["<|chat|>"]),
+    # ---- knowledge boundary: the reason this corpus exists
+    _task("tool_search_answer", ["tool-calling", "knowledge-boundary", "qa"], 9.0,
+          "User asks about something the assistant plainly has not learned (a product, company, acronym, "
+          "recent event, technical term). It thinks -- noting it does not recognise the term -- calls "
+          "search_internet with a tight query, reads the snippets, and answers in the user's language, "
+          "attributing what it found. It must NOT pretend prior familiarity.",
+          plan=["<|explain|>"], tools=True, think=True),
+    _task("no_tool_admit_unknown", ["knowledge-boundary", "qa"], 6.5,
+          "Same, but NO tool in scope could help (or there are no tools at all). The assistant thinks, "
+          "concludes it neither knows nor can look it up, and says so plainly and briefly. It may offer what "
+          "general reasoning it can (what kind of thing the name looks like) without inventing facts, and "
+          "does not apologise at length.",
+          plan=["<|chat|>"], think=True),
+    _task("retrieval_insufficient", ["insufficient-context", "rag", "tool-calling"], 6.5,
+          "A tool is called and the result does NOT answer the question -- empty, a different sense of the "
+          "term, or topically adjacent. The assistant must notice this in <think>, say that what it found "
+          "does not answer the question, and stop. Optionally one better re-query, then admit failure. "
+          "Inventing an answer from an irrelevant snippet is the exact failure this prevents.",
+          plan=["<|explain|>"], tools=True, think=True),
+    # ---- retrieval / grounding
+    _task("rag_document_qa", ["rag", "extractive-qa", "tool-calling"], 8.0,
+          "A document is supplied; the user asks about it. The assistant calls search_documents with a query "
+          "it composes itself, grounds its answer in the returned passages, and says where it came from. "
+          "Asked something the document does not cover, it says so rather than using general knowledge.",
+          plan=["<|RAG|>"], tools=True, think=True),
+    # ---- tool families beyond retrieval
+    _task("tool_compute", ["tool-calling", "structured-output"], 4.0,
+          "Quantitative questions answered with run_statistics / calculate / convert_units rather than mental "
+          "arithmetic: average rainfall over a season, price change between two months, bags to tonnes, "
+          "spread of test scores. The assistant shows the numbers it passed in and interprets the result in "
+          "one sentence.",
+          plan=["<|math|>", "<|analyze|>"], tools=True, think=True),
+    _task("tool_database", ["tool-calling", "structured-output"], 4.0,
+          "Record keeping with search_db / db_get_record / db_insert_record: look up a customer's balance, "
+          "find stock below a threshold, save a new patient visit or sale. Before writing, the assistant "
+          "confirms the values in words; after writing, it echoes what was stored. Includes zero-result "
+          "searches and rejected writes.",
+          plan=["<|data_extract|>", "<|plan|>"], tools=True, think=True),
+    _task("action_tool_use", ["tool-calling"], 4.0,
+          "The user asks for an action: send a message, set a reminder, check a route or a forecast. The "
+          "assistant confirms any ambiguous parameter FIRST, then emits the call, then reports the result -- "
+          "including cases where the tool fails and it explains the failure plainly.",
+          plan=["<|plan|>"], tools=True, think=True),
+    # ---- general understanding: the base the whole design rests on
+    _task("world_knowledge_qa", ["qa", "multi-turn-chat"], 11.0,
+          "Everyday how-and-why questions a curious 16-year-old could answer unaided: why bread rises, how a "
+          "generator makes electricity, why the harmattan is dusty, how loan interest works, why boiling "
+          "water makes it safe. Concrete, mechanism-first, no tools, no hedging.",
+          plan=["<|explain|>"]),
+    # ---- health
+    _task("health_education", ["health-education"], 4.0,
+          "Explaining a condition, medicine or prevention measure in plain language: what it is, how it "
+          "spreads or develops, how it is prevented. Accurate, non-alarmist, locally grounded (malaria, "
+          "typhoid, sickle cell, hypertension, immunisation).",
+          plan=["<|explain|>"], flags=["<|is_medical|>"]),
+    _task("health_advice", ["health-advice", "tool-calling"], 3.5,
+          "A non-urgent symptom, and what to do about it. Calls lookup_health_guidance, then gives practical "
+          "home care AND explicit signs that mean going to a clinic. Never diagnoses, never names a "
+          "prescription dose, never discourages seeking care.",
+          plan=["<|recommend|>"], flags=["<|is_medical|>"], tools=True, think=True),
+    _task("health_triage", ["health-triaging"], 3.0,
+          "Symptoms that may be serious. The job is sorting urgency: go now, go today, watch at home. Danger "
+          "signs stated concretely (a child too weak to drink, bleeding in pregnancy, chest pain with "
+          "breathlessness, a convulsion). Always errs toward seeking care.",
+          plan=["<|recommend|>"], flags=["<|is_medical|>"], think=True),
+    # ---- money
+    _task("financial_analysis", ["financial-analysis", "tool-calling"], 3.5,
+          "Small-trader and household money questions: margin on a sack of rice, whether a loan is worth it, "
+          "daily contribution savings, currency conversion, market price trends. Uses calculate / "
+          "get_exchange_rate / get_market_prices / run_statistics rather than mental arithmetic, and shows "
+          "the working.",
+          plan=["<|math|>", "<|analyze|>"], flags=["<|is_financial|>"], tools=True, think=True),
+    # ---- structure and format
+    _task("structured_output", ["structured-output"], 4.0,
+          "Return strictly-valid JSON matching a schema stated in the prompt -- extracting fields from a "
+          "passage, or formatting an answer. Emits the JSON and nothing around it.",
+          plan=["<|JSON|>", "<|data_extract|>"]),
+    # ---- translation: BOTH directions to English, and between the African languages
+    _task("translation_english", ["translation"], 4.0,
+          "Translate between this language and English, in BOTH directions (X->English and English->X). "
+          "Preserve register, names and numbers. The <|input_lang|> and <|target_lang|> markers must differ "
+          "and must match the actual direction.",
+          plan=["<translate>"]),
+    _task("translation_interlanguage", ["translation"], 3.0,
+          "Translate between two of the supported African languages WITHOUT going through English in the "
+          "output (e.g. Yoruba->Hausa, Twi->Ewe, Pidgin->Igbo). State both languages in the markers. This is "
+          "the hardest translation direction and the one no public corpus covers.",
+          plan=["<translate>"], think=True),
+    _task("summarization", ["summarization"], 4.0,
+          "Condense a passage to its substance. Both same-language and cross-language (summarise this English "
+          "text in Hausa).",
+          plan=["<summarize>"]),
+    # ---- labelling: one task per tag so each is separately countable
+    _task("topic_classification", ["topic-classification"], 2.0,
+          "Assign a topic label to a short text, using the <topic> token. The answer is the label plus at "
+          "most one clause of justification -- never an essay.",
+          plan=["<classify>"]),
+    _task("sentiment_analysis", ["sentiment-analysis"], 2.0,
+          "Label sentiment (positive / negative / neutral, or mixed) with the <sentiment> token, on real-"
+          "sounding text: market complaints, radio comments, product feedback.",
+          plan=["<classify>"]),
+    _task("intent_detection", ["intent-detection"], 1.5,
+          "Identify what the user is actually trying to do (book, complain, ask a price, cancel, greet) with "
+          "the <intent> token. Includes utterances whose surface form hides the intent.",
+          plan=["<classify>", "<identify>"]),
+    _task("toxicity_detection", ["toxicity-spam-detection"], 1.5,
+          "Flag abusive, hateful or spam text with the <toxic> token, and say briefly which it is. Includes "
+          "hard negatives: blunt or angry but not abusive, and local slang that only looks offensive.",
+          plan=["<classify>"]),
+    _task("language_identification", ["language-identification"], 1.5,
+          "Identify which language a snippet is in, using <lang_ID>. Must include the genuinely hard cases: "
+          "Twi vs Akan, Fulah vs Nigerian Fulfulde, Efik vs Ibibio, and Pidgin vs English.",
+          plan=["<identify>"], think=True),
+    _task("ner", ["ner"], 1.5,
+          "Named-entity recognition over a sentence, returned as aligned token/tag pairs using <NER> and "
+          "<tag>. Local person, place and organisation names specifically.",
+          plan=["<NER>"]),
+    _task("pos_tagging", ["pos-tagging"], 1.5,
+          "Part-of-speech tagging over a sentence in the target language, as aligned token/tag pairs.",
+          plan=["<NER>"]),
+    # ---- generation
+    _task("rephrasing_and_writing", ["text-rephrasing", "content-writing"], 4.0,
+          "Rewrite for register, length or clarity; or compose something short and real -- a market notice, a "
+          "condolence message, a school announcement, a radio advert.",
+          plan=["<|edit|>", "<|generate|>"]),
+    _task("general_chat", ["multi-turn-chat"], 2.5,
+          "Ordinary conversational glue: greetings, follow-ups, clarifying questions, changing the subject. "
+          "Keeps the model from sounding like a task-executor only.",
+          plan=["<|chat|>"]),
 ]
 
-# RL reuses the SFT task vocabulary but concentrates on what a reward model can actually separate:
-# honesty under uncertainty, correct tool choice, and grounding.
+# RL reuses the same task vocabulary but concentrates on what a judge can actually separate: honesty under
+# uncertainty, correct tool choice, and grounding.
+_RL_WEIGHTS = {
+    "tool_search_answer": 15.0, "no_tool_admit_unknown": 12.0, "retrieval_insufficient": 14.0,
+    "rag_document_qa": 13.0, "tool_compute": 6.0, "tool_database": 5.0, "action_tool_use": 6.0,
+    "world_knowledge_qa": 9.0, "health_advice": 6.0, "health_triage": 5.0, "financial_analysis": 4.0,
+    "structured_output": 2.0, "translation_english": 2.0, "translation_interlanguage": 1.0,
+}
 RL_TASKS = [
-    TaskSpec(t.name, t.tags, t.description, share=s, task_plan=t.task_plan, domain_flags=t.domain_flags,
-             uses_tools=t.uses_tools, requires_think=t.requires_think, languages=t.languages,
-             notes="Responses must differ in a way a judge can rank: one grounded/honest, one confidently wrong "
-                   "or invented, one partially right. Never three paraphrases of the same answer.")
-    for t, s in [
-        (SFT_TASKS[0], 16.0),   # tool_search_answer
-        (SFT_TASKS[1], 13.0),   # no_tool_admit_unknown
-        (SFT_TASKS[2], 15.0),   # retrieval_insufficient
-        (SFT_TASKS[3], 14.0),   # rag_document_qa
-        (SFT_TASKS[4], 8.0),    # action_tool_use
-        (SFT_TASKS[5], 10.0),   # world_knowledge_qa
-        (SFT_TASKS[7], 7.0),    # health_advice
-        (SFT_TASKS[8], 6.0),    # health_triage
-        (SFT_TASKS[9], 5.0),    # financial_analysis
-        (SFT_TASKS[10], 3.0),   # structured_output
-        (SFT_TASKS[11], 3.0),   # translation
-    ]
+    TaskSpec(t.name, t.tags, t.description, share=_RL_WEIGHTS[t.name], task_plan=t.task_plan,
+             domain_flags=t.domain_flags, uses_tools=t.uses_tools, requires_think=t.requires_think,
+             languages=t.languages,
+             notes="Candidates must differ in a way a judge can rank: one grounded and honest, one "
+                   "confidently wrong or invented, one partially right (correct but uselessly hedged, right "
+                   "answer via the wrong tool, or refusing when the answer WAS available). Never three "
+                   "paraphrases of the same answer.")
+    for t in SFT_TASKS if t.name in _RL_WEIGHTS
 ]
 
 CONVERSATION = {
@@ -430,14 +534,14 @@ direction so the model does not collapse into refusing everything."""
 
 
 def build(kind: str) -> Seed:
-    idx = {"pretrain": 3, "sft": 4, "rl": 5}[kind]
+    languages, yields = _languages(kind)
     target = {"name": "SabiYarn", "params": "306M", "architecture": "MoE, 12 layers, top-2 of up to 4 experts",
               "tokenizer": "BeardedMonster/SabiYarn-32k", "context": 4096,
               "philosophy": PHILOSOPHY}
     fmt = {"special_tokens": SPECIAL_TOKENS}
     if kind == "pretrain":
-        return Seed(kind="pretrain", details=PRETRAIN_DETAILS, languages=_languages(idx),
-                    target_model=target,
+        return Seed(kind="pretrain", details=PRETRAIN_DETAILS, languages=languages,
+                    target_model=target, yield_by_tier=yields,
                     format={**fmt, "output": "plain prose, no markup",
                             "columns": ["id", "lang", "domain", "subtopic", "genre", "title", "text"]}).validate()
     tasks = SFT_TASKS if kind == "sft" else RL_TASKS
@@ -449,7 +553,8 @@ def build(kind: str) -> Seed:
                    "response_1", "response_2", "response_3", "ranking", "rationale",
                    "instruction", "input", "context"]
     return Seed(kind=kind, details=SFT_DETAILS if kind == "sft" else RL_DETAILS,
-                languages=_languages(idx), tasks=tasks, tools=TOOLS, conversation=conv, target_model=target,
+                languages=languages, tasks=tasks, tools=TOOLS, conversation=conv, target_model=target,
+                yield_by_tier=yields,
                 format={**fmt, "assistant_turn": ASSISTANT_FORMAT, "columns": columns,
                         "column_notes": (
                             "messages/prompt_messages are the source of truth (role/content dicts, with "
@@ -469,7 +574,8 @@ def main() -> int:
     for kind in kinds:
         seed = build(kind)
         if args.print:
-            print(f"\n=== {kind}: {seed.total_samples():,} samples across {len(seed.languages)} languages")
+            print(f"\n=== {kind}: target {seed.total_samples():,} samples "
+                  f"({seed.total_requests():,} requests) across {len(seed.languages)} languages")
             if not seed.tasks:  # pretrain: the domain/genre sampler decides the mix, not a task list
                 for l in seed.languages:
                     print(f"  {l.code:5s} {l.samples:>7,}  tier={l.tier}")
@@ -478,7 +584,8 @@ def main() -> int:
                 top = sorted(tasks.items(), key=lambda kv: -kv[1])[:4]
                 print(f"  {lang:5s} {sum(tasks.values()):>7,}  " + "  ".join(f"{k}={v:,}" for k, v in top))
         else:
-            print(f"wrote {seed.save()}  ({seed.total_samples():,} samples)")
+            print(f"wrote {seed.save()}  target {seed.total_samples():,} samples "
+                  f"-> {seed.total_requests():,} requests at the budgeted yield")
     return 0
 
 

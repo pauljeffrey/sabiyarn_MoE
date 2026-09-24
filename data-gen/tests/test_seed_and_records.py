@@ -17,12 +17,16 @@ def seeds():
 # ----------------------------------------------------------------- schema / plan
 
 
+LOW_RESOURCE = ("efi", "urh", "fon", "ewe", "ful", "fuv")
+
+
 def test_seeds_load_and_validate(seeds):
     assert seeds["pretrain"].total_samples() >= 435_000
-    assert seeds["pretrain"].languages[0].code == "pcm" and seeds["pretrain"].languages[0].samples >= 60_000
     for l in seeds["pretrain"].languages:
+        if l.code == "pcm":
+            assert l.samples >= 60_000
         if l.code in ("urh", "efi"):
-            assert l.samples >= 30_000, f"{l.code} below the 30k floor"
+            assert l.samples >= 30_000, f"pretrain {l.code} below the 30k floor"
     for kind in ("sft", "rl"):
         s = seeds[kind]
         assert s.tools and s.tasks
@@ -31,12 +35,54 @@ def test_seeds_load_and_validate(seeds):
             assert set(t.tags) <= set(TAGS)
 
 
+def test_requested_volumes_meet_the_agreed_floors(seeds):
+    sft = {l.code: l.samples for l in seeds["sft"].languages}
+    assert 150_000 <= seeds["sft"].total_samples() <= 200_000, seeds["sft"].total_samples()
+    assert sft["pcm"] >= 50_000
+    for c in LOW_RESOURCE + ("yor", "twi", "ibo", "hau"):
+        assert sft[c] >= 10_000, f"sft {c} = {sft[c]}, below the 10k floor"
+    assert 60_000 <= seeds["rl"].total_samples() <= 70_000, seeds["rl"].total_samples()
+
+
+def test_yield_budget_over_requests_so_the_target_lands(seeds):
+    """Low-resource conversations fail validation more often, so more must be requested."""
+    for kind in ("pretrain", "sft", "rl"):
+        s = seeds[kind]
+        assert s.total_requests() > s.total_samples()
+        low = next(l for l in s.languages if l.code == "fon")
+        high = next(l for l in s.languages if l.code == "pcm")
+        assert s.requests_for(low) / low.samples > s.requests_for(high) / high.samples
+
+
+def test_every_tag_has_its_own_task(seeds):
+    """Bundled tags cannot be counted or held out separately, so each gets a task."""
+    for kind in ("sft",):
+        covered = {t for task in seeds[kind].tasks for t in task.tags}
+        assert covered == set(TAGS), f"{kind} missing {sorted(set(TAGS) - covered)}"
+
+
+def test_translation_covers_english_and_interlanguage(seeds):
+    names = {t.name for t in seeds["sft"].tasks}
+    assert {"translation_english", "translation_interlanguage"} <= names
+    inter = next(t for t in seeds["sft"].tasks if t.name == "translation_interlanguage")
+    assert "without going through english" in inter.description.lower()
+
+
+def test_tool_catalogue_spans_more_than_retrieval(seeds):
+    names = {t.name for t in seeds["sft"].tools}
+    for expected in ("search_internet", "search_db", "db_insert_record", "db_get_record",
+                     "run_statistics", "calculate", "convert_units", "get_market_prices",
+                     "lookup_crop_guidance", "find_health_facility", "get_weather_forecast"):
+        assert expected in names, expected
+    assert len(names) >= 18
+
+
 def test_plan_totals_match_per_language_volumes(seeds):
     for kind in ("sft", "rl"):
         s = seeds[kind]
         plan = s.plan()
         for lang in s.languages:
-            assert sum(plan[lang.code].values()) == lang.samples, f"{kind}/{lang.code}"
+            assert sum(plan[lang.code].values()) == s.requests_for(lang), f"{kind}/{lang.code}"
 
 
 def test_knowledge_boundary_is_the_biggest_block(seeds):
@@ -72,6 +118,42 @@ def test_prompt_building_is_deterministic_and_covers_the_taxonomy(seeds):
     assert len(pairs) == 200
 
 
+def test_thinking_is_english_and_task_plan_is_a_plan(seeds):
+    req = build_request(seeds["sft"], {"custom_id": "sft__fon__tool_search_answer__000003",
+                                       "lang": "fon", "task": "tool_search_answer", "index": 3})
+    brief = req.messages[0]["content"]
+    assert "<think> IS ALWAYS IN ENGLISH" in brief
+    assert "never in Fon" in brief
+    assert "<task_plan> is a PLAN, not a label" in brief
+    assert "ALWAYS in Fon" in brief  # the response, unlike the thinking
+
+
+def test_irrelevant_tools_are_in_scope_and_named(seeds):
+    """Tool selection is only a skill if there is something wrong to select."""
+    for i in range(30):
+        req = build_request(seeds["sft"], {"custom_id": f"sft__ibo__action_tool_use__{i:06d}",
+                                           "lang": "ibo", "task": "action_tool_use", "index": i})
+        md = req.metadata
+        d = md["distractor_tools"]
+        assert 2 <= len(d) <= 3, d
+        assert set(d) <= set(md["tools"])
+        assert "IRRELEVANT TOOLS: " + ", ".join(d) in req.messages[1]["content"]
+        # full definitions travel in metadata AND are attached natively for the provider
+        assert len(md["tool_definitions"]) == len(md["tools"])
+        assert req.tools and {t["function"]["name"] for t in req.tools} == set(md["tools"])
+
+
+def test_confidence_is_requested_for_every_kind(seeds):
+    for kind, row in (("pretrain", {"custom_id": "pretrain__yor__doc__000001", "lang": "yor",
+                                    "task": "doc", "index": 1}),
+                      ("sft", {"custom_id": "sft__yor__general_chat__000001", "lang": "yor",
+                               "task": "general_chat", "index": 1}),
+                      ("rl", {"custom_id": "rl__yor__world_knowledge_qa__000001", "lang": "yor",
+                              "task": "world_knowledge_qa", "index": 1})):
+        body = build_request(seeds[kind], row).messages[1]["content"]
+        assert '"confidence"' in body, kind
+
+
 def test_tools_referenced_by_a_task_are_in_scope(seeds):
     """A brief that says 'use get_exchange_rate' while omitting it from the tool list teaches nothing."""
     for i in range(60):
@@ -85,11 +167,21 @@ def test_tools_referenced_by_a_task_are_in_scope(seeds):
         assert "search_documents" in build_request(seeds["sft"], row).metadata["tools"]
 
 
-def test_no_malformed_special_tokens_in_any_prompt(seeds):
-    """Token 52043 is '|analyze|>' (missing its '<'), so '<|analyze|>' must never be asked for."""
+def test_only_usable_special_tokens_are_asked_for(seeds):
+    """Token 52043 was '|analyze|>' (missing its '<') and has since been fixed to '<|analyze|>', so the
+    corrected form is now valid. The bare form never is. Separately, tokenizer ids >= the model's
+    vocab_size (52050) can never be embedded, so tokens from that range must not appear either."""
+    unusable = {"|analyze|>", "<|hate|>"}          # bare form; and 52115, above vocab_size
     for kind in ("sft", "rl"):
         for t in seeds[kind].tasks:
-            assert "<|analyze|>" not in t.task_plan, f"{kind}/{t.name}"
+            for verb in t.task_plan:
+                assert verb not in unusable, f"{kind}/{t.name}: {verb}"
+                assert verb.startswith("<") and verb.endswith(">"), f"{kind}/{t.name}: {verb}"
+    allowed = set(seeds["sft"].format["special_tokens"]["task_plan_verbs"])
+    assert "<|analyze|>" in allowed or all(
+        v in allowed for t in seeds["sft"].tasks for v in t.task_plan), "task_plan verb not in the declared list"
+    for tok in unusable:
+        assert tok not in allowed
 
 
 # ----------------------------------------------------------------- records
@@ -127,7 +219,7 @@ def test_sft_record_keeps_both_representations(seeds):
     assert r is not None
     assert isinstance(r["messages"], list) and len(r["messages"]) == 5           # dict form
     assert r["text"].startswith("<s><|system|>") and r["text"].endswith("</s>")  # rendered form
-    assert "<tool_call>search_internet" in r["text"] and "<tool_result>" in r["text"]
+    assert "<tool_call>search_internet" in r["text"] and "<tool_response>" in r["text"]
     assert "knowledge-boundary" in r["tags"]
     assert r["instruction"] == "Kini AWS?" and "Amazon" in r["context"]
     assert r["response"].startswith("AWS jẹ́")

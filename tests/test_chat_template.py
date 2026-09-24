@@ -40,7 +40,9 @@ def test_tool_call_rendering():
     ]
     out = _render(load_chat_template(), msgs)
     assert '<tool_call>get_weather\n{"city": "Lagos"}</tool_call></s>' in out
-    assert "<tool_result>get_weather 31C</tool_result></s>" in out
+    # <tool_response> is a real single token in the tokenizer (52037/52038); <tool_result> was not and cost
+    # ~5 byte-BPE tokens per tag.
+    assert "<tool_response>get_weather 31C</tool_response></s>" in out
 
 
 def test_use_sabiyarn_chat_template_overrides_stale_template():

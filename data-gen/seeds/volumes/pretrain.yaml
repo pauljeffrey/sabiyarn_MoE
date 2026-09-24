@@ -1,0 +1,27 @@
+# Sample counts for PRETRAIN. Edit here, then re-run `python seeds/build_seeds.py`.
+# Counts are documents per language. Pretraining is world knowledge only -- how things work, how people and
+# institutions behave, health, technology -- as plain prose with no markup and no chat shape.
+kind: pretrain
+
+# Expected fraction of generated samples that survive validation, by resource tier. generate.py over-plans
+# by 1/yield so the TARGET below is what actually lands, not what gets requested. Measured, not guessed:
+# check `postprocess_gen.summary()` after the first few hundred samples per language and correct these.
+yield_by_tier:
+  high: 0.92     # pcm, eng
+  medium: 0.85   # yor, hau, ibo, twi, aka
+  low: 0.72      # efi, urh, fon, ewe, ful, fuv
+
+samples_per_language:
+  pcm: 60000     # English-lexified, transfers fastest, highest downstream use
+  yor: 40000
+  hau: 40000
+  ibo: 40000
+  twi: 30000
+  aka: 30000
+  efi: 30000
+  urh: 30000
+  fon: 30000
+  ewe: 30000
+  ful: 30000
+  fuv: 30000
+  eng: 15000     # present only so English does not decay; matters least

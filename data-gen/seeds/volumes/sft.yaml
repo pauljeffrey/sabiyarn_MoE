@@ -1,0 +1,24 @@
+# Sample counts for SFT. Edit here, then re-run `python seeds/build_seeds.py`.
+# Counts are CONVERSATIONS (6-10 messages each, 2-4 tasks each, ending on the assistant).
+kind: sft
+
+yield_by_tier:
+  high: 0.92
+  medium: 0.85
+  low: 0.72      # 6-10 turn tool-calling conversations in Fon/Efik are hard; expect real drop
+
+samples_per_language:
+  pcm: 50000     # floor requested: 50k
+  yor: 15000
+  hau: 15000
+  ibo: 15000
+  twi: 12000
+  aka: 10000
+  efi: 10000     # floor requested: 10k for the low-resource set
+  urh: 10000
+  fon: 10000
+  ewe: 10000
+  ful: 10000
+  fuv: 10000
+  eng: 8000
+# total: 185,000

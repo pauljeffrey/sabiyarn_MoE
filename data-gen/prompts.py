@@ -46,6 +46,13 @@ def _coverage_pick(lang: str, index: int) -> tuple[str, str, str]:
     return domain, subtopic, genre
 
 
+def _tool_defs(seed: Seed, names: list[str]) -> list[dict]:
+    """OpenAI-shaped definitions, carried in metadata so a batch job can attach them verbatim."""
+    return [{"type": "function", "function": {"name": t.name, "description": t.description,
+                                             "parameters": t.parameters}}
+            for t in seed.tools if t.name in names]
+
+
 def _tool_block(seed: Seed, names: list[str]) -> str:
     tools = [{"type": "function", "function": {"name": t.name, "description": t.description,
                                                "parameters": t.parameters}}
@@ -94,7 +101,7 @@ Requirements:
 - No invented statistics, no fake citations, no made-up named people presented as real.
 - Plain continuous prose. No markdown, no headings, no bullet lists, no chat markup.
 
-Return JSON: {{"title": "<short natural title in {lang.name}>", "text": "<the document>", "language_self_check": <true only if the whole text is fluent {lang.name}>}}"""
+Return JSON: {{"title": "<short natural title in {lang.name}>", "text": "<the document>", "language_self_check": <true only if the whole text is fluent {lang.name}>, "confidence": <float 0-1: your honest estimate that this text is accurate AND fluent {lang.name}>}}"""
 
     return Request(
         custom_id=row["custom_id"],
@@ -120,8 +127,12 @@ SPECIAL TOKEN FORMAT (the target model's own vocabulary -- use these EXACTLY):
 - An assistant turn that CALLS A TOOL emits NO <response>. Put the call in `tool_calls` (JSON), and its
   content is:  <|input_lang|><__LANG__><think>{why this tool, and this query}</think>
 - A tool result is a separate message with role "tool" and the tool's `name` set.
-- <think> is written in __LANGUAGE_NAME__, 1-3 sentences, and never just restates the question.
-- task_plan verbs must come from: __VERBS_ALLOWED__
+- <think> IS ALWAYS IN ENGLISH, never in __LANGUAGE_NAME__, whatever language the conversation is in. It is
+  the model's private scratchpad: 1-3 short English sentences reasoning about what is being asked, whether it
+  already knows, and what it would need. Never a restatement of the question.
+- The <response> text is ALWAYS in __LANGUAGE_NAME__.
+- <task_plan> is a PLAN, not a label. For a multi-step turn, list the verbs in the order they will be carried
+  out, e.g. <task_plan><|RAG|><|analyze|><|explain|></task_plan>. Verbs must come from: __VERBS_ALLOWED__
 """
 
 
@@ -156,14 +167,17 @@ def _sft_like_request(seed: Seed, row: dict, *, rl: bool) -> Request:
                     required.append(name)
         if any("financial-analysis" in t.tags for t in tasks) and "calculate" not in required:
             required.append("calculate")
+        # 2-3 deliberately IRRELEVANT tools are always in scope. Tool selection is only a real skill if
+        # there is something wrong to select, and a model trained only on catalogues where every tool is
+        # applicable learns to call whatever it is given.
         filler = [t.name for t in seed.tools if t.name not in required]
         rng.shuffle(filler)
-        # 3-6 tools total: enough distractors that tool SELECTION is a real choice, few enough that a
-        # 306M model can learn the catalogue.
-        n = max(len(required), min(6, rng.randint(3, 6)))
-        tool_names = required + filler[:max(0, n - len(required))]
+        n_distract = rng.randint(2, 3)
+        distractors = filler[:n_distract]
+        tool_names = required + distractors
+        rng.shuffle(tool_names)
     else:
-        tool_names = []
+        tool_names, distractors = [], []
 
     n_msgs = rng.randint(seed.conversation["min_messages"], seed.conversation["max_messages"])
     verbs = sorted({v for t in tasks for v in t.task_plan}) or ["<|chat|>"]
@@ -180,17 +194,22 @@ def _sft_like_request(seed: Seed, row: dict, *, rl: bool) -> Request:
         tools_section = (
             f"\nTOOLS available in this conversation (put this exact JSON in the system message):\n"
             f"{_tool_block(seed, tool_names)}\n\nHow these tools behave when called:\n"
-            f"{_tool_behaviour(seed, tool_names)}\n")
+            f"{_tool_behaviour(seed, tool_names)}\n"
+            f"\nIRRELEVANT TOOLS: {', '.join(distractors)} are in the catalogue but are NOT useful for this "
+            f"conversation. The assistant must never call them. Their presence is deliberate -- the model has "
+            f"to learn to pick the right tool, not just any tool.\n")
     else:
         tools_section = ("\nThis conversation has NO tools and NO system message. If the user asks something "
                          "the assistant does not know, the correct behaviour is to say so plainly.\n")
 
+    lang_name = lang.name
     if not rl:
         shape = f"""Produce ONE conversation of exactly {n_msgs} messages, ending with an assistant message.
 
 Return JSON:
 {{"messages": [{{"role": "system"|"user"|"assistant"|"tool", "content": "...", "name": "<tool name, tool role only>", "tool_calls": [{{"function": {{"name": "...", "arguments": {{...}}}}}}]}}],
-  "tasks": ["<task names used>"], "tags": ["<tags from the closed list>"]}}"""
+  "tasks": ["<task names used>"], "tags": ["<tags from the closed list>"],
+  "confidence": <float 0-1: your honest estimate that this conversation is correct AND fluent {lang_name}>}}"""
     else:
         shape = f"""Produce ONE conversation PREFIX of {n_msgs - 1} messages ending with a USER message, then
 {seed.conversation['responses_per_prompt']} alternative assistant replies to that final user message.
@@ -204,8 +223,9 @@ The replies must be genuinely rankable, not paraphrases:
 
 Return JSON:
 {{"prompt_messages": [...same message shape as above...],
-  "responses": [{{"content": "<full assistant turn incl. special tokens>", "quality": "best"|"partial"|"worst", "why": "<one line>"}}],
-  "tasks": [...], "tags": [...]}}"""
+  "responses": [{{"content": "<full assistant turn incl. special tokens>", "quality": "best"|"partial"|"worst", "why": "<one line, English>"}}],
+  "tasks": [...], "tags": [...],
+  "confidence": <float 0-1: your honest estimate that the ranking is right and the text is fluent {lang_name}>}}"""
 
     user = f"""Conversation language: {lang.name}. Everything the user and assistant say is in {lang.name}.
 
@@ -228,9 +248,14 @@ Hard requirements:
         messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
         max_tokens=4096, temperature=0.9,
         response_format={"type": "json_object"},
+        # tools= is attached natively so the generating model produces schema-valid call arguments with its
+        # own function-calling machinery instead of inventing the JSON as prose.
+        tools=_tool_defs(seed, tool_names) or None,
         metadata={"kind": seed.kind, "lang": lang.code, "task": task.name,
                   "tasks": [t.name for t in tasks], "tags": sorted({g for t in tasks for g in t.tags}),
-                  "tools": tool_names, "domain": domain, "subtopic": subtopic, "n_messages": n_msgs},
+                  "tools": tool_names, "distractor_tools": distractors,
+                  "tool_definitions": _tool_defs(seed, tool_names),
+                  "domain": domain, "subtopic": subtopic, "n_messages": n_msgs},
     )
 
 

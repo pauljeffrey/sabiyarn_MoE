@@ -518,11 +518,39 @@ per-language stride, so every pair is used once before any repeats -- with no sh
 | sft | 79,000 conversations | 6-10 messages, 2-4 tasks each, ends on the assistant |
 | rl | 19,400 prompts | x3 ranked candidate replies |
 
-## Two tokenizer problems to settle BEFORE a large run
+## Tokenizer: two fixed, one outstanding
 
-1. The chat template emits `<tool_result>`, which is **not** a special token -- it costs ~5 byte-BPE tokens
-   every time. The tokenizer does have `<tool_response>` (52037) and `</tool_response>` (52038) as single
-   tokens. Either change the template or add the token, but decide first: the choice is baked into every
-   generated sample.
-2. Token 52043 is `|analyze|>` -- it is missing its leading `<`. Nothing here emits `<|analyze|>`
-   (`tests/test_seed_and_records.py` enforces that); fix the tokenizer if you want that verb.
+FIXED and pushed to both `BeardedMonster/SabiYarn-32k` and `Aletheia-ng/SabiYarn_MoE-280M`:
+
+1. The chat template now emits `<tool_response>`/`</tool_response>` (single tokens 52037/52038) instead of
+   `<tool_result>`, which was not a special token and cost ~5 byte-BPE tokens per tag.
+2. Token 52043 was `|analyze|>`, missing its leading `<`. Renamed in place to `<|analyze|>` -- same id, same
+   vocab size, so no embedding resize and no retraining needed.
+
+STILL OUTSTANDING (does not block generation): tokenizer ids **52050-52115** are at or above the model's
+`vocab_size` (52050), so those 66 tokens can never be embedded. That range holds `<|hate|>` and ~65
+other-language tags. Nothing in this pipeline uses them -- the toxicity task uses `<toxic>` (52008), which is
+in range -- but resize the embedding before you rely on any of them.
+
+## Judging RL candidates
+
+`judge_gen.py` is a second batch pass that reduces the 3 generated candidates to `response_1` (chosen) /
+`response_2` (rejected). Candidates are relabelled A/B/C in a deterministic shuffle with the generator's own
+quality labels withheld, judged against ranked criteria (honesty at the knowledge boundary first, style
+last), and the verdict records whether the judge agreed with the generator. A near-100% agreement rate means
+the judge is rubber-stamping; near 33% means the generator's own labels are noise. Use a **different model**
+for the judge than for generation.
+
+## Cost (Together AI: $0.15/$0.60 per 1M standard, $0.075/$0.300 batch)
+
+`python estimate_gen.py` measures the real prompt sizes rather than guessing. At the mid output estimate:
+
+| phase | requests | input tokens | batch | standard |
+|---|---|---|---|---|
+| pretrain | 543k | 592M | $240 | $480 |
+| sft | 225k | 592M | $180 | $359 |
+| rl | 79k | 248M | $76 | $151 |
+| judge | 65k | 143M | $16 | $31 |
+| **total** | | | **~$511** | **~$1,022** |
+
+Request counts are yield-adjusted, so failed generations are already priced in.

@@ -123,6 +123,10 @@ class Seed:
     conversation: dict[str, Any] = field(default_factory=dict)
     target_model: dict[str, Any] = field(default_factory=dict)
     format: dict[str, Any] = field(default_factory=dict)
+    # Expected share of requests that survive validation, per resource tier. 6-10 turn tool-calling
+    # conversations in Fon or Efik genuinely fail more often than in Pidgin, so the planner over-requests
+    # by 1/yield and the TARGET count is what lands rather than what was asked for.
+    yield_by_tier: dict[str, float] = field(default_factory=lambda: {"high": 0.92, "medium": 0.85, "low": 0.72})
     version: int = 1
 
     # -- validation ---------------------------------------------------------
@@ -170,7 +174,21 @@ class Seed:
 
     # -- volumes ------------------------------------------------------------
     def total_samples(self) -> int:
+        """Target samples -- what should end up in the corpus after validation drops."""
         return sum(l.samples for l in self.languages)
+
+    def yield_for(self, tier: str) -> float:
+        y = float(self.yield_by_tier.get(tier, 0.8))
+        if not 0 < y <= 1:
+            raise ValueError(f"yield for tier {tier} must be in (0, 1], got {y}")
+        return y
+
+    def requests_for(self, lang: LanguageSpec) -> int:
+        """How many to REQUEST so that `lang.samples` survive."""
+        return int(round(lang.samples / self.yield_for(lang.tier)))
+
+    def total_requests(self) -> int:
+        return sum(self.requests_for(l) for l in self.languages)
 
     def task_shares(self) -> dict[str, float]:
         total = sum(t.share for t in self.tasks) or 1.0
@@ -181,12 +199,13 @@ class Seed:
         shares = self.task_shares()
         out: dict[str, dict[str, int]] = {}
         for lang in self.languages:
+            n_requests = self.requests_for(lang)
             allowed = [t for t in self.tasks if not t.languages or lang.code in t.languages]
             denom = sum(shares[t.name] for t in allowed) or 1.0
             counts, run = {}, 0
             for i, t in enumerate(allowed):
                 # last task absorbs the rounding remainder so the per-language total is exact
-                n = lang.samples - run if i == len(allowed) - 1 else round(lang.samples * shares[t.name] / denom)
+                n = n_requests - run if i == len(allowed) - 1 else round(n_requests * shares[t.name] / denom)
                 counts[t.name] = max(0, n)
                 run += counts[t.name]
             out[lang.code] = counts
@@ -201,6 +220,7 @@ class Seed:
             "tasks": [asdict(t) for t in self.tasks],
             "tools": [asdict(t) for t in self.tools],
             "conversation": self.conversation, "tags": list(TAGS), "format": self.format,
+            "yield_by_tier": self.yield_by_tier,
         }
 
     def save(self, path: Optional[Path] = None) -> Path:
@@ -216,7 +236,7 @@ class Seed:
             path = SEEDS_DIR / f"{kind_or_path}.json"
         raw = json.loads(path.read_text(encoding="utf-8"))
         known = {"kind", "version", "details", "target_model", "languages", "tasks", "tools",
-                 "conversation", "tags", "format"}
+                 "conversation", "tags", "format", "yield_by_tier"}
         unknown = set(raw) - known
         if unknown:
             raise ValueError(f"{path}: unknown key(s) {sorted(unknown)}")
@@ -227,4 +247,5 @@ class Seed:
             tasks=[TaskSpec(**t) for t in raw.get("tasks", [])],
             tools=[ToolSpec(**t) for t in raw.get("tools", [])],
             conversation=raw.get("conversation", {}), format=raw.get("format", {}),
+            yield_by_tier=raw.get("yield_by_tier") or {"high": 0.92, "medium": 0.85, "low": 0.72},
         ).validate()

@@ -1,0 +1,25 @@
+# Sample counts for RL preference data. Edit here, then re-run `python seeds/build_seeds.py`.
+# Counts are PROMPTS; each gets `responses_per_prompt` candidate final replies, then the judge pass
+# (seeds/../judge_gen.py) reduces them to response_1 (better) / response_2 (worse).
+kind: rl
+
+yield_by_tier:
+  high: 0.92
+  medium: 0.85
+  low: 0.72
+
+samples_per_language:
+  pcm: 17000
+  yor: 6000
+  hau: 6000
+  ibo: 6000
+  twi: 4000
+  aka: 3000
+  efi: 3500
+  urh: 3500
+  fon: 3500
+  ewe: 3500
+  ful: 3500
+  fuv: 3500
+  eng: 2000
+# total: 65,000
