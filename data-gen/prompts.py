@@ -38,12 +38,20 @@ def _lang_spec(seed: Seed, code: str):
 
 
 def _coverage_pick(lang: str, index: int) -> tuple[str, str, str]:
-    """(domain, subtopic, genre) -- walks every pair once before repeating, offset per language."""
-    off = _lang_offset(lang)
-    domain, subtopic = _PAIRS[(index + off) % len(_PAIRS)]
-    # A stride coprime-ish with the genre count so genre does not lock in step with domain.
-    genre = _GENRES[(index * 7 + off) % len(_GENRES)]
-    return domain, subtopic, genre
+    """(domain, subtopic, genre), walking the FULL CROSS PRODUCT of pairs x genres once before repeating.
+
+    The obvious version -- pair = (i + off) % n_pairs, genre = (i * 7 + off) % n_genres -- is broken: with
+    636 pairs and 28 genres, 636 * 7 is a multiple of 28, so for any fixed pair the genre never advances.
+    Every document about one sub-topic came out in the same genre, collapsing 17,808 combinations to 636.
+
+    Treating (pair, genre) as one odometer fixes it: the low digit cycles pairs, and each time it laps, the
+    high digit moves to the next genre. Still stateless and still deterministic in `index`, so it partitions
+    cleanly across workers and resumes exactly.
+    """
+    n_pairs, n_genres = len(_PAIRS), len(_GENRES)
+    combo = (index + _lang_offset(lang)) % (n_pairs * n_genres)
+    domain, subtopic = _PAIRS[combo % n_pairs]
+    return domain, subtopic, _GENRES[(combo // n_pairs) % n_genres]
 
 
 def _tool_defs(seed: Seed, names: list[str]) -> list[dict]:

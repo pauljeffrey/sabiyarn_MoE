@@ -103,6 +103,42 @@ def test_seed_rejects_unknown_keys(tmp_path):
 # ----------------------------------------------------------------- prompts
 
 
+def test_genre_is_not_locked_to_the_domain_pair(seeds):
+    """Regression: pair=(i+off)%636 with genre=(i*7+off)%28 locked each pair to ONE genre, because
+    636*7 is a multiple of 28. That collapsed 17,808 (pair, genre) combinations to 636 -- every document
+    about one sub-topic came out in the same genre. The walk must cover the full cross product."""
+    import collections
+
+    from prompts import _GENRES, _PAIRS
+
+    n_combo = len(_PAIRS) * len(_GENRES)
+    seen, per_pair = set(), collections.defaultdict(set)
+    for i in range(n_combo + 200):
+        md = build_request(seeds["pretrain"], {"custom_id": f"pretrain__yor__doc__{i:06d}",
+                                              "lang": "yor", "task": "doc", "index": i}).metadata
+        pair = (md["domain"], md["subtopic"])
+        seen.add((pair, md["genre"]))
+        per_pair[pair].add(md["genre"])
+    assert len(seen) == n_combo, f"only {len(seen)} of {n_combo} (pair, genre) combinations reachable"
+    assert min(len(v) for v in per_pair.values()) == len(_GENRES), "some pair never varies genre"
+    # and no combination repeats before all of them have been used
+    first_lap = set()
+    for i in range(n_combo):
+        md = build_request(seeds["pretrain"], {"custom_id": f"pretrain__hau__doc__{i:06d}",
+                                              "lang": "hau", "task": "doc", "index": i}).metadata
+        first_lap.add(((md["domain"], md["subtopic"]), md["genre"]))
+    assert len(first_lap) == n_combo
+
+
+def test_languages_get_different_slices_of_the_taxonomy(seeds):
+    """Per-language offset: two languages must not march through the taxonomy in lockstep."""
+    def first(lang, n=40):
+        return [build_request(seeds["pretrain"], {"custom_id": f"pretrain__{lang}__doc__{i:06d}",
+                                                 "lang": lang, "task": "doc", "index": i}
+                              ).metadata["subtopic"] for i in range(n)]
+    assert first("yor") != first("hau") != first("fon")
+
+
 def test_prompt_building_is_deterministic_and_covers_the_taxonomy(seeds):
     row = {"custom_id": "sft__yor__rag_document_qa__000001", "lang": "yor",
            "task": "rag_document_qa", "index": 1}

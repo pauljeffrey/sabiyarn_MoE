@@ -603,3 +603,47 @@ table.
 Both models fit one 80GB card: `gpt-oss-120b` is MoE with ~5B active params in MXFP4 (~60GB, needs vLLM
 >=0.10), and `gemma-3-27b-it` is ~54GB in bf16. Use `--tp N` for multiple GPUs and `DATA_GEN_SHARDS` to split
 one plan across several boxes.
+
+## vLLM vs llama.cpp for this job
+
+**vLLM, clearly** -- for this workload, not in general.
+
+| | vLLM | llama.cpp |
+|---|---|---|
+| batching 543k independent prompts | continuous batching: hundreds of sequences in flight, scheduler refills slots as they finish | parallel slots (`-np`), far lower throughput at high concurrency |
+| the 45-78% shared prefix | automatic prefix caching across concurrent requests (a radix tree of KV blocks) -- the entire cost argument here | prompt cache is single-sequence oriented, not shared across a live batch |
+| constrained JSON | xgrammar / outlines | GBNF grammars (also good) |
+| gpt-oss-120b MXFP4 | native | needs a GGUF conversion first |
+| memory | PagedAttention -> bigger batches on the same card | simpler allocator, smaller batches |
+
+Break-even against the API is ~1,400-1,600 output tok/s. llama.cpp at high batch sizes is typically several
+times slower than vLLM on the same GPU, and being slow here does not just cost time -- it flips the economics
+back toward just paying Together.
+
+llama.cpp is the better tool when you are on CPU, on a Mac, or on a GPU too small to hold the model without
+aggressive 4-bit quantization. None of those apply to a rented 80GB card doing bulk offline generation.
+
+**Yes, vLLM batches.** `engine.chat(list_of_conversations, params)` takes the whole list and vLLM's scheduler
+decides the running batch size dynamically from free KV-cache blocks. `--chunk` is NOT the batch size -- it
+only controls how often shards flush and progress prints; leave it large.
+
+## Running on vast.ai
+
+```bash
+export HF_TOKEN=...  HF_WRITE_TOKEN=...
+bash runners/vast_vllm.sh pretrain
+MODEL=google/gemma-3-27b-it TP=2 SHARDS=2 bash runners/vast_vllm.sh pretrain
+```
+
+Instance sizing (verify prices, they move hourly):
+
+| setup | GPU | rough $/hr |
+|---|---|---|
+| gemma-3-27b fp8 | 1 x 48GB (A6000/L40S) | $0.40-0.70 |
+| gemma-3-27b bf16 / gpt-oss-120b MXFP4 | 1 x 80GB (A100/H100) | $0.80-2.00 |
+| either, tensor-parallel | 2 x 24GB (2x RTX 4090, needs fp8 for 27B) | $0.50-0.90 |
+
+Ask for **>= 150GB disk** (the 120b weights are ~60GB and HF caches a copy) and a CUDA 12.4+ image. The script
+sets `HF_HOME` to the big volume, pushes shards to the Hub as they are written, and logs to
+`/workspace/<kind>.log` because vast's web terminal loses scrollback. Being outbid costs you only the shard in
+flight -- re-running skips everything already on the Hub.
