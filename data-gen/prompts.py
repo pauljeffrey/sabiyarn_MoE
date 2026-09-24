@@ -121,9 +121,9 @@ Return JSON: {{"title": "<short natural title in {lang.name}>", "text": "<the do
 _FORMAT_BRIEF = """\
 SPECIAL TOKEN FORMAT (the target model's own vocabulary -- use these EXACTLY):
 - An assistant turn that answers normally has content:
-    <|input_lang|><__LANG__><task_plan>__VERBS__</task_plan><|target_lang|><__LANG__><response>{the answer}
+    <|input_lang|><__LANG__><task_plan>{verbs}</task_plan><|target_lang|><__LANG__><response>{the answer}
 - An assistant turn that reasons first inserts <think>...</think> right after <|input_lang|><__LANG__>:
-    <|input_lang|><__LANG__><think>{short reasoning}</think><task_plan>__VERBS__</task_plan><|target_lang|><__LANG__><response>{the answer}
+    <|input_lang|><__LANG__><think>{short reasoning}</think><task_plan>{verbs}</task_plan><|target_lang|><__LANG__><response>{the answer}
 - An assistant turn that CALLS A TOOL emits NO <response>. Put the call in `tool_calls` (JSON), and its
   content is:  <|input_lang|><__LANG__><think>{why this tool, and this query}</think>
 - A tool result is a separate message with role "tool" and the tool's `name` set.
@@ -136,9 +136,12 @@ SPECIAL TOKEN FORMAT (the target model's own vocabulary -- use these EXACTLY):
 """
 
 
-def _format_brief(lang_code: str, language_name: str, verbs: str, verbs_allowed: str) -> str:
+def _format_brief(lang_code: str, language_name: str, verbs_allowed: str) -> str:
+    """A pure function of (language). Anything row-specific belongs in the user message instead: the system
+    prompt is the shared prefix that vLLM's prefix cache reuses across a whole (kind, lang) group, and one
+    varying character in it costs a full recompute per row."""
     return (_FORMAT_BRIEF.replace("__LANG__", lang_code).replace("__VERBS_ALLOWED__", verbs_allowed)
-            .replace("__LANGUAGE_NAME__", language_name).replace("__VERBS__", verbs))
+            .replace("__LANGUAGE_NAME__", language_name))
 
 
 def _sft_like_request(seed: Seed, row: dict, *, rl: bool) -> Request:
@@ -181,10 +184,12 @@ def _sft_like_request(seed: Seed, row: dict, *, rl: bool) -> Request:
 
     n_msgs = rng.randint(seed.conversation["min_messages"], seed.conversation["max_messages"])
     verbs = sorted({v for t in tasks for v in t.task_plan}) or ["<|chat|>"]
-    fmt = _format_brief(lang.code, lang.name, "".join(verbs),
+    fmt = _format_brief(lang.code, lang.name,
                         " ".join(seed.format["special_tokens"]["task_plan_verbs"]))
 
     task_lines = "\n".join(f"  * {t.name} [{', '.join(t.tags)}]: {t.description}" for t in tasks)
+    verbs_line = ("task_plan verbs for this conversation (use them in the order each turn carries them out): "
+                  + "".join(verbs))
     system = (f"{seed.details}\n\n{fmt}\n"
               f"You are generating training conversations in {lang.name} ({lang.code}). "
               f"Language guidance: {lang.guidance}\nReturn strict JSON only, no commentary.")
@@ -231,6 +236,8 @@ Return JSON:
 
 Tasks this conversation must cover (mix them, change subject at least once):
 {task_lines}
+
+{verbs_line}
 
 Ground the content in: {DOMAINS[domain].name} / {subtopic}.
 {tools_section}

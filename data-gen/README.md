@@ -554,3 +554,52 @@ for the judge than for generation.
 | **total** | | | **~$511** | **~$1,022** |
 
 Request counts are yield-adjusted, so failed generations are already priced in.
+
+## Self-hosting with vLLM (usually cheaper than the API here)
+
+`vllm_gen.py` runs the same seeds, the same `prompts.build_request`, the same validation and the same shard
+files on your own GPU instead of a per-token API.
+
+```bash
+python vllm_gen.py --kind sft --plan-only --gpu-cost 2.0        # cost model + break-even; no GPU needed
+pip install vllm                                               # on the GPU box
+python vllm_gen.py --kind sft --model openai/gpt-oss-120b --limit 200   # measure real throughput first
+python vllm_gen.py --kind pretrain --model google/gemma-3-27b-it --tp 2 --push
+python vllm_gen.py --kind judge --model google/gemma-3-27b-it --push    # judge with a DIFFERENT model
+```
+
+**Why it wins on this specific workload.** 45-78% of every prompt is a byte-identical prefix -- the seed
+brief, the special-token rules, the tool catalogue -- shared by every row of the same (kind, language):
+
+| kind | shared prefix | of input tokens |
+|---|---|---|
+| pretrain | 78% | 1,076/request |
+| sft | 57% | 2,517/request |
+| rl | 45% | 2,608/request |
+
+An API bills that prefix on every request. vLLM computes it once and reuses the KV cache, so the script turns
+on `enable_prefix_caching` **and sorts the work by (language, task)** so identical prefixes arrive
+consecutively rather than being evicted between rows. The system prompt is deliberately a pure function of
+(kind, language) -- anything row-specific lives in the user message -- and a test enforces that, because one
+varying character in the prefix costs a full recompute per row.
+
+The second win is `--guided` (on by default): the output JSON schema (`schemas/output.py`) is compiled into a
+decoding constraint, so malformed JSON becomes structurally impossible. `json_invalid` is the biggest drop
+reason on the API path; here it is zero, which raises effective yield.
+
+**Break-even.** At $2/hr for the box, self-hosting beats Together's batch price above roughly:
+
+| kind | break-even (output tok/s) |
+|---|---|
+| pretrain | ~1,600/s |
+| sft | ~1,400/s |
+| rl | ~1,400/s |
+
+Below that, the API is cheaper. Break-even rises with output length, because the API's per-request input cost
+amortises over more output -- so self-hosting wins most clearly on short outputs and prompt-heavy kinds. The
+script prints measured tok/s and $/1M as it runs, so decide from a `--limit 200` pilot rather than from this
+table.
+
+Both models fit one 80GB card: `gpt-oss-120b` is MoE with ~5B active params in MXFP4 (~60GB, needs vLLM
+>=0.10), and `gemma-3-27b-it` is ~54GB in bf16. Use `--tp N` for multiple GPUs and `DATA_GEN_SHARDS` to split
+one plan across several boxes.
