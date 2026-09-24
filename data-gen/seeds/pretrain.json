@@ -1,0 +1,226 @@
+{
+  "kind": "pretrain",
+  "version": 1,
+  "details": "The target model is SabiYarn, a ~306M-parameter mixture-of-experts causal LM for 12 West African languages\nplus English. It is SMALL. It cannot and must not be expected to memorise the world's facts.\n\nThe goal is a model with solid general understanding of the world -- how physical things work, how people\nand institutions behave, basic health, basic technology -- plus two learned reflexes:\n\n  1. THINK FIRST. When a question arrives, reason briefly inside <think>...</think> about what is being\n     asked, whether it already knows, and what it would need in order to answer.\n  2. USE TOOLS, OR SAY YOU CANNOT. If it lacks the knowledge and a suitable tool exists, call the tool,\n     read the result, and answer from it. If no suitable tool exists, say plainly that it does not know\n     and is not connected to a knowledge source. If a tool ran but the result does not actually answer\n     the question, say THAT, rather than inventing an answer from the irrelevant result.\n\nThe canonical example. Asked \"what is AWS?\", a well-trained SabiYarn should NOT recite a memorised\ndefinition. It should think along the lines of \"I have not come across this before; it looks like a\ntechnical product name; I should look it up\", then call search_internet with a query like \"what is AWS\",\nread the returned snippet, and answer from it in the user's language. With no search tool available, the\ncorrect behaviour is to say it does not know and cannot look it up right now.\n\nAim for the register of a bright, curious 16-year-old: confident about everyday things, honest about what\nit has not learned, and quick to look something up rather than bluff. Never sycophantic, never padded.\nConfabulation is the single worst failure mode; admitting ignorance is always preferred to a plausible\ninvention, and the training data must make that trade-off visible over and over.\n\nTHIS PHASE: pretraining documents. Plain continuous prose -- no chat markup, no special tokens, no\ninstructions, no question-and-answer shape. Each document is a self-contained piece of natural writing of\nthe requested genre, register and length, entirely in the target language.\n\nWhat this corpus must give the model is WORLD MODEL, not facts to recite: how things work, what objects\nand materials do, how institutions and markets and families behave, what health means day to day. Prefer\nexplanation and mechanism over lists of names and dates. A document about a generator should explain why\nfuel makes a coil turn and why the room must be ventilated -- not list generator brands.\n\nHealth is a first-class domain here (6 domains, ~60 sub-topics: clinical, public health, maternal and\nchild, nutrition, mental wellbeing, disability). The model should come out of pretraining able to reason\nabout illness and care in plain terms, so that at SFT time it can triage and advise with tool support.\n\nCoverage is driven by the sampler: every (domain, sub-topic) pair, every genre, every register is used\nbefore any repeats. Do not let the generator drift toward the same five topics.\n\nQuality bar: natural, locally grounded, factually careful, no invented statistics, no English code-switching\nexcept where a language genuinely borrows the word.",
+  "target_model": {
+    "name": "SabiYarn",
+    "params": "306M",
+    "architecture": "MoE, 12 layers, top-2 of up to 4 experts",
+    "tokenizer": "BeardedMonster/SabiYarn-32k",
+    "context": 4096,
+    "philosophy": "The target model is SabiYarn, a ~306M-parameter mixture-of-experts causal LM for 12 West African languages\nplus English. It is SMALL. It cannot and must not be expected to memorise the world's facts.\n\nThe goal is a model with solid general understanding of the world -- how physical things work, how people\nand institutions behave, basic health, basic technology -- plus two learned reflexes:\n\n  1. THINK FIRST. When a question arrives, reason briefly inside <think>...</think> about what is being\n     asked, whether it already knows, and what it would need in order to answer.\n  2. USE TOOLS, OR SAY YOU CANNOT. If it lacks the knowledge and a suitable tool exists, call the tool,\n     read the result, and answer from it. If no suitable tool exists, say plainly that it does not know\n     and is not connected to a knowledge source. If a tool ran but the result does not actually answer\n     the question, say THAT, rather than inventing an answer from the irrelevant result.\n\nThe canonical example. Asked \"what is AWS?\", a well-trained SabiYarn should NOT recite a memorised\ndefinition. It should think along the lines of \"I have not come across this before; it looks like a\ntechnical product name; I should look it up\", then call search_internet with a query like \"what is AWS\",\nread the returned snippet, and answer from it in the user's language. With no search tool available, the\ncorrect behaviour is to say it does not know and cannot look it up right now.\n\nAim for the register of a bright, curious 16-year-old: confident about everyday things, honest about what\nit has not learned, and quick to look something up rather than bluff. Never sycophantic, never padded.\nConfabulation is the single worst failure mode; admitting ignorance is always preferred to a plausible\ninvention, and the training data must make that trade-off visible over and over."
+  },
+  "languages": {
+    "pcm": {
+      "code": "pcm",
+      "name": "Nigerian Pidgin",
+      "tier": "high",
+      "samples": 60000,
+      "guidance": "English-lexified creole. Keep it genuinely Pidgin, not English with dropped copulas."
+    },
+    "yor": {
+      "code": "yor",
+      "name": "Yoruba",
+      "tier": "medium",
+      "samples": 40000,
+      "guidance": "Tone marks and under-dots are mandatory and meaning-bearing: ọ ẹ ṣ and the diacritics."
+    },
+    "hau": {
+      "code": "hau",
+      "name": "Hausa",
+      "tier": "medium",
+      "samples": 40000,
+      "guidance": "Use hooked letters ɓ ɗ ƙ and the apostrophe in 'y correctly."
+    },
+    "ibo": {
+      "code": "ibo",
+      "name": "Igbo",
+      "tier": "medium",
+      "samples": 40000,
+      "guidance": "Dotted vowels ị ọ ụ and the nasal ṅ are required."
+    },
+    "urh": {
+      "code": "urh",
+      "name": "Urhobo",
+      "tier": "low",
+      "samples": 30000,
+      "guidance": "Very low-resource. Prefer short, concrete sentences over ambitious prose."
+    },
+    "efi": {
+      "code": "efi",
+      "name": "Efik",
+      "tier": "low",
+      "samples": 30000,
+      "guidance": "Very low-resource. Watch for drift into Ibibio."
+    },
+    "twi": {
+      "code": "twi",
+      "name": "Twi (Akan)",
+      "tier": "medium",
+      "samples": 30000,
+      "guidance": "Use ɛ and ɔ. Keep Asante Twi consistent within a document."
+    },
+    "ewe": {
+      "code": "ewe",
+      "name": "Ewe",
+      "tier": "low",
+      "samples": 30000,
+      "guidance": "Uses ɖ ƒ ŋ ɣ ʋ and tone marks."
+    },
+    "fon": {
+      "code": "fon",
+      "name": "Fon",
+      "tier": "low",
+      "samples": 30000,
+      "guidance": "Uses ɖ ɛ ɔ and tone marks. Do not drift into French."
+    },
+    "aka": {
+      "code": "aka",
+      "name": "Akan",
+      "tier": "medium",
+      "samples": 30000,
+      "guidance": "Closely related to Twi; keep them distinguishable."
+    },
+    "ful": {
+      "code": "ful",
+      "name": "Fulah",
+      "tier": "low",
+      "samples": 30000,
+      "guidance": "Uses ɓ ɗ ƴ ŋ. Adlam script is NOT used here -- Latin only."
+    },
+    "fuv": {
+      "code": "fuv",
+      "name": "Nigerian Fulfulde",
+      "tier": "low",
+      "samples": 30000,
+      "guidance": "Nigerian variety specifically, distinct from Pular/Fuuta."
+    },
+    "eng": {
+      "code": "eng",
+      "name": "English",
+      "tier": "high",
+      "samples": 15000,
+      "guidance": "Plain, concrete English. No flowery register."
+    }
+  },
+  "tasks": [],
+  "tools": [],
+  "conversation": {},
+  "tags": [
+    "tool-calling",
+    "rag",
+    "structured-output",
+    "qa",
+    "extractive-qa",
+    "health-education",
+    "health-advice",
+    "health-triaging",
+    "financial-analysis",
+    "language-identification",
+    "ner",
+    "pos-tagging",
+    "intent-detection",
+    "toxicity-spam-detection",
+    "text-rephrasing",
+    "topic-classification",
+    "summarization",
+    "sentiment-analysis",
+    "content-writing",
+    "translation",
+    "knowledge-boundary",
+    "insufficient-context",
+    "multi-turn-chat"
+  ],
+  "format": {
+    "special_tokens": {
+      "bos": "<s>",
+      "eos": "</s>",
+      "roles": {
+        "system": "<|system|>",
+        "user": "<|user|>",
+        "assistant": "<|assistant|>"
+      },
+      "think": [
+        "<think>",
+        "</think>"
+      ],
+      "task_plan": [
+        "<task_plan>",
+        "</task_plan>"
+      ],
+      "tool_call": [
+        "<tool_call>",
+        "</tool_call>"
+      ],
+      "tool_result": [
+        "<tool_result>",
+        "</tool_result>"
+      ],
+      "lang_markers": {
+        "input": "<|input_lang|>",
+        "target": "<|target_lang|>"
+      },
+      "response": "<response>",
+      "context": [
+        "<context>",
+        "</context>"
+      ],
+      "task_plan_verbs": [
+        "<|chat|>",
+        "<|generate|>",
+        "<|edit|>",
+        "<|data_extract|>",
+        "<|math|>",
+        "<|JSON|>",
+        "<|code|>",
+        "<|plan|>",
+        "<|recommend|>",
+        "<|explain|>",
+        "<|debug|>",
+        "<|RAG|>",
+        "<summarize>",
+        "<translate>",
+        "<classify>",
+        "<NER>",
+        "<identify>",
+        "<qa>"
+      ],
+      "domain_flags": [
+        "<|is_technical|>",
+        "<|is_legal|>",
+        "<|is_medical|>",
+        "<|is_scientific|>",
+        "<|is_non_technical|>",
+        "<|is_financial|>"
+      ],
+      "label_tokens": {
+        "sentiment": "<sentiment>",
+        "topic": "<topic>",
+        "intent": "<intent>",
+        "toxic": "<toxic>",
+        "hate": "<|hate|>",
+        "lang_id": "<lang_ID>",
+        "ner_tag": "<tag>",
+        "answer": "<answer>",
+        "title": "<title>",
+        "headline": "<headline>",
+        "summary": "<summary>",
+        "question": "<question>"
+      },
+      "_warnings": [
+        "The chat template emits <tool_result>...</tool_result>, which is NOT in the tokenizer's special vocabulary and therefore costs ~5 byte-BPE tokens per tag. The tokenizer DOES have <tool_response> (52037) and </tool_response> (52038) as single tokens. Either change the template to emit <tool_response>, or add <tool_result> to the tokenizer -- but decide BEFORE generating, because the choice is baked into every generated sample.",
+        "Token 52043 is '|analyze|>' -- it is missing its leading '<'. Do not use it in task plans; use <|explain|> or <|plan|> instead until the tokenizer is fixed."
+      ]
+    },
+    "output": "plain prose, no markup",
+    "columns": [
+      "id",
+      "lang",
+      "domain",
+      "subtopic",
+      "genre",
+      "title",
+      "text"
+    ]
+  }
+}

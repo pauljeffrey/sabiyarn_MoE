@@ -1,0 +1,267 @@
+#!/usr/bin/env python3
+"""Turn a seed into data. One driver, any provider, any platform.
+
+    python generate.py --kind sft --provider openrouter --limit 20 --dry-run     # prints prompts, no spend
+    python generate.py --kind sft --provider openrouter --limit 200              # live, sync
+    python generate.py --kind pretrain --provider together --batch               # half price, 24h window
+    python generate.py --kind rl --provider together --langs yor,hau --push      # push shards to the Hub
+
+Resumable by construction: every planned sample gets a deterministic `custom_id`, completed ids are read
+back out of the existing shards on disk (and optionally the Hub) and skipped, so re-running after a crash,
+a rate-limit wall or a spot-instance eviction costs nothing extra.
+
+Output lands in data/out/<kind>/<lang>/shard-*.jsonl -- one JSON record per line carrying BOTH the
+role/content message list and the chat-template rendering of it, per the seed's `format.columns`.
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import random
+import sys
+import time
+import uuid
+from pathlib import Path
+from typing import Any, Iterator, Optional
+
+HERE = Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE))
+
+from prompts import build_request          # noqa: E402
+from providers import get_provider         # noqa: E402
+from providers.base import Request, Response  # noqa: E402
+from schemas.seed import Seed              # noqa: E402
+
+OUT_ROOT = Path(os.environ.get("DATA_GEN_OUTPUT_DIR", HERE / "data")) / "out"
+
+
+# --------------------------------------------------------------------------- planning
+
+
+def custom_id(kind: str, lang: str, task: str, i: int) -> str:
+    """Deterministic and collision-free: the same plan row always gets the same id, on every machine."""
+    return f"{kind}__{lang}__{task}__{i:06d}"
+
+
+def plan_rows(seed: Seed, langs: Optional[list[str]] = None) -> Iterator[dict[str, Any]]:
+    """Every sample this seed calls for, as {custom_id, lang, task, index}."""
+    wanted = set(langs) if langs else None
+    if not seed.tasks:  # pretrain: the domain/genre sampler supplies the variety
+        for l in seed.languages:
+            if wanted and l.code not in wanted:
+                continue
+            for i in range(l.samples):
+                yield {"custom_id": custom_id(seed.kind, l.code, "doc", i), "lang": l.code,
+                       "task": "doc", "index": i}
+        return
+    for lang, tasks in seed.plan().items():
+        if wanted and lang not in wanted:
+            continue
+        for task, n in tasks.items():
+            for i in range(n):
+                yield {"custom_id": custom_id(seed.kind, lang, task, i), "lang": lang,
+                       "task": task, "index": i}
+
+
+# --------------------------------------------------------------------------- shards
+
+
+def shard_dir(kind: str, lang: str) -> Path:
+    return OUT_ROOT / kind / lang
+
+
+def done_ids(kind: str, langs: Optional[list[str]] = None) -> set[str]:
+    """custom_ids already written to disk, so a resumed run skips them."""
+    ids: set[str] = set()
+    root = OUT_ROOT / kind
+    if not root.exists():
+        return ids
+    for lang_dir in sorted(root.iterdir()):
+        if not lang_dir.is_dir() or (langs and lang_dir.name not in langs):
+            continue
+        for shard in lang_dir.glob("shard-*.jsonl"):
+            with shard.open(encoding="utf-8") as fh:
+                for line in fh:
+                    if line.strip():
+                        try:
+                            ids.add(json.loads(line)["id"])
+                        except Exception:
+                            continue  # a half-written last line after a kill: ignore, it re-generates
+    return ids
+
+
+class ShardWriter:
+    """Appends records to one shard per language, flushing continuously so a kill loses at most a line."""
+
+    def __init__(self, kind: str, tag: Optional[str] = None):
+        self.kind = kind
+        self.tag = tag or uuid.uuid4().hex[:8]
+        self._files: dict[str, Any] = {}
+        self.counts: dict[str, int] = {}
+
+    def write(self, lang: str, record: dict) -> None:
+        fh = self._files.get(lang)
+        if fh is None:
+            d = shard_dir(self.kind, lang)
+            d.mkdir(parents=True, exist_ok=True)
+            fh = self._files[lang] = (d / f"shard-{self.tag}.jsonl").open("a", encoding="utf-8")
+        fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+        fh.flush()
+        self.counts[lang] = self.counts.get(lang, 0) + 1
+
+    def close(self) -> list[Path]:
+        paths = [Path(f.name) for f in self._files.values()]
+        for f in self._files.values():
+            f.close()
+        self._files.clear()
+        return paths
+
+
+# --------------------------------------------------------------------------- run
+
+
+def run(kind: str, provider_name: str, *, model: Optional[str] = None, langs: Optional[list[str]] = None,
+        limit: int = 0, batch: bool = False, dry_run: bool = False, concurrency: int = 16,
+        push: bool = False, repo_id: str = "BeardedMonster/data-gen", seed_path: Optional[str] = None,
+        shuffle: bool = True) -> int:
+    seed = Seed.load(seed_path or kind)
+    rows = list(plan_rows(seed, langs))
+    already = done_ids(kind, langs)
+    todo = [r for r in rows if r["custom_id"] not in already]
+    if shuffle:
+        # Interleave languages/tasks so an interrupted run still has balanced coverage rather than
+        # 100% of Yoruba and none of Fon. Fixed seed: every worker shuffles to the SAME order, which is
+        # what makes the stride below a clean partition.
+        random.Random(1234).shuffle(todo)
+
+    # Horizontal scaling: worker i of n takes every nth row. Deterministic, needs no coordination, and
+    # lets Modal + RunPod + a vast box all contribute to one corpus without overlapping.
+    n_shards = max(1, int(os.environ.get("DATA_GEN_SHARDS", "1")))
+    shard_index = int(os.environ.get("DATA_GEN_SHARD_INDEX", "0"))
+    if n_shards > 1:
+        if not 0 <= shard_index < n_shards:
+            raise SystemExit(f"DATA_GEN_SHARD_INDEX={shard_index} out of range for {n_shards} shards")
+        todo = todo[shard_index::n_shards]
+        print(f"  shard {shard_index + 1}/{n_shards}: {len(todo):,} rows")
+    if limit:
+        todo = todo[:limit]
+
+    print(f"[{kind}] planned {len(rows):,} | already done {len(already):,} | this run {len(todo):,}")
+    if not todo:
+        print("nothing to do")
+        return 0
+
+    requests = [build_request(seed, r) for r in todo]
+
+    if dry_run:
+        for req in requests[:3]:
+            print("\n" + "=" * 100)
+            print(f"custom_id: {req.custom_id}   metadata: {req.metadata}")
+            for m in req.messages:
+                print(f"\n--- {m['role']} ---\n{m['content'][:2400]}")
+        print(f"\n(dry run: {len(requests):,} requests would be sent, none were)")
+        return 0
+
+    provider = get_provider(provider_name, model, max_concurrency=concurrency)
+    shard_tag = (f"w{os.environ['DATA_GEN_SHARD_INDEX']}-{uuid.uuid4().hex[:6]}"
+                 if os.environ.get("DATA_GEN_SHARDS", "1") != "1" else None)
+    writer = ShardWriter(kind, shard_tag)
+    from postprocess_gen import to_record  # imported late: needs the tokenizer only on the live path
+
+    kept = failed = 0
+    t0 = time.time()
+
+    def handle(resp: Response) -> None:
+        nonlocal kept, failed
+        if not resp.ok:
+            failed += 1
+            return
+        rec = to_record(seed, resp)
+        if rec is None:
+            failed += 1
+            return
+        writer.write(rec["lang"], rec)
+        kept += 1
+
+    if batch:
+        if not provider.supports_batch:
+            raise SystemExit(f"{provider_name} has no batch API -- drop --batch (it will run concurrently)")
+        workdir = OUT_ROOT / kind / "_batches" / time.strftime("%Y%m%d_%H%M%S")
+        bid = provider.submit_batch(requests, workdir)
+        print(f"\nbatch {bid} submitted. Poll and fetch with:\n"
+              f"    python generate.py --kind {kind} --provider {provider_name} --fetch {bid}")
+        return 0
+
+    for resp in provider.complete_many(requests, on_result=handle):
+        pass
+
+    paths = writer.close()
+    dt = time.time() - t0
+    print(f"\n[{kind}] kept {kept:,}  failed {failed:,}  in {dt/60:.1f}m")
+    print(" ", provider.usage_line())
+    for p in paths:
+        print(f"  wrote {p}")
+
+    if push and paths:
+        from hub import push_shards
+        push_shards(kind, paths, repo_id=repo_id)
+    return 0
+
+
+def fetch(kind: str, provider_name: str, batch_id: str, model: Optional[str] = None,
+          push: bool = False, repo_id: str = "BeardedMonster/data-gen") -> int:
+    seed = Seed.load(kind)
+    provider = get_provider(provider_name, model)
+    st = provider.poll_batch(batch_id)
+    print(f"batch {batch_id}: {st['status']}  {st['completed']}/{st['total']} done, {st['failed']} failed")
+    if st["status"] != "completed":
+        return 1
+    workdir = OUT_ROOT / kind / "_batches"
+    cand = sorted(workdir.glob("*"), key=lambda p: p.stat().st_mtime, reverse=True)
+    target = next((d for d in cand if (d / "batch.json").exists()
+                   and json.loads((d / "batch.json").read_text())["batch_id"] == batch_id), cand[0] if cand else workdir)
+    responses = provider.fetch_batch(batch_id, target / "batch_output.jsonl")
+    from postprocess_gen import to_record
+    writer = ShardWriter(kind)
+    kept = 0
+    for resp in responses:
+        rec = to_record(seed, resp) if resp.ok else None
+        if rec:
+            writer.write(rec["lang"], rec)
+            kept += 1
+    paths = writer.close()
+    print(f"kept {kept:,} of {len(responses):,}")
+    if push and paths:
+        from hub import push_shards
+        push_shards(kind, paths, repo_id=repo_id)
+    return 0
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--kind", required=True, choices=["pretrain", "sft", "rl"])
+    ap.add_argument("--provider", default="openrouter", choices=["together", "openrouter"])
+    ap.add_argument("--model", default=None)
+    ap.add_argument("--langs", default=None, help="comma list, e.g. yor,hau")
+    ap.add_argument("--limit", type=int, default=0, help="cap this run (0 = everything outstanding)")
+    ap.add_argument("--concurrency", type=int, default=16)
+    ap.add_argument("--batch", action="store_true", help="use the provider's batch queue (~50%% price)")
+    ap.add_argument("--fetch", default=None, metavar="BATCH_ID", help="download a finished batch")
+    ap.add_argument("--dry-run", action="store_true", help="print prompts, send nothing")
+    ap.add_argument("--push", action="store_true", help="push shards to the Hub when done")
+    ap.add_argument("--repo-id", default="BeardedMonster/data-gen")
+    ap.add_argument("--seed-path", default=None)
+    a = ap.parse_args()
+    langs = [s.strip() for s in a.langs.split(",")] if a.langs else None
+    if a.fetch:
+        return fetch(a.kind, a.provider, a.fetch, a.model, a.push, a.repo_id)
+    return run(a.kind, a.provider, model=a.model, langs=langs, limit=a.limit, batch=a.batch,
+               dry_run=a.dry_run, concurrency=a.concurrency, push=a.push, repo_id=a.repo_id,
+               seed_path=a.seed_path)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

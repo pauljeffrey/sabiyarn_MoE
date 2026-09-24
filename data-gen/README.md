@@ -453,3 +453,76 @@ scripts/            mock_generate.py (free pipeline test, no API calls)
 tests/              pytest suite (offline)
 run.py              convenience dispatcher for all of the above
 ```
+
+---
+
+# Seed-driven generation (Together AI / OpenRouter / Modal / RunPod / vast)
+
+The pipeline above targets the OpenAI Batch API. This newer one is seed-driven, multi-provider and
+multi-platform, and pushes straight to `BeardedMonster/data-gen` on the Hub.
+
+## The idea
+
+The target model is ~306M parameters. It cannot hold the world's facts. So the corpus teaches **general
+understanding plus two reflexes**: reason inside `<think>...</think>`, then either call a tool or say
+plainly that it does not know. Asked "what is AWS?", the right behaviour is not a memorised definition --
+it is to notice it has not heard of it, call `search_internet`, and answer from what comes back. With no
+such tool, the right answer is "I don't know, and I can't look it up." ~24% of the SFT task mix is exactly
+this: looking things up, admitting it cannot, and noticing that a retrieval did not answer the question.
+
+## Files
+
+| | |
+|---|---|
+| `schemas/seed.py` | the seed schema: tasks, tools, tags, volumes, validation |
+| `seeds/build_seeds.py` | **edit this**, then re-run it; it writes the JSON |
+| `seeds/{pretrain,sft,rl}.json` | generated -- the brief every provider and platform reads |
+| `prompts.py` | seed + plan row -> meta-prompt (deterministic) |
+| `generate.py` | the driver: plan, call, validate, shard, push |
+| `postprocess_gen.py` | response -> validated record (both `messages` and rendered `text`) |
+| `providers/{together,openrouter}.py` | the two providers |
+| `hub.py` | incremental push to the Hub |
+| `runners/{modal_gen,runpod_gen}.py` | Modal / RunPod / vast |
+
+## Run it
+
+```bash
+python seeds/build_seeds.py --print                        # see the plan, write nothing
+python generate.py --kind sft --provider openrouter --limit 5 --dry-run    # see the prompts, spend nothing
+python -m providers.openrouter --check                     # 1 live request, confirms the key works
+
+python generate.py --kind sft --provider openrouter --limit 500 --push
+python generate.py --kind pretrain --provider together --batch             # ~50% price, 24h window
+python generate.py --kind pretrain --provider together --fetch <batch_id> --push
+
+modal run runners/modal_gen.py --kind sft --limit 20000 --shards 8
+python runners/runpod_gen.py --kind sft --limit 20000 --shards 4           # on a RunPod/vast box
+python hub.py --push-seeds && python hub.py --status
+```
+
+## Why it is safe to interrupt
+
+Every planned sample has a deterministic `custom_id` derived from (kind, language, task, index). Completed
+ids are read back from the shards on disk and skipped, so re-running after a crash, a rate-limit wall or a
+spot eviction costs nothing. `--shards N` gives worker *i* every *N*th row of the same fixed plan, so Modal,
+RunPod and a vast box can all generate into one corpus without overlapping or coordinating.
+
+Coverage is by construction, not by sampling: the row index walks the (domain, sub-topic) list with a
+per-language stride, so every pair is used once before any repeats -- with no shared sampler state.
+
+## Volumes
+
+| kind | total | notes |
+|---|---|---|
+| pretrain | 435,000 docs | pcm 60k; yor/hau/ibo 40k; urh/efi + 6 others 30k; eng 15k |
+| sft | 79,000 conversations | 6-10 messages, 2-4 tasks each, ends on the assistant |
+| rl | 19,400 prompts | x3 ranked candidate replies |
+
+## Two tokenizer problems to settle BEFORE a large run
+
+1. The chat template emits `<tool_result>`, which is **not** a special token -- it costs ~5 byte-BPE tokens
+   every time. The tokenizer does have `<tool_response>` (52037) and `</tool_response>` (52038) as single
+   tokens. Either change the template or add the token, but decide first: the choice is baked into every
+   generated sample.
+2. Token 52043 is `|analyze|>` -- it is missing its leading `<`. Nothing here emits `<|analyze|>`
+   (`tests/test_seed_and_records.py` enforces that); fix the tokenizer if you want that verb.

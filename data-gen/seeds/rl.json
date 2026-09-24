@@ -1,0 +1,660 @@
+{
+  "kind": "rl",
+  "version": 1,
+  "details": "The target model is SabiYarn, a ~306M-parameter mixture-of-experts causal LM for 12 West African languages\nplus English. It is SMALL. It cannot and must not be expected to memorise the world's facts.\n\nThe goal is a model with solid general understanding of the world -- how physical things work, how people\nand institutions behave, basic health, basic technology -- plus two learned reflexes:\n\n  1. THINK FIRST. When a question arrives, reason briefly inside <think>...</think> about what is being\n     asked, whether it already knows, and what it would need in order to answer.\n  2. USE TOOLS, OR SAY YOU CANNOT. If it lacks the knowledge and a suitable tool exists, call the tool,\n     read the result, and answer from it. If no suitable tool exists, say plainly that it does not know\n     and is not connected to a knowledge source. If a tool ran but the result does not actually answer\n     the question, say THAT, rather than inventing an answer from the irrelevant result.\n\nThe canonical example. Asked \"what is AWS?\", a well-trained SabiYarn should NOT recite a memorised\ndefinition. It should think along the lines of \"I have not come across this before; it looks like a\ntechnical product name; I should look it up\", then call search_internet with a query like \"what is AWS\",\nread the returned snippet, and answer from it in the user's language. With no search tool available, the\ncorrect behaviour is to say it does not know and cannot look it up right now.\n\nAim for the register of a bright, curious 16-year-old: confident about everyday things, honest about what\nit has not learned, and quick to look something up rather than bluff. Never sycophantic, never padded.\nConfabulation is the single worst failure mode; admitting ignorance is always preferred to a plausible\ninvention, and the training data must make that trade-off visible over and over.\n\nTHIS PHASE: preference data. Each sample is a conversation prefix ending with a user message, plus 2-3\ncandidate assistant responses to that final turn, to be ranked.\n\nOnly the FINAL response is graded. The prefix is shared and fixed.\n\nCandidates must differ along an axis a judge can actually rank, and the intended ranking is recorded:\n  - one grounded, honest, correctly-tool-using response (best);\n  - one that is confidently wrong -- invents a fact, answers from an irrelevant retrieval, or claims\n    familiarity with something it was never told (worst; this is the behaviour we are training against);\n  - optionally one that is partially right: correct but hedged into uselessness, or right answer with the\n    wrong tool, or over-refusal where the answer was actually available.\nThree paraphrases of the same answer are worthless here and must not be generated.\n\nOver-refusal is a real failure too. If the answer IS available -- in the document, from the tool result, or\nfrom ordinary world knowledge -- then refusing is the worse response, and some samples must teach that\ndirection so the model does not collapse into refusing everything.",
+  "target_model": {
+    "name": "SabiYarn",
+    "params": "306M",
+    "architecture": "MoE, 12 layers, top-2 of up to 4 experts",
+    "tokenizer": "BeardedMonster/SabiYarn-32k",
+    "context": 4096,
+    "philosophy": "The target model is SabiYarn, a ~306M-parameter mixture-of-experts causal LM for 12 West African languages\nplus English. It is SMALL. It cannot and must not be expected to memorise the world's facts.\n\nThe goal is a model with solid general understanding of the world -- how physical things work, how people\nand institutions behave, basic health, basic technology -- plus two learned reflexes:\n\n  1. THINK FIRST. When a question arrives, reason briefly inside <think>...</think> about what is being\n     asked, whether it already knows, and what it would need in order to answer.\n  2. USE TOOLS, OR SAY YOU CANNOT. If it lacks the knowledge and a suitable tool exists, call the tool,\n     read the result, and answer from it. If no suitable tool exists, say plainly that it does not know\n     and is not connected to a knowledge source. If a tool ran but the result does not actually answer\n     the question, say THAT, rather than inventing an answer from the irrelevant result.\n\nThe canonical example. Asked \"what is AWS?\", a well-trained SabiYarn should NOT recite a memorised\ndefinition. It should think along the lines of \"I have not come across this before; it looks like a\ntechnical product name; I should look it up\", then call search_internet with a query like \"what is AWS\",\nread the returned snippet, and answer from it in the user's language. With no search tool available, the\ncorrect behaviour is to say it does not know and cannot look it up right now.\n\nAim for the register of a bright, curious 16-year-old: confident about everyday things, honest about what\nit has not learned, and quick to look something up rather than bluff. Never sycophantic, never padded.\nConfabulation is the single worst failure mode; admitting ignorance is always preferred to a plausible\ninvention, and the training data must make that trade-off visible over and over."
+  },
+  "languages": {
+    "pcm": {
+      "code": "pcm",
+      "name": "Nigerian Pidgin",
+      "tier": "high",
+      "samples": 3000,
+      "guidance": "English-lexified creole. Keep it genuinely Pidgin, not English with dropped copulas."
+    },
+    "yor": {
+      "code": "yor",
+      "name": "Yoruba",
+      "tier": "medium",
+      "samples": 2000,
+      "guidance": "Tone marks and under-dots are mandatory and meaning-bearing: ọ ẹ ṣ and the diacritics."
+    },
+    "hau": {
+      "code": "hau",
+      "name": "Hausa",
+      "tier": "medium",
+      "samples": 2000,
+      "guidance": "Use hooked letters ɓ ɗ ƙ and the apostrophe in 'y correctly."
+    },
+    "ibo": {
+      "code": "ibo",
+      "name": "Igbo",
+      "tier": "medium",
+      "samples": 2000,
+      "guidance": "Dotted vowels ị ọ ụ and the nasal ṅ are required."
+    },
+    "urh": {
+      "code": "urh",
+      "name": "Urhobo",
+      "tier": "low",
+      "samples": 1200,
+      "guidance": "Very low-resource. Prefer short, concrete sentences over ambitious prose."
+    },
+    "efi": {
+      "code": "efi",
+      "name": "Efik",
+      "tier": "low",
+      "samples": 1200,
+      "guidance": "Very low-resource. Watch for drift into Ibibio."
+    },
+    "twi": {
+      "code": "twi",
+      "name": "Twi (Akan)",
+      "tier": "medium",
+      "samples": 1200,
+      "guidance": "Use ɛ and ɔ. Keep Asante Twi consistent within a document."
+    },
+    "ewe": {
+      "code": "ewe",
+      "name": "Ewe",
+      "tier": "low",
+      "samples": 1200,
+      "guidance": "Uses ɖ ƒ ŋ ɣ ʋ and tone marks."
+    },
+    "fon": {
+      "code": "fon",
+      "name": "Fon",
+      "tier": "low",
+      "samples": 1200,
+      "guidance": "Uses ɖ ɛ ɔ and tone marks. Do not drift into French."
+    },
+    "aka": {
+      "code": "aka",
+      "name": "Akan",
+      "tier": "medium",
+      "samples": 1200,
+      "guidance": "Closely related to Twi; keep them distinguishable."
+    },
+    "ful": {
+      "code": "ful",
+      "name": "Fulah",
+      "tier": "low",
+      "samples": 1200,
+      "guidance": "Uses ɓ ɗ ƴ ŋ. Adlam script is NOT used here -- Latin only."
+    },
+    "fuv": {
+      "code": "fuv",
+      "name": "Nigerian Fulfulde",
+      "tier": "low",
+      "samples": 1200,
+      "guidance": "Nigerian variety specifically, distinct from Pular/Fuuta."
+    },
+    "eng": {
+      "code": "eng",
+      "name": "English",
+      "tier": "high",
+      "samples": 800,
+      "guidance": "Plain, concrete English. No flowery register."
+    }
+  },
+  "tasks": [
+    {
+      "name": "tool_search_answer",
+      "tags": [
+        "tool-calling",
+        "knowledge-boundary",
+        "qa"
+      ],
+      "description": "User asks about something the assistant plainly has not learned (a product, company, acronym, recent event, technical term). The assistant thinks -- noting it does not recognise it -- calls search_internet with a tight query, reads the snippets, and answers in the user's language, attributing what it found. It must NOT pretend prior familiarity.",
+      "share": 16.0,
+      "task_plan": [
+        "<|explain|>"
+      ],
+      "domain_flags": [],
+      "uses_tools": true,
+      "requires_think": true,
+      "languages": null,
+      "notes": "Responses must differ in a way a judge can rank: one grounded/honest, one confidently wrong or invented, one partially right. Never three paraphrases of the same answer."
+    },
+    {
+      "name": "no_tool_admit_unknown",
+      "tags": [
+        "knowledge-boundary",
+        "qa"
+      ],
+      "description": "Same as tool_search_answer, but the system prompt offers NO tool that could help (or no tools at all). The assistant thinks, concludes it neither knows nor can look it up, and says so plainly and briefly in the user's language. It offers what general reasoning it can (e.g. what kind of thing the name looks like) without inventing facts, and does not apologise at length.",
+      "share": 13.0,
+      "task_plan": [
+        "<|chat|>"
+      ],
+      "domain_flags": [],
+      "uses_tools": false,
+      "requires_think": true,
+      "languages": null,
+      "notes": "Responses must differ in a way a judge can rank: one grounded/honest, one confidently wrong or invented, one partially right. Never three paraphrases of the same answer."
+    },
+    {
+      "name": "retrieval_insufficient",
+      "tags": [
+        "insufficient-context",
+        "rag",
+        "tool-calling"
+      ],
+      "description": "The assistant calls a tool, and the result does NOT answer the question -- empty, about a different sense of the term, or topically adjacent. The assistant must notice this in <think>, say that what it found does not answer the question, and stop. Optionally one re-query with a better term, then admit it if that also fails. Inventing an answer from an irrelevant snippet is the exact failure this task exists to prevent.",
+      "share": 15.0,
+      "task_plan": [
+        "<|explain|>"
+      ],
+      "domain_flags": [],
+      "uses_tools": true,
+      "requires_think": true,
+      "languages": null,
+      "notes": "Responses must differ in a way a judge can rank: one grounded/honest, one confidently wrong or invented, one partially right. Never three paraphrases of the same answer."
+    },
+    {
+      "name": "rag_document_qa",
+      "tags": [
+        "rag",
+        "extractive-qa",
+        "tool-calling"
+      ],
+      "description": "A document is supplied. The user asks about it. The assistant calls search_documents, grounds its answer in the returned passages, and quotes or cites where the answer came from. Asked something the document does not cover, it says so rather than drawing on general knowledge.",
+      "share": 14.0,
+      "task_plan": [
+        "<|RAG|>"
+      ],
+      "domain_flags": [],
+      "uses_tools": true,
+      "requires_think": true,
+      "languages": null,
+      "notes": "Responses must differ in a way a judge can rank: one grounded/honest, one confidently wrong or invented, one partially right. Never three paraphrases of the same answer."
+    },
+    {
+      "name": "action_tool_use",
+      "tags": [
+        "tool-calling"
+      ],
+      "description": "The user asks for an action: send a message, set a reminder, check a rate, compute something. The assistant confirms any ambiguous parameter in words FIRST, then emits the call, then reports the result. Includes cases where the tool fails and the assistant explains the failure plainly.",
+      "share": 8.0,
+      "task_plan": [
+        "<|plan|>"
+      ],
+      "domain_flags": [],
+      "uses_tools": true,
+      "requires_think": true,
+      "languages": null,
+      "notes": "Responses must differ in a way a judge can rank: one grounded/honest, one confidently wrong or invented, one partially right. Never three paraphrases of the same answer."
+    },
+    {
+      "name": "world_knowledge_qa",
+      "tags": [
+        "qa",
+        "multi-turn-chat"
+      ],
+      "description": "Everyday how-and-why questions a curious 16-year-old could answer unaided: why bread rises, how a generator makes electricity, why the harmattan is dusty, how interest on a loan works, why boiling water makes it safe. Concrete, mechanism-first, no tools, no hedging. This is the general understanding the whole design rests on.",
+      "share": 10.0,
+      "task_plan": [
+        "<|explain|>"
+      ],
+      "domain_flags": [],
+      "uses_tools": false,
+      "requires_think": false,
+      "languages": null,
+      "notes": "Responses must differ in a way a judge can rank: one grounded/honest, one confidently wrong or invented, one partially right. Never three paraphrases of the same answer."
+    },
+    {
+      "name": "health_advice",
+      "tags": [
+        "health-advice",
+        "tool-calling"
+      ],
+      "description": "A user describes a non-urgent symptom and asks what to do. The assistant calls lookup_health_guidance, then gives practical home-care steps AND explicit signs that mean going to a clinic. It never diagnoses, never names a prescription dose, and never discourages seeking care.",
+      "share": 7.0,
+      "task_plan": [
+        "<|recommend|>"
+      ],
+      "domain_flags": [
+        "<|is_medical|>"
+      ],
+      "uses_tools": true,
+      "requires_think": true,
+      "languages": null,
+      "notes": "Responses must differ in a way a judge can rank: one grounded/honest, one confidently wrong or invented, one partially right. Never three paraphrases of the same answer."
+    },
+    {
+      "name": "health_triage",
+      "tags": [
+        "health-triaging"
+      ],
+      "description": "A user describes symptoms that may be serious. The assistant's job is to sort urgency: go now, go today, watch at home. Danger signs must be stated concretely (a child too weak to drink, bleeding in pregnancy, chest pain with breathlessness, a convulsion). Always errs toward seeking care.",
+      "share": 6.0,
+      "task_plan": [
+        "<|recommend|>"
+      ],
+      "domain_flags": [
+        "<|is_medical|>"
+      ],
+      "uses_tools": false,
+      "requires_think": true,
+      "languages": null,
+      "notes": "Responses must differ in a way a judge can rank: one grounded/honest, one confidently wrong or invented, one partially right. Never three paraphrases of the same answer."
+    },
+    {
+      "name": "financial_analysis",
+      "tags": [
+        "financial-analysis",
+        "tool-calling"
+      ],
+      "description": "Small-trader and household money questions: margin on a sack of rice, whether a loan is worth it, daily contribution savings, converting currency. Uses calculate/get_exchange_rate rather than arithmetic in its head, and shows the working.",
+      "share": 5.0,
+      "task_plan": [
+        "<|math|>",
+        "<|explain|>"
+      ],
+      "domain_flags": [
+        "<|is_financial|>"
+      ],
+      "uses_tools": true,
+      "requires_think": false,
+      "languages": null,
+      "notes": "Responses must differ in a way a judge can rank: one grounded/honest, one confidently wrong or invented, one partially right. Never three paraphrases of the same answer."
+    },
+    {
+      "name": "structured_output",
+      "tags": [
+        "structured-output"
+      ],
+      "description": "Return strictly-valid JSON matching a schema stated in the prompt -- extracting fields from a passage, or formatting an answer. Emits the JSON and nothing else around it.",
+      "share": 3.0,
+      "task_plan": [
+        "<|JSON|>",
+        "<|data_extract|>"
+      ],
+      "domain_flags": [],
+      "uses_tools": false,
+      "requires_think": false,
+      "languages": null,
+      "notes": "Responses must differ in a way a judge can rank: one grounded/honest, one confidently wrong or invented, one partially right. Never three paraphrases of the same answer."
+    },
+    {
+      "name": "translation",
+      "tags": [
+        "translation"
+      ],
+      "description": "Translate between any supported pair, including into and out of English. Preserve register, names and numbers. Both directions appear.",
+      "share": 3.0,
+      "task_plan": [
+        "<translate>"
+      ],
+      "domain_flags": [],
+      "uses_tools": false,
+      "requires_think": false,
+      "languages": null,
+      "notes": "Responses must differ in a way a judge can rank: one grounded/honest, one confidently wrong or invented, one partially right. Never three paraphrases of the same answer."
+    }
+  ],
+  "tools": [
+    {
+      "name": "search_internet",
+      "description": "Search the public internet for information the assistant does not already know. Use for named products, companies, people, places, events, or any technical term the assistant has not encountered. Returns short text snippets.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "query": {
+            "type": "string",
+            "description": "A short search query, in English, 2-8 words."
+          }
+        },
+        "required": [
+          "query"
+        ]
+      },
+      "returns": "2-4 snippets of 1-3 sentences each, sometimes with a source name. Often partial, sometimes stale.",
+      "failure_modes": [
+        "no results at all",
+        "results about a different sense of the word",
+        "results that mention the term but never define it"
+      ]
+    },
+    {
+      "name": "search_documents",
+      "description": "Search the documents supplied in this conversation for passages relevant to a query. Use this before answering any question about a supplied document. Does NOT search the internet.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "query": {
+            "type": "string",
+            "description": "What to look for, in the document's language."
+          },
+          "top_k": {
+            "type": "integer",
+            "description": "How many passages to return (1-5). Default 3."
+          }
+        },
+        "required": [
+          "query"
+        ]
+      },
+      "returns": "Verbatim passages from the supplied document, each with a rough location.",
+      "failure_modes": [
+        "the document genuinely does not discuss it",
+        "passages are topically near but do not answer"
+      ]
+    },
+    {
+      "name": "lookup_health_guidance",
+      "description": "Look up plain-language public-health guidance on a symptom, condition, medicine or prevention topic. Use for any health question before answering. Not a diagnosis.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "topic": {
+            "type": "string",
+            "description": "Symptom, condition or medicine, in English."
+          }
+        },
+        "required": [
+          "topic"
+        ]
+      },
+      "returns": "Guidance paragraphs: what it is, warning signs, what to do at home, when to go to a clinic.",
+      "failure_modes": [
+        "topic too vague to match",
+        "guidance covers adults but the question was about an infant"
+      ]
+    },
+    {
+      "name": "calculate",
+      "description": "Evaluate an arithmetic expression. Use for any calculation rather than doing it mentally.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "expression": {
+            "type": "string",
+            "description": "e.g. '4500 * 12 - 3000'"
+          }
+        },
+        "required": [
+          "expression"
+        ]
+      },
+      "returns": "The numeric result.",
+      "failure_modes": [
+        "malformed expression",
+        "division by zero"
+      ]
+    },
+    {
+      "name": "get_exchange_rate",
+      "description": "Get the current exchange rate between two currencies, by ISO code.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "base": {
+            "type": "string",
+            "description": "e.g. 'NGN'"
+          },
+          "quote": {
+            "type": "string",
+            "description": "e.g. 'USD'"
+          }
+        },
+        "required": [
+          "base",
+          "quote"
+        ]
+      },
+      "returns": "A rate and the timestamp it was quoted at.",
+      "failure_modes": [
+        "unknown currency code",
+        "rate unavailable for that pair"
+      ]
+    },
+    {
+      "name": "get_current_datetime",
+      "description": "Get the current date, time and timezone. Use whenever the answer depends on today's date.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "timezone": {
+            "type": "string",
+            "description": "IANA zone, e.g. 'Africa/Lagos'. Optional."
+          }
+        },
+        "required": []
+      },
+      "returns": "ISO timestamp and timezone name.",
+      "failure_modes": [
+        "unknown timezone name"
+      ]
+    },
+    {
+      "name": "send_message",
+      "description": "Send a text message on the user's behalf. Only call this after the user has clearly asked for the message to be sent, and confirm the recipient and wording first if either is unclear.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "recipient": {
+            "type": "string",
+            "description": "Name or phone number."
+          },
+          "body": {
+            "type": "string",
+            "description": "The message text, in the user's language."
+          }
+        },
+        "required": [
+          "recipient",
+          "body"
+        ]
+      },
+      "returns": "Delivery confirmation, or an error.",
+      "failure_modes": [
+        "recipient not found",
+        "network failure",
+        "ambiguous recipient (two contacts match)"
+      ]
+    },
+    {
+      "name": "set_reminder",
+      "description": "Create a reminder for the user at a specific time.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "when": {
+            "type": "string",
+            "description": "ISO datetime, or a plain phrase like 'tomorrow 07:00'."
+          },
+          "text": {
+            "type": "string",
+            "description": "What to remind the user about."
+          }
+        },
+        "required": [
+          "when",
+          "text"
+        ]
+      },
+      "returns": "Confirmation with the resolved absolute time.",
+      "failure_modes": [
+        "time in the past",
+        "unparseable time phrase"
+      ]
+    },
+    {
+      "name": "translate_text",
+      "description": "Translate text between the languages this assistant supports. Use only when the user asks for a translation the assistant is not confident producing itself.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "text": {
+            "type": "string"
+          },
+          "target_language": {
+            "type": "string",
+            "description": "Language code, e.g. 'yor'."
+          }
+        },
+        "required": [
+          "text",
+          "target_language"
+        ]
+      },
+      "returns": "The translated text.",
+      "failure_modes": [
+        "unsupported language code",
+        "input too long"
+      ]
+    }
+  ],
+  "conversation": {
+    "min_messages": 6,
+    "max_messages": 10,
+    "ends_with": "assistant",
+    "counting": "A tool_call and its tool result count as messages. 6-10 covers roughly 3-5 user turns.",
+    "task_mix_per_conversation": [
+      2,
+      4
+    ],
+    "theme_drift": "A conversation should change subject at least once -- that is what teaches the model to track context rather than answer in isolation.",
+    "system_prompt": "Present in ~70% of conversations; carries the tool catalogue as a JSON block. The remaining 30% have no system prompt and no tools, which is where no_tool_admit_unknown lives.",
+    "think_policy": "Open with <think>...</think> whenever the turn involves a tool, a judgement about whether the assistant knows something, or triage. Skip it for simple chat and labelling -- a model that thinks about everything is as badly calibrated as one that never does.",
+    "language_policy": "The whole conversation is in one language unless the task is translation or cross-lingual summarisation. The assistant always replies in the language the user wrote in.",
+    "responses_per_prompt": 3
+  },
+  "tags": [
+    "tool-calling",
+    "rag",
+    "structured-output",
+    "qa",
+    "extractive-qa",
+    "health-education",
+    "health-advice",
+    "health-triaging",
+    "financial-analysis",
+    "language-identification",
+    "ner",
+    "pos-tagging",
+    "intent-detection",
+    "toxicity-spam-detection",
+    "text-rephrasing",
+    "topic-classification",
+    "summarization",
+    "sentiment-analysis",
+    "content-writing",
+    "translation",
+    "knowledge-boundary",
+    "insufficient-context",
+    "multi-turn-chat"
+  ],
+  "format": {
+    "special_tokens": {
+      "bos": "<s>",
+      "eos": "</s>",
+      "roles": {
+        "system": "<|system|>",
+        "user": "<|user|>",
+        "assistant": "<|assistant|>"
+      },
+      "think": [
+        "<think>",
+        "</think>"
+      ],
+      "task_plan": [
+        "<task_plan>",
+        "</task_plan>"
+      ],
+      "tool_call": [
+        "<tool_call>",
+        "</tool_call>"
+      ],
+      "tool_result": [
+        "<tool_result>",
+        "</tool_result>"
+      ],
+      "lang_markers": {
+        "input": "<|input_lang|>",
+        "target": "<|target_lang|>"
+      },
+      "response": "<response>",
+      "context": [
+        "<context>",
+        "</context>"
+      ],
+      "task_plan_verbs": [
+        "<|chat|>",
+        "<|generate|>",
+        "<|edit|>",
+        "<|data_extract|>",
+        "<|math|>",
+        "<|JSON|>",
+        "<|code|>",
+        "<|plan|>",
+        "<|recommend|>",
+        "<|explain|>",
+        "<|debug|>",
+        "<|RAG|>",
+        "<summarize>",
+        "<translate>",
+        "<classify>",
+        "<NER>",
+        "<identify>",
+        "<qa>"
+      ],
+      "domain_flags": [
+        "<|is_technical|>",
+        "<|is_legal|>",
+        "<|is_medical|>",
+        "<|is_scientific|>",
+        "<|is_non_technical|>",
+        "<|is_financial|>"
+      ],
+      "label_tokens": {
+        "sentiment": "<sentiment>",
+        "topic": "<topic>",
+        "intent": "<intent>",
+        "toxic": "<toxic>",
+        "hate": "<|hate|>",
+        "lang_id": "<lang_ID>",
+        "ner_tag": "<tag>",
+        "answer": "<answer>",
+        "title": "<title>",
+        "headline": "<headline>",
+        "summary": "<summary>",
+        "question": "<question>"
+      },
+      "_warnings": [
+        "The chat template emits <tool_result>...</tool_result>, which is NOT in the tokenizer's special vocabulary and therefore costs ~5 byte-BPE tokens per tag. The tokenizer DOES have <tool_response> (52037) and </tool_response> (52038) as single tokens. Either change the template to emit <tool_response>, or add <tool_result> to the tokenizer -- but decide BEFORE generating, because the choice is baked into every generated sample.",
+        "Token 52043 is '|analyze|>' -- it is missing its leading '<'. Do not use it in task plans; use <|explain|> or <|plan|> instead until the tokenizer is fixed."
+      ]
+    },
+    "assistant_turn": {
+      "plain": "<|input_lang|>{src}<task_plan>{verbs}</task_plan><|target_lang|>{tgt}<response>{text}",
+      "with_think": "<|input_lang|>{src}<think>{reasoning}</think><task_plan>{verbs}</task_plan><|target_lang|>{tgt}<response>{text}",
+      "tool_call": "<|input_lang|>{src}<think>{reasoning}</think><tool_call>{name}\n{arguments_json}</tool_call>",
+      "notes": "src/tgt are language tags like <yor>. verbs are one or more task_plan verbs. A turn that calls a tool emits ONLY the tool_call form (no <response>); the tool result comes back as a separate role='tool' message and the assistant then speaks again. Reasoning inside <think> is written in the TARGET language, short (1-3 sentences), and never restates the question."
+    },
+    "columns": [
+      "id",
+      "lang",
+      "tags",
+      "tasks",
+      "prompt_messages",
+      "prompt_text",
+      "response_1",
+      "response_2",
+      "response_3",
+      "ranking",
+      "rationale",
+      "instruction",
+      "input",
+      "context"
+    ],
+    "column_notes": "messages/prompt_messages are the source of truth (role/content dicts, with tool_calls on assistant turns and role='tool' results). text/prompt_text is the chat-template rendering. instruction/input/context/response are flattened conveniences derived from the LAST exchange, for tooling that expects the Alpaca shape; they are lossy for multi-turn samples and must not be trained on instead of messages."
+  }
+}
