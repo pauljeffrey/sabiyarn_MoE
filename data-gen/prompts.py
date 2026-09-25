@@ -174,6 +174,11 @@ SPECIAL TOKEN FORMAT (the target model's own vocabulary -- use these EXACTLY):
 - The <response> text is ALWAYS in __LANGUAGE_NAME__.
 - <task_plan> is a PLAN, not a label. For a multi-step turn, list the verbs in the order they will be carried
   out, e.g. <task_plan><|RAG|><|analyze|><|explain|></task_plan>. Verbs must come from: __VERBS_ALLOWED__
+- NEVER invent a <|...|> token. The ONLY pipe tokens that exist are <|input_lang|>, <|target_lang|>, the role
+  tokens, and the task_plan verbs listed below. A language tag is written <yor> with ANGLE BRACKETS ONLY --
+  <|yor|>, <|eng|>, <|efi|> and the like do not exist and are junk sub-words. The language marker is always
+  the pair: <|input_lang|> immediately followed by the bare tag, e.g. <|input_lang|><eng>. Writing <|eng|> on
+  its own is the single most common mistake made here; do not make it.
 - CLOSING TAGS: only these five have one -- </think>, </task_plan>, </tool_call>, </tool_response>, </context>.
   Every other marker is an OPENER ONLY and must never be closed. Write <response>the answer with nothing after
   it, and <sentiment>positive with no closing tag. Inventing </response> or </sentiment> is wrong: they are not

@@ -175,11 +175,17 @@ def analyse(recs: list[dict], seed: Seed) -> dict[str, Any]:
                     if len(txt.strip()) < 40:
                         m["stub_responses"] += 1
                     m["distinct4"].append(_distinct_ngram(txt))
+                    # Only judge orthography and English leak on turns whose TARGET language is the native
+                    # one. With io_direction, english_english and native_to_english answer in English by
+                    # design -- scoring those for Yoruba diacritics measures nothing and makes a correct
+                    # sample look broken.
+                    answers_native = r.get("io_direction") in (None, "native_native", "english_to_native",
+                                                               "crosslingual")
                     want = DIACRITICS.get(r["lang"], set())
-                    if want:
+                    if want and answers_native:
                         ok, tot = m["diacritics_ok"][r["lang"]]
                         m["diacritics_ok"][r["lang"]] = [ok + bool(set(txt.lower()) & want), tot + 1]
-                    if r["lang"] != "pcm":
+                    if r["lang"] != "pcm" and answers_native:
                         words = re.findall(r"[a-zA-Z]+", txt.lower())
                         if len(words) >= 12:
                             m["eng_leak"][r["lang"]].append(
@@ -228,12 +234,15 @@ def report(results: dict[str, dict[str, Any]]) -> None:
     row("total messages (mean)", lambda m: f"{_mean([k*v for k,v in m['total_msgs'].items()])/max(_mean(list(m['total_msgs'].values())),1e-9):.1f}"
         if m["total_msgs"] else "0")
     print("  LANGUAGE")
+    print("    (scored only on turns whose target language is the native one)")
     for lang in sorted({l for m in results.values() for l in m["diacritics_ok"]}):
         row(f"diacritics present: {lang}", lambda m, L=lang: (
             f"{m['diacritics_ok'][L][0]}/{m['diacritics_ok'][L][1]}"
             f" ({m['diacritics_ok'][L][0]/max(m['diacritics_ok'][L][1],1):.0%})"
             if L in m["diacritics_ok"] else "-"))
-    row("English leak (mean, non-pcm)", lambda m: f"{_mean([x for v in m['eng_leak'].values() for x in v]):.1%}")
+    row("English leak (native-target only)",
+        lambda m: f"{_mean([x for v in m['eng_leak'].values() for x in v]):.1%}"
+                  f" (n={sum(len(v) for v in m['eng_leak'].values())})")
     print("  LANGUAGE DIRECTION (target: even across 5)")
     row("directions seen", lambda m: len(m["io_dirs"]))
     row("most/least common", lambda m: (f"{m['io_dirs'].most_common(1)[0][1]}/"

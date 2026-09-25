@@ -134,6 +134,13 @@ def _validate_conversation(msgs: list[dict], seed: Seed, *, ends_with: str) -> b
             if c["function"]["name"] not in tool_names:
                 _drop("unknown_tool")
                 return False
+    invented = _invented_pipe_tokens(msgs)
+    if invented:
+        _drop(f"invented_pipe_token:{invented[0]}")
+        return False
+    if _degenerate_user_message(msgs):
+        _drop("degenerate_user_message")
+        return False
     return True
 
 
@@ -151,6 +158,49 @@ def _flatten(msgs: list[dict]) -> dict[str, str]:
     ctx = "\n\n".join(m.get("content", "") for m in msgs if m["role"] == "tool")
     return {"instruction": (last_user or {}).get("content", ""), "input": "",
             "context": ctx, "response": _assistant_parts((last_asst or {}).get("content", ""))["response"]}
+
+
+# Every <|...|> token that exists in the tokenizer. Anything else is a pseudo-token the generator invented --
+# measured at 70 occurrences vs 21 correct markers in low-resource languages, where the model substitutes
+# <|efi|> for <|input_lang|><efi>. Those are junk sub-words the target model would learn to emit.
+_VALID_PIPE_TOKENS = {
+    "<|system|>", "<|user|>", "<|assistant|>", "<|input_lang|>", "<|target_lang|>",
+    "<|chat|>", "<|generate|>", "<|edit|>", "<|data_extract|>", "<|math|>", "<|JSON|>", "<|code|>",
+    "<|plan|>", "<|analyze|>", "<|recommend|>", "<|explain|>", "<|debug|>", "<|RAG|>",
+    "<|is_technical|>", "<|is_legal|>", "<|is_medical|>", "<|is_scientific|>", "<|is_non_technical|>",
+    "<|is_financial|>", "<|hate|>",
+}
+_PIPE_RE = re.compile(r"<\|[^|>]{1,20}\|>")
+
+
+def _invented_pipe_tokens(msgs: list[dict]) -> list[str]:
+    found = []
+    for m in msgs:
+        for t in _PIPE_RE.findall(m.get("content") or ""):
+            if t not in _VALID_PIPE_TOKENS:
+                found.append(t)
+    return found
+
+
+def _distinct_ngram(text: str, n: int = 4) -> float:
+    w = text.split()
+    if len(w) <= n:
+        return 1.0
+    g = [tuple(w[i:i + n]) for i in range(len(w) - n + 1)]
+    return len(set(g)) / len(g)
+
+
+def _degenerate_user_message(msgs: list[dict], floor: float = 0.75) -> bool:
+    """A looping user message ("mme nka mme nka nte nnyin eyenam eyọm nnyin mme nka...") is the signature of
+    a model that does not actually know the language. Checked on USER turns specifically: repetition metrics
+    over assistant responses alone scored those samples 0.974 and passed them."""
+    for m in msgs:
+        if m["role"] != "user":
+            continue
+        c = m.get("content") or ""
+        if len(c.split()) >= 12 and _distinct_ngram(c) < floor:
+            return True
+    return False
 
 
 _MARKER_RE = re.compile(r"<\|input_lang\|><([a-z]{2,4})>.*?<\|target_lang\|><([a-z]{2,4})>", re.S)
