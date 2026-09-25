@@ -1,0 +1,92 @@
+{
+  "note": "Structurally perfect conversations mined from generated data. They demonstrate the MARKER FORMAT, THINK PLACEMENT and TOOL PLUMBING only -- their language is whatever they were generated in, and a generation in another language must copy the structure, not the words.",
+  "exemplars": [
+    {
+      "id": "sft__hau__rag_document_qa__000911",
+      "lang": "hau",
+      "io_direction": "crosslingual",
+      "uses_tools": true,
+      "messages": [
+        {
+          "role": "system",
+          "content": "{\"tools\": [{\"type\": \"function\", \"function\": {\"name\": \"search_documents\", \"description\": \"Search the documents supplied in this conversation for relevant passages. Use before answering any question about a supplied document. Does NOT search the internet.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"query\": {\"type\": \"string\", \"description\": \"What to look for.\"}, \"top_k\": {\"type\": \"integer\", \"description\": \"1-5, default 3.\"}}, \"required\": [\"query\"]}}}, {\"type\": \"function\", \"function\": {\"name\": \"db_insert_record\", \"description\": \"Save a new record to a table. Only call this after the user has confirmed the values, and echo back what was saved.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"table\": {\"type\": \"string\"}, \"record\": {\"type\": \"object\", \"description\": \"Field/value pairs to store.\"}}, \"required\": [\"table\", \"record\"]}}}, {\"type\": \"function\", \"function\": {\"name\": \"lookup_legal_info\", \"description\": \"Look up plain-language information about a law, right or official procedure.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"topic\": {\"type\": \"string\", \"description\": \"e.g. 'tenancy notice period', 'registering a business'.\"}, \"country\": {\"type\": \"string\"}}, \"required\": [\"topic\"]}}}, {\"type\": \"function\", \"function\": {\"name\": \"get_current_datetime\", \"description\": \"Get the current date, time and timezone. Use whenever the answer depends on today's date.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"timezone\": {\"type\": \"string\", \"description\": \"IANA zone, e.g. 'Africa/Lagos'.\"}}, \"required\": []}}}]}"
+        },
+        {
+          "role": "user",
+          "content": "Nka nọ Calabar, mọkọ mọ nọ ẹmbo-nọ-ẹmbo. Kọfere nọ nọ nñke nọ nọ ẹmbo-nọ-ẹmbo. (I am in Calabar, my work is interpreting. Please identify the names in this sentence: 'Etidiong works at the Cross River Translation Bureau in Calabar.')"
+        },
+        {
+          "role": "assistant",
+          "content": "<|input_lang|><efi><think>The user wants NER for a specific English sentence provided within an Efik request. I need to identify persons, locations, and organizations.</think><task_plan><NER></task_plan><|target_lang|><hau><response>Ga sunayen da na gano: <NER>Etidiong<tag>PERSON, <NER>Cross River Translation Bureau<tag>ORGANIZATION, <NER>Calabar<tag>LOCATION."
+        },
+        {
+          "role": "user",
+          "content": "Mọ kọfere nọ nọ ẹmbo-nọ-ẹmbo: 'Professional interpreters must maintain strict confidentiality and adhere to ethical guidelines.' Translate this to Hausa."
+        },
+        {
+          "role": "assistant",
+          "content": "<|input_lang|><efi><think>The user provided an English sentence and requested a translation into Hausa. I must preserve the formal register regarding professional ethics.</think><task_plan><translate></task_plan><|target_lang|><hau><response>Masu fassara ƙwararruna dole ne su kiyaye sirri sosai kuma su bi ƙa'idodin ɗabi'a."
+        },
+        {
+          "role": "user",
+          "content": "Afo mọ nọ nọ ẹmbo-nọ-ẹmbo nọ nọ. Based on the provided document about interpreter certification, what are the requirements for the Level 3 exam? Answer me in Hausa."
+        },
+        {
+          "role": "assistant",
+          "content": "<|input_lang|><efi><think>The user is asking about Level 3 exam requirements from a document. I need to search the documents for 'Level 3 exam requirements'.</think>",
+          "tool_calls": [
+            {
+              "function": {
+                "name": "search_documents",
+                "arguments": {
+                  "query": "Level 3 exam requirements for interpreter certification"
+                }
+              }
+            }
+          ]
+        },
+        {
+          "role": "tool",
+          "content": "[Passage 1: The Level 2 certification requires a 40-hour practicum. Level 1 is for entry-level students. The Level 3 Advanced Certification requires a Master's degree in Linguistics, 5 years of documented professional experience, and a passing score on the comprehensive oral exam.]",
+          "name": "search_documents"
+        },
+        {
+          "role": "assistant",
+          "content": "<|input_lang|><efi><think>The search result clearly lists the requirements for Level 3: Master's in Linguistics, 5 years experience, and passing the oral exam. I will translate this to Hausa.</think><task_plan><|RAG|><|chat|></task_plan><|target_lang|><hau><response>A cikin takardun da aka bayar, buƙatun jarrabawar Mataki na 3 (Level 3) sune: digamakarin Master a fannin Linguistics, ƙwarewar aiki na shekaru 5 da aka tabbatar, da kuma cin nasara a jarrabawar baki ta comprehensive."
+        }
+      ]
+    },
+    {
+      "id": "sft__yor__general_chat__000000",
+      "lang": "yor",
+      "io_direction": "english_to_native",
+      "uses_tools": false,
+      "messages": [
+        {
+          "role": "user",
+          "content": "Hello! I have a short text about a school event. Can you tell me the topic of this text and summarize it in Yoruba? 'The annual Inter-House sports competition was held on Friday, with students from all grades competing in 100m sprints and high jump. It was a colorful event with plenty of cheering.'"
+        },
+        {
+          "role": "assistant",
+          "content": "<|input_lang|><eng><think>Classify the topic of the text and then translate the summary into Yoruba as requested.</think><task_plan><classify><summarize></task_plan><|target_lang|><yor><response><topic>Sports Day - It describes a school athletic competition. Ìjírèkòọ́-ẹyọ ara ti ilé-ìwé wáyé ní ọjọ́ Ẹ́Cúgọ́, níbi tí àwọn akẹ́kọ̀ọ́ ti sọ ara wọn di ẹyọ nínú sáré ati ìfoògùn."
+        },
+        {
+          "role": "user",
+          "content": "Thanks! Now, if I say 'The weather was too hot for the kids to run', what topic is that?"
+        },
+        {
+          "role": "assistant",
+          "content": "<|input_lang|><eng><think>Identify the topic of the sentence regarding weather and children's running.</think><task_plan><classify></task_plan><|target_lang|><yor><response><topic>Weather - It refers to the temperature during the event."
+        },
+        {
+          "role": "user",
+          "content": "One last thing, do you know who won the 100m race in that specific text?"
+        },
+        {
+          "role": "assistant",
+          "content": "<|input_lang|><eng><think>The provided text mentions the competition happened but does not name any winners.</think><task_plan><|chat|></task_plan><|target_lang|><yor><response>Ìwé náà kò sọ ẹni tí ó gbe sáré 100m yẹn."
+        }
+      ]
+    }
+  ]
+}

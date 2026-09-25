@@ -476,3 +476,74 @@ def test_a_pack_that_loses_ordering_is_discarded(seeds):
     short = {"samples": [_sft_payload()]}
     assert len(to_records(seeds["sft"], Response("y", json.dumps(short), True,
                                                  metadata=packed.metadata))) == 1
+
+
+# ----------------------------------------------------------------- few-shot / free-tier backoff
+
+
+def test_fewshot_attaches_only_to_the_low_resource_tier(seeds, monkeypatch):
+    """Exemplars cost ~1,600 tokens. They go where structure actually collapses, not everywhere."""
+    monkeypatch.delenv("DATA_GEN_FEWSHOT", raising=False)
+    from prompts import _fewshot_block
+    if not _fewshot_block():
+        pytest.skip("seeds/fewshot.json not built")
+
+    def sysmsg(lang):
+        return build_request(seeds["sft"], {"custom_id": f"sft__{lang}__rag_document_qa__000001",
+                                           "lang": lang, "task": "rag_document_qa",
+                                           "index": 1}).messages[0]["content"]
+
+    assert "WORKED EXAMPLES" in sysmsg("efi")      # low
+    assert "WORKED EXAMPLES" in sysmsg("fon")      # low
+    assert "WORKED EXAMPLES" not in sysmsg("yor")  # medium
+    assert "WORKED EXAMPLES" not in sysmsg("pcm")  # high
+    monkeypatch.setenv("DATA_GEN_FEWSHOT", "1")
+    build_request.__globals__["_fewshot_block"].cache_clear()
+    assert "WORKED EXAMPLES" in sysmsg("yor")      # forced on
+
+
+def test_fewshot_stays_inside_the_shared_prefix(seeds):
+    """If exemplars varied per row they would break prefix caching and cost 1,600 tokens every time."""
+    from prompts import _fewshot_block
+    if not _fewshot_block():
+        pytest.skip("seeds/fewshot.json not built")
+    seen = {build_request(seeds["sft"], {"custom_id": f"sft__efi__general_chat__{i:06d}", "lang": "efi",
+                                        "task": "general_chat", "index": i}).messages[0]["content"]
+            for i in range(20)}
+    assert len(seen) == 1
+
+
+def test_fewshot_exemplars_are_structurally_perfect():
+    """A wrong exemplar is worse than none -- the model copies it."""
+    from pathlib import Path as _P
+    p = _P(__file__).resolve().parents[1] / "seeds" / "fewshot.json"
+    if not p.exists():
+        pytest.skip("not built")
+    from postprocess_gen import _degenerate_user_message, _invented_pipe_tokens
+    data = json.loads(p.read_text(encoding="utf-8"))
+    ex = data["exemplars"]
+    assert ex, "no exemplars"
+    for e in ex:
+        msgs = e["messages"]
+        assert _invented_pipe_tokens(msgs) == []
+        assert not _degenerate_user_message(msgs)
+        assert msgs[-1]["role"] == "assistant"
+        assert any("<response>" in (m.get("content") or "") for m in msgs)
+    assert any(e["uses_tools"] for e in ex), "need one tool-using exemplar"
+    assert any(not e["uses_tools"] for e in ex), "need one plain exemplar"
+
+
+def test_free_endpoints_get_minutes_of_backoff_and_low_concurrency(monkeypatch):
+    """A ':free' endpoint rate-limits on a scale of minutes; a 1.5s->60s backoff just burns retries."""
+    monkeypatch.setenv("OPENROUTER_API_KEY", "k")
+    from providers.openrouter import OpenRouterProvider
+    free = OpenRouterProvider("google/gemma-4-31b-it:free", max_concurrency=16)
+    paid = OpenRouterProvider("google/gemma-4-31b-it", max_concurrency=16)
+    assert free.is_free and not paid.is_free
+    assert free.retry_base_s >= 120 and free.retry_max_s >= 300
+    assert free.max_concurrency <= 2 < paid.max_concurrency
+    assert free.max_retries > paid.max_retries
+    assert free.rates() == (0.0, 0.0)
+    # an explicit override still wins
+    custom = OpenRouterProvider("google/gemma-4-31b-it:free", retry_base_s=30, retry_max_s=90)
+    assert custom.retry_base_s == 30 and custom.retry_max_s == 90

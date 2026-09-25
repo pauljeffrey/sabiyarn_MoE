@@ -13,12 +13,63 @@ from __future__ import annotations
 import hashlib
 import json
 import random
+from functools import lru_cache
+from pathlib import Path
 from typing import Any, Optional
+
+import os
 
 from providers.base import Request
 from sampling.taxonomy import DOMAINS, GENRES, all_pairs
 from schemas.output import schema_for
 from schemas.seed import Seed
+
+_FEWSHOT_PATH = Path(__file__).resolve().parent / "seeds" / "fewshot.json"
+
+
+@lru_cache(maxsize=1)
+def _fewshot_block() -> str:
+    """Structurally perfect exemplars, rendered into the system prompt.
+
+    Only the STRUCTURE transfers: these are real conversations in whatever language they were generated in,
+    and the prompt says so. Structure is what collapses in low-resource languages -- 70 invented pipe tokens
+    against 21 correct markers -- so that is what the examples are for.
+    """
+    if not _FEWSHOT_PATH.exists():
+        return ""
+    data = json.loads(_FEWSHOT_PATH.read_text(encoding="utf-8"))
+    parts = []
+    for i, ex in enumerate(data.get("exemplars", []), start=1):
+        lines = []
+        for m in ex["messages"]:
+            role = m["role"]
+            if m.get("tool_calls"):
+                c = m.get("content") or ""
+                call = m["tool_calls"][0]["function"]
+                lines.append(f'  {{"role": "assistant", "content": {json.dumps(c, ensure_ascii=False)}, '
+                             f'"tool_calls": [{{"function": {{"name": "{call["name"]}", '
+                             f'"arguments": {json.dumps(call["arguments"], ensure_ascii=False)}}}}}]}}')
+            elif role == "tool":
+                lines.append(f'  {{"role": "tool", "name": "{m.get("name","")}", '
+                             f'"content": {json.dumps(m.get("content") or "", ensure_ascii=False)}}}')
+            else:
+                lines.append(f'  {{"role": "{role}", '
+                             f'"content": {json.dumps(m.get("content") or "", ensure_ascii=False)}}}')
+        parts.append(f"--- EXEMPLAR {i} ({ex['lang']}, io_direction={ex.get('io_direction')}, "
+                     f"tools={'yes' if ex.get('uses_tools') else 'no'}) ---\n"
+                     + "[\n" + ",\n".join(lines) + "\n]")
+    if not parts:
+        return ""
+    return (
+        "\n\nWORKED EXAMPLES OF THE REQUIRED STRUCTURE\n"
+        "These are real, verified-correct conversations. Copy their STRUCTURE exactly: where the markers go, "
+        "how <think> sits before a tool call and again after the tool result, how a tool result comes back as "
+        "its own role='tool' message, and how the final turn carries <response>.\n"
+        "Do NOT copy their language, topic, names or wording -- they happen to be in the languages they were "
+        "generated in, and yours must be in the language this task specifies.\n\n"
+        + "\n\n".join(parts) + "\n"
+    )
+
 
 _PAIRS = all_pairs()
 _GENRES = sorted(GENRES)
@@ -252,7 +303,12 @@ def _sft_like_request(seed: Seed, row: dict, *, rl: bool) -> Request:
                    "message and nothing else.")
     verbs_line = ("task_plan verbs for this conversation (use them in the order each turn carries them out): "
                   + "".join(verbs))
-    system = (f"{seed.details}\n\n{fmt}\n"
+    # Exemplars are attached for the low-resource tier, where structure collapses, and can be forced
+    # everywhere with DATA_GEN_FEWSHOT=1. They live in the SYSTEM prompt, so they stay part of the shared
+    # prefix: constant per (kind, language) and free under vLLM prefix caching.
+    want_fewshot = lang.tier == "low" or os.environ.get("DATA_GEN_FEWSHOT") == "1"
+    shots = _fewshot_block() if want_fewshot else ""
+    system = (f"{seed.details}\n\n{fmt}{shots}\n"
               f"You are generating training conversations in {lang.name} ({lang.code}). "
               f"Language guidance: {lang.guidance}\nReturn strict JSON only, no commentary.")
 

@@ -119,7 +119,8 @@ class Provider:
     default_pricing: tuple[float, float] = (0.20, 0.60)
 
     def __init__(self, model: str, *, api_key: Optional[str] = None, max_concurrency: int = 16,
-                 max_retries: int = 5, timeout: float = 180.0):
+                 max_retries: int = 5, timeout: float = 180.0,
+                 retry_base_s: Optional[float] = None, retry_max_s: Optional[float] = None):
         load_env()
         self.model = model
         self.api_key = api_key or os.environ.get(self.env_key, "")
@@ -128,9 +129,20 @@ class Provider:
                 f"{self.name}: no API key. Put {self.env_key}=... in {ROOT/'.env'} "
                 f"(one .env for the whole repo).")
         warn_if_reasoning_model(model)
-        self.max_concurrency = max_concurrency
-        self.max_retries = max_retries
+        # A ':free' endpoint rate-limits on a scale of minutes, not seconds: a 1.5s-doubling-to-60s backoff
+        # just burns retries against a wall. Free models therefore wait 2-5 minutes between attempts and get
+        # more of them, which is slow but is the difference between eventually succeeding and never.
+        free = model.endswith(":free")
+        self.is_free = free
+        self.retry_base_s = retry_base_s if retry_base_s is not None else (120.0 if free else 1.5)
+        self.retry_max_s = retry_max_s if retry_max_s is not None else (300.0 if free else 60.0)
+        self.max_concurrency = 2 if (free and max_concurrency > 2) else max_concurrency
+        self.max_retries = max_retries if not free else max(max_retries, 8)
         self.timeout = timeout
+        if free:
+            print(f"  [{self.name}] {model} is a free endpoint: concurrency capped at "
+                  f"{self.max_concurrency}, backoff {self.retry_base_s:.0f}-{self.retry_max_s:.0f}s, "
+                  f"{self.max_retries} attempts. Expect this to be slow.", flush=True)
         self._lock = threading.Lock()
         self.prompt_tokens = 0
         self.completion_tokens = 0
@@ -156,7 +168,7 @@ class Provider:
     def complete(self, req: Request) -> Response:
         """One request, with retry/backoff. Never raises for an API failure -- returns ok=False."""
         client = self._client()
-        delay = 1.5
+        delay = self.retry_base_s
         last = ""
         for attempt in range(self.max_retries):
             try:
@@ -178,8 +190,13 @@ class Provider:
                                  "overload", "connection", "temporarily"))
                 if not transient or attempt == self.max_retries - 1:
                     break
-                time.sleep(delay + random.uniform(0, delay))  # jitter: 100s of workers must not sync up
-                delay = min(delay * 2, 60)
+                # jitter so many workers do not retry in lockstep against the same upstream
+                wait = delay + random.uniform(0, min(delay, 30.0))
+                if wait > 30:
+                    print(f"  [{self.name}] rate-limited, cooling down {wait/60:.1f}m "
+                          f"(attempt {attempt + 1}/{self.max_retries})", flush=True)
+                time.sleep(wait)
+                delay = min(delay * 2, self.retry_max_s)
         return Response(req.custom_id, "", False, last, metadata=req.metadata)
 
     def complete_many(self, requests: Iterable[Request], *, on_result: Optional[Callable[[Response], None]] = None,
