@@ -17,12 +17,14 @@ from typing import Any, Optional
 
 from providers.base import Request
 from sampling.taxonomy import DOMAINS, GENRES, all_pairs
+from schemas.output import schema_for
 from schemas.seed import Seed
 
 _PAIRS = all_pairs()
 _GENRES = sorted(GENRES)
 _REGISTERS = ["plain everyday", "formal", "conversational", "explanatory/teacherly", "journalistic", "storytelling"]
-_LENGTHS = [(120, 200), (200, 320), (320, 480), (480, 700)]
+# 300-500 words, in four buckets so length still varies within the band.
+_LENGTHS = [(300, 350), (350, 400), (400, 450), (450, 500)]
 
 
 def _rng(custom_id: str) -> random.Random:
@@ -114,7 +116,9 @@ Return JSON: {{"title": "<short natural title in {lang.name}>", "text": "<the do
     return Request(
         custom_id=row["custom_id"],
         messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
-        max_tokens=min(4096, int(hi * 4)), temperature=0.95,
+        # 4 tokens/word is generous for English but tight for diacritic-heavy languages, where 500
+        # words can exceed 1,200 tokens; the floor stops truncation mid-document.
+        max_tokens=max(1800, min(4096, int(hi * 4))), temperature=0.95,
         response_format={"type": "json_object"},
         metadata={"kind": "pretrain", "lang": lang.code, "domain": domain, "subtopic": subtopic,
                   "genre": genre, "register": register, "target_words": [lo, hi]},
@@ -141,6 +145,11 @@ SPECIAL TOKEN FORMAT (the target model's own vocabulary -- use these EXACTLY):
 - The <response> text is ALWAYS in __LANGUAGE_NAME__.
 - <task_plan> is a PLAN, not a label. For a multi-step turn, list the verbs in the order they will be carried
   out, e.g. <task_plan><|RAG|><|analyze|><|explain|></task_plan>. Verbs must come from: __VERBS_ALLOWED__
+- CLOSING TAGS: only these five have one -- </think>, </task_plan>, </tool_call>, </tool_response>, </context>.
+  Every other marker is an OPENER ONLY and must never be closed. Write <response>the answer with nothing after
+  it, and <sentiment>positive with no closing tag. Inventing </response> or </sentiment> is wrong: they are not
+  in the model's vocabulary and cost 3-4 junk sub-word tokens each.
+- Label tasks put the label straight after its marker, e.g. <|target_lang|><__LANG__><response><sentiment>mixed
 """
 
 
@@ -190,7 +199,8 @@ def _sft_like_request(seed: Seed, row: dict, *, rl: bool) -> Request:
     else:
         tool_names, distractors = [], []
 
-    n_msgs = rng.randint(seed.conversation["min_messages"], seed.conversation["max_messages"])
+    n_user = rng.randint(int(seed.conversation.get("min_user_turns", 3)),
+                         int(seed.conversation.get("max_user_turns", 5)))
     verbs = sorted({v for t in tasks for v in t.task_plan}) or ["<|chat|>"]
     fmt = _format_brief(lang.code, lang.name,
                         " ".join(seed.format["special_tokens"]["task_plan_verbs"]))
@@ -217,14 +227,18 @@ def _sft_like_request(seed: Seed, row: dict, *, rl: bool) -> Request:
 
     lang_name = lang.name
     if not rl:
-        shape = f"""Produce ONE conversation of exactly {n_msgs} messages, ending with an assistant message.
+        shape = f"""Produce ONE conversation with EXACTLY {n_user} messages of role "user" -- no more, no
+fewer. Each is answered by the assistant, and the conversation ends on an assistant message. The assistant may
+add tool-call turns and their role="tool" results in between; those are not user messages and do not count.
+Count your user messages before you finish: there must be exactly {n_user}.
 
 Return JSON:
 {{"messages": [{{"role": "system"|"user"|"assistant"|"tool", "content": "...", "name": "<tool name, tool role only>", "tool_calls": [{{"function": {{"name": "...", "arguments": {{...}}}}}}]}}],
   "tasks": ["<task names used>"], "tags": ["<tags from the closed list>"],
   "confidence": <float 0-1: your honest estimate that this conversation is correct AND fluent {lang_name}>}}"""
     else:
-        shape = f"""Produce ONE conversation PREFIX of {n_msgs - 1} messages ending with a USER message, then
+        shape = f"""Produce ONE conversation PREFIX with EXACTLY {n_user} messages of role "user", the LAST
+of which ends the prefix (tool turns are extra and do not count), then
 {seed.conversation['responses_per_prompt']} alternative assistant replies to that final user message.
 
 The replies must be genuinely rankable, not paraphrases:
@@ -261,7 +275,14 @@ Hard requirements:
     return Request(
         custom_id=row["custom_id"],
         messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
-        max_tokens=4096, temperature=0.9,
+        # 5 user turns + tool calls + tool results + think blocks overruns 4096 and the JSON is truncated
+        # mid-string, which showed up as json_invalid on ~17% of a pilot. Headroom is far cheaper than a retry.
+        max_tokens=6144, temperature=0.9,
+        # Deliberately json_object, NOT json_schema. A pilot with the schema attached produced *more*
+        # rejects (messages_malformed 11/24 vs 1/24): providers coerce the output to satisfy the schema
+        # literally -- emitting every optional key, including empty tool_calls on plain turns -- which is
+        # valid JSON but not a well-formed conversation. The same schema IS worth using in vllm_gen.py, where
+        # it constrains decoding directly rather than being reinterpreted by a provider.
         response_format={"type": "json_object"},
         # tools= is attached natively so the generating model produces schema-valid call arguments with its
         # own function-calling machinery instead of inventing the JSON as prose.
@@ -270,7 +291,7 @@ Hard requirements:
                   "tasks": [t.name for t in tasks], "tags": sorted({g for t in tasks for g in t.tags}),
                   "tools": tool_names, "distractor_tools": distractors,
                   "tool_definitions": _tool_defs(seed, tool_names),
-                  "domain": domain, "subtopic": subtopic, "n_messages": n_msgs},
+                  "domain": domain, "subtopic": subtopic, "n_user_turns": n_user},
     )
 
 

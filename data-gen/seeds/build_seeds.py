@@ -457,7 +457,14 @@ RL_TASKS = [
 
 CONVERSATION = {
     "min_messages": 6, "max_messages": 10, "ends_with": "assistant",
-    "counting": "A tool_call and its tool result count as messages. 6-10 covers roughly 3-5 user turns.",
+    # What is actually specified to the generator and validated: user turns. 3-5 user turns, each answered,
+    # is the 6-10 conversational messages above. Asking a model for "10 messages" while it is also composing
+    # tool calls does not work -- it overshoots to 12-21. Asking for "4 user messages" works.
+    "min_user_turns": 3, "max_user_turns": 5,
+    "counting": "Counts USER + ASSISTANT messages only: 6-10 means 3-5 exchanges. Tool-call turns and their "
+                "role='tool' results are plumbing and do not count, so a tool-heavy conversation is longer in "
+                "raw messages -- `max_total_messages` bounds that so a runaway is still caught.",
+    "max_total_messages": 26,
     "task_mix_per_conversation": [2, 4],
     "theme_drift": "A conversation should change subject at least once -- that is what teaches the model to "
                    "track context rather than answer in isolation.",
@@ -474,7 +481,8 @@ CONVERSATION = {
 
 PRETRAIN_DETAILS = f"""{PHILOSOPHY}
 
-THIS PHASE: pretraining documents. Plain continuous prose -- no chat markup, no special tokens, no
+THIS PHASE: pretraining documents, 300-500 words each, emitted as a `title` and a `text` field.
+Plain continuous prose -- no chat markup, no special tokens, no
 instructions, no question-and-answer shape. Each document is a self-contained piece of natural writing of
 the requested genre, register and length, entirely in the target language.
 
@@ -543,7 +551,8 @@ def build(kind: str) -> Seed:
         return Seed(kind="pretrain", details=PRETRAIN_DETAILS, languages=languages,
                     target_model=target, yield_by_tier=yields,
                     format={**fmt, "output": "plain prose, no markup",
-                            "columns": ["id", "lang", "domain", "subtopic", "genre", "title", "text"]}).validate()
+                            "columns": ["id", "lang", "domain", "subtopic", "genre", "title", "text", "confidence"],
+                            "text_words": [300, 500]}).validate()
     tasks = SFT_TASKS if kind == "sft" else RL_TASKS
     conv = dict(CONVERSATION)
     columns = ["id", "lang", "tags", "tasks", "messages", "text", "instruction", "input", "context", "response"]

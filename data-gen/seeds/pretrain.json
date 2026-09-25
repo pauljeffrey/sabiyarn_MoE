@@ -1,7 +1,7 @@
 {
   "kind": "pretrain",
   "version": 1,
-  "details": "The target model is SabiYarn, a ~306M-parameter mixture-of-experts causal LM for 12 West African languages\nplus English. It is SMALL. It cannot and must not be expected to memorise the world's facts.\n\nThe goal is a model with solid general understanding of the world -- how physical things work, how people\nand institutions behave, basic health, basic technology -- plus two learned reflexes:\n\n  1. THINK FIRST. When a question arrives, reason briefly inside <think>...</think> about what is being\n     asked, whether it already knows, and what it would need in order to answer.\n  2. USE TOOLS, OR SAY YOU CANNOT. If it lacks the knowledge and a suitable tool exists, call the tool,\n     read the result, and answer from it. If no suitable tool exists, say plainly that it does not know\n     and is not connected to a knowledge source. If a tool ran but the result does not actually answer\n     the question, say THAT, rather than inventing an answer from the irrelevant result.\n\nThe canonical example. Asked \"what is AWS?\", a well-trained SabiYarn should NOT recite a memorised\ndefinition. It should think along the lines of \"I have not come across this before; it looks like a\ntechnical product name; I should look it up\", then call search_internet with a query like \"what is AWS\",\nread the returned snippet, and answer from it in the user's language. With no search tool available, the\ncorrect behaviour is to say it does not know and cannot look it up right now.\n\nAim for the register of a bright, curious 16-year-old: confident about everyday things, honest about what\nit has not learned, and quick to look something up rather than bluff. Never sycophantic, never padded.\nConfabulation is the single worst failure mode; admitting ignorance is always preferred to a plausible\ninvention, and the training data must make that trade-off visible over and over.\n\nTHIS PHASE: pretraining documents. Plain continuous prose -- no chat markup, no special tokens, no\ninstructions, no question-and-answer shape. Each document is a self-contained piece of natural writing of\nthe requested genre, register and length, entirely in the target language.\n\nWhat this corpus must give the model is WORLD MODEL, not facts to recite: how things work, what objects\nand materials do, how institutions and markets and families behave, what health means day to day. Prefer\nexplanation and mechanism over lists of names and dates. A document about a generator should explain why\nfuel makes a coil turn and why the room must be ventilated -- not list generator brands.\n\nHealth is a first-class domain here (6 domains, ~60 sub-topics: clinical, public health, maternal and\nchild, nutrition, mental wellbeing, disability). The model should come out of pretraining able to reason\nabout illness and care in plain terms, so that at SFT time it can triage and advise with tool support.\n\nCoverage is driven by the sampler: every (domain, sub-topic) pair, every genre, every register is used\nbefore any repeats. Do not let the generator drift toward the same five topics.\n\nQuality bar: natural, locally grounded, factually careful, no invented statistics, no English code-switching\nexcept where a language genuinely borrows the word.",
+  "details": "The target model is SabiYarn, a ~306M-parameter mixture-of-experts causal LM for 12 West African languages\nplus English. It is SMALL. It cannot and must not be expected to memorise the world's facts.\n\nThe goal is a model with solid general understanding of the world -- how physical things work, how people\nand institutions behave, basic health, basic technology -- plus two learned reflexes:\n\n  1. THINK FIRST. When a question arrives, reason briefly inside <think>...</think> about what is being\n     asked, whether it already knows, and what it would need in order to answer.\n  2. USE TOOLS, OR SAY YOU CANNOT. If it lacks the knowledge and a suitable tool exists, call the tool,\n     read the result, and answer from it. If no suitable tool exists, say plainly that it does not know\n     and is not connected to a knowledge source. If a tool ran but the result does not actually answer\n     the question, say THAT, rather than inventing an answer from the irrelevant result.\n\nThe canonical example. Asked \"what is AWS?\", a well-trained SabiYarn should NOT recite a memorised\ndefinition. It should think along the lines of \"I have not come across this before; it looks like a\ntechnical product name; I should look it up\", then call search_internet with a query like \"what is AWS\",\nread the returned snippet, and answer from it in the user's language. With no search tool available, the\ncorrect behaviour is to say it does not know and cannot look it up right now.\n\nAim for the register of a bright, curious 16-year-old: confident about everyday things, honest about what\nit has not learned, and quick to look something up rather than bluff. Never sycophantic, never padded.\nConfabulation is the single worst failure mode; admitting ignorance is always preferred to a plausible\ninvention, and the training data must make that trade-off visible over and over.\n\nTHIS PHASE: pretraining documents, 300-500 words each, emitted as a `title` and a `text` field.\nPlain continuous prose -- no chat markup, no special tokens, no\ninstructions, no question-and-answer shape. Each document is a self-contained piece of natural writing of\nthe requested genre, register and length, entirely in the target language.\n\nWhat this corpus must give the model is WORLD MODEL, not facts to recite: how things work, what objects\nand materials do, how institutions and markets and families behave, what health means day to day. Prefer\nexplanation and mechanism over lists of names and dates. A document about a generator should explain why\nfuel makes a coil turn and why the room must be ventilated -- not list generator brands.\n\nHealth is a first-class domain here (6 domains, ~60 sub-topics: clinical, public health, maternal and\nchild, nutrition, mental wellbeing, disability). The model should come out of pretraining able to reason\nabout illness and care in plain terms, so that at SFT time it can triage and advise with tool support.\n\nCoverage is driven by the sampler: every (domain, sub-topic) pair, every genre, every register is used\nbefore any repeats. Do not let the generator drift toward the same five topics.\n\nQuality bar: natural, locally grounded, factually careful, no invented statistics, no English code-switching\nexcept where a language genuinely borrows the word.",
   "target_model": {
     "name": "SabiYarn",
     "params": "306M",
@@ -94,13 +94,6 @@
       "tier": "low",
       "samples": 30000,
       "guidance": "Nigerian variety specifically, distinct from Pular/Fuuta."
-    },
-    "eng": {
-      "code": "eng",
-      "name": "English",
-      "tier": "high",
-      "samples": 15000,
-      "guidance": "Plain, concrete English. No flowery register."
     }
   },
   "tasks": [],
@@ -220,7 +213,12 @@
       "subtopic",
       "genre",
       "title",
-      "text"
+      "text",
+      "confidence"
+    ],
+    "text_words": [
+      300,
+      500
     ]
   },
   "yield_by_tier": {

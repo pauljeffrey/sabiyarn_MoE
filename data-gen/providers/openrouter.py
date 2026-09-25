@@ -24,13 +24,24 @@ class OpenRouterProvider(Provider):
     supports_batch = False
     # USD per 1M (input, output). VERIFY at https://openrouter.ai/models -- OpenRouter quotes per upstream
     # and the cheapest upstream changes week to week.
+    # USD per 1M (input, output), read from OpenRouter's /models endpoint 2026-09-24. Re-check with
+    # `python -m providers.openrouter --prices` -- the cheapest upstream for a model changes week to week.
     pricing = {
+        "gemma-4-31b-it": (0.09, 0.34),
+        "gemma-4-26b-a4b-it": (0.09, 0.30),
+        "gemma-3-27b-it": (0.08, 0.45),
+        "gemma-3-12b-it": (0.05, 0.15),
+        "llama-3.3-70b-instruct": (0.10, 0.32),
+        "llama-3.1-70b-instruct": (0.40, 0.40),
+        # :batch is markedly cheaper than Together's batch tier -- see README.
+        "gpt-oss-120b:batch": (0.03, 0.14),
         "gpt-oss-120b": (0.15, 0.60),
-        "gpt-oss-20b": (0.05, 0.20),
-        "gemma-3-27b": (0.20, 0.30),
-        "qwen-3-235b": (0.20, 0.60),
-        "llama-3.3-70b": (0.60, 0.60),
+        "gpt-oss-20b": (0.02, 0.09),
     }
+    # A ':free' suffix means exactly that, but the endpoints are heavily rate-limited upstream and will
+    # 429 for long stretches; useful for smoke tests, not for a 225k-request run.
+    FREE_SUFFIX = ":free"
+
     default_pricing = (0.30, 0.80)
 
     def __init__(self, model: str, *, provider_order: Optional[list[str]] = None,
@@ -38,6 +49,15 @@ class OpenRouterProvider(Provider):
         super().__init__(model, **kw)
         self.provider_order = provider_order
         self.allow_fallbacks = allow_fallbacks
+
+    def rates(self) -> tuple[float, float]:
+        if self.model.endswith(self.FREE_SUFFIX):
+            return (0.0, 0.0)
+        # longest matching key wins, so "gpt-oss-120b:batch" is not shadowed by "gpt-oss-120b"
+        for key in sorted(self.pricing, key=len, reverse=True):
+            if key in self.model:
+                return self.pricing[key]
+        return self.default_pricing
 
     def extra_headers(self) -> dict[str, str]:
         return {"HTTP-Referer": "https://github.com/pauljeffrey/sabiyarn_MoE",

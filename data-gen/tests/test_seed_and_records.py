@@ -20,8 +20,15 @@ def seeds():
 LOW_RESOURCE = ("efi", "urh", "fon", "ewe", "ful", "fuv")
 
 
+def test_pretrain_has_no_english(seeds):
+    """Pretraining is for the 12 target languages only."""
+    assert "eng" not in {l.code for l in seeds["pretrain"].languages}
+    assert len(seeds["pretrain"].languages) == 12
+    assert seeds["pretrain"].format["text_words"] == [300, 500]
+
+
 def test_seeds_load_and_validate(seeds):
-    assert seeds["pretrain"].total_samples() >= 435_000
+    assert seeds["pretrain"].total_samples() >= 420_000
     for l in seeds["pretrain"].languages:
         if l.code == "pcm":
             assert l.samples >= 60_000
@@ -239,13 +246,20 @@ def test_pretrain_record(seeds):
 def _sft_payload():
     return {"messages": [
         {"role": "system", "content": "You are helpful. Tools: [...]"},
+        {"role": "user", "content": "Bawo ni?"},
+        {"role": "assistant", "content": "<|input_lang|><yor><task_plan><|chat|></task_plan>"
+                                         "<|target_lang|><yor><response>Mo wa daadaa."},
         {"role": "user", "content": "Kini AWS?"},
         {"role": "assistant", "content": "<|input_lang|><yor><think>N kò tíì gbọ́ nǹkan yìí rí.</think>",
          "tool_calls": [{"function": {"name": "search_internet", "arguments": {"query": "what is AWS"}}}]},
         {"role": "tool", "name": "search_internet", "content": "AWS is Amazon's cloud computing platform."},
         {"role": "assistant",
          "content": "<|input_lang|><yor><task_plan><|explain|></task_plan><|target_lang|><yor><response>AWS jẹ́ ìpèsè kọ̀ǹpútà ti Amazon."},
-    ], "tasks": ["tool_search_answer"], "tags": ["tool-calling", "knowledge-boundary", "qa"]}
+        {"role": "user", "content": "O se."},
+        {"role": "assistant", "content": "<|input_lang|><yor><task_plan><|chat|></task_plan>"
+                                         "<|target_lang|><yor><response>Ko si wahala."},
+    ], "tasks": ["tool_search_answer"], "tags": ["tool-calling", "knowledge-boundary", "qa"],
+        "confidence": 0.9}
 
 
 def test_sft_record_keeps_both_representations(seeds):
@@ -253,12 +267,12 @@ def test_sft_record_keeps_both_representations(seeds):
           "tools": ["search_internet"]}
     r = to_record(seeds["sft"], _resp("sft__yor__tool_search_answer__000001", _sft_payload(), md))
     assert r is not None
-    assert isinstance(r["messages"], list) and len(r["messages"]) == 5           # dict form
+    assert isinstance(r["messages"], list) and len(r["messages"]) == 9           # dict form
+    assert r["confidence"] == 0.9
     assert r["text"].startswith("<s><|system|>") and r["text"].endswith("</s>")  # rendered form
     assert "<tool_call>search_internet" in r["text"] and "<tool_response>" in r["text"]
     assert "knowledge-boundary" in r["tags"]
-    assert r["instruction"] == "Kini AWS?" and "Amazon" in r["context"]
-    assert r["response"].startswith("AWS jẹ́")
+    assert r["instruction"] == "O se." and "Amazon" in r["context"]
 
 
 def test_sft_rejects_broken_conversations(seeds):
@@ -267,16 +281,16 @@ def test_sft_rejects_broken_conversations(seeds):
     bad["messages"][-1]["content"] = "no response token at all"
     assert to_record(seeds["sft"], _resp("a", bad, md)) is None
     orphan = _sft_payload()
-    orphan["messages"][2].pop("tool_calls")           # tool result with nothing that called it
+    orphan["messages"][4].pop("tool_calls")           # tool result with nothing that called it
     assert to_record(seeds["sft"], _resp("b", orphan, md)) is None
     unknown = _sft_payload()
-    unknown["messages"][2]["tool_calls"][0]["function"]["name"] = "not_a_real_tool"
+    unknown["messages"][4]["tool_calls"][0]["function"]["name"] = "not_a_real_tool"
     assert to_record(seeds["sft"], _resp("c", unknown, md)) is None
 
 
 def test_rl_record_orders_responses_and_rejects_paraphrases(seeds):
     md = {"kind": "rl", "lang": "hau", "tasks": ["tool_search_answer"], "tags": ["tool-calling"], "tools": []}
-    prefix = _sft_payload()["messages"][:4] + [{"role": "user", "content": "To, me ke nan?"}]
+    prefix = _sft_payload()["messages"][:6] + [{"role": "user", "content": "To, me ke nan?"}]
     good = {"prompt_messages": prefix, "tasks": ["tool_search_answer"], "tags": ["knowledge-boundary"],
             "responses": [
                 {"content": "<|input_lang|><hau><response>Ban sani ba.", "quality": "worst", "why": "invented"},

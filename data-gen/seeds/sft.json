@@ -1037,7 +1037,10 @@
     "min_messages": 6,
     "max_messages": 10,
     "ends_with": "assistant",
-    "counting": "A tool_call and its tool result count as messages. 6-10 covers roughly 3-5 user turns.",
+    "min_user_turns": 3,
+    "max_user_turns": 5,
+    "counting": "Counts USER + ASSISTANT messages only: 6-10 means 3-5 exchanges. Tool-call turns and their role='tool' results are plumbing and do not count, so a tool-heavy conversation is longer in raw messages -- `max_total_messages` bounds that so a runaway is still caught.",
+    "max_total_messages": 26,
     "task_mix_per_conversation": [
       2,
       4

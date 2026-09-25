@@ -25,6 +25,22 @@ from schemas.seed import TAGS, Seed
 
 ROLES = ("system", "user", "assistant", "tool")
 _THINK = re.compile(r"<think>(.*?)</think>", re.S)
+# The only closers in the tokenizer. Everything else a generator invents (</response>, </sentiment>, </NER>)
+# is not in the vocabulary and costs 3-4 junk sub-word tokens.
+_VALID_CLOSERS = {"</think>", "</task_plan>", "</tool_call>", "</tool_response>", "</context>", "</s>"}
+_ANY_CLOSER = re.compile(r"</[A-Za-z_|][^>\s]*>")
+
+
+def _strip_invalid_closers(text: str) -> str:
+    """Remove closing tags that do not exist in the tokenizer.
+
+    This is the ONE sanctioned repair in this module. Everything else that fails validation is dropped,
+    because a silently-fixed structural error teaches the model the error. A redundant closing tag is
+    different: it carries no information, its removal cannot change meaning, and generators emit them
+    constantly however firmly the prompt forbids it (measured: 61 occurrences of </response> in a 26-sample
+    pilot). Dropping those samples would throw away good conversations over pure punctuation.
+    """
+    return _ANY_CLOSER.sub(lambda m: m.group(0) if m.group(0) in _VALID_CLOSERS else "", text)
 _RESP = re.compile(r"<response>(.*)", re.S)
 
 STATS: dict[str, int] = {}
@@ -42,12 +58,13 @@ def _json(text: str) -> Optional[dict]:
     try:
         v = json.loads(t)
         return v if isinstance(v, dict) else None
-    except json.JSONDecodeError:
+    except ValueError:  # JSONDecodeError, and the bare ValueError for >4300-digit integer literals
         start, end = t.find("{"), t.rfind("}")
         if 0 <= start < end:
             try:
-                return json.loads(t[start:end + 1])
-            except json.JSONDecodeError:
+                v = json.loads(t[start:end + 1])
+                return v if isinstance(v, dict) else None
+            except ValueError:
                 return None
         return None
 
@@ -61,7 +78,7 @@ def _clean_messages(raw: Any) -> Optional[list[dict]]:
         if not isinstance(m, dict) or m.get("role") not in ROLES:
             return None
         role = m["role"]
-        msg: dict[str, Any] = {"role": role, "content": (m.get("content") or "")}
+        msg: dict[str, Any] = {"role": role, "content": _strip_invalid_closers(m.get("content") or "")}
         if role == "tool":
             if not msg["content"]:
                 return None
@@ -87,8 +104,14 @@ def _clean_messages(raw: Any) -> Optional[list[dict]]:
 
 def _validate_conversation(msgs: list[dict], seed: Seed, *, ends_with: str) -> bool:
     conv = seed.conversation
-    if not (conv["min_messages"] - 1 <= len(msgs) <= conv["max_messages"]):
-        _drop(f"message_count:{len(msgs)}")
+    # User turns are what the generator is asked for and what is checked; assistant and tool turns follow
+    # from them (see the seed's min_user_turns/max_user_turns).
+    n_user = sum(1 for m in msgs if m["role"] == "user")
+    if not (int(conv.get("min_user_turns", 3)) <= n_user <= int(conv.get("max_user_turns", 5))):
+        _drop(f"user_turns:{n_user}")
+        return False
+    if len(msgs) > int(conv.get("max_total_messages", 26)):
+        _drop(f"total_messages:{len(msgs)}")
         return False
     if msgs[-1]["role"] != ends_with:
         _drop(f"ends_with:{msgs[-1]['role']}")
@@ -132,12 +155,26 @@ def _tags(raw: Any, fallback: list[str]) -> list[str]:
 
 
 def to_record(seed: Seed, resp: Response) -> Optional[dict]:
+    """Never raises. A single malformed response must not be able to kill a 500k-request run."""
+    try:
+        return _to_record(seed, resp)
+    except Exception as exc:  # noqa: BLE001
+        _drop(f"postprocess_error:{type(exc).__name__}")
+        return None
+
+
+def _to_record(seed: Seed, resp: Response) -> Optional[dict]:
     md = resp.metadata or {}
     data = _json(resp.text)
     if data is None:
         _drop("json_invalid")
         return None
-    base = {"id": resp.custom_id, "lang": md.get("lang", ""),
+    conf = data.get("confidence")
+    try:
+        conf = min(1.0, max(0.0, float(conf))) if conf is not None else None
+    except (TypeError, ValueError):
+        conf = None
+    base = {"id": resp.custom_id, "lang": md.get("lang", ""), "confidence": conf,
             "model": resp.model, "domain": md.get("domain", ""), "subtopic": md.get("subtopic", "")}
 
     if seed.kind == "pretrain":
@@ -182,7 +219,7 @@ def to_record(seed: Seed, resp: Response) -> Optional[dict]:
     if "best" not in quals or "worst" not in quals:
         _drop("no_best_or_worst")
         return None
-    texts = [r["content"].strip() for r in responses]
+    texts = [_strip_invalid_closers(r["content"]).strip() for r in responses]
     if len(set(texts)) < len(texts):
         _drop("duplicate_responses")
         return None

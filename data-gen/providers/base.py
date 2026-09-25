@@ -171,8 +171,15 @@ class Provider:
                 if progress and (done % 25 == 0 or done == len(reqs)):
                     rate = done / max(time.time() - t0, 1e-9)
                     eta = (len(reqs) - done) / max(rate, 1e-9)
+                    extra = ""
+                    try:  # surface systematic validation failures while there is still time to stop
+                        from postprocess_gen import summary as _drops
+                        d = _drops()
+                        extra = f"  drops: {d}" if d != "no drops" else ""
+                    except Exception:
+                        pass
                     print(f"  [{self.name}] {done}/{len(reqs)}  {rate:.1f}/s  eta {eta/60:.1f}m  "
-                          f"${self.cost_usd():.2f}", flush=True)
+                          f"${self.cost_usd():.4f}{extra}", flush=True)
                 yield resp
 
     # -- batch (providers that have a queue override these) ------------------

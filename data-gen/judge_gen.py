@@ -141,13 +141,13 @@ def apply_verdict(resp: Response, *, min_confidence: float = 0.0) -> Optional[di
         return None
     try:
         v = json.loads(resp.text.strip().strip("`").replace("json\n", "", 1))
-    except json.JSONDecodeError:
+    except ValueError:
         start, end = resp.text.find("{"), resp.text.rfind("}")
         if not (0 <= start < end):
             return None
         try:
             v = json.loads(resp.text[start:end + 1])
-        except json.JSONDecodeError:
+        except ValueError:
             return None
     if v.get("both_bad"):
         return None

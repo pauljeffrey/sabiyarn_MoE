@@ -200,7 +200,9 @@ def run(kind: str, provider_name: str, *, model: Optional[str] = None, langs: Op
 
     paths = writer.close()
     dt = time.time() - t0
-    print(f"\n[{kind}] kept {kept:,}  failed {failed:,}  in {dt/60:.1f}m")
+    from postprocess_gen import summary
+    print(f"\n[{kind}] kept {kept:,}  failed {failed:,}  (yield {kept/max(kept+failed,1):.0%})  in {dt/60:.1f}m")
+    print(f"  {summary()}")
     print(" ", provider.usage_line())
     for p in paths:
         print(f"  wrote {p}")

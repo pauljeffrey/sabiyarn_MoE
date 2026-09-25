@@ -1,5 +1,5 @@
 # Sample counts for PRETRAIN. Edit here, then re-run `python seeds/build_seeds.py`.
-# Counts are documents per language. Pretraining is world knowledge only -- how things work, how people and
+# Counts are documents per language. NO ENGLISH: pretraining is for the 12 target languages only. Pretraining is world knowledge only -- how things work, how people and
 # institutions behave, health, technology -- as plain prose with no markup and no chat shape.
 kind: pretrain
 
@@ -24,4 +24,3 @@ samples_per_language:
   ewe: 30000
   ful: 30000
   fuv: 30000
-  eng: 15000     # present only so English does not decay; matters least
