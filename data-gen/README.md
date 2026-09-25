@@ -687,13 +687,33 @@ sft/rl -- though it remains a candidate for **pretrain**, which needs no special
 **llama-3.3-70b** reasoned in the target language rather than English half the time, barely used tools, and
 produced no Hausa hooked letters at all in 4 samples. Not suitable here.
 
-## Batch on either provider
+## Batch: who has it, and what shape
 
-Both Together and OpenRouter expose OpenAI-shaped `/files` and `/batches` at roughly half price. On
-OpenRouter the cheapest tier is reachable ONLY that way -- `openai/gpt-oss-120b:batch` 404s on
-chat/completions with "cannot be used with the chat/completions endpoint".
+**Gemma has no batch tier on OpenRouter.** Of 460 models, 72 carry a `:batch` suffix; every Google one is
+Gemini, not Gemma. The batch endpoint rejects it outright: *"Model 'google/gemma-4-31b-it' does not have a
+:batch endpoint."* Same for `meta-llama/llama-3.3-70b-instruct`. So since gemma won the quality comparison,
+the options for it are **synchronous with concurrency** here, or **self-hosting** (`vllm_gen.py`) -- where
+prefix caching gives batch-like economics anyway and gemma's open weights are an advantage.
+
+`openai/gpt-oss-120b:batch` at **$0.03/$0.136 per 1M** is the cheapest thing available and is a real
+candidate for **pretrain**, which needs no special tokens. It is useless for sft/rl (no `<think>` blocks).
+
+The two providers' batch APIs are **not the same shape**:
+
+| | Together | OpenRouter |
+|---|---|---|
+| submit | upload a JSONL file (`purpose="batch-api"`), then create a batch | POST the whole batch inline as JSON |
+| body | OpenAI lines: `{custom_id, method, url, body}` | `{endpoint, model, requests:[{custom_id, body}]}` |
+| key order | irrelevant | **significant** -- `endpoint` and `model` must precede `requests` |
+| `model` | in each request body | at the batch level only |
+| results | a downloadable output file | a `results` array on the batch object |
+| freshly created | queryable at once | 404s for a few seconds (poll retries) |
 
 ```bash
 python generate.py --kind pretrain --provider openrouter --model openai/gpt-oss-120b:batch --batch
 python generate.py --kind pretrain --provider openrouter --fetch <batch_id> --push
+python generate.py --kind pretrain --provider together  --model openai/gpt-oss-120b --batch
 ```
+
+Verified end to end on OpenRouter: submit -> poll -> fetch, metadata preserved, usage reported
+(231 tokens billed at $0.000018, confirming the rate).
