@@ -171,21 +171,61 @@ def test_thinking_is_english_and_task_plan_is_a_plan(seeds):
     assert "ALWAYS in Fon" in brief  # the response, unlike the thinking
 
 
-def test_irrelevant_tools_are_in_scope_and_named(seeds):
-    """Tool selection is only a skill if there is something wrong to select."""
+def test_distractors_are_withheld_from_the_generator(seeds):
+    """Distractors are injected at post-processing, not shown to the generator: it called them 12 times in
+    35 once few-shot was added, and their definitions cost 300-1,200 input tokens for no generative benefit."""
     for i in range(30):
         req = build_request(seeds["sft"], {"custom_id": f"sft__ibo__action_tool_use__{i:06d}",
                                            "lang": "ibo", "task": "action_tool_use", "index": i})
         md = req.metadata
         d = md["distractor_tools"]
         assert 2 <= len(d) <= 3, d
-        assert set(d) <= set(md["tools"])
-        body = req.messages[1]["content"]
-        assert "IRRELEVANT TOOLS -- DO NOT CALL: " + ", ".join(d) in body
-        assert "will be discarded" in body      # the prohibition states the consequence
-        # full definitions travel in metadata AND are attached natively for the provider
-        assert len(md["tool_definitions"]) == len(md["tools"])
+        # withheld: not in the shown list, not in the attached defs, not mentioned in the prompt
+        assert not (set(d) & set(md["tools"])), "distractor leaked into the shown tool list"
         assert req.tools and {t["function"]["name"] for t in req.tools} == set(md["tools"])
+        body = req.messages[1]["content"] + req.messages[0]["content"]
+        for name in d:
+            assert name not in body, f"distractor {name} named in the prompt"
+        # but their definitions ride along for injection
+        assert len(md["distractor_definitions"]) == len(d)
+
+
+def test_distractors_are_injected_into_the_finished_sample(seeds):
+    """The finished catalogue must still contain them, or the sample stops teaching tool selection."""
+    md = {"kind": "sft", "lang": "yor", "tasks": [], "tags": [],
+          "tools": ["search_internet"], "distractor_tools": ["set_reminder", "convert_units"],
+          "tool_definitions": [{"type": "function", "function": {"name": "search_internet",
+                                                                "description": "d", "parameters": {}}}],
+          "distractor_definitions": [
+              {"type": "function", "function": {"name": "set_reminder", "description": "d", "parameters": {}}},
+              {"type": "function", "function": {"name": "convert_units", "description": "d",
+                                                "parameters": {}}}]}
+    rec = to_record(seeds["sft"], _resp("sft__yor__x__000001", _sft_payload(), md))
+    assert rec is not None
+    sysmsg = rec["messages"][0]
+    assert sysmsg["role"] == "system"
+    names = [f["function"]["name"] for f in json.loads(sysmsg["content"].split("\n", 1)[1])]
+    assert set(names) == {"search_internet", "set_reminder", "convert_units"}
+    # position must not be a tell: over many ids a distractor lands somewhere other than last
+    lasts = set()
+    for i in range(30):
+        r = to_record(seeds["sft"], _resp(f"sft__yor__x__{i:06d}", _sft_payload(), md))
+        n = [f["function"]["name"] for f in json.loads(r["messages"][0]["content"].split("\n", 1)[1])]
+        lasts.add(n[-1])
+    assert len(lasts) > 1, "distractors always in the same position"
+
+
+def test_system_message_is_canonical_not_the_generators(seeds):
+    """Built by us, so every sample in the corpus has an identically-formatted catalogue."""
+    md = {"kind": "sft", "lang": "yor", "tasks": [], "tags": [], "tools": ["search_internet"],
+          "distractor_tools": [], "tool_definitions": [
+              {"type": "function", "function": {"name": "search_internet", "description": "d",
+                                               "parameters": {}}}], "distractor_definitions": []}
+    payload = _sft_payload()
+    payload["messages"][0]["content"] = "whatever prose the generator felt like writing"
+    rec = to_record(seeds["sft"], _resp("sft__yor__y__000001", payload, md))
+    assert rec["messages"][0]["content"].startswith("You are a helpful multilingual assistant")
+    assert "whatever prose" not in rec["text"]
 
 
 def test_confidence_is_requested_for_every_kind(seeds):

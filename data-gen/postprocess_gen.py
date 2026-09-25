@@ -16,6 +16,7 @@ sequence that reaches training teaches the model to emit malformed special-token
 from __future__ import annotations
 
 import json
+import random
 import re
 from typing import Any, Optional
 
@@ -136,10 +137,9 @@ def _validate_conversation(msgs: list[dict], seed: Seed, *, ends_with: str,
             if c["function"]["name"] not in tool_names:
                 _drop("unknown_tool")
                 return False
-    # A distractor tool is one the seed put in scope precisely because it is NOT useful here. Calling it is
-    # the exact behaviour the distractors exist to train AGAINST, so such a sample teaches the opposite of
-    # what it is for. Measured at 12 of 35 calls once few-shot exemplars were added -- the model copies
-    # "call a tool" from the example without copying "pick the right one".
+    # Safety net only: distractors are now injected after generation, so the generator never saw them and
+    # cannot have called one. Kept in case a name ever collides, because a sample that calls a distractor
+    # teaches the exact opposite of what distractors are for.
     distractors = set(md.get("distractor_tools") or [])
     if distractors:
         for m in msgs:
@@ -234,6 +234,30 @@ def _markers_ok(msgs: list[dict], expect: Optional[list[str]]) -> Optional[bool]
     return all(list(pair) == list(expect) for pair in seen)
 
 
+_SYSTEM_PREAMBLE = ("You are a helpful multilingual assistant for West African language speakers. "
+                    "You have access to the following tools:")
+
+
+def _rebuild_system_message(md: dict, rng_seed: str) -> Optional[str]:
+    """Canonical system message: the preamble plus the applicable tools AND the injected distractors.
+
+    Built here rather than taken from the generator for three reasons. It guarantees the distractors are
+    present (the generator never saw them, so it cannot have called one). It gives every sample in the corpus
+    an identically-formatted catalogue, instead of whatever prose the generator wrapped around its JSON. And
+    it keeps the distractor definitions out of the generation request, which is 300-1,200 input tokens saved
+    per request for no loss of signal -- the target model learns from the finished catalogue, and cannot tell
+    where a definition came from.
+    """
+    real = md.get("tool_definitions") or []
+    fake = md.get("distractor_definitions") or []
+    if not real and not fake:
+        return None
+    catalogue = list(real) + list(fake)
+    # Deterministic shuffle so distractors are not always last -- position must not be a tell.
+    random.Random(rng_seed).shuffle(catalogue)
+    return _SYSTEM_PREAMBLE + "\n" + json.dumps(catalogue, ensure_ascii=False, indent=2)
+
+
 def _tags(raw: Any, fallback: list[str]) -> list[str]:
     got = [t for t in (raw or []) if t in TAGS]
     return sorted(set(got) | set(fallback)) or list(fallback)
@@ -283,6 +307,12 @@ def _to_record(seed: Seed, resp: Response) -> Optional[dict]:
         if not _assistant_parts(msgs[-1].get("content", ""))["response"]:
             _drop("final_turn_has_no_response_token")
             return None
+        sysmsg = _rebuild_system_message(md, resp.custom_id)
+        if sysmsg:
+            if msgs and msgs[0]["role"] == "system":
+                msgs[0]["content"] = sysmsg
+            else:
+                msgs.insert(0, {"role": "system", "content": sysmsg})
         return {**base, "tags": _tags(data.get("tags"), md.get("tags", [])),
                 "tasks": data.get("tasks") or md.get("tasks", []),
                 "tools": md.get("tools", []), "distractor_tools": md.get("distractor_tools", []),

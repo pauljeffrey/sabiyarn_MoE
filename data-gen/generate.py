@@ -171,9 +171,22 @@ def run(kind: str, provider_name: str, *, model: Optional[str] = None, langs: Op
         by_lang: dict[str, list[dict]] = {}
         for r in todo:
             by_lang.setdefault(r["lang"], []).append(r)
-        requests = [build_packed_request(seed, group[i:i + pack])
-                    for group in by_lang.values() for i in range(0, len(group), pack)]
-        print(f"  packed {len(todo):,} samples into {len(requests):,} requests ({pack}/request)")
+        # A pack of 1-2 is worse than no pack: asked for "EXACTLY 1 sample" inside the packed format the
+        # model returned 4 (and once 18), and an over-long pack has to be discarded whole because nothing can
+        # be trusted to match its spec. Measured as pack_size:4of1 and pack_size:18of2 drops. Remainders
+        # therefore go out as ordinary single requests.
+        requests, n_packed, n_single = [], 0, 0
+        for group in by_lang.values():
+            for i in range(0, len(group), pack):
+                chunk = group[i:i + pack]
+                if len(chunk) >= 3:
+                    requests.append(build_packed_request(seed, chunk))
+                    n_packed += len(chunk)
+                else:
+                    requests.extend(build_request(seed, r) for r in chunk)
+                    n_single += len(chunk)
+        print(f"  {len(todo):,} samples -> {len(requests):,} requests "
+              f"({n_packed:,} packed at {pack}/request, {n_single:,} sent singly as remainders)")
     else:
         requests = [build_request(seed, r) for r in todo]
 

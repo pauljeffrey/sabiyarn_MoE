@@ -259,28 +259,59 @@ def _sft_like_request(seed: Seed, row: dict, *, rl: bool) -> Request:
 
     needs_tools = any(t.uses_tools for t in tasks)
     if needs_tools:
-        # Every task that needs a specific tool must have it in scope, or the brief contradicts itself
-        # ("use get_exchange_rate" while the tool list omits it).
+        # Which tools a task genuinely needs. Tag hints alone left generic tool-calling tasks
+        # (action_tool_use) with an EMPTY set once distractors stopped padding the list -- a tool-calling
+        # task with no tools. Task names are explicit here; tags stay as a fallback for new tasks.
+        BY_TASK = {
+            "action_tool_use": ["send_message", "set_reminder", "get_transport_route",
+                                "get_weather_forecast", "get_current_datetime"],
+            "tool_compute": ["run_statistics", "calculate", "convert_units"],
+            "tool_database": ["search_db", "db_get_record", "db_insert_record"],
+            "rag_document_qa": ["search_documents", "search_internet"],
+            "tool_search_answer": ["search_internet"],
+            "retrieval_insufficient": ["search_internet", "search_documents"],
+            "health_advice": ["lookup_health_guidance", "find_health_facility"],
+            "health_triage": ["lookup_health_guidance", "find_health_facility"],
+            "financial_analysis": ["get_exchange_rate", "calculate", "get_market_prices", "run_statistics"],
+        }
+        BY_TAG = {
+            "rag": "search_documents", "extractive-qa": "search_documents",
+            "knowledge-boundary": "search_internet", "insufficient-context": "search_internet",
+            "health-advice": "lookup_health_guidance", "health-triaging": "lookup_health_guidance",
+            "financial-analysis": "get_exchange_rate",
+        }
         required: list[str] = []
         for t in tasks:
-            for hint, name in (("rag", "search_documents"), ("extractive-qa", "search_documents"),
-                               ("knowledge-boundary", "search_internet"),
-                               ("insufficient-context", "search_internet"),
-                               ("health-advice", "lookup_health_guidance"),
-                               ("health-triaging", "lookup_health_guidance"),
-                               ("financial-analysis", "get_exchange_rate")):
-                if hint in t.tags and name not in required:
+            for name in BY_TASK.get(t.name, []):
+                if name not in required:
                     required.append(name)
-        if any("financial-analysis" in t.tags for t in tasks) and "calculate" not in required:
-            required.append("calculate")
-        # 2-3 deliberately IRRELEVANT tools are always in scope. Tool selection is only a real skill if
-        # there is something wrong to select, and a model trained only on catalogues where every tool is
-        # applicable learns to call whatever it is given.
-        filler = [t.name for t in seed.tools if t.name not in required]
-        rng.shuffle(filler)
-        n_distract = rng.randint(2, 3)
-        distractors = filler[:n_distract]
-        tool_names = required + distractors
+            for tag, name in BY_TAG.items():
+                if tag in t.tags and name not in required:
+                    required.append(name)
+        if not required:
+            # A task marked uses_tools with nothing mapped: give it a small plausible set rather than none.
+            required = rng.sample([t.name for t in seed.tools], k=3)
+
+        # The generator sees ONLY these. The 2-3 irrelevant "distractor" tools that must appear in the
+        # finished sample are chosen here but INJECTED AT POST-PROCESSING (see
+        # postprocess_gen._rebuild_system_message). Two reasons, both measured:
+        #   * the generator called them 12 times in 35 calls once few-shot exemplars were added, so a third
+        #     of samples had to be discarded for teaching the exact behaviour distractors exist to prevent;
+        #   * their definitions cost 300-1,200 input tokens per request for no generative benefit.
+        # The training signal is identical: the target model learns from the finished catalogue and cannot
+        # tell whether a definition was in the generator's prompt or added afterwards.
+        # A tool named in any of this conversation's task descriptions ("calls search_documents", "uses
+        # calculate / get_exchange_rate") must never be a distractor: the brief would be telling the
+        # generator to use a tool the catalogue withholds, which is the same self-contradiction that once
+        # had tasks referencing out-of-scope tools.
+        # seed.details counts too: the SFT brief names search_documents when it explains that RAG is
+        # modelled as a tool call, and details goes into the system prompt.
+        mentioned = " ".join([t.description for t in tasks] + [seed.details])
+        plausible = [t.name for t in seed.tools
+                     if t.name not in required and t.name not in mentioned]
+        rng.shuffle(plausible)
+        distractors = plausible[:rng.randint(2, 3)]
+        tool_names = list(required)
         rng.shuffle(tool_names)
     else:
         tool_names, distractors = [], []
@@ -318,12 +349,7 @@ def _sft_like_request(seed: Seed, row: dict, *, rl: bool) -> Request:
             f"\nTOOLS available in this conversation (put this exact JSON in the system message):\n"
             f"{_tool_block(seed, tool_names)}\n\nHow these tools behave when called:\n"
             f"{_tool_behaviour(seed, tool_names)}\n"
-            f"\nIRRELEVANT TOOLS -- DO NOT CALL: {', '.join(distractors)}\n"
-            f"These are in the catalogue on purpose, as distractors. Calling any of them makes the whole sample "
-            f"useless and it will be discarded, because the point of this data is teaching the model to pick "
-            f"the RIGHT tool rather than whichever tool is offered. Before emitting any tool_call, check the "
-            f"name against this list. Only these are legitimate here: "
-            f"{', '.join(n for n in tool_names if n not in distractors)}.\n")
+            f"\nEvery tool listed above is applicable to this conversation. Use the ones the tasks call for.\n")
     else:
         tools_section = ("\nThis conversation has NO tools and NO system message. If the user asks something "
                          "the assistant does not know, the correct behaviour is to say so plainly.\n")
@@ -399,6 +425,8 @@ Hard requirements:
                   "tasks": [t.name for t in tasks], "tags": sorted({g for t in tasks for g in t.tags}),
                   "tools": tool_names, "distractor_tools": distractors,
                   "tool_definitions": _tool_defs(seed, tool_names),
+                  # injected after generation, so the finished sample still teaches tool SELECTION
+                  "distractor_definitions": _tool_defs(seed, distractors),
                   "domain": domain, "subtopic": subtopic, "n_user_turns": n_user,
                   "io_direction": io["key"], "io_other_lang": io["other"],
                   "expect_markers": io["expect_markers"]},
