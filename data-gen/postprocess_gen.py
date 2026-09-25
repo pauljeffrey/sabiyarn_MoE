@@ -71,6 +71,47 @@ def _json(text: str) -> Optional[dict]:
         return None
 
 
+# A tool-calling turn whose plan the generator forgot: infer it from the tool, exactly as the repair script
+# does for published data. Deterministic, and the alternative is discarding an otherwise sound conversation.
+_PLAN_BY_TOOL = {
+    "search_documents": ["<|RAG|>"], "search_internet": ["<|explain|>"], "fetch_page": ["<|analyze|>"],
+    "lookup_health_guidance": ["<|recommend|>"], "find_health_facility": ["<|recommend|>"],
+    "calculate": ["<|math|>"], "run_statistics": ["<|math|>"], "convert_units": ["<|math|>"],
+    "get_exchange_rate": ["<|math|>"], "get_market_prices": ["<|analyze|>"],
+    "search_db": ["<|data_extract|>"], "db_get_record": ["<|data_extract|>"],
+    "db_insert_record": ["<|plan|>"], "send_message": ["<|plan|>"], "set_reminder": ["<|plan|>"],
+    "translate_text": ["<translate>"], "get_weather_forecast": ["<|explain|>"],
+    "get_transport_route": ["<|plan|>"], "lookup_crop_guidance": ["<|recommend|>"],
+    "lookup_legal_info": ["<|explain|>"], "get_current_datetime": ["<|chat|>"],
+}
+
+
+def _fill_turn_defaults(turns: Any, md: dict) -> Any:
+    """Supply the few fields the generator omits, where the value is determined rather than guessed.
+
+    Measured on a live run: 4 turns with no input_lang, 1 with no task_plan, 1 using <|summarize|> for
+    <summarize>. Each is a near-miss with exactly one sensible completion, so filling it recovers a sound
+    conversation instead of discarding one. Anything genuinely ambiguous is still dropped by the assembler.
+    """
+    if not isinstance(turns, list):
+        return turns
+    expect = md.get("expect_markers") or []
+    src_default = expect[0] if expect else md.get("lang")
+    tgt_default = expect[1] if len(expect) > 1 else md.get("lang")
+    for t in turns:
+        if not isinstance(t, dict) or t.get("role") != "assistant":
+            continue
+        if not t.get("input_lang"):
+            t["input_lang"] = src_default
+        call = t.get("tool_call") or {}
+        if not t.get("task_plan"):
+            name = (call or {}).get("name")
+            t["task_plan"] = _PLAN_BY_TOOL.get(name, ["<|chat|>"])
+        if not call and not t.get("target_lang"):
+            t["target_lang"] = tgt_default
+    return turns
+
+
 def _messages_from_turns(raw: Any) -> Optional[list[dict]]:
     """Structured turns -> template-shaped messages, with all markers built by assemble.py.
 
@@ -255,8 +296,18 @@ def _markers_ok(msgs: list[dict], expect: Optional[list[str]]) -> Optional[bool]
     return any(list(pair) == list(expect) for pair in seen)
 
 
-_SYSTEM_PREAMBLE = ("You are a helpful multilingual assistant for West African language speakers. "
-                    "You have access to the following tools:")
+# Varied so the model does not bind its behaviour to one name and a deployment can rename it without
+# retraining. Chosen deterministically from the sample id.
+IDENTITIES = [
+    "You are a helpful AI assistant.",
+    "You are an AI assistant.",
+    "You are SabiYarn, an AI assistant for West African languages.",
+    "You are an AI assistant. Your name is Aegis.",
+    "You are an AI assistant called Sabi.",
+    "You are a helpful assistant that speaks West African languages.",
+    "You are an AI assistant. Your name is Ọmọlúàbí.",
+    "You are a multilingual AI assistant.",
+]
 
 
 def _rebuild_system_message(md: dict, rng_seed: str) -> Optional[str]:
@@ -274,9 +325,13 @@ def _rebuild_system_message(md: dict, rng_seed: str) -> Optional[str]:
     if not real and not fake:
         return None
     catalogue = list(real) + list(fake)
+    rng = random.Random(rng_seed)
     # Deterministic shuffle so distractors are not always last -- position must not be a tell.
-    random.Random(rng_seed).shuffle(catalogue)
-    return _SYSTEM_PREAMBLE + "\n" + json.dumps(catalogue, ensure_ascii=False, indent=2)
+    rng.shuffle(catalogue)
+    identity = md.get("identity") or rng.choice(IDENTITIES)
+    # Compact JSON: indent=2 cost ~40% more tokens for no benefit to the model.
+    return f"{identity} You have these tools:\n" + json.dumps(catalogue, ensure_ascii=False,
+                                                              separators=(",", ":"))
 
 
 def _tags(raw: Any, fallback: list[str]) -> list[str]:
@@ -321,8 +376,12 @@ def _to_record(seed: Seed, resp: Response) -> Optional[dict]:
     if seed.kind == "sft":
         # `turns` is the current contract (structured fields); `messages` is the legacy pre-assembled shape,
         # still accepted so old batch output can be post-processed.
-        if data.get("turns") is not None:
-            msgs = _messages_from_turns(data["turns"])
+        turns = data.get("turns") or data.get("messages") or data.get("conversation")
+        if isinstance(turns, list) and any(isinstance(t, dict) and ("task_plan" in t or "response" in t
+                                                                   or "tool_call" in t) for t in turns):
+            msgs = _messages_from_turns(_fill_turn_defaults(turns, md))
+        elif data.get("turns") is not None:
+            msgs = _messages_from_turns(_fill_turn_defaults(data["turns"], md))
         else:
             msgs = _clean_messages(data.get("messages"))
         if msgs is None:
@@ -347,7 +406,7 @@ def _to_record(seed: Seed, resp: Response) -> Optional[dict]:
 
     # rl
     if data.get("prompt_turns") is not None:
-        msgs = _messages_from_turns(data["prompt_turns"])
+        msgs = _messages_from_turns(_fill_turn_defaults(data["prompt_turns"], md))
     else:
         msgs = _clean_messages(data.get("prompt_messages"))
     if msgs is None:

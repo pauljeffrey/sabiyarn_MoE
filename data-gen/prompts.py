@@ -74,6 +74,14 @@ def _fewshot_block() -> str:
 
 _PAIRS = all_pairs()
 _GENRES = sorted(GENRES)
+# Implied current date/time, cycled so time-dependent behaviour is not learned against one anchor.
+_WHENS = [
+    "a Monday morning in January", "a Wednesday afternoon in March", "a Friday evening in May",
+    "a Saturday morning in July", "a Sunday afternoon in August", "a Tuesday night in October",
+    "a Thursday midday in November", "a Saturday evening in December",
+    "early morning during Ramadan", "the week before Christmas", "the middle of the rainy season",
+    "the height of the harmattan",
+]
 _REGISTERS = ["plain everyday", "formal", "conversational", "explanatory/teacherly", "journalistic", "storytelling"]
 # 300-500 words, in four buckets so length still varies within the band.
 _LENGTHS = [(300, 350), (350, 400), (400, 450), (450, 500)]
@@ -144,7 +152,7 @@ def _tool_block(seed: Seed, names: list[str]) -> str:
     tools = [{"type": "function", "function": {"name": t.name, "description": t.description,
                                                "parameters": t.parameters}}
              for t in seed.tools if t.name in names]
-    return json.dumps(tools, ensure_ascii=False, indent=2)
+    return json.dumps(tools, ensure_ascii=False, separators=(",", ":"))
 
 
 def _tool_behaviour(seed: Seed, names: list[str]) -> str:
@@ -233,9 +241,12 @@ A conversation is a list of `turns`. Each turn is one of:
 
 RULES THAT FOLLOW FROM THIS
 - A turn either ANSWERS (response + target_lang, no tool_call) or CALLS A TOOL (tool_call, no response).
-  After a tool result comes back, the assistant takes ANOTHER turn -- often with a fresh `think` judging
-  whether the result actually answers the question.
-- task_plan is the PLAN, so a tool-calling turn has one too: it is what decided to call the tool.
+  After a tool result the assistant takes ANOTHER turn, usually with a fresh `think` judging whether the
+  result actually answers the question.
+- task_plan is a PLAN and every assistant turn has one, including a tool-calling turn -- the plan is what
+  decided to call the tool. Plans are REVISED as work proceeds, exactly as a person would: think -> plan
+  (search the document) -> call -> read the result -> think again -> revised plan (that was not it; search for
+  X instead, or now analyse and explain) -> act. Do not reuse the same plan every turn.
 - task_plan verbs must come from: __VERBS_ALLOWED__
 - Language codes must come from: __LANGS_ALLOWED__
 - For a translation, input_lang and target_lang DIFFER and must match the real direction. Put only the
@@ -253,6 +264,14 @@ def _format_brief(lang_code: str, language_name: str, verbs_allowed: str) -> str
 
 _PAIRS = all_pairs()
 _GENRES = sorted(GENRES)
+# Implied current date/time, cycled so time-dependent behaviour is not learned against one anchor.
+_WHENS = [
+    "a Monday morning in January", "a Wednesday afternoon in March", "a Friday evening in May",
+    "a Saturday morning in July", "a Sunday afternoon in August", "a Tuesday night in October",
+    "a Thursday midday in November", "a Saturday evening in December",
+    "early morning during Ramadan", "the week before Christmas", "the middle of the rainy season",
+    "the height of the harmattan",
+]
 _REGISTERS = ["plain everyday", "formal", "conversational", "explanatory/teacherly", "journalistic", "storytelling"]
 # 300-500 words, in four buckets so length still varies within the band.
 _LENGTHS = [(300, 350), (350, 400), (400, 450), (450, 500)]
@@ -323,7 +342,7 @@ def _tool_block(seed: Seed, names: list[str]) -> str:
     tools = [{"type": "function", "function": {"name": t.name, "description": t.description,
                                                "parameters": t.parameters}}
              for t in seed.tools if t.name in names]
-    return json.dumps(tools, ensure_ascii=False, indent=2)
+    return json.dumps(tools, ensure_ascii=False, separators=(",", ":"))
 
 
 def _tool_behaviour(seed: Seed, names: list[str]) -> str:
@@ -396,6 +415,13 @@ def _sft_like_request(seed: Seed, row: dict, *, rl: bool) -> Request:
     tasks = [task] + extra
     domain, subtopic, _ = _coverage_pick(lang.code, row["index"])
     io = _io_direction(seed, lang.code, row["index"], rng)
+    identities = seed.conversation.get("identities") or []
+    identity = identities[(row["index"] + _lang_offset(lang.code)) % len(identities)] if identities else ""
+    # Spread the implied "now" across the year, days of the week and hours so nothing is anchored to one
+    # date: anything time-dependent (reminders, forecasts, rates, "today") must work at any point.
+    # Stride must be COPRIME with len(_WHENS) or most values are unreachable: *3 mod 12 reached only 4 of 12,
+    # the same arithmetic trap that once locked every sub-topic to one genre. 5 is coprime with 12.
+    when = _WHENS[(row["index"] * 5 + _lang_offset(lang.code)) % len(_WHENS)]
 
     needs_tools = any(t.uses_tools for t in tasks)
     if needs_tools:
@@ -446,7 +472,10 @@ def _sft_like_request(seed: Seed, row: dict, *, rl: bool) -> Request:
         # had tasks referencing out-of-scope tools.
         # seed.details counts too: the SFT brief names search_documents when it explains that RAG is
         # modelled as a tool call, and details goes into the system prompt.
-        mentioned = " ".join([t.description for t in tasks] + [seed.details])
+        # Tool DESCRIPTIONS name other tools too -- search_internet's says "you must then call fetch_page" --
+        # and those descriptions are rendered into the prompt, so a tool named there cannot be a distractor.
+        req_desc = [t.description for t in seed.tools if t.name in required]
+        mentioned = " ".join([t.description for t in tasks] + req_desc + [seed.details])
         plausible = [t.name for t in seed.tools
                      if t.name not in required and t.name not in mentioned]
         rng.shuffle(plausible)
@@ -535,6 +564,9 @@ Tasks this conversation must cover (mix them, change subject at least once):
 {verbs_line}
 
 Ground the content in: {DOMAINS[domain].name} / {subtopic}.
+It is {when}; anything time-dependent (a reminder, a forecast, a rate, "today") must fit that.
+The assistant's identity in the system message will be: "{identity}" -- keep its self-references consistent
+with that, and do not assume any other name.
 {tools_section}
 {shape}
 
@@ -568,6 +600,7 @@ Hard requirements:
                   "distractor_definitions": _tool_defs(seed, distractors),
                   "domain": domain, "subtopic": subtopic, "n_user_turns": n_user,
                   "io_direction": io["key"], "io_other_lang": io["other"],
+                  "identity": identity, "when": when,
                   "expect_markers": io["expect_markers"]},
     )
 

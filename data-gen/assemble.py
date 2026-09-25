@@ -95,6 +95,16 @@ def _check_plain(text: str, field: str, allow: Optional[set[str]] = None) -> str
     return t
 
 
+# <|summarize|> vs <summarize>: the generator picks the wrong bracket form for a verb that does exist. The
+# intent is unambiguous, so the form is normalised rather than the sample dropped.
+_VERB_BY_BARE = {v.strip("<>|"): v for v in VALID_VERBS}
+
+
+def normalise_verb(v: str) -> str:
+    bare = (v or "").strip().strip("<>").strip("|")
+    return _VERB_BY_BARE.get(bare, v)
+
+
 def assistant_content(
     *,
     input_lang: str,
@@ -116,7 +126,7 @@ def assistant_content(
         if t:
             parts.append(f"<think>{t}</think>")
 
-    verbs = [v for v in (task_plan or []) if v]
+    verbs = [normalise_verb(v) for v in (task_plan or []) if v]
     bad = [v for v in verbs if v not in VALID_VERBS]
     if bad:
         raise AssemblyError(f"task_plan verb(s) {bad} not in the tokenizer")

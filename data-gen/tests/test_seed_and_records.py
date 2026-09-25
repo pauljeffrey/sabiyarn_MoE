@@ -229,7 +229,11 @@ def test_system_message_is_canonical_not_the_generators(seeds):
     payload = _sft_payload()
     payload["messages"][0]["content"] = "whatever prose the generator felt like writing"
     rec = to_record(seeds["sft"], _resp("sft__yor__y__000001", payload, md))
-    assert rec["messages"][0]["content"].startswith("You are a helpful multilingual assistant")
+    # identity is varied across samples, so assert the SHAPE rather than one fixed string
+    from postprocess_gen import IDENTITIES
+    first = rec["messages"][0]["content"]
+    assert any(first.startswith(i) for i in IDENTITIES), first[:60]
+    assert "You have these tools:" in first
     assert "whatever prose" not in rec["text"]
 
 
@@ -493,8 +497,9 @@ def test_think_is_allowed_before_and_after_tool_use(seeds):
                           ).messages[0]["content"]
     # a tool round trip is two assistant turns, and the second gets its own think
     assert "takes ANOTHER turn" in brief and "fresh `think`" in brief
-    # and the plan belongs on the calling turn, which 114 of 108 records got wrong
-    assert "a tool-calling turn has one too" in brief
+    # the plan belongs on the calling turn (114 published tool turns had none) and is revised as work proceeds
+    assert "including a tool-calling turn" in brief
+    assert "REVISED as work proceeds" in brief
 
 
 def test_packing_shares_one_system_prompt_and_preserves_order(seeds):

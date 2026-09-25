@@ -25,29 +25,20 @@ from schemas.seed import LanguageSpec, Seed, TaskSpec, ToolSpec
 # ---------------------------------------------------------------------------
 
 PHILOSOPHY = """\
-The target model is SabiYarn, a ~306M-parameter mixture-of-experts causal LM for 12 West African languages
-plus English. It is SMALL. It cannot and must not be expected to memorise the world's facts.
+TARGET MODEL: SabiYarn, ~306M params, 12 West African languages + English. It is SMALL and cannot memorise
+the world's facts. The corpus teaches world MODEL (how things work) plus two reflexes:
 
-The goal is a model with solid general understanding of the world -- how physical things work, how people
-and institutions behave, basic health, basic technology -- plus two learned reflexes:
+1. THINK FIRST -- reason briefly about what is asked and whether you already know it.
+2. USE A TOOL, OR SAY YOU CANNOT. Lack the knowledge and have a fitting tool? Call it, read the result, answer
+   from it. No fitting tool? Say plainly you do not know and cannot look it up. Tool ran but the result does
+   not answer the question? Say THAT -- never build an answer out of an irrelevant result.
 
-  1. THINK FIRST. When a question arrives, reason briefly inside <think>...</think> about what is being
-     asked, whether it already knows, and what it would need in order to answer.
-  2. USE TOOLS, OR SAY YOU CANNOT. If it lacks the knowledge and a suitable tool exists, call the tool,
-     read the result, and answer from it. If no suitable tool exists, say plainly that it does not know
-     and is not connected to a knowledge source. If a tool ran but the result does not actually answer
-     the question, say THAT, rather than inventing an answer from the irrelevant result.
+Canonical case: asked "what is AWS?", do NOT recite a definition. Think "not familiar, looks like a technical
+product, look it up", search, read, answer in the user's language. With no search tool, say you cannot.
 
-The canonical example. Asked "what is AWS?", a well-trained SabiYarn should NOT recite a memorised
-definition. It should think along the lines of "I have not come across this before; it looks like a
-technical product name; I should look it up", then call search_internet with a query like "what is AWS",
-read the returned snippet, and answer from it in the user's language. With no search tool available, the
-correct behaviour is to say it does not know and cannot look it up right now.
-
-Aim for the register of a bright, curious 16-year-old: confident about everyday things, honest about what
-it has not learned, and quick to look something up rather than bluff. Never sycophantic, never padded.
-Confabulation is the single worst failure mode; admitting ignorance is always preferred to a plausible
-invention, and the training data must make that trade-off visible over and over."""
+Register: a bright, curious 16-year-old. Confident on everyday things, honest about what it has not learned,
+quick to look something up rather than bluff. CONFABULATION IS THE WORST FAILURE; admitting ignorance always
+beats a plausible invention, and the data must show that trade repeatedly."""
 
 SPECIAL_TOKENS = {
     "bos": "<s>", "eos": "</s>",
@@ -173,11 +164,22 @@ _INT = {"type": "integer"}
 # impossible. Each conversation sees only 4-7 of these, of which 2-3 are deliberately irrelevant.
 TOOLS = [
     # -- retrieval
-    _t("search_internet", "Search the public internet for information the assistant does not already know. "
-       "Use for named products, companies, people, places, events, or any technical term it has not met.",
+    _t("search_internet", "Search the web. Returns a LIST OF RESULTS (title, url, snippet) -- not the answer. "
+       "To read one you must then call fetch_page on its url.",
        {"query": {**_STR, "description": "Short search query in English, 2-8 words."}}, ["query"],
-       "2-4 snippets of 1-3 sentences, sometimes with a source name. Often partial, sometimes stale.",
-       ["no results", "results about a different sense of the word", "mentions the term but never defines it"],
+       "A numbered list of 3-6 results: title, url, and a snippet truncated mid-sentence and often SEO-padded. "
+       "A snippet tells you which page MIGHT hold the answer, rarely the answer itself.",
+       ["no results", "results about a different sense of the word", "every snippet is listicle spam",
+        "the best-looking result turns out to be a login wall"],
+       ["all"]),
+    _t("fetch_page", "Fetch one url from a search_internet result. Returns the RAW PAGE with HTML tags, "
+       "navigation, cookie banners and adverts still in it -- read past them.",
+       {"url": {**_STR, "description": "A url from a search_internet result."}}, ["url"],
+       "Page text with tags left in (<h1>, <p>, <div class=...>, <nav>, <script>), plus 'Accept cookies', "
+       "newsletter prompts, related-article lists and boilerplate. The useful part is a few sentences "
+       "somewhere in the middle, when it is there at all.",
+       ["404 or moved", "paywall with no content", "the page means the term in a different sense",
+        "content present but contradicts another page"],
        ["all"]),
     _t("search_documents", "Search the documents supplied in this conversation for relevant passages. Use "
        "before answering any question about a supplied document. Does NOT search the internet.",
@@ -312,8 +314,17 @@ SFT_TASKS = [
           "search_internet with a tight query, reads the snippets, and answers in the user's language, "
           "attributing what it found. It must NOT pretend prior familiarity.",
           plan=["<|explain|>"], tools=True, think=True),
+    _task("tool_chain_insufficient", ["insufficient-context", "knowledge-boundary", "tool-calling"], 5.0,
+          "A TECHNICAL question the assistant does not know (a product, protocol, API, framework, device). It "
+          "searches, gets a list of links, fetches one or two pages, reads past the navigation and adverts -- "
+          "and the content still does not answer the question, or contradicts itself. After two or three "
+          "honest attempts it says what it looked at, what it found, and that it still cannot answer. It must "
+          "NOT stitch a confident answer out of fragments that do not support one. Each tool round trip gets "
+          "its own <think>, and the plan is REVISED between attempts.",
+          plan=["<|plan|>", "<|analyze|>", "<|explain|>"], tools=True, think=True),
     _task("no_tool_admit_unknown", ["knowledge-boundary", "qa"], 6.5,
-          "Same, but NO tool in scope could help (or there are no tools at all). The assistant thinks, "
+          "A TECHNICAL or specialist question -- a named product, an acronym, a recent release, a piece of "
+          "jargon -- where NO tool in scope could help (or there are no tools at all). The assistant thinks, "
           "concludes it neither knows nor can look it up, and says so plainly and briefly. It may offer what "
           "general reasoning it can (what kind of thing the name looks like) without inventing facts, and "
           "does not apologise at length.",
@@ -396,10 +407,18 @@ SFT_TASKS = [
           "output (e.g. Yoruba->Hausa, Twi->Ewe, Pidgin->Igbo). State both languages in the markers. This is "
           "the hardest translation direction and the one no public corpus covers.",
           plan=["<translate>"], think=True),
-    _task("summarization", ["summarization"], 4.0,
+    _task("summarization", ["summarization"], 3.0,
           "Condense a passage to its substance. Both same-language and cross-language (summarise this English "
           "text in Hausa).",
           plan=["<summarize>"]),
+    _task("long_document_summarization", ["summarization"], 3.0,
+          "The user pastes a LONG document -- 900-3,500 words -- and asks for a summary. Generate the document "
+          "too: a real piece of writing (report, article, minutes, guideline, transcript), not filler, with "
+          "sections and specifics. Language of the DOCUMENT: English 70% of the time, mixed English + the "
+          "target language 10%, entirely the target language 20% (and keep those shorter, 900-1,400 words, to "
+          "protect quality). The summary goes in whatever language the io_direction calls for, so "
+          "English-document-into-Yoruba-summary is a normal case.",
+          plan=["<summarize>"], think=True),
     # ---- labelling: one task per tag so each is separately countable
     _task("topic_classification", ["topic-classification"], 2.0,
           "Assign a topic label to a short text, using the <topic> token. The answer is the label plus at "
@@ -461,6 +480,32 @@ RL_TASKS = [
 # The input/output language pattern. Sampled on its own odometer so the distribution is EXACTLY even across
 # every task, language and phase rather than approximately even by chance. `other` is a second supported
 # language, drawn per sample, for the genuinely cross-lingual case.
+# The assistant's self-description. Varied so the model does not bind its behaviour to one name, and so a
+# deployment can rename it without retraining. Sampled per sample on its own odometer.
+IDENTITIES = [
+    "You are a helpful AI assistant.",
+    "You are an AI assistant.",
+    "You are SabiYarn, an AI assistant for West African languages.",
+    "You are an AI assistant. Your name is Aegis.",
+    "You are an AI assistant called Sabi.",
+    "You are a helpful assistant that speaks West African languages.",
+    "You are an AI assistant. Your name is Ọmọlúàbí.",
+    "You are a multilingual AI assistant.",
+]
+
+# How the assistant should sound. Warm and colloquial is DESIRED, not tolerated -- a stiff textbook register
+# is the wrong output for this audience.
+PERSONA = """\
+VOICE: talk like a knowledgeable friend (a paddy), not a manual.
+- Code-switching, local slang and idiom are WANTED, not merely allowed: "no wahala", "e go better", "abeg",
+  "omo", proverbs, the way people actually speak. Match the user's register -- formal if they are formal.
+- Friendly, respectful, direct. Never sycophantic ("Great question!"), never padded, never lecturing.
+- Helpful unless you genuinely do not know, and then say so plainly and briefly.
+- Safe: no medical diagnosis or dosing, no legal or financial instruction presented as advice, nothing that
+  puts someone at risk. Point to a clinic, a lawyer, an official body where that is the real answer.
+- NO CODE. This model is not being taught to program. Never write code blocks, never explain syntax. A
+  question about how software works is answered in plain words like any other how-things-work question."""
+
 IO_DIRECTIONS = [
     {"key": "native_native", "weight": 1.0,
      "brief": "Everything is in {lang}: the user writes {lang}, the assistant answers in {lang}. "
@@ -520,72 +565,61 @@ CONVERSATION = {
 
 PRETRAIN_DETAILS = f"""{PHILOSOPHY}
 
-THIS PHASE: pretraining documents, 300-500 words each, emitted as a `title` and a `text` field.
-Plain continuous prose -- no chat markup, no special tokens, no
-instructions, no question-and-answer shape. Each document is a self-contained piece of natural writing of
-the requested genre, register and length, entirely in the target language.
+THIS PHASE: pretraining documents, 300-500 words, as `title` + `text`. Plain prose -- no chat markup, no
+special tokens, no Q&A shape. Entirely in the target language.
 
-What this corpus must give the model is WORLD MODEL, not facts to recite: how things work, what objects
-and materials do, how institutions and markets and families behave, what health means day to day. Prefer
-explanation and mechanism over lists of names and dates. A document about a generator should explain why
-fuel makes a coil turn and why the room must be ventilated -- not list generator brands.
+Give the model a WORLD MODEL, not facts to recite: how things work, what materials and objects do, how
+institutions, markets and families behave, what health means day to day. Mechanism over name-dropping -- a
+piece on a generator explains why fuel turns a coil and why the room needs air, not which brands exist. Keep
+technicality light; this is general knowledge of the world.
 
-Health is a first-class domain here (6 domains, ~60 sub-topics: clinical, public health, maternal and
-child, nutrition, mental wellbeing, disability). The model should come out of pretraining able to reason
-about illness and care in plain terms, so that at SFT time it can triage and advise with tool support.
+Health is first-class (6 domains, ~60 sub-topics) so the model can later triage and advise with tool support.
 
-Coverage is driven by the sampler: every (domain, sub-topic) pair, every genre, every register is used
-before any repeats. Do not let the generator drift toward the same five topics.
-
+Coverage is driven by the sampler: every (domain, sub-topic) pair and genre is used before any repeats.
 Quality bar: natural, locally grounded, factually careful, no invented statistics, no English code-switching
-except where a language genuinely borrows the word."""
+beyond genuine borrowings."""
 
 SFT_DETAILS = f"""{PHILOSOPHY}
 
-THIS PHASE: supervised fine-tuning conversations. Each sample is a multi-turn conversation of 6-10 messages
-ending in an assistant message, mixing 2-4 different tasks and changing subject at least once.
+{PERSONA}
 
-Conversations are serialized twice and BOTH are kept: (a) `messages`, a list of role/content dicts, and
-(b) `text`, the exact string the SabiYarn chat template renders from it. The dict form is the source of
-truth; the text form is what training consumes, and keeping both means a template change is a re-render
-rather than a regeneration.
+THIS PHASE: SFT conversations. 3-6 user turns, ending on an assistant turn, mixing 2-4 tasks and changing
+subject at least once. Tool turns and tool results are extra and do not count.
 
-Tool use is the centrepiece. RAG is NOT a context-stuffing exercise -- it is modelled as a tool call: the
-assistant emits a search_documents call with a query it composes itself, receives passages back as a tool
-result message, and answers from those. The model must learn the whole loop, including the loop failing.
+Saved twice, both kept: `messages` (role/content dicts, the source of truth) and `text` (the chat-template
+rendering). A template change is then a re-render, not a regeneration.
 
-Every sample is tagged with `lang` and one or more task tags, so the mix can be audited and slices held out.
+Tool use is the centrepiece, and RAG is a TOOL CALL, not context stuffing: the assistant composes a query,
+receives passages, answers from them. It must learn the whole loop INCLUDING the loop failing. Assume the
+knowledge base is already connected and reachable through the tool.
 
-LANGUAGE DIRECTION. Each sample also carries an `io_direction`, distributed EXACTLY evenly across every task:
-native->native, English->English, English->native, native->English, and cross-lingual (one African language
-in, another out). This matters because the deployed model will be asked to read English and answer in Yoruba
-at least as often as it is asked to work wholly within one language, and because retrieved context for these
-languages is realistically English whatever the user writes in. A corpus that only ever works within one
-language teaches a model that cannot do the job.
+Every sample is tagged with `lang` plus task tags so the mix can be audited and sliced.
 
-The hardest and most important quality bar: the assistant must be visibly honest about the edge of its
-knowledge. Roughly a quarter of all exchanges are about exactly that -- looking something up, admitting it
-cannot, or noticing that what came back does not answer the question."""
+The hardest bar: visible honesty at the edge of knowledge. A quarter of all exchanges are exactly that --
+looking something up, admitting it cannot, or noticing that what came back does not answer the question."""
 
 RL_DETAILS = f"""{PHILOSOPHY}
 
-THIS PHASE: preference data. Each sample is a conversation prefix ending with a user message, plus 2-3
-candidate assistant responses to that final turn, to be ranked.
+{PERSONA}
 
-Only the FINAL response is graded. The prefix is shared and fixed.
+THIS PHASE: preference data. A conversation prefix ending on a user turn, plus 2-3 candidate final assistant
+responses to rank. ONLY the final response is graded; the prefix is shared and fixed.
 
-Candidates must differ along an axis a judge can actually rank, and the intended ranking is recorded:
-  - one grounded, honest, correctly-tool-using response (best);
-  - one that is confidently wrong -- invents a fact, answers from an irrelevant retrieval, or claims
-    familiarity with something it was never told (worst; this is the behaviour we are training against);
-  - optionally one that is partially right: correct but hedged into uselessness, or right answer with the
-    wrong tool, or over-refusal where the answer was actually available.
-Three paraphrases of the same answer are worthless here and must not be generated.
+Candidates must differ along an axis a judge can rank, and the intended ranking is recorded:
+  - one grounded, honest, correctly tool-using (best);
+  - one confidently wrong -- invents a fact, answers from an irrelevant retrieval, or claims familiarity it
+    was never given (worst; this is what we train against);
+  - optionally one partially right: correct but hedged into uselessness, right answer via the wrong tool, or
+    over-refusal where the answer WAS available.
+Three paraphrases of one answer are worthless and must not be generated.
 
-Over-refusal is a real failure too. If the answer IS available -- in the document, from the tool result, or
-from ordinary world knowledge -- then refusing is the worse response, and some samples must teach that
-direction so the model does not collapse into refusing everything."""
+Over-refusal is a real failure too. If the answer IS available -- in the document, the tool result, or
+ordinary world knowledge -- refusing is the WORSE response, and some samples must teach that direction so the
+model does not collapse into refusing everything.
 
+Coverage must span: general world knowledge, basic arithmetic, technical questions it cannot know, technical
+questions it can resolve with a tool, and technical questions where the tools return wrong or insufficient
+context."""
 
 def build(kind: str) -> Seed:
     languages, yields = _languages(kind)
@@ -607,7 +641,7 @@ def build(kind: str) -> Seed:
         columns = ["id", "lang", "tags", "tasks", "prompt_messages", "prompt_text",
                    "response_1", "response_2", "response_3", "ranking", "rationale",
                    "instruction", "input", "context"]
-    conv = {**conv, "io_directions": IO_DIRECTIONS}
+    conv = {**conv, "io_directions": IO_DIRECTIONS, "identities": IDENTITIES, "persona": PERSONA}
     return Seed(kind=kind, details=SFT_DETAILS if kind == "sft" else RL_DETAILS,
                 languages=languages, tasks=tasks, tools=TOOLS, conversation=conv, target_model=target,
                 yield_by_tier=yields,
