@@ -318,9 +318,12 @@ def _sft_like_request(seed: Seed, row: dict, *, rl: bool) -> Request:
             f"\nTOOLS available in this conversation (put this exact JSON in the system message):\n"
             f"{_tool_block(seed, tool_names)}\n\nHow these tools behave when called:\n"
             f"{_tool_behaviour(seed, tool_names)}\n"
-            f"\nIRRELEVANT TOOLS: {', '.join(distractors)} are in the catalogue but are NOT useful for this "
-            f"conversation. The assistant must never call them. Their presence is deliberate -- the model has "
-            f"to learn to pick the right tool, not just any tool.\n")
+            f"\nIRRELEVANT TOOLS -- DO NOT CALL: {', '.join(distractors)}\n"
+            f"These are in the catalogue on purpose, as distractors. Calling any of them makes the whole sample "
+            f"useless and it will be discarded, because the point of this data is teaching the model to pick "
+            f"the RIGHT tool rather than whichever tool is offered. Before emitting any tool_call, check the "
+            f"name against this list. Only these are legitimate here: "
+            f"{', '.join(n for n in tool_names if n not in distractors)}.\n")
     else:
         tools_section = ("\nThis conversation has NO tools and NO system message. If the user asks something "
                          "the assistant does not know, the correct behaviour is to say so plainly.\n")

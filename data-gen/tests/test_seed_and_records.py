@@ -180,7 +180,9 @@ def test_irrelevant_tools_are_in_scope_and_named(seeds):
         d = md["distractor_tools"]
         assert 2 <= len(d) <= 3, d
         assert set(d) <= set(md["tools"])
-        assert "IRRELEVANT TOOLS: " + ", ".join(d) in req.messages[1]["content"]
+        body = req.messages[1]["content"]
+        assert "IRRELEVANT TOOLS -- DO NOT CALL: " + ", ".join(d) in body
+        assert "will be discarded" in body      # the prohibition states the consequence
         # full definitions travel in metadata AND are attached natively for the provider
         assert len(md["tool_definitions"]) == len(md["tools"])
         assert req.tools and {t["function"]["name"] for t in req.tools} == set(md["tools"])
@@ -354,6 +356,31 @@ def test_tool_conversations_get_more_room(seeds):
     assert to_record(seeds["sft"], _resp("t2", convo(7, False), md)) is None
     # 3 user turns, no tools, is the compact shape
     assert to_record(seeds["sft"], _resp("t3", convo(3, False), md)) is not None
+
+
+def test_calling_a_distractor_tool_discards_the_sample(seeds):
+    """Distractors exist to train tool SELECTION. A sample that calls one teaches the opposite, so it is a
+    drop rather than a warning -- measured at 12 of 35 calls once few-shot exemplars were added."""
+    md = {"kind": "sft", "lang": "yor", "tasks": [], "tags": [],
+          "tools": ["search_internet", "set_reminder"], "distractor_tools": ["set_reminder"]}
+
+    def convo(tool):
+        return {"messages": [
+            {"role": "user", "content": "q1"},
+            {"role": "assistant", "content": "<|input_lang|><yor><think>look it up</think>",
+             "tool_calls": [{"function": {"name": tool, "arguments": {"query": "x", "when": "now",
+                                                                     "text": "t"}}}]},
+            {"role": "tool", "name": tool, "content": "a substantive result of adequate length here"},
+            {"role": "user", "content": "q2"},
+            {"role": "assistant", "content": "<|input_lang|><yor><task_plan><|chat|></task_plan>"
+                                             "<|target_lang|><yor><response>ans"},
+            {"role": "user", "content": "q3"},
+            {"role": "assistant", "content": "<|input_lang|><yor><task_plan><|chat|></task_plan>"
+                                             "<|target_lang|><yor><response>ans2"},
+        ], "tasks": [], "tags": [], "confidence": 0.9}
+
+    assert to_record(seeds["sft"], _resp("legit", convo("search_internet"), md)) is not None
+    assert to_record(seeds["sft"], _resp("bad", convo("set_reminder"), md)) is None
 
 
 def test_reasoning_models_are_flagged(capsys):

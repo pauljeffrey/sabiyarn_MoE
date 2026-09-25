@@ -102,7 +102,9 @@ def _clean_messages(raw: Any) -> Optional[list[dict]]:
     return out
 
 
-def _validate_conversation(msgs: list[dict], seed: Seed, *, ends_with: str) -> bool:
+def _validate_conversation(msgs: list[dict], seed: Seed, *, ends_with: str,
+                           md: Optional[dict] = None) -> bool:
+    md = md or {}
     conv = seed.conversation
     # User turns are what the generator is asked for and what is checked; assistant and tool turns follow
     # from them (see the seed's min_user_turns/max_user_turns).
@@ -134,6 +136,17 @@ def _validate_conversation(msgs: list[dict], seed: Seed, *, ends_with: str) -> b
             if c["function"]["name"] not in tool_names:
                 _drop("unknown_tool")
                 return False
+    # A distractor tool is one the seed put in scope precisely because it is NOT useful here. Calling it is
+    # the exact behaviour the distractors exist to train AGAINST, so such a sample teaches the opposite of
+    # what it is for. Measured at 12 of 35 calls once few-shot exemplars were added -- the model copies
+    # "call a tool" from the example without copying "pick the right one".
+    distractors = set(md.get("distractor_tools") or [])
+    if distractors:
+        for m in msgs:
+            for c in m.get("tool_calls", []):
+                if c["function"]["name"] in distractors:
+                    _drop(f"called_distractor_tool:{c['function']['name']}")
+                    return False
     invented = _invented_pipe_tokens(msgs)
     if invented:
         _drop(f"invented_pipe_token:{invented[0]}")
@@ -265,7 +278,7 @@ def _to_record(seed: Seed, resp: Response) -> Optional[dict]:
         if msgs is None:
             _drop("messages_malformed")
             return None
-        if not _validate_conversation(msgs, seed, ends_with="assistant"):
+        if not _validate_conversation(msgs, seed, ends_with="assistant", md=md):
             return None
         if not _assistant_parts(msgs[-1].get("content", ""))["response"]:
             _drop("final_turn_has_no_response_token")
@@ -281,7 +294,7 @@ def _to_record(seed: Seed, resp: Response) -> Optional[dict]:
     if msgs is None:
         _drop("prompt_messages_malformed")
         return None
-    if not _validate_conversation(msgs, seed, ends_with="user"):
+    if not _validate_conversation(msgs, seed, ends_with="user", md=md):
         return None
     responses = data.get("responses") or []
     want = int(seed.conversation["responses_per_prompt"])
