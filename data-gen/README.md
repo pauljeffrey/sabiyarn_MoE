@@ -717,3 +717,38 @@ python generate.py --kind pretrain --provider together  --model openai/gpt-oss-1
 
 Verified end to end on OpenRouter: submit -> poll -> fetch, metadata preserved, usage reported
 (231 tokens billed at $0.000018, confirming the rate).
+
+## Free endpoints: measured, not viable
+
+`google/gemma-4-31b-it:free` was given every advantage -- 120-300s backoff, 8 attempts, concurrency capped at
+2, `--pack 4` so only 6 requests were needed for 24 samples:
+
+    [sft] kept 0  failed 24  (yield 0%)  in 163.2m
+    openrouter/google/gemma-4-31b-it:free: 0 in + 0 out = $0.00
+
+Zero output in 2.7 hours, every request exhausting all 8 retries on `429 ... temporarily rate-limited
+upstream`. Six requests it cannot serve does not extrapolate to the ~56,000 a full SFT run needs. The backoff
+is implemented and correct; the endpoint simply is not serving. Budget the paid endpoint
+(`google/gemma-4-31b-it`, $0.09/$0.34) or self-host.
+
+## Few-shot for low-resource languages: worth it
+
+Structure is what collapses in efi/urh/fon/ewe/ful/fuv, not orthography. Exemplars mined from verified-correct
+samples (`scripts/build_fewshot.py`) and attached to the low tier only:
+
+| | baseline | + few-shot |
+|---|---|---|
+| usable yield | 17% | **67%** |
+| invented pipe tokens | 70 (vs 21 correct) | **0** |
+| distractor tool calls | 1 | **0** |
+| tool results in English | 15/15 | 18/18 |
+| think before / after tool | 15 / 15 | 17 / 18 |
+| markers match io_direction | 75% | 81% |
+| tags covered | 17 | 20 |
+
+The unvalidated headline was 88%, but distractor calls had risen 1 -> 12 (34% of all calls): the model copies
+"call a tool" from the exemplar without copying "pick the right one". Those samples now drop, which is why the
+honest figure is 67%.
+
+Remaining regression: responses are thinner under few-shot (123 vs 151 chars, more sub-40-char replies). Add a
+length floor to the brief before a full run.

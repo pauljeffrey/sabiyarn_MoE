@@ -140,9 +140,13 @@ class Provider:
         self.max_retries = max_retries if not free else max(max_retries, 8)
         self.timeout = timeout
         if free:
-            print(f"  [{self.name}] {model} is a free endpoint: concurrency capped at "
+            print(f"  [{self.name}] {model} is a FREE endpoint: concurrency capped at "
                   f"{self.max_concurrency}, backoff {self.retry_base_s:.0f}-{self.retry_max_s:.0f}s, "
-                  f"{self.max_retries} attempts. Expect this to be slow.", flush=True)
+                  f"{self.max_retries} attempts.\n"
+                  f"  MEASURED 2026-09-24: google/gemma-4-31b-it:free produced 0 of 24 samples in 163 "
+                  f"minutes, exhausting all 8 retries on every request with ~5m cooldowns. It is useful for "
+                  f"a smoke test and unusable for volume -- expect to fall back to the paid endpoint.",
+                  flush=True)
         self._lock = threading.Lock()
         self.prompt_tokens = 0
         self.completion_tokens = 0
