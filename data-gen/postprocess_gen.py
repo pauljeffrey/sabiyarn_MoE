@@ -21,6 +21,7 @@ import re
 from typing import Any, Optional
 
 from providers.base import Response
+from assemble import AssemblyError, build_messages
 from rendering.render import render_messages
 from schemas.seed import TAGS, Seed
 
@@ -67,6 +68,23 @@ def _json(text: str) -> Optional[dict]:
                 return v if isinstance(v, dict) else None
             except ValueError:
                 return None
+        return None
+
+
+def _messages_from_turns(raw: Any) -> Optional[list[dict]]:
+    """Structured turns -> template-shaped messages, with all markers built by assemble.py.
+
+    This replaced asking the generator for the finished marker string, which it got wrong in 88 of 108
+    published records. Anything the assembler cannot build correctly is dropped with a specific reason
+    rather than patched.
+    """
+    try:
+        return build_messages(raw)
+    except AssemblyError as exc:
+        _drop(f"assembly:{str(exc)[:60]}")
+        return None
+    except Exception as exc:  # noqa: BLE001
+        _drop(f"assembly_error:{type(exc).__name__}")
         return None
 
 
@@ -231,7 +249,10 @@ def _markers_ok(msgs: list[dict], expect: Optional[list[str]]) -> Optional[bool]
             for m in _MARKER_RE.findall(msg.get("content") or "")]
     if not seen:
         return None
-    return all(list(pair) == list(expect) for pair in seen)
+    # Satisfied if ANY answering turn uses the required pair. Requiring every turn was wrong: a conversation
+    # that reads English material and then takes Pidgin follow-ups legitimately has several directions, and
+    # io_direction names the primary pattern, not a constraint on every turn.
+    return any(list(pair) == list(expect) for pair in seen)
 
 
 _SYSTEM_PREAMBLE = ("You are a helpful multilingual assistant for West African language speakers. "
@@ -298,9 +319,14 @@ def _to_record(seed: Seed, resp: Response) -> Optional[dict]:
         return {**base, "genre": md.get("genre", ""), "title": (data.get("title") or "").strip(), "text": text}
 
     if seed.kind == "sft":
-        msgs = _clean_messages(data.get("messages"))
+        # `turns` is the current contract (structured fields); `messages` is the legacy pre-assembled shape,
+        # still accepted so old batch output can be post-processed.
+        if data.get("turns") is not None:
+            msgs = _messages_from_turns(data["turns"])
+        else:
+            msgs = _clean_messages(data.get("messages"))
         if msgs is None:
-            _drop("messages_malformed")
+            _drop("messages_malformed") if data.get("turns") is None else None
             return None
         if not _validate_conversation(msgs, seed, ends_with="assistant", md=md):
             return None
@@ -320,9 +346,12 @@ def _to_record(seed: Seed, resp: Response) -> Optional[dict]:
                 "messages": msgs, "text": render_messages(msgs), **_flatten(msgs)}
 
     # rl
-    msgs = _clean_messages(data.get("prompt_messages"))
+    if data.get("prompt_turns") is not None:
+        msgs = _messages_from_turns(data["prompt_turns"])
+    else:
+        msgs = _clean_messages(data.get("prompt_messages"))
     if msgs is None:
-        _drop("prompt_messages_malformed")
+        _drop("prompt_messages_malformed") if data.get("prompt_turns") is None else None
         return None
     if not _validate_conversation(msgs, seed, ends_with="user", md=md):
         return None

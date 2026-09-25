@@ -161,14 +161,19 @@ def test_prompt_building_is_deterministic_and_covers_the_taxonomy(seeds):
     assert len(pairs) == 200
 
 
-def test_thinking_is_english_and_task_plan_is_a_plan(seeds):
+def test_the_contract_asks_for_fields_not_marker_strings(seeds):
+    """The generator got the finished marker string wrong in 88 of 108 published records, so it is no longer
+    asked for one: it returns fields and assemble.py builds the scaffolding."""
     req = build_request(seeds["sft"], {"custom_id": "sft__fon__tool_search_answer__000003",
                                        "lang": "fon", "task": "tool_search_answer", "index": 3})
     brief = req.messages[0]["content"]
-    assert "<think> IS ALWAYS IN ENGLISH" in brief
-    assert "never in Fon" in brief
-    assert "<task_plan> is a PLAN, not a label" in brief
-    assert "ALWAYS in Fon" in brief  # the response, unlike the thinking
+    assert "OUTPUT CONTRACT" in brief
+    assert "never write <|input_lang|>" in brief
+    assert "ALWAYS IN ENGLISH" in brief              # think
+    assert "OMIT IT for simple turns" in brief       # think is optional, saving tokens
+    assert "PLAIN TEXT" in brief
+    # the old string-template instructions must be gone
+    assert "<|input_lang|><__LANG__>" not in brief
 
 
 def test_distractors_are_withheld_from_the_generator(seeds):
@@ -486,7 +491,10 @@ def test_think_is_allowed_before_and_after_tool_use(seeds):
     brief = build_request(seeds["sft"], {"custom_id": "sft__yor__tool_search_answer__000001",
                                         "lang": "yor", "task": "tool_search_answer", "index": 1}
                           ).messages[0]["content"]
-    assert "BEFORE a tool call" in brief and "AGAIN after the result" in brief
+    # a tool round trip is two assistant turns, and the second gets its own think
+    assert "takes ANOTHER turn" in brief and "fresh `think`" in brief
+    # and the plan belongs on the calling turn, which 114 of 108 records got wrong
+    assert "a tool-calling turn has one too" in brief
 
 
 def test_packing_shares_one_system_prompt_and_preserves_order(seeds):
