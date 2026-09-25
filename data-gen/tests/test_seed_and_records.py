@@ -326,9 +326,12 @@ def test_tool_conversations_get_more_room(seeds):
     """A tool call is an assistant turn and its result a tool turn, so the same number of exchanges is twice
     the raw messages. Tool samples get 6 user turns and a higher total bound; non-tool samples stay tight."""
     conv = seeds["sft"].conversation
-    assert conv["max_user_turns"] == 5 and conv["max_user_turns_with_tools"] == 6
+    # 6-16 messages overall; tool conversations get more dialogue turns and a higher total bound, since a
+    # call is an assistant turn and its result a tool turn.
+    assert conv["min_messages"] == 6 and conv["max_messages"] == 16
+    assert conv["max_user_turns"] == 6 and conv["max_user_turns_with_tools"] == 8
     assert conv["max_total_messages"] < conv["max_total_messages_with_tools"]
-    assert conv["target_messages_with_tools"] == [12, 16]
+    assert conv["target_messages_with_tools"] == [10, 16]
 
     md = {"kind": "sft", "lang": "yor", "tasks": [], "tags": [], "tools": ["search_internet"]}
 
@@ -346,10 +349,9 @@ def test_tool_conversations_get_more_room(seeds):
                                     "<|target_lang|><yor><response>a"})
         return {"messages": msgs, "tasks": [], "tags": [], "confidence": 0.9}
 
-    # 6 user turns WITH tools = 24 raw messages: allowed on turns, caught by the total bound
     assert to_record(seeds["sft"], _resp("t1", convo(5, True), md)) is not None
-    # 6 user turns WITHOUT tools exceeds max_user_turns (5)
-    assert to_record(seeds["sft"], _resp("t2", convo(6, False), md)) is None
+    # 7 user turns WITHOUT tools exceeds max_user_turns (6)
+    assert to_record(seeds["sft"], _resp("t2", convo(7, False), md)) is None
     # 3 user turns, no tools, is the compact shape
     assert to_record(seeds["sft"], _resp("t3", convo(3, False), md)) is not None
 
@@ -362,3 +364,115 @@ def test_reasoning_models_are_flagged(capsys):
     assert "reasoning model" in capsys.readouterr().out
     warn_if_reasoning_model("google/gemma-4-31b-it")
     assert capsys.readouterr().out == ""
+
+
+# ----------------------------------------------------------------- language direction / packing
+
+
+def test_io_directions_are_exactly_even(seeds):
+    """Sampled on its own odometer, so the distribution is exact rather than approximately even."""
+    import collections
+    for lang in ("yor", "fon"):
+        c = collections.Counter(
+            build_request(seeds["sft"], {"custom_id": f"sft__{lang}__general_chat__{i:06d}",
+                                        "lang": lang, "task": "general_chat", "index": i}
+                          ).metadata["io_direction"] for i in range(500))
+        assert len(c) == 5, c
+        assert max(c.values()) == min(c.values()) == 100, c
+
+
+def test_io_direction_survives_the_domain_odometer(seeds):
+    """The pair/genre odometer laps every 17,808 rows and 17,808 mod 5 = 3, coprime with 5, so a fixed
+    (domain, genre) still sees all five directions rather than locking to one."""
+    seen = set()
+    for lap in range(6):
+        i = lap * 636          # same domain pair every lap for sft (no genre dimension)
+        md = build_request(seeds["sft"], {"custom_id": f"sft__ibo__general_chat__{i:06d}",
+                                         "lang": "ibo", "task": "general_chat", "index": i}).metadata
+        seen.add(md["io_direction"])
+    assert len(seen) >= 3, seen
+
+
+def test_expected_markers_match_the_direction(seeds):
+    want = {"native_native": ["yor", "yor"], "english_english": ["eng", "eng"],
+            "english_to_native": ["eng", "yor"], "native_to_english": ["yor", "eng"]}
+    for i in range(60):
+        md = build_request(seeds["sft"], {"custom_id": f"sft__yor__general_chat__{i:06d}",
+                                        "lang": "yor", "task": "general_chat", "index": i}).metadata
+        d = md["io_direction"]
+        if d in want:
+            assert md["expect_markers"] == want[d], (d, md["expect_markers"])
+        else:  # crosslingual: other language in, target out, and never English on either side
+            assert md["expect_markers"][1] == "yor"
+            assert md["expect_markers"][0] not in ("eng", "yor")
+
+
+def test_rag_context_is_specified_as_english(seeds):
+    rag = next(t for t in seeds["sft"].tasks if t.name == "rag_document_qa")
+    assert "ALWAYS IN ENGLISH" in rag.description
+    req = build_request(seeds["sft"], {"custom_id": "sft__fon__rag_document_qa__000001",
+                                      "lang": "fon", "task": "rag_document_qa", "index": 1})
+    assert "ALWAYS IN ENGLISH" in req.messages[0]["content"]
+
+
+def test_think_is_allowed_before_and_after_tool_use(seeds):
+    brief = build_request(seeds["sft"], {"custom_id": "sft__yor__tool_search_answer__000001",
+                                        "lang": "yor", "task": "tool_search_answer", "index": 1}
+                          ).messages[0]["content"]
+    assert "BEFORE a tool call" in brief and "AGAIN after the result" in brief
+
+
+def test_packing_shares_one_system_prompt_and_preserves_order(seeds):
+    """The whole point of packing is paying the ~1,200-token system prompt once."""
+    from prompts import build_packed_request
+    rows = [{"custom_id": f"sft__hau__general_chat__{i:06d}", "lang": "hau",
+             "task": "general_chat", "index": i} for i in range(4)]
+    packed = build_packed_request(seeds["sft"], rows)
+    singles = [build_request(seeds["sft"], r) for r in rows]
+    assert packed.messages[0]["content"] == singles[0].messages[0]["content"]
+    assert packed.metadata["custom_ids"] == [r["custom_id"] for r in rows]
+    assert len(packed.metadata["members"]) == 4
+    body = packed.messages[1]["content"]
+    for i in range(1, 5):
+        assert f"SAMPLE {i} of 4" in body
+    # packing one request must cost less than four separate ones
+    assert len(body) + len(packed.messages[0]["content"]) < sum(
+        len(m["content"]) for s in singles for m in s.messages)
+
+
+def test_packing_refuses_mixed_languages(seeds):
+    from prompts import build_packed_request
+    with pytest.raises(ValueError, match="single-language"):
+        build_packed_request(seeds["sft"], [
+            {"custom_id": "a", "lang": "yor", "task": "general_chat", "index": 0},
+            {"custom_id": "b", "lang": "hau", "task": "general_chat", "index": 1}])
+
+
+def test_packed_response_splits_into_records(seeds):
+    from postprocess_gen import to_records
+    from prompts import build_packed_request
+    rows = [{"custom_id": f"sft__yor__general_chat__{i:06d}", "lang": "yor",
+             "task": "general_chat", "index": i} for i in range(2)]
+    packed = build_packed_request(seeds["sft"], rows)
+    payload = {"samples": [_sft_payload(), _sft_payload()]}
+    recs = to_records(seeds["sft"], Response(packed.custom_id, json.dumps(payload), True,
+                                            metadata=packed.metadata))
+    assert len(recs) == 2
+    assert [r["id"] for r in recs] == [r["custom_id"] for r in rows]
+    assert {r["lang"] for r in recs} == {"yor"}
+
+
+def test_a_pack_that_loses_ordering_is_discarded(seeds):
+    """More samples than specs means the model lost track and nothing can be trusted to match its spec."""
+    from postprocess_gen import to_records
+    from prompts import build_packed_request
+    rows = [{"custom_id": f"sft__yor__general_chat__{i:06d}", "lang": "yor",
+             "task": "general_chat", "index": i} for i in range(2)]
+    packed = build_packed_request(seeds["sft"], rows)
+    too_many = {"samples": [_sft_payload()] * 3}
+    assert to_records(seeds["sft"], Response("x", json.dumps(too_many), True,
+                                            metadata=packed.metadata)) == []
+    # a SHORT pack is salvaged: take what lined up
+    short = {"samples": [_sft_payload()]}
+    assert len(to_records(seeds["sft"], Response("y", json.dumps(short), True,
+                                                 metadata=packed.metadata))) == 1

@@ -1,7 +1,7 @@
 {
   "kind": "sft",
   "version": 1,
-  "details": "The target model is SabiYarn, a ~306M-parameter mixture-of-experts causal LM for 12 West African languages\nplus English. It is SMALL. It cannot and must not be expected to memorise the world's facts.\n\nThe goal is a model with solid general understanding of the world -- how physical things work, how people\nand institutions behave, basic health, basic technology -- plus two learned reflexes:\n\n  1. THINK FIRST. When a question arrives, reason briefly inside <think>...</think> about what is being\n     asked, whether it already knows, and what it would need in order to answer.\n  2. USE TOOLS, OR SAY YOU CANNOT. If it lacks the knowledge and a suitable tool exists, call the tool,\n     read the result, and answer from it. If no suitable tool exists, say plainly that it does not know\n     and is not connected to a knowledge source. If a tool ran but the result does not actually answer\n     the question, say THAT, rather than inventing an answer from the irrelevant result.\n\nThe canonical example. Asked \"what is AWS?\", a well-trained SabiYarn should NOT recite a memorised\ndefinition. It should think along the lines of \"I have not come across this before; it looks like a\ntechnical product name; I should look it up\", then call search_internet with a query like \"what is AWS\",\nread the returned snippet, and answer from it in the user's language. With no search tool available, the\ncorrect behaviour is to say it does not know and cannot look it up right now.\n\nAim for the register of a bright, curious 16-year-old: confident about everyday things, honest about what\nit has not learned, and quick to look something up rather than bluff. Never sycophantic, never padded.\nConfabulation is the single worst failure mode; admitting ignorance is always preferred to a plausible\ninvention, and the training data must make that trade-off visible over and over.\n\nTHIS PHASE: supervised fine-tuning conversations. Each sample is a multi-turn conversation of 6-10 messages\nending in an assistant message, mixing 2-4 different tasks and changing subject at least once.\n\nConversations are serialized twice and BOTH are kept: (a) `messages`, a list of role/content dicts, and\n(b) `text`, the exact string the SabiYarn chat template renders from it. The dict form is the source of\ntruth; the text form is what training consumes, and keeping both means a template change is a re-render\nrather than a regeneration.\n\nTool use is the centrepiece. RAG is NOT a context-stuffing exercise -- it is modelled as a tool call: the\nassistant emits a search_documents call with a query it composes itself, receives passages back as a tool\nresult message, and answers from those. The model must learn the whole loop, including the loop failing.\n\nEvery sample is tagged with `lang` and one or more task tags, so the mix can be audited and slices held out.\n\nThe hardest and most important quality bar: the assistant must be visibly honest about the edge of its\nknowledge. Roughly a quarter of all exchanges are about exactly that -- looking something up, admitting it\ncannot, or noticing that what came back does not answer the question.",
+  "details": "The target model is SabiYarn, a ~306M-parameter mixture-of-experts causal LM for 12 West African languages\nplus English. It is SMALL. It cannot and must not be expected to memorise the world's facts.\n\nThe goal is a model with solid general understanding of the world -- how physical things work, how people\nand institutions behave, basic health, basic technology -- plus two learned reflexes:\n\n  1. THINK FIRST. When a question arrives, reason briefly inside <think>...</think> about what is being\n     asked, whether it already knows, and what it would need in order to answer.\n  2. USE TOOLS, OR SAY YOU CANNOT. If it lacks the knowledge and a suitable tool exists, call the tool,\n     read the result, and answer from it. If no suitable tool exists, say plainly that it does not know\n     and is not connected to a knowledge source. If a tool ran but the result does not actually answer\n     the question, say THAT, rather than inventing an answer from the irrelevant result.\n\nThe canonical example. Asked \"what is AWS?\", a well-trained SabiYarn should NOT recite a memorised\ndefinition. It should think along the lines of \"I have not come across this before; it looks like a\ntechnical product name; I should look it up\", then call search_internet with a query like \"what is AWS\",\nread the returned snippet, and answer from it in the user's language. With no search tool available, the\ncorrect behaviour is to say it does not know and cannot look it up right now.\n\nAim for the register of a bright, curious 16-year-old: confident about everyday things, honest about what\nit has not learned, and quick to look something up rather than bluff. Never sycophantic, never padded.\nConfabulation is the single worst failure mode; admitting ignorance is always preferred to a plausible\ninvention, and the training data must make that trade-off visible over and over.\n\nTHIS PHASE: supervised fine-tuning conversations. Each sample is a multi-turn conversation of 6-10 messages\nending in an assistant message, mixing 2-4 different tasks and changing subject at least once.\n\nConversations are serialized twice and BOTH are kept: (a) `messages`, a list of role/content dicts, and\n(b) `text`, the exact string the SabiYarn chat template renders from it. The dict form is the source of\ntruth; the text form is what training consumes, and keeping both means a template change is a re-render\nrather than a regeneration.\n\nTool use is the centrepiece. RAG is NOT a context-stuffing exercise -- it is modelled as a tool call: the\nassistant emits a search_documents call with a query it composes itself, receives passages back as a tool\nresult message, and answers from those. The model must learn the whole loop, including the loop failing.\n\nEvery sample is tagged with `lang` and one or more task tags, so the mix can be audited and slices held out.\n\nLANGUAGE DIRECTION. Each sample also carries an `io_direction`, distributed EXACTLY evenly across every task:\nnative->native, English->English, English->native, native->English, and cross-lingual (one African language\nin, another out). This matters because the deployed model will be asked to read English and answer in Yoruba\nat least as often as it is asked to work wholly within one language, and because retrieved context for these\nlanguages is realistically English whatever the user writes in. A corpus that only ever works within one\nlanguage teaches a model that cannot do the job.\n\nThe hardest and most important quality bar: the assistant must be visibly honest about the edge of its\nknowledge. Roughly a quarter of all exchanges are about exactly that -- looking something up, admitting it\ncannot, or noticing that what came back does not answer the question.",
   "target_model": {
     "name": "SabiYarn",
     "params": "306M",
@@ -164,7 +164,7 @@
         "extractive-qa",
         "tool-calling"
       ],
-      "description": "A document is supplied; the user asks about it. The assistant calls search_documents with a query it composes itself, grounds its answer in the returned passages, and says where it came from. Asked something the document does not cover, it says so rather than using general knowledge.",
+      "description": "A document is supplied; the user asks about it. The assistant calls search_documents with a query it composes itself, grounds its answer in the returned passages, and says where it came from. Asked something the document does not cover, it says so rather than using general knowledge. THE RETRIEVED CONTEXT IS ALWAYS IN ENGLISH -- that is what a real retrieval corpus looks like for these languages -- so the assistant must read English passages and answer in whatever language the io_direction calls for. Its search query is in English too.",
       "share": 8.0,
       "task_plan": [
         "<|RAG|>"
@@ -1035,17 +1035,22 @@
   ],
   "conversation": {
     "min_messages": 6,
-    "max_messages": 10,
+    "max_messages": 16,
     "ends_with": "assistant",
     "min_user_turns": 3,
-    "max_user_turns": 5,
-    "max_user_turns_with_tools": 6,
-    "target_messages_with_tools": [
-      12,
+    "max_user_turns": 6,
+    "max_user_turns_with_tools": 8,
+    "target_messages": [
+      6,
       16
     ],
-    "max_total_messages": 12,
-    "max_total_messages_with_tools": 20,
+    "target_messages_with_tools": [
+      10,
+      16
+    ],
+    "max_total_messages": 16,
+    "max_total_messages_with_tools": 26,
+    "think_placement": "A <think> block may appear BEFORE a tool call (deciding which tool and what query) and AGAIN after the tool result comes back (judging whether it actually answers the question). Both are wanted: the second is where the model learns to notice a useless retrieval. A turn may also have no <think> at all when nothing needs deciding.",
     "counting": "Counts USER + ASSISTANT messages only: 6-10 means 3-5 exchanges. Tool-call turns and their role='tool' results are plumbing and do not count, so a tool-heavy conversation is longer in raw messages -- `max_total_messages` bounds that so a runaway is still caught.",
     "task_mix_per_conversation": [
       2,
@@ -1054,7 +1059,34 @@
     "theme_drift": "A conversation should change subject at least once -- that is what teaches the model to track context rather than answer in isolation.",
     "system_prompt": "Present in ~70% of conversations; carries the tool catalogue as a JSON block. The remaining 30% have no system prompt and no tools, which is where no_tool_admit_unknown lives.",
     "think_policy": "Open with <think>...</think> whenever the turn involves a tool, a judgement about whether the assistant knows something, or triage. Skip it for simple chat and labelling -- a model that thinks about everything is as badly calibrated as one that never does.",
-    "language_policy": "The whole conversation is in one language unless the task is translation or cross-lingual summarisation. The assistant always replies in the language the user wrote in."
+    "language_policy": "The whole conversation is in one language unless the task is translation or cross-lingual summarisation. The assistant always replies in the language the user wrote in.",
+    "io_directions": [
+      {
+        "key": "native_native",
+        "weight": 1.0,
+        "brief": "Everything is in {lang}: the user writes {lang}, the assistant answers in {lang}. <|input_lang|> and <|target_lang|> are both <{code}>."
+      },
+      {
+        "key": "english_english",
+        "weight": 1.0,
+        "brief": "Everything is in English: the user writes English and the assistant answers in English. <|input_lang|> and <|target_lang|> are both <eng>. This keeps the model's English alive and is the case where its world knowledge is most exposed."
+      },
+      {
+        "key": "english_to_native",
+        "weight": 1.0,
+        "brief": "The material and the instruction are in ENGLISH, but the user explicitly asks for the answer in {lang} -- e.g. an English passage with 'summarise this in {lang}'. <|input_lang|> is <eng> and <|target_lang|> is <{code}>. The assistant's <response> must be {lang}."
+      },
+      {
+        "key": "native_to_english",
+        "weight": 1.0,
+        "brief": "The material and instruction are in {lang}, and the user asks for the answer in ENGLISH. <|input_lang|> is <{code}> and <|target_lang|> is <eng>. The assistant's <response> must be English."
+      },
+      {
+        "key": "crosslingual",
+        "weight": 1.0,
+        "brief": "The material is in {other_name} and the user asks for the answer in {lang} -- neither is English. <|input_lang|> is <{other_code}> and <|target_lang|> is <{code}>. This is the direction no public corpus covers and the hardest one."
+      }
+    ]
   },
   "tags": [
     "tool-calling",

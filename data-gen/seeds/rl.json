@@ -164,7 +164,7 @@
         "extractive-qa",
         "tool-calling"
       ],
-      "description": "A document is supplied; the user asks about it. The assistant calls search_documents with a query it composes itself, grounds its answer in the returned passages, and says where it came from. Asked something the document does not cover, it says so rather than using general knowledge.",
+      "description": "A document is supplied; the user asks about it. The assistant calls search_documents with a query it composes itself, grounds its answer in the returned passages, and says where it came from. Asked something the document does not cover, it says so rather than using general knowledge. THE RETRIEVED CONTEXT IS ALWAYS IN ENGLISH -- that is what a real retrieval corpus looks like for these languages -- so the assistant must read English passages and answer in whatever language the io_direction calls for. Its search query is in English too.",
       "share": 13.0,
       "task_plan": [
         "<|RAG|>"
@@ -854,17 +854,22 @@
   ],
   "conversation": {
     "min_messages": 6,
-    "max_messages": 10,
+    "max_messages": 16,
     "ends_with": "assistant",
     "min_user_turns": 3,
-    "max_user_turns": 5,
-    "max_user_turns_with_tools": 6,
-    "target_messages_with_tools": [
-      12,
+    "max_user_turns": 6,
+    "max_user_turns_with_tools": 8,
+    "target_messages": [
+      6,
       16
     ],
-    "max_total_messages": 12,
-    "max_total_messages_with_tools": 20,
+    "target_messages_with_tools": [
+      10,
+      16
+    ],
+    "max_total_messages": 16,
+    "max_total_messages_with_tools": 26,
+    "think_placement": "A <think> block may appear BEFORE a tool call (deciding which tool and what query) and AGAIN after the tool result comes back (judging whether it actually answers the question). Both are wanted: the second is where the model learns to notice a useless retrieval. A turn may also have no <think> at all when nothing needs deciding.",
     "counting": "Counts USER + ASSISTANT messages only: 6-10 means 3-5 exchanges. Tool-call turns and their role='tool' results are plumbing and do not count, so a tool-heavy conversation is longer in raw messages -- `max_total_messages` bounds that so a runaway is still caught.",
     "task_mix_per_conversation": [
       2,
@@ -874,7 +879,34 @@
     "system_prompt": "Present in ~70% of conversations; carries the tool catalogue as a JSON block. The remaining 30% have no system prompt and no tools, which is where no_tool_admit_unknown lives.",
     "think_policy": "Open with <think>...</think> whenever the turn involves a tool, a judgement about whether the assistant knows something, or triage. Skip it for simple chat and labelling -- a model that thinks about everything is as badly calibrated as one that never does.",
     "language_policy": "The whole conversation is in one language unless the task is translation or cross-lingual summarisation. The assistant always replies in the language the user wrote in.",
-    "responses_per_prompt": 3
+    "responses_per_prompt": 3,
+    "io_directions": [
+      {
+        "key": "native_native",
+        "weight": 1.0,
+        "brief": "Everything is in {lang}: the user writes {lang}, the assistant answers in {lang}. <|input_lang|> and <|target_lang|> are both <{code}>."
+      },
+      {
+        "key": "english_english",
+        "weight": 1.0,
+        "brief": "Everything is in English: the user writes English and the assistant answers in English. <|input_lang|> and <|target_lang|> are both <eng>. This keeps the model's English alive and is the case where its world knowledge is most exposed."
+      },
+      {
+        "key": "english_to_native",
+        "weight": 1.0,
+        "brief": "The material and the instruction are in ENGLISH, but the user explicitly asks for the answer in {lang} -- e.g. an English passage with 'summarise this in {lang}'. <|input_lang|> is <eng> and <|target_lang|> is <{code}>. The assistant's <response> must be {lang}."
+      },
+      {
+        "key": "native_to_english",
+        "weight": 1.0,
+        "brief": "The material and instruction are in {lang}, and the user asks for the answer in ENGLISH. <|input_lang|> is <{code}> and <|target_lang|> is <eng>. The assistant's <response> must be English."
+      },
+      {
+        "key": "crosslingual",
+        "weight": 1.0,
+        "brief": "The material is in {other_name} and the user asks for the answer in {lang} -- neither is English. <|input_lang|> is <{other_code}> and <|target_lang|> is <{code}>. This is the direction no public corpus covers and the hardest one."
+      }
+    ]
   },
   "tags": [
     "tool-calling",

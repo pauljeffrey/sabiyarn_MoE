@@ -35,6 +35,31 @@ def _lang_offset(lang: str) -> int:
     return int(hashlib.sha256(lang.encode()).hexdigest()[:8], 16)
 
 
+def _io_direction(seed: Seed, lang: str, index: int, rng: random.Random) -> dict:
+    """Pick the input/output language pattern on its own odometer.
+
+    `index` advances by 1 per row for a fixed (lang, task), so stepping through a 5-element list gives an
+    EXACTLY even distribution rather than an approximately even one. It also stays independent of the
+    domain/genre odometer: that one laps every 17,808 rows and 17,808 mod 5 = 3, which is coprime with 5, so
+    a given (domain, genre) still sees all five directions.
+    """
+    dirs = seed.conversation.get("io_directions") or [{"key": "native_native", "brief": "Everything in {lang}."}]
+    d = dict(dirs[(index + _lang_offset(lang)) % len(dirs)])
+    others = [l for l in seed.languages if l.code not in (lang, "eng")]
+    other = rng.choice(others) if others else None
+    me = _lang_spec(seed, lang)
+    d["brief"] = (d["brief"].replace("{lang}", me.name).replace("{code}", me.code)
+                  .replace("{other_name}", other.name if other else "Hausa")
+                  .replace("{other_code}", other.code if other else "hau"))
+    d["other"] = other.code if other else None
+    # the language tags the assistant's markers must carry, so compliance can be measured
+    expect = {"native_native": (me.code, me.code), "english_english": ("eng", "eng"),
+              "english_to_native": ("eng", me.code), "native_to_english": (me.code, "eng"),
+              "crosslingual": (d["other"] or "hau", me.code)}
+    d["expect_markers"] = list(expect.get(d["key"], (me.code, me.code)))
+    return d
+
+
 def _lang_spec(seed: Seed, code: str):
     return next(l for l in seed.languages if l.code == code)
 
@@ -138,7 +163,11 @@ SPECIAL TOKEN FORMAT (the target model's own vocabulary -- use these EXACTLY):
     <|input_lang|><__LANG__><think>{short reasoning}</think><task_plan>{verbs}</task_plan><|target_lang|><__LANG__><response>{the answer}
 - An assistant turn that CALLS A TOOL emits NO <response>. Put the call in `tool_calls` (JSON), and its
   content is:  <|input_lang|><__LANG__><think>{why this tool, and this query}</think>
-- A tool result is a separate message with role "tool" and the tool's `name` set.
+- A tool result is a separate message with role "tool" and the tool's `name` set. Retrieved/search context in
+  a tool result is ALWAYS IN ENGLISH, whatever language the conversation is in.
+- <think> may appear BEFORE a tool call (which tool, what query) and AGAIN after the result comes back
+  (does this actually answer the question?). Both are wanted; the second is where the model learns to notice a
+  useless retrieval. A turn that needs no decision may have no <think> at all.
 - <think> IS ALWAYS IN ENGLISH, never in __LANGUAGE_NAME__, whatever language the conversation is in. It is
   the model's private scratchpad: 1-3 short English sentences reasoning about what is being asked, whether it
   already knows, and what it would need. Never a restatement of the question.
@@ -170,6 +199,7 @@ def _sft_like_request(seed: Seed, row: dict, *, rl: bool) -> Request:
     extra = rng.sample(others, k=min(len(others), rng.randint(1, 3)))
     tasks = [task] + extra
     domain, subtopic, _ = _coverage_pick(lang.code, row["index"])
+    io = _io_direction(seed, lang.code, row["index"], rng)
 
     needs_tools = any(t.uses_tools for t in tasks)
     if needs_tools:
@@ -264,7 +294,11 @@ Return JSON:
   "tasks": [...], "tags": [...],
   "confidence": <float 0-1: your honest estimate that the ranking is right and the text is fluent {lang_name}>}}"""
 
-    user = f"""Conversation language: {lang.name}. Everything the user and assistant say is in {lang.name}.
+    user = f"""LANGUAGE DIRECTION for this conversation -- {io['key']}:
+{io['brief']}
+Set <|input_lang|> to <{io['expect_markers'][0]}> and <|target_lang|> to <{io['expect_markers'][1]}> on every
+assistant turn that produces a <response>. Where the two differ, that difference is the point of the sample:
+the user asks in one language for an answer in another, and the assistant complies.
 
 Tasks this conversation must cover (mix them, change subject at least once):
 {task_lines}
@@ -301,7 +335,9 @@ Hard requirements:
                   "tasks": [t.name for t in tasks], "tags": sorted({g for t in tasks for g in t.tags}),
                   "tools": tool_names, "distractor_tools": distractors,
                   "tool_definitions": _tool_defs(seed, tool_names),
-                  "domain": domain, "subtopic": subtopic, "n_user_turns": n_user},
+                  "domain": domain, "subtopic": subtopic, "n_user_turns": n_user,
+                  "io_direction": io["key"], "io_other_lang": io["other"],
+                  "expect_markers": io["expect_markers"]},
     )
 
 
@@ -309,3 +345,56 @@ def build_request(seed: Seed, row: dict) -> Request:
     if seed.kind == "pretrain":
         return _pretrain_request(seed, row)
     return _sft_like_request(seed, row, rl=(seed.kind == "rl"))
+
+
+# ---------------------------------------------------------------------------------------- packing
+#
+# One request, several conversations. The system prompt -- seed brief, format rules, tool catalogue -- is
+# ~1,200 tokens and identical for every row of the same (kind, language). Asking for N conversations in one
+# call pays that once instead of N times, which is what turns a 1,000-request/day free tier into 1,000 x N
+# samples/day. The ceiling is output length, not context: gemma-4 has 262k of context but a single completion
+# has to hold all N conversations, so N trades throughput against truncation. Sweep it (scripts/sweep_pack.py)
+# rather than guessing.
+
+
+def build_packed_request(seed: Seed, rows: list[dict]) -> Request:
+    """One Request carrying `len(rows)` independent conversation specs. Rows must share a language."""
+    if not rows:
+        raise ValueError("no rows")
+    langs = {r["lang"] for r in rows}
+    if len(langs) != 1:
+        raise ValueError(f"a packed request must be single-language, got {sorted(langs)}")
+    singles = [_sft_like_request(seed, r, rl=(seed.kind == "rl")) for r in rows]
+    system = singles[0].messages[0]["content"]          # identical by construction; this is the whole point
+
+    specs = []
+    for i, (row, req) in enumerate(zip(rows, singles), start=1):
+        # Keep each spec's own body, minus the generic shape instructions that now apply to all of them.
+        body = req.messages[1]["content"]
+        specs.append(f"=================== SAMPLE {i} of {len(rows)} ===================\n{body}")
+
+    kind_key = "samples"
+    user = (
+        f"You will produce {len(rows)} INDEPENDENT samples in one reply. They share nothing: different tasks, "
+        f"different domains, different language directions, different tool sets. Do not let them echo each "
+        f"other -- no repeated openings, no reused names, numbers or examples across samples. A reader must not "
+        f"be able to tell they were written together.\n\n"
+        + "\n\n".join(specs)
+        + f"\n\n=================== OUTPUT ===================\n"
+        f'Return strict JSON: {{"{kind_key}": [ ... {len(rows)} objects, in the order given above ... ]}}\n'
+        f"Each object has exactly the shape described in its own SAMPLE block. If you cannot complete a "
+        f"sample properly, still emit an object for it with an empty messages list rather than shifting the "
+        f"others out of order."
+    )
+    return Request(
+        custom_id="pack__" + "|".join(r["custom_id"] for r in rows),
+        messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
+        # Output is the binding constraint: each conversation runs 700-2,500 tokens.
+        max_tokens=min(60000, 3000 * len(rows) + 1000),
+        temperature=0.95, top_p=0.95,
+        response_format={"type": "json_object"},
+        tools=singles[0].tools,
+        metadata={"packed": True, "kind": seed.kind, "lang": rows[0]["lang"],
+                  "members": [r.metadata for r in singles],
+                  "custom_ids": [r["custom_id"] for r in rows]},
+    )

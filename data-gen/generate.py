@@ -135,7 +135,7 @@ class ShardWriter:
 def run(kind: str, provider_name: str, *, model: Optional[str] = None, langs: Optional[list[str]] = None,
         limit: int = 0, batch: bool = False, dry_run: bool = False, concurrency: int = 16,
         push: bool = False, repo_id: str = "BeardedMonster/data-gen", seed_path: Optional[str] = None,
-        shuffle: bool = True, run_tag: Optional[str] = None) -> int:
+        shuffle: bool = True, run_tag: Optional[str] = None, pack: int = 1) -> int:
     seed = Seed.load(seed_path or kind)
     ns = namespace(kind, run_tag)
     rows = list(plan_rows(seed, langs))
@@ -164,7 +164,18 @@ def run(kind: str, provider_name: str, *, model: Optional[str] = None, langs: Op
         print("nothing to do")
         return 0
 
-    requests = [build_request(seed, r) for r in todo]
+    if pack > 1:
+        # Pack only rows that share a language: the shared system prompt is per (kind, language), and mixing
+        # languages in one request would both break that and invite cross-contamination between samples.
+        from prompts import build_packed_request
+        by_lang: dict[str, list[dict]] = {}
+        for r in todo:
+            by_lang.setdefault(r["lang"], []).append(r)
+        requests = [build_packed_request(seed, group[i:i + pack])
+                    for group in by_lang.values() for i in range(0, len(group), pack)]
+        print(f"  packed {len(todo):,} samples into {len(requests):,} requests ({pack}/request)")
+    else:
+        requests = [build_request(seed, r) for r in todo]
 
     if dry_run:
         for req in requests[:3]:
@@ -179,22 +190,22 @@ def run(kind: str, provider_name: str, *, model: Optional[str] = None, langs: Op
     shard_tag = (f"w{os.environ['DATA_GEN_SHARD_INDEX']}-{uuid.uuid4().hex[:6]}"
                  if os.environ.get("DATA_GEN_SHARDS", "1") != "1" else None)
     writer = ShardWriter(ns, shard_tag)
-    from postprocess_gen import to_record  # imported late: needs the tokenizer only on the live path
+    from postprocess_gen import to_records  # imported late: needs the tokenizer only on the live path
 
     kept = failed = 0
     t0 = time.time()
 
     def handle(resp: Response) -> None:
         nonlocal kept, failed
+        n_expected = len((resp.metadata or {}).get("custom_ids", [])) or 1
         if not resp.ok:
-            failed += 1
+            failed += n_expected
             return
-        rec = to_record(seed, resp)
-        if rec is None:
-            failed += 1
-            return
-        writer.write(rec["lang"], rec)
-        kept += 1
+        recs = to_records(seed, resp)
+        for rec in recs:
+            writer.write(rec["lang"], rec)
+        kept += len(recs)
+        failed += max(0, n_expected - len(recs))
 
     if batch:
         if not provider.supports_batch:
@@ -266,6 +277,10 @@ def main() -> int:
     ap.add_argument("--push", action="store_true", help="push shards to the Hub when done")
     ap.add_argument("--repo-id", default="BeardedMonster/data-gen")
     ap.add_argument("--seed-path", default=None)
+    ap.add_argument("--pack", type=int, default=1,
+                    help="conversations per request. >1 amortises the ~1,200-token shared system prompt, "
+                         "which is what makes a 1,000-request/day free tier useful. Sweep it with "
+                         "scripts/sweep_pack.py rather than guessing.")
     ap.add_argument("--run-tag", default=None,
                     help="namespace local shards (e.g. the model name) so several models can generate the "
                          "same plan rows independently and nothing is overwritten")
@@ -275,7 +290,7 @@ def main() -> int:
         return fetch(a.kind, a.provider, a.fetch, a.model, a.push, a.repo_id)
     return run(a.kind, a.provider, model=a.model, langs=langs, limit=a.limit, batch=a.batch,
                dry_run=a.dry_run, concurrency=a.concurrency, push=a.push, repo_id=a.repo_id,
-               seed_path=a.seed_path, run_tag=a.run_tag)
+               seed_path=a.seed_path, run_tag=a.run_tag, pack=a.pack)
 
 
 if __name__ == "__main__":

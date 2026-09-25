@@ -153,6 +153,24 @@ def _flatten(msgs: list[dict]) -> dict[str, str]:
             "context": ctx, "response": _assistant_parts((last_asst or {}).get("content", ""))["response"]}
 
 
+_MARKER_RE = re.compile(r"<\|input_lang\|><([a-z]{2,4})>.*?<\|target_lang\|><([a-z]{2,4})>", re.S)
+
+
+def _markers_ok(msgs: list[dict], expect: Optional[list[str]]) -> Optional[bool]:
+    """Did the assistant set <|input_lang|>/<|target_lang|> to the pair the io_direction called for?
+
+    Recorded rather than enforced: a mislabelled direction is bad data, but measuring compliance first tells
+    us whether to filter on it or fix the prompt. compare_models.py reports the rate.
+    """
+    if not expect:
+        return None
+    seen = [m for msg in msgs if msg["role"] == "assistant"
+            for m in _MARKER_RE.findall(msg.get("content") or "")]
+    if not seen:
+        return None
+    return all(list(pair) == list(expect) for pair in seen)
+
+
 def _tags(raw: Any, fallback: list[str]) -> list[str]:
     got = [t for t in (raw or []) if t in TAGS]
     return sorted(set(got) | set(fallback)) or list(fallback)
@@ -179,6 +197,7 @@ def _to_record(seed: Seed, resp: Response) -> Optional[dict]:
     except (TypeError, ValueError):
         conf = None
     base = {"id": resp.custom_id, "lang": md.get("lang", ""), "confidence": conf,
+            "io_direction": md.get("io_direction"),
             "model": resp.model, "domain": md.get("domain", ""), "subtopic": md.get("subtopic", "")}
 
     if seed.kind == "pretrain":
@@ -203,8 +222,9 @@ def _to_record(seed: Seed, resp: Response) -> Optional[dict]:
             return None
         return {**base, "tags": _tags(data.get("tags"), md.get("tags", [])),
                 "tasks": data.get("tasks") or md.get("tasks", []),
-                "tools": md.get("tools", []), "messages": msgs,
-                "text": render_messages(msgs), **_flatten(msgs)}
+                "tools": md.get("tools", []), "distractor_tools": md.get("distractor_tools", []),
+                "io_markers_ok": _markers_ok(msgs, md.get("expect_markers")),
+                "messages": msgs, "text": render_messages(msgs), **_flatten(msgs)}
 
     # rl
     msgs = _clean_messages(data.get("prompt_messages"))
@@ -237,6 +257,40 @@ def _to_record(seed: Seed, resp: Response) -> Optional[dict]:
     for n in range(want):
         rec[f"response_{n + 1}"] = texts[order[n]] if n < len(order) else None
     return rec
+
+
+def to_records(seed: Seed, resp: Response) -> list[dict]:
+    """Split a packed response into one record per member. Unpacked responses give a list of 0 or 1."""
+    md = resp.metadata or {}
+    if not md.get("packed"):
+        r = to_record(seed, resp)
+        return [r] if r else []
+    data = _json(resp.text)
+    if data is None:
+        _drop("json_invalid")
+        return []
+    items = data.get("samples") or data.get("conversations") or []
+    if not isinstance(items, list):
+        _drop("pack_not_a_list")
+        return []
+    members, ids = md.get("members", []), md.get("custom_ids", [])
+    if len(items) != len(members):
+        # A short pack is salvageable -- take what lined up, count the rest -- but a long one means the model
+        # lost track of the ordering and nothing can be trusted to belong to the spec it claims.
+        _drop(f"pack_size:{len(items)}of{len(members)}")
+        if len(items) > len(members):
+            return []
+    out = []
+    for i, item in enumerate(items):
+        if i >= len(members) or not isinstance(item, dict):
+            continue
+        sub = Response(ids[i], json.dumps(item, ensure_ascii=False), True, None,
+                       resp.prompt_tokens // max(len(items), 1),
+                       resp.completion_tokens // max(len(items), 1), resp.model, None, members[i])
+        rec = to_record(seed, sub)
+        if rec:
+            out.append(rec)
+    return out
 
 
 def summary() -> str:

@@ -328,7 +328,10 @@ SFT_TASKS = [
     _task("rag_document_qa", ["rag", "extractive-qa", "tool-calling"], 8.0,
           "A document is supplied; the user asks about it. The assistant calls search_documents with a query "
           "it composes itself, grounds its answer in the returned passages, and says where it came from. "
-          "Asked something the document does not cover, it says so rather than using general knowledge.",
+          "Asked something the document does not cover, it says so rather than using general knowledge. "
+          "THE RETRIEVED CONTEXT IS ALWAYS IN ENGLISH -- that is what a real retrieval corpus looks like for "
+          "these languages -- so the assistant must read English passages and answer in whatever language "
+          "the io_direction calls for. Its search query is in English too.",
           plan=["<|RAG|>"], tools=True, think=True),
     # ---- tool families beyond retrieval
     _task("tool_compute", ["tool-calling", "structured-output"], 4.0,
@@ -455,19 +458,49 @@ RL_TASKS = [
     for t in SFT_TASKS if t.name in _RL_WEIGHTS
 ]
 
+# The input/output language pattern. Sampled on its own odometer so the distribution is EXACTLY even across
+# every task, language and phase rather than approximately even by chance. `other` is a second supported
+# language, drawn per sample, for the genuinely cross-lingual case.
+IO_DIRECTIONS = [
+    {"key": "native_native", "weight": 1.0,
+     "brief": "Everything is in {lang}: the user writes {lang}, the assistant answers in {lang}. "
+              "<|input_lang|> and <|target_lang|> are both <{code}>."},
+    {"key": "english_english", "weight": 1.0,
+     "brief": "Everything is in English: the user writes English and the assistant answers in English. "
+              "<|input_lang|> and <|target_lang|> are both <eng>. This keeps the model's English alive and "
+              "is the case where its world knowledge is most exposed."},
+    {"key": "english_to_native", "weight": 1.0,
+     "brief": "The material and the instruction are in ENGLISH, but the user explicitly asks for the answer "
+              "in {lang} -- e.g. an English passage with 'summarise this in {lang}'. <|input_lang|> is <eng> "
+              "and <|target_lang|> is <{code}>. The assistant's <response> must be {lang}."},
+    {"key": "native_to_english", "weight": 1.0,
+     "brief": "The material and instruction are in {lang}, and the user asks for the answer in ENGLISH. "
+              "<|input_lang|> is <{code}> and <|target_lang|> is <eng>. The assistant's <response> must be "
+              "English."},
+    {"key": "crosslingual", "weight": 1.0,
+     "brief": "The material is in {other_name} and the user asks for the answer in {lang} -- neither is "
+              "English. <|input_lang|> is <{other_code}> and <|target_lang|> is <{code}>. This is the "
+              "direction no public corpus covers and the hardest one."},
+]
+
 CONVERSATION = {
-    "min_messages": 6, "max_messages": 10, "ends_with": "assistant",
+    "min_messages": 6, "max_messages": 16, "ends_with": "assistant",
     # What is actually specified to the generator and validated: user turns. 3-5 user turns, each answered,
     # is the 6-10 conversational messages above. Asking a model for "10 messages" while it is also composing
     # tool calls does not work -- it overshoots to 12-21. Asking for "4 user messages" works.
-    "min_user_turns": 3, "max_user_turns": 5,
+    "min_user_turns": 3, "max_user_turns": 6,
     # A conversation that calls tools needs room: every call is an assistant turn and every result a tool
     # turn, so the same number of exchanges is twice the raw messages. Tool conversations get up to 6
     # dialogue turns and 12-16 messages; the total bound is only a runaway guard, not a target.
-    "max_user_turns_with_tools": 6,
-    "target_messages_with_tools": [12, 16],
-    "max_total_messages": 12,
-    "max_total_messages_with_tools": 20,
+    "max_user_turns_with_tools": 8,
+    "target_messages": [6, 16],
+    "target_messages_with_tools": [10, 16],
+    "max_total_messages": 16,
+    "max_total_messages_with_tools": 26,
+    "think_placement": "A <think> block may appear BEFORE a tool call (deciding which tool and what query) "
+                       "and AGAIN after the tool result comes back (judging whether it actually answers the "
+                       "question). Both are wanted: the second is where the model learns to notice a useless "
+                       "retrieval. A turn may also have no <think> at all when nothing needs deciding.",
     "counting": "Counts USER + ASSISTANT messages only: 6-10 means 3-5 exchanges. Tool-call turns and their "
                 "role='tool' results are plumbing and do not count, so a tool-heavy conversation is longer in "
                 "raw messages -- `max_total_messages` bounds that so a runaway is still caught.",
@@ -523,6 +556,13 @@ result message, and answers from those. The model must learn the whole loop, inc
 
 Every sample is tagged with `lang` and one or more task tags, so the mix can be audited and slices held out.
 
+LANGUAGE DIRECTION. Each sample also carries an `io_direction`, distributed EXACTLY evenly across every task:
+native->native, English->English, English->native, native->English, and cross-lingual (one African language
+in, another out). This matters because the deployed model will be asked to read English and answer in Yoruba
+at least as often as it is asked to work wholly within one language, and because retrieved context for these
+languages is realistically English whatever the user writes in. A corpus that only ever works within one
+language teaches a model that cannot do the job.
+
 The hardest and most important quality bar: the assistant must be visibly honest about the edge of its
 knowledge. Roughly a quarter of all exchanges are about exactly that -- looking something up, admitting it
 cannot, or noticing that what came back does not answer the question."""
@@ -567,6 +607,7 @@ def build(kind: str) -> Seed:
         columns = ["id", "lang", "tags", "tasks", "prompt_messages", "prompt_text",
                    "response_1", "response_2", "response_3", "ranking", "rationale",
                    "instruction", "input", "context"]
+    conv = {**conv, "io_directions": IO_DIRECTIONS}
     return Seed(kind=kind, details=SFT_DETAILS if kind == "sft" else RL_DETAILS,
                 languages=languages, tasks=tasks, tools=TOOLS, conversation=conv, target_model=target,
                 yield_by_tier=yields,

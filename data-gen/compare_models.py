@@ -111,6 +111,11 @@ def analyse(recs: list[dict], seed: Seed) -> dict[str, Any]:
         "conf": [], "resp_chars": [], "distinct4": [],
         "diacritics_ok": defaultdict(lambda: [0, 0]), "eng_leak": defaultdict(list),
         "tags": Counter(),
+        # completeness: a "tool result" of "ok" or a two-word assistant reply is technically valid and
+        # useless as training data, so measure substance, not just presence.
+        "user_chars": [], "tool_chars": [], "tool_english": [0, 0],
+        "io_dirs": Counter(), "io_markers_ok": [0, 0], "think_after_tool": 0, "think_before_tool": 0,
+        "stub_tool_results": 0, "stub_responses": 0,
     }
     for r in recs:
         msgs = r.get("messages") or r.get("prompt_messages") or []
@@ -121,9 +126,30 @@ def analyse(recs: list[dict], seed: Seed) -> dict[str, Any]:
         for t in r.get("tags", []):
             m["tags"][t] += 1
         distractors = set(r.get("distractor_tools") or [])
+        if r.get("io_direction"):
+            m["io_dirs"][r["io_direction"]] += 1
+        if r.get("io_markers_ok") is not None:
+            m["io_markers_ok"][0] += bool(r["io_markers_ok"])
+            m["io_markers_ok"][1] += 1
         used_tool = False
+        prev_was_tool_result = False
         for msg in msgs:
             content = msg.get("content") or ""
+            if msg["role"] == "user":
+                m["user_chars"].append(len(content))
+            if msg["role"] == "tool":
+                m["tool_chars"].append(len(content))
+                if len(content.strip()) < 25:
+                    m["stub_tool_results"] += 1          # "ok" / "success" teaches nothing
+                words = re.findall(r"[a-zA-Z]+", content.lower())
+                m["tool_english"][1] += 1
+                m["tool_english"][0] += bool(words) and len(set(words) & ENGLISH_STOPWORDS) >= 1
+            if msg["role"] == "assistant" and THINK.search(content):
+                if prev_was_tool_result:
+                    m["think_after_tool"] += 1
+                elif msg.get("tool_calls"):
+                    m["think_before_tool"] += 1
+            prev_was_tool_result = msg["role"] == "tool"
             m["bad_closers"] += sum(1 for c in ANY_CLOSER.findall(content) if c not in VALID_CLOSERS)
             for th in THINK.findall(content):
                 m["think_total"] += 1
@@ -146,6 +172,8 @@ def analyse(recs: list[dict], seed: Seed) -> dict[str, Any]:
                 if body:
                     txt = body.group(1)
                     m["resp_chars"].append(len(txt))
+                    if len(txt.strip()) < 40:
+                        m["stub_responses"] += 1
                     m["distinct4"].append(_distinct_ngram(txt))
                     want = DIACRITICS.get(r["lang"], set())
                     if want:
@@ -206,6 +234,23 @@ def report(results: dict[str, dict[str, Any]]) -> None:
             f" ({m['diacritics_ok'][L][0]/max(m['diacritics_ok'][L][1],1):.0%})"
             if L in m["diacritics_ok"] else "-"))
     row("English leak (mean, non-pcm)", lambda m: f"{_mean([x for v in m['eng_leak'].values() for x in v]):.1%}")
+    print("  LANGUAGE DIRECTION (target: even across 5)")
+    row("directions seen", lambda m: len(m["io_dirs"]))
+    row("most/least common", lambda m: (f"{m['io_dirs'].most_common(1)[0][1]}/"
+                                        f"{min(m['io_dirs'].values())}" if m["io_dirs"] else "-"))
+    row("markers match direction", lambda m: (f"{m['io_markers_ok'][0]}/{m['io_markers_ok'][1]}"
+                                              f" ({m['io_markers_ok'][0]/max(m['io_markers_ok'][1],1):.0%})"
+                                              if m["io_markers_ok"][1] else "-"))
+    print("  COMPLETENESS (substance, not presence)")
+    row("mean user message chars", lambda m: f"{_mean(m['user_chars']):.0f}")
+    row("mean tool result chars", lambda m: f"{_mean(m['tool_chars']):.0f}")
+    row("stub tool results (<25 ch)", lambda m: m["stub_tool_results"])
+    row("stub responses (<40 ch)", lambda m: m["stub_responses"])
+    row("tool results in English", lambda m: (f"{m['tool_english'][0]}/{m['tool_english'][1]}"
+                                              f" ({m['tool_english'][0]/max(m['tool_english'][1],1):.0%})"
+                                              if m["tool_english"][1] else "-"))
+    row("think BEFORE tool call", lambda m: m["think_before_tool"])
+    row("think AFTER tool result", lambda m: m["think_after_tool"])
     print("  QUALITY")
     row("distinct-4gram (higher=better)", lambda m: f"{_mean(m['distinct4'], 1.0):.3f}")
     row("mean response chars", lambda m: f"{_mean(m['resp_chars']):.0f}")
