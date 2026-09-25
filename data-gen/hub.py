@@ -61,12 +61,13 @@ def remote_files(repo_id: str = REPO_ID) -> set[str]:
         return set()
 
 
-def _repo_path(kind: str, path: Path) -> str:
-    """local .../out/<kind>/<lang>/shard-x.jsonl -> '<kind>/<lang>/shard-x.jsonl'"""
-    return f"{kind}/{path.parent.name}/{path.name}"
+def _repo_path(kind: str, path: Path, name_prefix: str = "") -> str:
+    """local .../out/<ns>/<lang>/shard-x.jsonl -> '<kind>/<lang>/[<prefix>-]shard-x.jsonl'"""
+    name = f"{name_prefix}-{path.name}" if name_prefix else path.name
+    return f"{kind}/{path.parent.name}/{name}"
 
 
-def push_shards(kind: str, paths: Iterable[Path], repo_id: str = REPO_ID) -> int:
+def push_shards(kind: str, paths: Iterable[Path], repo_id: str = REPO_ID, name_prefix: str = "") -> int:
     """Upload shards the repo does not already have, in one commit. Returns how many were uploaded."""
     from huggingface_hub import CommitOperationAdd
 
@@ -77,7 +78,7 @@ def push_shards(kind: str, paths: Iterable[Path], repo_id: str = REPO_ID) -> int
     for p in paths:
         if not p.exists() or p.stat().st_size == 0:
             continue
-        dest = _repo_path(kind, p)
+        dest = _repo_path(kind, p, name_prefix)
         if dest in have:
             continue  # immutable shards: already there means identical
         ops.append(CommitOperationAdd(path_in_repo=dest, path_or_fileobj=str(p)))
@@ -91,12 +92,21 @@ def push_shards(kind: str, paths: Iterable[Path], repo_id: str = REPO_ID) -> int
     return len(ops)
 
 
-def push_all_local(kind: str, repo_id: str = REPO_ID) -> int:
-    root = OUT_ROOT / kind
+def push_all_local(namespace: str, repo_id: str = REPO_ID) -> int:
+    """`namespace` is a local dir: a bare kind ("sft") or a run-tagged one ("sft__gemma4"). Either way the
+    shards land under the plain kind on the Hub, so every model's output shares one folder and is told apart
+    by the `model` field on each record."""
+    root = OUT_ROOT / namespace
     if not root.exists():
         print(f"[hub] no local data at {root}")
         return 0
-    return push_shards(kind, sorted(root.glob("*/shard-*.jsonl")), repo_id)
+    kind = namespace.split("__")[0]
+    if kind not in KINDS and kind != "rl_judged":
+        raise SystemExit(f"{namespace}: first path segment must be one of {KINDS}")
+    # keep the tag in the filename so two models' shards never collide on the Hub
+    tag = namespace.split("__", 1)[1] if "__" in namespace else ""
+    paths = sorted(root.glob("*/shard-*.jsonl"))
+    return push_shards(kind, paths, repo_id, name_prefix=tag)
 
 
 def push_seeds(repo_id: str = REPO_ID) -> None:
@@ -180,7 +190,8 @@ def build_card(repo_id: str = REPO_ID) -> str:
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--repo-id", default=REPO_ID)
-    ap.add_argument("--push", default=None, choices=list(KINDS), help="push all local shards of this kind")
+    ap.add_argument("--push", default=None,
+                    help="local namespace to push: a kind ('sft') or a run-tagged dir ('sft__gemma4')")
     ap.add_argument("--push-seeds", action="store_true")
     ap.add_argument("--status", action="store_true")
     ap.add_argument("--card", action="store_true", help="print the dataset card without pushing")

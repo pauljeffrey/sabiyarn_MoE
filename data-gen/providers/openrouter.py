@@ -1,4 +1,4 @@
-"""OpenRouter. One key, many models, OpenAI-compatible. No batch queue -- throughput comes from concurrency.
+"""OpenRouter. One key, many models, OpenAI-compatible, with an OpenAI-shaped batch queue.
 
     python -m providers.openrouter --check
     from providers import get_provider; p = get_provider("openrouter", "openai/gpt-oss-120b")
@@ -21,7 +21,10 @@ class OpenRouterProvider(Provider):
     name = "openrouter"
     base_url = "https://openrouter.ai/api/v1"
     env_key = "OPENROUTER_API_KEY"
-    supports_batch = False
+    # Its ':batch' models (the cheapest tier) are reachable ONLY through /files + /batches; chat/completions
+    # 404s for them with "cannot be used with the chat/completions endpoint".
+    supports_batch = True
+    batch_file_purpose = "batch"
     # USD per 1M (input, output). VERIFY at https://openrouter.ai/models -- OpenRouter quotes per upstream
     # and the cheapest upstream changes week to week.
     # USD per 1M (input, output), read from OpenRouter's /models endpoint 2026-09-24. Re-check with

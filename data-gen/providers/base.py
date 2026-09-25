@@ -79,6 +79,34 @@ class RateLimit(Exception):
     pass
 
 
+# Models whose chain of thought goes to a separate `reasoning` field and which STRIP <think> from the message
+# content. Measured: asked to emit "<think>I am thinking</think>DONE" literally, gpt-oss-120b returns "DONE".
+# They cannot produce this corpus's assistant format, whatever the prompt says, so warn rather than let a
+# 200k-request run come back with zero think blocks.
+REASONING_MODELS_THAT_STRIP_THINK = ("gpt-oss", "o1-", "o3-", "o4-", "deepseek-r1", "qwq")
+
+
+def warn_if_reasoning_model(model: str) -> None:
+    if any(k in model.lower() for k in REASONING_MODELS_THAT_STRIP_THINK):
+        print(f"  WARNING: {model} is a reasoning model. It routes its chain of thought to a separate "
+              f"`reasoning` field and strips <think> from the content, so samples will have NO <think> "
+              f"blocks -- measured at 0 of 14 on a pilot. Use a non-reasoning model "
+              f"(e.g. google/gemma-4-31b-it) for sft/rl.", flush=True)
+
+
+def _parse_batch_line(row: dict, meta: dict, model: str) -> Response:
+    cid = row.get("custom_id", "")
+    md = meta.get(cid, {})
+    body = (row.get("response") or {}).get("body") or {}
+    if row.get("error") or not body.get("choices"):
+        return Response(cid, "", False, json.dumps(row.get("error") or "no choices")[:400], metadata=md)
+    msg = body["choices"][0].get("message", {})
+    usage = body.get("usage", {})
+    return Response(cid, msg.get("content") or "", True, None, usage.get("prompt_tokens", 0),
+                    usage.get("completion_tokens", 0), body.get("model", model),
+                    msg.get("tool_calls"), md)
+
+
 class Provider:
     """Subclass and set `name`, `base_url`, `env_key`. Everything else is shared."""
 
@@ -99,6 +127,7 @@ class Provider:
             raise SystemExit(
                 f"{self.name}: no API key. Put {self.env_key}=... in {ROOT/'.env'} "
                 f"(one .env for the whole repo).")
+        warn_if_reasoning_model(model)
         self.max_concurrency = max_concurrency
         self.max_retries = max_retries
         self.timeout = timeout
@@ -182,15 +211,58 @@ class Provider:
                           f"${self.cost_usd():.4f}{extra}", flush=True)
                 yield resp
 
-    # -- batch (providers that have a queue override these) ------------------
+    # -- batch --------------------------------------------------------------
+    # Together and OpenRouter both expose OpenAI-shaped /files and /batches, at roughly half price with a
+    # 24h window. On OpenRouter the cheapest models (e.g. openai/gpt-oss-120b:batch at $0.03/$0.14) are
+    # reachable ONLY this way -- chat/completions returns 404 for them.
+    batch_file_purpose = "batch"
+
+    def _batch_line(self, req: Request) -> dict[str, Any]:
+        return {"custom_id": req.custom_id, "method": "POST", "url": "/v1/chat/completions",
+                "body": self._payload(req)}
+
     def submit_batch(self, requests: Iterable[Request], workdir: Path) -> str:
-        raise NotImplementedError(f"{self.name} has no batch API; use complete_many()")
+        workdir.mkdir(parents=True, exist_ok=True)
+        reqs = list(requests)
+        path = workdir / "batch_input.jsonl"
+        meta = {r.custom_id: r.metadata for r in reqs}
+        path.write_text("".join(json.dumps(self._batch_line(r), ensure_ascii=False) + "\n" for r in reqs),
+                        encoding="utf-8")
+        (workdir / "metadata.json").write_text(json.dumps(meta, ensure_ascii=False), encoding="utf-8")
+        client = self._client()
+        with path.open("rb") as fh:
+            uploaded = client.files.create(file=fh, purpose=self.batch_file_purpose)
+        batch = client.batches.create(input_file_id=uploaded.id, endpoint="/v1/chat/completions",
+                                      completion_window="24h")
+        (workdir / "batch.json").write_text(
+            json.dumps({"batch_id": batch.id, "input_file_id": uploaded.id, "n": len(reqs),
+                        "model": self.model}, indent=2), encoding="utf-8")
+        print(f"[{self.name}] submitted {len(reqs)} requests -> batch {batch.id} (~50% price, 24h window)")
+        return batch.id
 
     def poll_batch(self, batch_id: str) -> dict[str, Any]:
-        raise NotImplementedError(f"{self.name} has no batch API")
+        b = self._client().batches.retrieve(batch_id)
+        counts = getattr(b, "request_counts", None)
+        return {"id": b.id, "status": getattr(b, "status", "unknown"),
+                "completed": getattr(counts, "completed", 0) if counts else 0,
+                "failed": getattr(counts, "failed", 0) if counts else 0,
+                "total": getattr(counts, "total", 0) if counts else 0,
+                "output_file_id": getattr(b, "output_file_id", None),
+                "error_file_id": getattr(b, "error_file_id", None)}
 
     def fetch_batch(self, batch_id: str, out_path: Path) -> list[Response]:
-        raise NotImplementedError(f"{self.name} has no batch API")
+        st = self.poll_batch(batch_id)
+        if st["status"] != "completed":
+            raise RuntimeError(f"batch {batch_id} is {st['status']}, not completed")
+        client = self._client()
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        content = client.files.content(st["output_file_id"])
+        data = content.read() if hasattr(content, "read") else content.content
+        out_path.write_bytes(data)
+        meta_path = out_path.parent / "metadata.json"
+        meta = json.loads(meta_path.read_text(encoding="utf-8")) if meta_path.exists() else {}
+        return [_parse_batch_line(json.loads(l), meta, self.model)
+                for l in out_path.read_text(encoding="utf-8").splitlines() if l.strip()]
 
     # -- accounting ---------------------------------------------------------
     def rates(self) -> tuple[float, float]:

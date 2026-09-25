@@ -107,11 +107,15 @@ def _validate_conversation(msgs: list[dict], seed: Seed, *, ends_with: str) -> b
     # User turns are what the generator is asked for and what is checked; assistant and tool turns follow
     # from them (see the seed's min_user_turns/max_user_turns).
     n_user = sum(1 for m in msgs if m["role"] == "user")
-    if not (int(conv.get("min_user_turns", 3)) <= n_user <= int(conv.get("max_user_turns", 5))):
-        _drop(f"user_turns:{n_user}")
+    uses_tools = any(m.get("tool_calls") for m in msgs) or any(m["role"] == "tool" for m in msgs)
+    hi_turns = int(conv.get("max_user_turns_with_tools", 6) if uses_tools else conv.get("max_user_turns", 5))
+    if not (int(conv.get("min_user_turns", 3)) <= n_user <= hi_turns):
+        _drop(f"user_turns:{n_user}{'+tools' if uses_tools else ''}")
         return False
-    if len(msgs) > int(conv.get("max_total_messages", 26)):
-        _drop(f"total_messages:{len(msgs)}")
+    max_total = int(conv.get("max_total_messages_with_tools", 20) if uses_tools
+                    else conv.get("max_total_messages", 12))
+    if len(msgs) > max_total:
+        _drop(f"total_messages:{len(msgs)}{'+tools' if uses_tools else ''}")
         return False
     if msgs[-1]["role"] != ends_with:
         _drop(f"ends_with:{msgs[-1]['role']}")

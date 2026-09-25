@@ -461,10 +461,16 @@ CONVERSATION = {
     # is the 6-10 conversational messages above. Asking a model for "10 messages" while it is also composing
     # tool calls does not work -- it overshoots to 12-21. Asking for "4 user messages" works.
     "min_user_turns": 3, "max_user_turns": 5,
+    # A conversation that calls tools needs room: every call is an assistant turn and every result a tool
+    # turn, so the same number of exchanges is twice the raw messages. Tool conversations get up to 6
+    # dialogue turns and 12-16 messages; the total bound is only a runaway guard, not a target.
+    "max_user_turns_with_tools": 6,
+    "target_messages_with_tools": [12, 16],
+    "max_total_messages": 12,
+    "max_total_messages_with_tools": 20,
     "counting": "Counts USER + ASSISTANT messages only: 6-10 means 3-5 exchanges. Tool-call turns and their "
                 "role='tool' results are plumbing and do not count, so a tool-heavy conversation is longer in "
                 "raw messages -- `max_total_messages` bounds that so a runaway is still caught.",
-    "max_total_messages": 26,
     "task_mix_per_conversation": [2, 4],
     "theme_drift": "A conversation should change subject at least once -- that is what teaches the model to "
                    "track context rather than answer in isolation.",

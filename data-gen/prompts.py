@@ -199,13 +199,22 @@ def _sft_like_request(seed: Seed, row: dict, *, rl: bool) -> Request:
     else:
         tool_names, distractors = [], []
 
-    n_user = rng.randint(int(seed.conversation.get("min_user_turns", 3)),
-                         int(seed.conversation.get("max_user_turns", 5)))
+    # tool conversations get an extra exchange of headroom (see the seed's conversation policy)
+    _hi = int(seed.conversation.get("max_user_turns_with_tools", 6) if needs_tools
+              else seed.conversation.get("max_user_turns", 5))
+    n_user = rng.randint(int(seed.conversation.get("min_user_turns", 3)), _hi)
     verbs = sorted({v for t in tasks for v in t.task_plan}) or ["<|chat|>"]
     fmt = _format_brief(lang.code, lang.name,
                         " ".join(seed.format["special_tokens"]["task_plan_verbs"]))
 
     task_lines = "\n".join(f"  * {t.name} [{', '.join(t.tags)}]: {t.description}" for t in tasks)
+    lo_m, hi_m = seed.conversation.get("target_messages_with_tools", [12, 16])
+    length_hint = (f"Because this conversation uses tools, expect {lo_m}-{hi_m} messages in total once the "
+                   f"tool-call turns and their results are included. That is correct -- do not drop tool use "
+                   f"to hit a smaller number."
+                   if needs_tools else
+                   "This conversation uses no tools, so it should stay compact: one assistant reply per user "
+                   "message and nothing else.")
     verbs_line = ("task_plan verbs for this conversation (use them in the order each turn carries them out): "
                   + "".join(verbs))
     system = (f"{seed.details}\n\n{fmt}\n"
@@ -231,6 +240,7 @@ def _sft_like_request(seed: Seed, row: dict, *, rl: bool) -> Request:
 fewer. Each is answered by the assistant, and the conversation ends on an assistant message. The assistant may
 add tool-call turns and their role="tool" results in between; those are not user messages and do not count.
 Count your user messages before you finish: there must be exactly {n_user}.
+{length_hint}
 
 Return JSON:
 {{"messages": [{{"role": "system"|"user"|"assistant"|"tool", "content": "...", "name": "<tool name, tool role only>", "tool_calls": [{{"function": {{"name": "...", "arguments": {{...}}}}}}]}}],

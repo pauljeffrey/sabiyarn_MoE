@@ -305,3 +305,60 @@ def test_rl_record_orders_responses_and_rejects_paraphrases(seeds):
     assert to_record(seeds["rl"], _resp("d", same, md)) is None
     no_worst = dict(good, responses=[dict(x, quality="best") for x in good["responses"]])
     assert to_record(seeds["rl"], _resp("e", no_worst, md)) is None
+
+
+# ----------------------------------------------------------------- run namespacing / tool length
+
+
+def test_run_tag_namespaces_output_so_models_do_not_collide(monkeypatch):
+    """Two models must be able to generate the SAME plan rows; without a namespace, done_ids() would make
+    the second skip everything the first produced and the comparison would be impossible."""
+    from generate import namespace
+    monkeypatch.delenv("DATA_GEN_RUN_TAG", raising=False)
+    assert namespace("sft") == "sft"
+    assert namespace("sft", "gemma4") == "sft__gemma4"
+    assert namespace("sft", "google/gemma-4-31b-it") == "sft__google-gemma-4-31b-it"  # path-safe
+    monkeypatch.setenv("DATA_GEN_RUN_TAG", "llama33")
+    assert namespace("rl") == "rl__llama33"
+
+
+def test_tool_conversations_get_more_room(seeds):
+    """A tool call is an assistant turn and its result a tool turn, so the same number of exchanges is twice
+    the raw messages. Tool samples get 6 user turns and a higher total bound; non-tool samples stay tight."""
+    conv = seeds["sft"].conversation
+    assert conv["max_user_turns"] == 5 and conv["max_user_turns_with_tools"] == 6
+    assert conv["max_total_messages"] < conv["max_total_messages_with_tools"]
+    assert conv["target_messages_with_tools"] == [12, 16]
+
+    md = {"kind": "sft", "lang": "yor", "tasks": [], "tags": [], "tools": ["search_internet"]}
+
+    def convo(n_user, with_tools):
+        msgs = []
+        for i in range(n_user):
+            msgs.append({"role": "user", "content": f"q{i}"})
+            if with_tools:
+                msgs.append({"role": "assistant", "content": "<|input_lang|><yor><think>look it up</think>",
+                             "tool_calls": [{"function": {"name": "search_internet",
+                                                         "arguments": {"query": "x"}}}]})
+                msgs.append({"role": "tool", "name": "search_internet", "content": "result"})
+            msgs.append({"role": "assistant",
+                         "content": "<|input_lang|><yor><task_plan><|chat|></task_plan>"
+                                    "<|target_lang|><yor><response>a"})
+        return {"messages": msgs, "tasks": [], "tags": [], "confidence": 0.9}
+
+    # 6 user turns WITH tools = 24 raw messages: allowed on turns, caught by the total bound
+    assert to_record(seeds["sft"], _resp("t1", convo(5, True), md)) is not None
+    # 6 user turns WITHOUT tools exceeds max_user_turns (5)
+    assert to_record(seeds["sft"], _resp("t2", convo(6, False), md)) is None
+    # 3 user turns, no tools, is the compact shape
+    assert to_record(seeds["sft"], _resp("t3", convo(3, False), md)) is not None
+
+
+def test_reasoning_models_are_flagged(capsys):
+    """gpt-oss routes its chain of thought to a `reasoning` field and strips <think> from the content, so it
+    produced 0 of 14 think blocks on a pilot. A 200k-request run must not discover that at the end."""
+    from providers.base import warn_if_reasoning_model
+    warn_if_reasoning_model("openai/gpt-oss-120b")
+    assert "reasoning model" in capsys.readouterr().out
+    warn_if_reasoning_model("google/gemma-4-31b-it")
+    assert capsys.readouterr().out == ""

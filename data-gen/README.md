@@ -647,3 +647,53 @@ Ask for **>= 150GB disk** (the 120b weights are ~60GB and HF caches a copy) and 
 sets `HF_HOME` to the big volume, pushes shards to the Hub as they are written, and logs to
 `/workspace/<kind>.log` because vast's web terminal loses scrollback. Being outbid costs you only the shard in
 flight -- re-running skips everything already on the Hub.
+
+## Model comparison (measured, not guessed)
+
+`compare_models.py` scores whatever each model actually produced. Generate the same plan rows under
+different `--run-tag`s, then compare -- plan rows are deterministic, so every model answered identical
+prompts.
+
+```bash
+for spec in gemma4:google/gemma-4-31b-it llama33:meta-llama/llama-3.3-70b-instruct; do
+  python generate.py --kind sft --provider openrouter --model "${spec#*:}" --run-tag "${spec%%:*}" \
+    --langs yor,hau,ibo,pcm --limit 24
+done
+python compare_models.py --kind sft
+```
+
+Results on 24 identical SFT prompts in yor/hau/ibo/pcm:
+
+| | gemma-4-31b-it | llama-3.3-70b | gpt-oss-120b |
+|---|---|---|---|
+| yield | **83%** | 46% | 58% |
+| `<think>` blocks | **112** | 47 | **0** |
+| ... in English | **94%** | 49% | n/a |
+| samples using tools | **65%** | 18% | 57% |
+| unknown tool / bad args / distractor called | 0 / 0 / 0 | 0 / 0 / 0 | 0 / 0 / 0 |
+| distinct-4gram | **1.000** | 0.984 | 0.996 |
+| tags covered | **22** | 17 | 19 |
+| mean response chars | 187 | 117 | 162 |
+
+**gemma-4-31b-it wins on every axis.** Use it for sft and rl.
+
+**gpt-oss-120b cannot do this job at any price.** It is a reasoning model: its chain of thought goes to a
+separate `reasoning` field and it strips `<think>` from the message content. Asked to emit
+`<think>I am thinking</think>DONE` literally, it returns `DONE`. Zero think blocks in 14 samples. Since the
+think blocks are the entire point of the corpus, its cheap `:batch` tier ($0.03/$0.14) is irrelevant for
+sft/rl -- though it remains a candidate for **pretrain**, which needs no special tokens at all.
+`providers/base.py` warns when a reasoning model is selected.
+
+**llama-3.3-70b** reasoned in the target language rather than English half the time, barely used tools, and
+produced no Hausa hooked letters at all in 4 samples. Not suitable here.
+
+## Batch on either provider
+
+Both Together and OpenRouter expose OpenAI-shaped `/files` and `/batches` at roughly half price. On
+OpenRouter the cheapest tier is reachable ONLY that way -- `openai/gpt-oss-120b:batch` 404s on
+chat/completions with "cannot be used with the chat/completions endpoint".
+
+```bash
+python generate.py --kind pretrain --provider openrouter --model openai/gpt-oss-120b:batch --batch
+python generate.py --kind pretrain --provider openrouter --fetch <batch_id> --push
+```
