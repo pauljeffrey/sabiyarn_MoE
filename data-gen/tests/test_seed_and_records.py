@@ -695,14 +695,15 @@ def test_content_is_accepted_where_response_was_asked_for():
     assert out[-1]["content"].endswith("<response>I dey fine o.")
 
 
-def test_a_pre_assembled_content_string_is_left_alone():
-    """Content carrying markers is the legacy shape and belongs to the other code path; treating it as a
-    response would double the scaffolding."""
+def test_a_pre_assembled_content_string_is_parsed_not_taken_as_prose():
+    """Content carrying markers is the legacy finished-string shape. Treating it as a plain response would
+    double the scaffolding, so it is taken APART into fields instead."""
     from postprocess_gen import _fill_turn_defaults
     turns = [{"role": "assistant", "task_plan": ["<|chat|>"],
               "content": "<|input_lang|><pcm><response>already assembled"}]
-    out = _fill_turn_defaults(turns, _md())
-    assert "response" not in out[0]
+    out = _fill_turn_defaults(turns, _md())[0]
+    assert out["response"] == "already assembled"          # the markers are gone, the text is not
+    assert "<|input_lang|>" not in out["response"]
 
 
 def test_sequence_tasks_may_use_the_tag_token():
@@ -724,3 +725,79 @@ def test_a_non_sequence_task_still_rejects_the_tag_token():
              {"role": "assistant", "task_plan": ["<|explain|>"], "response": "word <tag> NOUN"}]
     with _pt.raises(AssemblyError):
         build_messages(_fill_turn_defaults(turns, _md("world_knowledge_qa")))
+
+
+def test_invented_closing_tags_are_stripped_on_the_field_path():
+    """_strip_invalid_closers is the one sanctioned repair here, and it was wired only into the legacy
+    pre-assembled path -- so the current field-based contract never got it, and live generation dropped sound
+    conversations over </sentiment> and </intent>. A closer absent from the tokenizer carries no information,
+    which is what separates this from stripping an opening marker."""
+    from postprocess_gen import _fill_turn_defaults
+    from assemble import build_messages
+    turns = [{"role": "user", "content": "Mood?"},
+             {"role": "assistant", "task_plan": ["<classify>"],
+              "think": "Simple label.</think>",
+              "response": "<sentiment>negative</sentiment>"}]
+    out = build_messages(_fill_turn_defaults(turns, _md("sentiment_analysis")))
+    content = out[-1]["content"]
+    assert "</sentiment>" not in content
+    assert content.endswith("<response><sentiment>negative")
+    # the assembler supplies <think></think>, so the field must not also carry them
+    assert content.count("</think>") == 1 and content.count("<think>") == 1
+    assert "<think>Simple label.</think>" in content
+
+
+def test_a_valid_closer_is_never_stripped():
+    from postprocess_gen import _strip_invalid_closers
+    for good in ("</think>", "</task_plan>", "</tool_call>", "</tool_response>", "</context>", "</s>"):
+        assert _strip_invalid_closers(f"a {good} b") == f"a {good} b"
+    assert _strip_invalid_closers("a </response> b") == "a  b"
+
+
+# --------------------------------------------------------------------------- few-shot exemplars
+
+
+def test_fewshot_exemplars_are_shown_as_fields_not_marker_strings():
+    """The exemplars are finished training records, and rendering them verbatim told the generator -- three
+    lines after the contract forbade it -- to emit pre-assembled marker strings. It believed the example:
+    every captured `non-tool turn must carry a non-empty response` drop was a low-resource language, the only
+    tier that receives exemplars, returning "<|input_lang|><ful><think>..." in `content`."""
+    from prompts import _fewshot_block
+    block = _fewshot_block()
+    if not block:
+        import pytest as _pt
+        _pt.skip("no exemplars on disk")
+    body = block.split("Never write them yourself.", 1)[1]
+    for marker in ("<|input_lang|>", "<|target_lang|>", "<response>", "<task_plan>"):
+        assert marker not in body, marker
+    assert '"task_plan"' in body and '"input_lang"' in body and '"think"' in body
+
+
+def test_every_shown_exemplar_survives_the_assembler():
+    """An example of something the pipeline discards is worse than no example. One exemplar answered NER as
+    "<NER>Etidiong<tag>PERSON", which the assembler rejects, and it was the source of the <NER> drops."""
+    import json as _json
+    from prompts import _fewshot_block
+    from assemble import build_messages
+    block = _fewshot_block()
+    if not block:
+        import pytest as _pt
+        _pt.skip("no exemplars on disk")
+    for chunk in block.split("--- EXEMPLAR ")[1:]:
+        turns = _json.loads(chunk[chunk.index("["):chunk.rindex("]") + 1])
+        build_messages(turns)          # raises AssemblyError if the exemplar is not itself valid
+
+
+def test_a_pre_assembled_content_string_is_recovered_into_fields():
+    """Belt and braces for a generator that emits the old shape anyway, using the same parser that repaired
+    the published corpus."""
+    from postprocess_gen import _fill_turn_defaults
+    from assemble import build_messages
+    turns = [{"role": "user", "content": "Wetin be MTN Data Turbo?"},
+             {"role": "assistant", "input_lang": "ful", "target_lang": "ful", "task_plan": ["<|chat|>"],
+              "content": "<|input_lang|><ful><think>Not familiar.</think><task_plan><|chat|>"
+                         "</task_plan><|target_lang|><ful><response>Mi anndaa ngal."}]
+    out = build_messages(_fill_turn_defaults(turns, _md("no_tool_admit_unknown", "ful")))
+    assert out[-1]["content"].count("<|input_lang|>") == 1          # not doubled
+    assert out[-1]["content"].endswith("<response>Mi anndaa ngal.")
+    assert "<think>Not familiar.</think>" in out[-1]["content"]

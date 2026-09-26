@@ -22,6 +22,7 @@ from typing import Any, Optional
 
 from providers.base import Response
 from assemble import LABEL_TOKENS, AssemblyError, build_messages
+from disassemble import looks_pre_assembled, turn_from_assistant
 from longdocs import splice as splice_document
 from rendering.render import render_messages
 from schemas.seed import TAGS, Seed
@@ -120,12 +121,36 @@ def _fill_turn_defaults(turns: Any, md: dict) -> Any:
         if not call and not t.get("target_lang"):
             t["target_lang"] = tgt_default
         # `content` where `response` was asked for. An assistant turn with neither a response nor a tool call
-        # is discarded as empty, and this was the single largest drop on a low-resource pilot (7 of 31): the
-        # generator uses the `content` key it uses for user turns. Only when it is plain text -- content
-        # carrying markers is the legacy pre-assembled shape and belongs to the other code path.
-        if not call and not t.get("response") and isinstance(t.get("content"), str):
-            if "<|input_lang|>" not in t["content"]:
+        # is discarded as empty, and this was the single largest drop on a low-resource pilot: the generator
+        # uses the `content` key it uses for user turns.
+        if not t.get("response") and isinstance(t.get("content"), str) and t["content"].strip():
+            if looks_pre_assembled(t["content"]):
+                # The OLD finished-string shape. Its cause was the few-shot exemplars, which were rendered
+                # verbatim from finished training records and so demonstrated exactly what the contract
+                # forbids (see prompts._fewshot_block). That is fixed at the source; this recovers the cases
+                # where the generator does it anyway, using the same parser that repaired the published corpus.
+                parsed = turn_from_assistant({"content": t["content"],
+                                              "tool_calls": ([{"function": call}] if call else [])},
+                                             t.get("input_lang") or src_default)
+                if parsed:
+                    t.clear()
+                    t.update(parsed)
+                    call = t.get("tool_call") or {}
+            elif not call:
                 t["response"] = t.pop("content")
+        # Invented CLOSING tags (</sentiment>, </intent>, </response>). _strip_invalid_closers is the one
+        # sanctioned repair in this module and it was only wired into the LEGACY pre-assembled path, so the
+        # current field-based contract never got it -- measured live as stray-tag drops on otherwise sound
+        # conversations. A closer that is not in the tokenizer carries no information and its removal cannot
+        # change meaning, which is what makes this different from stripping an opening marker.
+        # A field also carrying its OWN wrapper (`think`: "...</think>", `response`: "<response>...") is pure
+        # duplication -- the assembler emits the wrapper -- so removing it cannot change meaning.
+        for key, wrappers in (("response", ("<response>",)), ("think", ("<think>", "</think>"))):
+            if isinstance(t.get(key), str):
+                v = _strip_invalid_closers(t[key])
+                for w in wrappers:
+                    v = v.replace(w, "")
+                t[key] = v.strip()
         # A label token written INLINE instead of in the `label_token` field. The token is legal, the
         # position is not, and the assembler emits it in exactly the right place from the field -- so moving
         # it is information-preserving, unlike stripping it. 10 of 31 drops on the same pilot.

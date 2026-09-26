@@ -31,43 +31,77 @@ _FEWSHOT_PATH = Path(__file__).resolve().parent / "seeds" / "fewshot.json"
 
 @lru_cache(maxsize=1)
 def _fewshot_block() -> str:
-    """Structurally perfect exemplars, rendered into the system prompt.
+    """Structurally perfect exemplars, rendered into the system prompt AS FIELDS.
 
     Only the STRUCTURE transfers: these are real conversations in whatever language they were generated in,
-    and the prompt says so. Structure is what collapses in low-resource languages -- 70 invented pipe tokens
-    against 21 correct markers -- so that is what the examples are for.
+    and the prompt says so. Structure is what collapses in low-resource languages, so that is what the
+    examples are for.
+
+    THEY MUST BE RENDERED IN THE FIELD SHAPE, and were not. `seeds/fewshot.json` holds finished training
+    records, whose assistant turns are pre-assembled marker strings -- the exact shape the field contract
+    replaced. Printing them verbatim told the generator, immediately after the contract forbade it, to do it
+    anyway, and the generator believed the example: every captured `non-tool turn must carry a non-empty
+    response` drop was a low-resource language (the only tier that receives exemplars) returning
+    "<|input_lang|><ful><think>...</think>...<response>..." in `content`. 31 drops in 225 requests on one live
+    run, and it was the single largest failure class.
+
+    So the records are taken APART here (disassemble.py, the same parser that repaired the published corpus)
+    and shown as the fields the generator is actually asked for.
     """
     if not _FEWSHOT_PATH.exists():
         return ""
+    from assemble import AssemblyError, build_messages
+    from disassemble import looks_pre_assembled, turn_from_assistant
+
     data = json.loads(_FEWSHOT_PATH.read_text(encoding="utf-8"))
     parts = []
     for i, ex in enumerate(data.get("exemplars", []), start=1):
-        lines = []
+        lines, turns = [], []
         for m in ex["messages"]:
             role = m["role"]
-            if m.get("tool_calls"):
-                c = m.get("content") or ""
-                call = m["tool_calls"][0]["function"]
-                lines.append(f'  {{"role": "assistant", "content": {json.dumps(c, ensure_ascii=False)}, '
-                             f'"tool_calls": [{{"function": {{"name": "{call["name"]}", '
-                             f'"arguments": {json.dumps(call["arguments"], ensure_ascii=False)}}}}}]}}')
+            if role == "assistant":
+                turn = (turn_from_assistant(m, ex.get("lang", "eng"))
+                        if looks_pre_assembled(m.get("content")) or m.get("tool_calls") else None)
+                if not turn:
+                    continue
+                # Key order matches the contract's, so the example reads as the contract does.
+                ordered = {k: v for k in ("role", "think", "task_plan", "input_lang", "target_lang",
+                                          "response", "label_token", "tool_call")
+                           if (v := turn.get(k)) not in (None, "", [], False)}
+                turns.append(turn)
+                lines.append("  " + json.dumps(ordered, ensure_ascii=False))
             elif role == "tool":
-                lines.append(f'  {{"role": "tool", "name": "{m.get("name","")}", '
-                             f'"content": {json.dumps(m.get("content") or "", ensure_ascii=False)}}}')
-            else:
-                lines.append(f'  {{"role": "{role}", '
-                             f'"content": {json.dumps(m.get("content") or "", ensure_ascii=False)}}}')
-        parts.append(f"--- EXEMPLAR {i} ({ex['lang']}, io_direction={ex.get('io_direction')}, "
-                     f"tools={'yes' if ex.get('uses_tools') else 'no'}) ---\n"
-                     + "[\n" + ",\n".join(lines) + "\n]")
+                msg = {"role": "tool", "name": m.get("name", ""), "content": m.get("content") or ""}
+                turns.append(msg)
+                lines.append("  " + json.dumps(msg, ensure_ascii=False))
+            elif role == "user":
+                msg = {"role": "user", "content": m.get("content") or ""}
+                turns.append(msg)
+                lines.append("  " + json.dumps(msg, ensure_ascii=False))
+            # the system message is rebuilt from the tool catalogue after generation, so it is not an example
+        # An exemplar must itself SURVIVE the assembler. One did not: it answered NER as
+        # "<NER>Etidiong<tag>PERSON", which the assembler rejects because <NER> is a task_plan verb and not
+        # legal inside a response -- and that exemplar was the source of the <NER> drops in live generation.
+        # An example of something we discard is worse than no example.
+        try:
+            build_messages(turns)
+        except (AssemblyError, Exception):  # noqa: BLE001
+            continue
+        if len(lines) >= 4:
+            parts.append(f"--- EXEMPLAR {i} ({ex['lang']}, io_direction={ex.get('io_direction')}, "
+                         f"tools={'yes' if ex.get('uses_tools') else 'no'}) ---\n"
+                         + "[\n" + ",\n".join(lines) + "\n]")
     if not parts:
         return ""
     return (
-        "\n\nWORKED EXAMPLES OF THE REQUIRED STRUCTURE\n"
-        "These are real, verified-correct conversations. Copy their STRUCTURE exactly: where the markers go, "
-        "how <think> sits before a tool call and again after the tool result, how a tool result comes back as "
-        "its own role='tool' message, and how the final turn carries <response>.\n"
-        "Do NOT copy their language, topic, names or wording -- they happen to be in the languages they were "
+        "\n\nWORKED EXAMPLES OF THE REQUIRED SHAPE\n"
+        "Real, verified-correct conversations, shown as the FIELDS you must return. Copy the SHAPE exactly: "
+        "which keys each turn carries, how a tool-calling turn has a tool_call and no response, how the tool "
+        "result comes back as its own role='tool' message, and how the assistant then takes another turn with "
+        "a fresh `think` judging what came back.\n"
+        "Note that NO turn contains <|input_lang|>, <think>, <task_plan> or <response> -- those are built from "
+        "your fields afterwards. Never write them yourself.\n"
+        "Do NOT copy the language, topic, names or wording -- these happen to be in the languages they were "
         "generated in, and yours must be in the language this task specifies.\n\n"
         + "\n\n".join(parts) + "\n"
     )

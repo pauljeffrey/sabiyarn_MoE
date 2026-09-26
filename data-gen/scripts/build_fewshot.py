@@ -53,6 +53,31 @@ def _perfect(rec: dict) -> bool:
         for t in THINK.findall(c):
             if sum(ord(ch) < 128 for ch in t) / max(len(t), 1) < 0.95:
                 return False
+    # It must also survive a ROUND TRIP through the field contract, because that is how it will be shown.
+    # One exemplar did not: it answered NER as "<NER>Etidiong<tag>PERSON", which the assembler rejects since
+    # <NER> is a task_plan verb and illegal inside a response -- and that exemplar was the source of the <NER>
+    # drops in live generation. An example of something the pipeline discards is worse than no example.
+    return _survives_round_trip(rec)
+
+
+def _survives_round_trip(rec: dict) -> bool:
+    from assemble import build_messages
+    from disassemble import looks_pre_assembled, turn_from_assistant
+
+    turns = []
+    for m in rec["messages"]:
+        if m["role"] == "assistant":
+            turn = turn_from_assistant(m, rec.get("lang", "eng")) if (
+                looks_pre_assembled(m.get("content")) or m.get("tool_calls")) else None
+            if not turn:
+                return False
+            turns.append(turn)
+        elif m["role"] in ("user", "tool"):
+            turns.append(dict(m))
+    try:
+        build_messages(turns)
+    except Exception:  # noqa: BLE001
+        return False
     return True
 
 
