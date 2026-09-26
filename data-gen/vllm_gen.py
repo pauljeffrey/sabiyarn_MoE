@@ -316,11 +316,30 @@ def _plan_report(kind: str, reqs: list[Request], in_tok: float, max_tokens: int,
           f"\n    numbers rather than this table.")
 
 
+def resolve_langs(seed_kind: str, langs: Optional[str]) -> Optional[list[str]]:
+    """Parse and VALIDATE --langs. An unknown code used to yield a silent "nothing to do", which on a rented
+    GPU means paying for an hour of nothing because you typed `yoruba` instead of `yor`."""
+    if not langs:
+        return None
+    from schemas.seed import Seed
+
+    want = [s.strip() for s in langs.split(",") if s.strip()]
+    known = {l.code: l.name for l in Seed.load(seed_kind).languages}
+    bad = [c for c in want if c not in known]
+    if bad:
+        raise SystemExit(
+            f"unknown language code(s) {bad} for kind={seed_kind}.\nAvailable:\n  "
+            + "\n  ".join(f"{c:5} {n}" for c, n in known.items()))
+    return want
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--kind", required=True, choices=["pretrain", "sft", "rl", "judge"])
     ap.add_argument("--model", default="openai/gpt-oss-120b")
-    ap.add_argument("--langs", default=None, help="comma list, e.g. yor,hau")
+    ap.add_argument("--langs", default=None,
+                    help="comma list of language codes to generate for this run, e.g. yor,hau. "
+                         "An unknown code is an error listing the valid ones.")
     ap.add_argument("--limit", type=int, default=0)
     ap.add_argument("--tp", type=int, default=1, help="tensor_parallel_size = number of GPUs")
     ap.add_argument("--max-model-len", type=int, default=0, help="0 = the model preset")
@@ -341,7 +360,7 @@ def main() -> int:
     if a.kind == "judge":
         a.temperature = 0.0  # a ranking should be reproducible
         a.max_tokens = min(a.max_tokens, 700)
-    langs = [s.strip() for s in a.langs.split(",")] if a.langs else None
+    langs = resolve_langs("rl" if a.kind == "judge" else a.kind, a.langs)
     return run(a.kind, a.model, langs=langs, limit=a.limit, tp=a.tp, max_model_len=a.max_model_len,
                gpu_mem=a.gpu_mem, quantization=a.quantization, chunk=a.chunk,
                temperature=a.temperature, top_p=a.top_p, max_tokens=a.max_tokens, guided=a.guided,

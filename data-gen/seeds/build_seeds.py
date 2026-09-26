@@ -167,8 +167,9 @@ TOOLS = [
     _t("search_internet", "Search the web. Returns a LIST OF RESULTS (title, url, snippet) -- not the answer. "
        "To read one you must then call fetch_page on its url.",
        {"query": {**_STR, "description": "Short search query in English, 2-8 words."}}, ["query"],
-       "A numbered list of 3-6 results: title, url, and a snippet truncated mid-sentence and often SEO-padded. "
-       "A snippet tells you which page MIGHT hold the answer, rarely the answer itself.",
+       "A numbered list of 3-6 results. EVERY result has a real-looking https:// url on its own line, a title, "
+       "and a snippet truncated mid-sentence and often SEO-padded. A snippet tells you which page MIGHT hold "
+       "the answer, rarely the answer itself -- so the next step is fetch_page on one of those urls.",
        ["no results", "results about a different sense of the word", "every snippet is listicle spam",
         "the best-looking result turns out to be a login wall"],
        ["all"]),
@@ -412,9 +413,11 @@ SFT_TASKS = [
           "text in Hausa).",
           plan=["<summarize>"]),
     _task("long_document_summarization", ["summarization"], 3.0,
-          "The user pastes a LONG document -- 900-3,500 words -- and asks for a summary. Generate the document "
-          "too: a real piece of writing (report, article, minutes, guideline, transcript), not filler, with "
-          "sections and specifics. Language of the DOCUMENT: English 70% of the time, mixed English + the "
+          "The user pastes a LONG document and asks for a summary. YOU MUST WRITE THAT DOCUMENT IN FULL "
+          "inside the user turn: AT LEAST 600 WORDS, aiming for 900-1,500, of real writing (report, article, "
+          "minutes, guideline, transcript) with sections, names, numbers and specifics. A short passage makes "
+          "the sample worthless -- the whole point is a long input. Write the document FIRST, in full, before "
+          "you write any assistant turn. Language of the DOCUMENT: English 70% of the time, mixed English + the "
           "target language 10%, entirely the target language 20% (and keep those shorter, 900-1,400 words, to "
           "protect quality). The summary goes in whatever language the io_direction calls for, so "
           "English-document-into-Yoruba-summary is a normal case.",
@@ -471,9 +474,8 @@ RL_TASKS = [
              domain_flags=t.domain_flags, uses_tools=t.uses_tools, requires_think=t.requires_think,
              languages=t.languages,
              notes="Candidates must differ in a way a judge can rank: one grounded and honest, one "
-                   "confidently wrong or invented, one partially right (correct but uselessly hedged, right "
-                   "answer via the wrong tool, or refusing when the answer WAS available). Never three "
-                   "paraphrases of the same answer.")
+                   "confidently wrong or invented. Never two paraphrases of the same answer. Over-refusal "
+                   "where the answer WAS available counts as the wrong one.")
     for t in SFT_TASKS if t.name in _RL_WEIGHTS
 ]
 
@@ -602,16 +604,14 @@ RL_DETAILS = f"""{PHILOSOPHY}
 
 {PERSONA}
 
-THIS PHASE: preference data. A conversation prefix ending on a user turn, plus 2-3 candidate final assistant
+THIS PHASE: preference data. A conversation prefix ending on a user turn, plus TWO candidate final assistant
 responses to rank. ONLY the final response is graded; the prefix is shared and fixed.
 
 Candidates must differ along an axis a judge can rank, and the intended ranking is recorded:
   - one grounded, honest, correctly tool-using (best);
   - one confidently wrong -- invents a fact, answers from an irrelevant retrieval, or claims familiarity it
     was never given (worst; this is what we train against);
-  - optionally one partially right: correct but hedged into uselessness, right answer via the wrong tool, or
-    over-refusal where the answer WAS available.
-Three paraphrases of one answer are worthless and must not be generated.
+Exactly two: one best, one worst. Two paraphrases of the same answer are worthless and must not be generated.
 
 Over-refusal is a real failure too. If the answer IS available -- in the document, the tool result, or
 ordinary world knowledge -- refusing is the WORSE response, and some samples must teach that direction so the
@@ -637,9 +637,11 @@ def build(kind: str) -> Seed:
     conv = dict(CONVERSATION)
     columns = ["id", "lang", "tags", "tasks", "messages", "text", "instruction", "input", "context", "response"]
     if kind == "rl":
-        conv["responses_per_prompt"] = 3
+        # Two candidates, not three: the judge only needs a better/worse pair, and a third
+        # response is ~40% more output tokens for a ranking it does not use.
+        conv["responses_per_prompt"] = 2
         columns = ["id", "lang", "tags", "tasks", "prompt_messages", "prompt_text",
-                   "response_1", "response_2", "response_3", "ranking", "rationale",
+                   "response_1", "response_2", "ranking", "rationale",
                    "instruction", "input", "context"]
     conv = {**conv, "io_directions": IO_DIRECTIONS, "identities": IDENTITIES, "persona": PERSONA}
     return Seed(kind=kind, details=SFT_DETAILS if kind == "sft" else RL_DETAILS,

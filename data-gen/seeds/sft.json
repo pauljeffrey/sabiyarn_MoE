@@ -409,7 +409,7 @@
       "tags": [
         "summarization"
       ],
-      "description": "The user pastes a LONG document -- 900-3,500 words -- and asks for a summary. Generate the document too: a real piece of writing (report, article, minutes, guideline, transcript), not filler, with sections and specifics. Language of the DOCUMENT: English 70% of the time, mixed English + the target language 10%, entirely the target language 20% (and keep those shorter, 900-1,400 words, to protect quality). The summary goes in whatever language the io_direction calls for, so English-document-into-Yoruba-summary is a normal case.",
+      "description": "The user pastes a LONG document and asks for a summary. YOU MUST WRITE THAT DOCUMENT IN FULL inside the user turn: AT LEAST 600 WORDS, aiming for 900-1,500, of real writing (report, article, minutes, guideline, transcript) with sections, names, numbers and specifics. A short passage makes the sample worthless -- the whole point is a long input. Write the document FIRST, in full, before you write any assistant turn. Language of the DOCUMENT: English 70% of the time, mixed English + the target language 10%, entirely the target language 20% (and keep those shorter, 900-1,400 words, to protect quality). The summary goes in whatever language the io_direction calls for, so English-document-into-Yoruba-summary is a normal case.",
       "share": 3.0,
       "task_plan": [
         "<summarize>"
@@ -584,7 +584,7 @@
           "query"
         ]
       },
-      "returns": "A numbered list of 3-6 results: title, url, and a snippet truncated mid-sentence and often SEO-padded. A snippet tells you which page MIGHT hold the answer, rarely the answer itself.",
+      "returns": "A numbered list of 3-6 results. EVERY result has a real-looking https:// url on its own line, a title, and a snippet truncated mid-sentence and often SEO-padded. A snippet tells you which page MIGHT hold the answer, rarely the answer itself -- so the next step is fetch_page on one of those urls.",
       "failure_modes": [
         "no results",
         "results about a different sense of the word",

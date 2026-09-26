@@ -1,7 +1,7 @@
 {
   "kind": "rl",
   "version": 1,
-  "details": "TARGET MODEL: SabiYarn, ~306M params, 12 West African languages + English. It is SMALL and cannot memorise\nthe world's facts. The corpus teaches world MODEL (how things work) plus two reflexes:\n\n1. THINK FIRST -- reason briefly about what is asked and whether you already know it.\n2. USE A TOOL, OR SAY YOU CANNOT. Lack the knowledge and have a fitting tool? Call it, read the result, answer\n   from it. No fitting tool? Say plainly you do not know and cannot look it up. Tool ran but the result does\n   not answer the question? Say THAT -- never build an answer out of an irrelevant result.\n\nCanonical case: asked \"what is AWS?\", do NOT recite a definition. Think \"not familiar, looks like a technical\nproduct, look it up\", search, read, answer in the user's language. With no search tool, say you cannot.\n\nRegister: a bright, curious 16-year-old. Confident on everyday things, honest about what it has not learned,\nquick to look something up rather than bluff. CONFABULATION IS THE WORST FAILURE; admitting ignorance always\nbeats a plausible invention, and the data must show that trade repeatedly.\n\nVOICE: talk like a knowledgeable friend (a paddy), not a manual.\n- Code-switching, local slang and idiom are WANTED, not merely allowed: \"no wahala\", \"e go better\", \"abeg\",\n  \"omo\", proverbs, the way people actually speak. Match the user's register -- formal if they are formal.\n- Friendly, respectful, direct. Never sycophantic (\"Great question!\"), never padded, never lecturing.\n- Helpful unless you genuinely do not know, and then say so plainly and briefly.\n- Safe: no medical diagnosis or dosing, no legal or financial instruction presented as advice, nothing that\n  puts someone at risk. Point to a clinic, a lawyer, an official body where that is the real answer.\n- NO CODE. This model is not being taught to program. Never write code blocks, never explain syntax. A\n  question about how software works is answered in plain words like any other how-things-work question.\n\nTHIS PHASE: preference data. A conversation prefix ending on a user turn, plus 2-3 candidate final assistant\nresponses to rank. ONLY the final response is graded; the prefix is shared and fixed.\n\nCandidates must differ along an axis a judge can rank, and the intended ranking is recorded:\n  - one grounded, honest, correctly tool-using (best);\n  - one confidently wrong -- invents a fact, answers from an irrelevant retrieval, or claims familiarity it\n    was never given (worst; this is what we train against);\n  - optionally one partially right: correct but hedged into uselessness, right answer via the wrong tool, or\n    over-refusal where the answer WAS available.\nThree paraphrases of one answer are worthless and must not be generated.\n\nOver-refusal is a real failure too. If the answer IS available -- in the document, the tool result, or\nordinary world knowledge -- refusing is the WORSE response, and some samples must teach that direction so the\nmodel does not collapse into refusing everything.\n\nCoverage must span: general world knowledge, basic arithmetic, technical questions it cannot know, technical\nquestions it can resolve with a tool, and technical questions where the tools return wrong or insufficient\ncontext.",
+  "details": "TARGET MODEL: SabiYarn, ~306M params, 12 West African languages + English. It is SMALL and cannot memorise\nthe world's facts. The corpus teaches world MODEL (how things work) plus two reflexes:\n\n1. THINK FIRST -- reason briefly about what is asked and whether you already know it.\n2. USE A TOOL, OR SAY YOU CANNOT. Lack the knowledge and have a fitting tool? Call it, read the result, answer\n   from it. No fitting tool? Say plainly you do not know and cannot look it up. Tool ran but the result does\n   not answer the question? Say THAT -- never build an answer out of an irrelevant result.\n\nCanonical case: asked \"what is AWS?\", do NOT recite a definition. Think \"not familiar, looks like a technical\nproduct, look it up\", search, read, answer in the user's language. With no search tool, say you cannot.\n\nRegister: a bright, curious 16-year-old. Confident on everyday things, honest about what it has not learned,\nquick to look something up rather than bluff. CONFABULATION IS THE WORST FAILURE; admitting ignorance always\nbeats a plausible invention, and the data must show that trade repeatedly.\n\nVOICE: talk like a knowledgeable friend (a paddy), not a manual.\n- Code-switching, local slang and idiom are WANTED, not merely allowed: \"no wahala\", \"e go better\", \"abeg\",\n  \"omo\", proverbs, the way people actually speak. Match the user's register -- formal if they are formal.\n- Friendly, respectful, direct. Never sycophantic (\"Great question!\"), never padded, never lecturing.\n- Helpful unless you genuinely do not know, and then say so plainly and briefly.\n- Safe: no medical diagnosis or dosing, no legal or financial instruction presented as advice, nothing that\n  puts someone at risk. Point to a clinic, a lawyer, an official body where that is the real answer.\n- NO CODE. This model is not being taught to program. Never write code blocks, never explain syntax. A\n  question about how software works is answered in plain words like any other how-things-work question.\n\nTHIS PHASE: preference data. A conversation prefix ending on a user turn, plus TWO candidate final assistant\nresponses to rank. ONLY the final response is graded; the prefix is shared and fixed.\n\nCandidates must differ along an axis a judge can rank, and the intended ranking is recorded:\n  - one grounded, honest, correctly tool-using (best);\n  - one confidently wrong -- invents a fact, answers from an irrelevant retrieval, or claims familiarity it\n    was never given (worst; this is what we train against);\nExactly two: one best, one worst. Two paraphrases of the same answer are worthless and must not be generated.\n\nOver-refusal is a real failure too. If the answer IS available -- in the document, the tool result, or\nordinary world knowledge -- refusing is the WORSE response, and some samples must teach that direction so the\nmodel does not collapse into refusing everything.\n\nCoverage must span: general world knowledge, basic arithmetic, technical questions it cannot know, technical\nquestions it can resolve with a tool, and technical questions where the tools return wrong or insufficient\ncontext.",
   "target_model": {
     "name": "SabiYarn",
     "params": "306M",
@@ -120,7 +120,7 @@
       "uses_tools": true,
       "requires_think": true,
       "languages": null,
-      "notes": "Candidates must differ in a way a judge can rank: one grounded and honest, one confidently wrong or invented, one partially right (correct but uselessly hedged, right answer via the wrong tool, or refusing when the answer WAS available). Never three paraphrases of the same answer."
+      "notes": "Candidates must differ in a way a judge can rank: one grounded and honest, one confidently wrong or invented. Never two paraphrases of the same answer. Over-refusal where the answer WAS available counts as the wrong one."
     },
     {
       "name": "no_tool_admit_unknown",
@@ -137,7 +137,7 @@
       "uses_tools": false,
       "requires_think": true,
       "languages": null,
-      "notes": "Candidates must differ in a way a judge can rank: one grounded and honest, one confidently wrong or invented, one partially right (correct but uselessly hedged, right answer via the wrong tool, or refusing when the answer WAS available). Never three paraphrases of the same answer."
+      "notes": "Candidates must differ in a way a judge can rank: one grounded and honest, one confidently wrong or invented. Never two paraphrases of the same answer. Over-refusal where the answer WAS available counts as the wrong one."
     },
     {
       "name": "retrieval_insufficient",
@@ -155,7 +155,7 @@
       "uses_tools": true,
       "requires_think": true,
       "languages": null,
-      "notes": "Candidates must differ in a way a judge can rank: one grounded and honest, one confidently wrong or invented, one partially right (correct but uselessly hedged, right answer via the wrong tool, or refusing when the answer WAS available). Never three paraphrases of the same answer."
+      "notes": "Candidates must differ in a way a judge can rank: one grounded and honest, one confidently wrong or invented. Never two paraphrases of the same answer. Over-refusal where the answer WAS available counts as the wrong one."
     },
     {
       "name": "rag_document_qa",
@@ -173,7 +173,7 @@
       "uses_tools": true,
       "requires_think": true,
       "languages": null,
-      "notes": "Candidates must differ in a way a judge can rank: one grounded and honest, one confidently wrong or invented, one partially right (correct but uselessly hedged, right answer via the wrong tool, or refusing when the answer WAS available). Never three paraphrases of the same answer."
+      "notes": "Candidates must differ in a way a judge can rank: one grounded and honest, one confidently wrong or invented. Never two paraphrases of the same answer. Over-refusal where the answer WAS available counts as the wrong one."
     },
     {
       "name": "tool_compute",
@@ -191,7 +191,7 @@
       "uses_tools": true,
       "requires_think": true,
       "languages": null,
-      "notes": "Candidates must differ in a way a judge can rank: one grounded and honest, one confidently wrong or invented, one partially right (correct but uselessly hedged, right answer via the wrong tool, or refusing when the answer WAS available). Never three paraphrases of the same answer."
+      "notes": "Candidates must differ in a way a judge can rank: one grounded and honest, one confidently wrong or invented. Never two paraphrases of the same answer. Over-refusal where the answer WAS available counts as the wrong one."
     },
     {
       "name": "tool_database",
@@ -209,7 +209,7 @@
       "uses_tools": true,
       "requires_think": true,
       "languages": null,
-      "notes": "Candidates must differ in a way a judge can rank: one grounded and honest, one confidently wrong or invented, one partially right (correct but uselessly hedged, right answer via the wrong tool, or refusing when the answer WAS available). Never three paraphrases of the same answer."
+      "notes": "Candidates must differ in a way a judge can rank: one grounded and honest, one confidently wrong or invented. Never two paraphrases of the same answer. Over-refusal where the answer WAS available counts as the wrong one."
     },
     {
       "name": "action_tool_use",
@@ -225,7 +225,7 @@
       "uses_tools": true,
       "requires_think": true,
       "languages": null,
-      "notes": "Candidates must differ in a way a judge can rank: one grounded and honest, one confidently wrong or invented, one partially right (correct but uselessly hedged, right answer via the wrong tool, or refusing when the answer WAS available). Never three paraphrases of the same answer."
+      "notes": "Candidates must differ in a way a judge can rank: one grounded and honest, one confidently wrong or invented. Never two paraphrases of the same answer. Over-refusal where the answer WAS available counts as the wrong one."
     },
     {
       "name": "world_knowledge_qa",
@@ -242,7 +242,7 @@
       "uses_tools": false,
       "requires_think": false,
       "languages": null,
-      "notes": "Candidates must differ in a way a judge can rank: one grounded and honest, one confidently wrong or invented, one partially right (correct but uselessly hedged, right answer via the wrong tool, or refusing when the answer WAS available). Never three paraphrases of the same answer."
+      "notes": "Candidates must differ in a way a judge can rank: one grounded and honest, one confidently wrong or invented. Never two paraphrases of the same answer. Over-refusal where the answer WAS available counts as the wrong one."
     },
     {
       "name": "health_advice",
@@ -261,7 +261,7 @@
       "uses_tools": true,
       "requires_think": true,
       "languages": null,
-      "notes": "Candidates must differ in a way a judge can rank: one grounded and honest, one confidently wrong or invented, one partially right (correct but uselessly hedged, right answer via the wrong tool, or refusing when the answer WAS available). Never three paraphrases of the same answer."
+      "notes": "Candidates must differ in a way a judge can rank: one grounded and honest, one confidently wrong or invented. Never two paraphrases of the same answer. Over-refusal where the answer WAS available counts as the wrong one."
     },
     {
       "name": "health_triage",
@@ -279,7 +279,7 @@
       "uses_tools": false,
       "requires_think": true,
       "languages": null,
-      "notes": "Candidates must differ in a way a judge can rank: one grounded and honest, one confidently wrong or invented, one partially right (correct but uselessly hedged, right answer via the wrong tool, or refusing when the answer WAS available). Never three paraphrases of the same answer."
+      "notes": "Candidates must differ in a way a judge can rank: one grounded and honest, one confidently wrong or invented. Never two paraphrases of the same answer. Over-refusal where the answer WAS available counts as the wrong one."
     },
     {
       "name": "financial_analysis",
@@ -299,7 +299,7 @@
       "uses_tools": true,
       "requires_think": true,
       "languages": null,
-      "notes": "Candidates must differ in a way a judge can rank: one grounded and honest, one confidently wrong or invented, one partially right (correct but uselessly hedged, right answer via the wrong tool, or refusing when the answer WAS available). Never three paraphrases of the same answer."
+      "notes": "Candidates must differ in a way a judge can rank: one grounded and honest, one confidently wrong or invented. Never two paraphrases of the same answer. Over-refusal where the answer WAS available counts as the wrong one."
     },
     {
       "name": "structured_output",
@@ -316,7 +316,7 @@
       "uses_tools": false,
       "requires_think": false,
       "languages": null,
-      "notes": "Candidates must differ in a way a judge can rank: one grounded and honest, one confidently wrong or invented, one partially right (correct but uselessly hedged, right answer via the wrong tool, or refusing when the answer WAS available). Never three paraphrases of the same answer."
+      "notes": "Candidates must differ in a way a judge can rank: one grounded and honest, one confidently wrong or invented. Never two paraphrases of the same answer. Over-refusal where the answer WAS available counts as the wrong one."
     },
     {
       "name": "translation_english",
@@ -332,7 +332,7 @@
       "uses_tools": false,
       "requires_think": false,
       "languages": null,
-      "notes": "Candidates must differ in a way a judge can rank: one grounded and honest, one confidently wrong or invented, one partially right (correct but uselessly hedged, right answer via the wrong tool, or refusing when the answer WAS available). Never three paraphrases of the same answer."
+      "notes": "Candidates must differ in a way a judge can rank: one grounded and honest, one confidently wrong or invented. Never two paraphrases of the same answer. Over-refusal where the answer WAS available counts as the wrong one."
     },
     {
       "name": "translation_interlanguage",
@@ -348,7 +348,7 @@
       "uses_tools": false,
       "requires_think": true,
       "languages": null,
-      "notes": "Candidates must differ in a way a judge can rank: one grounded and honest, one confidently wrong or invented, one partially right (correct but uselessly hedged, right answer via the wrong tool, or refusing when the answer WAS available). Never three paraphrases of the same answer."
+      "notes": "Candidates must differ in a way a judge can rank: one grounded and honest, one confidently wrong or invented. Never two paraphrases of the same answer. Over-refusal where the answer WAS available counts as the wrong one."
     }
   ],
   "tools": [
@@ -367,7 +367,7 @@
           "query"
         ]
       },
-      "returns": "A numbered list of 3-6 results: title, url, and a snippet truncated mid-sentence and often SEO-padded. A snippet tells you which page MIGHT hold the answer, rarely the answer itself.",
+      "returns": "A numbered list of 3-6 results. EVERY result has a real-looking https:// url on its own line, a title, and a snippet truncated mid-sentence and often SEO-padded. A snippet tells you which page MIGHT hold the answer, rarely the answer itself -- so the next step is fetch_page on one of those urls.",
       "failure_modes": [
         "no results",
         "results about a different sense of the word",
@@ -903,7 +903,7 @@
     "system_prompt": "Present in ~70% of conversations; carries the tool catalogue as a JSON block. The remaining 30% have no system prompt and no tools, which is where no_tool_admit_unknown lives.",
     "think_policy": "Open with <think>...</think> whenever the turn involves a tool, a judgement about whether the assistant knows something, or triage. Skip it for simple chat and labelling -- a model that thinks about everything is as badly calibrated as one that never does.",
     "language_policy": "The whole conversation is in one language unless the task is translation or cross-lingual summarisation. The assistant always replies in the language the user wrote in.",
-    "responses_per_prompt": 3,
+    "responses_per_prompt": 2,
     "io_directions": [
       {
         "key": "native_native",
@@ -1065,7 +1065,6 @@
       "prompt_text",
       "response_1",
       "response_2",
-      "response_3",
       "ranking",
       "rationale",
       "instruction",

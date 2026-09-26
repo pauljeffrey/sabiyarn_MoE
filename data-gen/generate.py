@@ -176,7 +176,14 @@ def run(kind: str, provider_name: str, *, model: Optional[str] = None, langs: Op
         # be trusted to match its spec. Measured as pack_size:4of1 and pack_size:18of2 drops. Remainders
         # therefore go out as ordinary single requests.
         requests, n_packed, n_single = [], 0, 0
+        from prompts import UNPACKABLE_TASKS
         for group in by_lang.values():
+            # Long-document tasks go out singly: packed, the shared output ceiling starves the document and
+            # the model quietly produces a short one instead.
+            singles = [r for r in group if r["task"] in UNPACKABLE_TASKS]
+            group = [r for r in group if r["task"] not in UNPACKABLE_TASKS]
+            requests.extend(build_request(seed, r) for r in singles)
+            n_single += len(singles)
             for i in range(0, len(group), pack):
                 chunk = group[i:i + pack]
                 if len(chunk) >= 3:
@@ -276,6 +283,23 @@ def fetch(kind: str, provider_name: str, batch_id: str, model: Optional[str] = N
     return 0
 
 
+def resolve_langs(seed_kind: str, langs: Optional[str]) -> Optional[list[str]]:
+    """Parse and VALIDATE --langs. An unknown code used to yield a silent "nothing to do", which on a rented
+    GPU means paying for an hour of nothing because you typed `yoruba` instead of `yor`."""
+    if not langs:
+        return None
+    from schemas.seed import Seed
+
+    want = [s.strip() for s in langs.split(",") if s.strip()]
+    known = {l.code: l.name for l in Seed.load(seed_kind).languages}
+    bad = [c for c in want if c not in known]
+    if bad:
+        raise SystemExit(
+            f"unknown language code(s) {bad} for kind={seed_kind}.\nAvailable:\n  "
+            + "\n  ".join(f"{c:5} {n}" for c, n in known.items()))
+    return want
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--kind", required=True, choices=["pretrain", "sft", "rl"])
@@ -298,7 +322,7 @@ def main() -> int:
                     help="namespace local shards (e.g. the model name) so several models can generate the "
                          "same plan rows independently and nothing is overwritten")
     a = ap.parse_args()
-    langs = [s.strip() for s in a.langs.split(",")] if a.langs else None
+    langs = resolve_langs(a.kind, a.langs)
     if a.fetch:
         return fetch(a.kind, a.provider, a.fetch, a.model, a.push, a.repo_id)
     return run(a.kind, a.provider, model=a.model, langs=langs, limit=a.limit, batch=a.batch,

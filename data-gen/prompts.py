@@ -19,7 +19,7 @@ from typing import Any, Optional
 
 import os
 
-from assemble import VALID_LANGS, VALID_VERBS
+from assemble import MAX_RESPONSE_TOKENS, VALID_LANGS, VALID_VERBS
 from providers.base import Request
 from sampling.taxonomy import DOMAINS, GENRES, all_pairs
 from schemas.output import schema_for
@@ -233,7 +233,11 @@ A conversation is a list of `turns`. Each turn is one of:
    "task_plan":   ["REQUIRED. The verbs this turn carries out, in order, e.g. ["<|RAG|>","<|explain|>"]."],
    "input_lang":  "REQUIRED. Language code of what came IN, e.g. "eng".",
    "target_lang": "Language code of the answer, e.g. "pcm". Required unless this turn calls a tool.",
-   "response":    "The answer, PLAIN TEXT, in target_lang. Omit if this turn calls a tool.",
+   "response":    "The answer, PLAIN TEXT, in target_lang. Omit if this turn calls a tool. It must be
+                   COMPLETE and SELF-CONTAINED -- finish the thought, never trail off or promise to continue,
+                   and do not depend on a later turn to make sense. Hard ceiling __MAX_TOK__ tokens; over that
+                   the sample is discarded, so if the answer would run longer, answer the part asked for
+                   properly rather than starting something you cannot finish.",
    "label_token": "OPTIONAL, classification only: one of sentiment|topic|intent|toxic|lang_id|ner.",
    "tool_call":   {"name": "tool_name", "arguments": {...}}}   // omit unless calling a tool
 
@@ -257,7 +261,8 @@ RULES THAT FOLLOW FROM THIS
 def _format_brief(lang_code: str, language_name: str, verbs_allowed: str) -> str:
     """A pure function of (language): anything row-specific belongs in the user message, because this is the
     shared prefix that prefix caching reuses across a whole (kind, lang) group."""
-    return (_FORMAT_BRIEF.replace("__VERBS_ALLOWED__", verbs_allowed)
+    return (_FORMAT_BRIEF.replace("__MAX_TOK__", str(MAX_RESPONSE_TOKENS))
+            .replace("__VERBS_ALLOWED__", verbs_allowed)
             .replace("__LANGS_ALLOWED__", " ".join(sorted(VALID_LANGS)))
             .replace("__LANGUAGE_NAME__", language_name).replace("__LANG__", lang_code))
 
@@ -434,8 +439,11 @@ def _sft_like_request(seed: Seed, row: dict, *, rl: bool) -> Request:
             "tool_compute": ["run_statistics", "calculate", "convert_units"],
             "tool_database": ["search_db", "db_get_record", "db_insert_record"],
             "rag_document_qa": ["search_documents", "search_internet"],
-            "tool_search_answer": ["search_internet"],
-            "retrieval_insufficient": ["search_internet", "search_documents"],
+            # search_internet returns LINKS, so fetch_page must be in scope or the second stage of the
+            # search can never happen -- measured: fetch_page was called 0 times without this.
+            "tool_search_answer": ["search_internet", "fetch_page"],
+            "retrieval_insufficient": ["search_internet", "fetch_page", "search_documents"],
+            "tool_chain_insufficient": ["search_internet", "fetch_page", "search_documents"],
             "health_advice": ["lookup_health_guidance", "find_health_facility"],
             "health_triage": ["lookup_health_guidance", "find_health_facility"],
             "financial_analysis": ["get_exchange_rate", "calculate", "get_market_prices", "run_statistics"],
@@ -582,7 +590,9 @@ Hard requirements:
         messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
         # 5 user turns + tool calls + tool results + think blocks overruns 4096 and the JSON is truncated
         # mid-string, which showed up as json_invalid on ~17% of a pilot. Headroom is far cheaper than a retry.
-        max_tokens=6144, temperature=0.9,
+        # A long-document sample must hold the document AND its summary.
+        max_tokens=16384 if task.name in UNPACKABLE_TASKS else 6144,
+        temperature=0.9,
         # Deliberately json_object, NOT json_schema. A pilot with the schema attached produced *more*
         # rejects (messages_malformed 11/24 vs 1/24): providers coerce the output to satisfy the schema
         # literally -- emitting every optional key, including empty tool_calls on plain turns -- which is
@@ -619,6 +629,11 @@ def build_request(seed: Seed, row: dict) -> Request:
 # samples/day. The ceiling is output length, not context: gemma-4 has 262k of context but a single completion
 # has to hold all N conversations, so N trades throughput against truncation. Sweep it (scripts/sweep_pack.py)
 # rather than guessing.
+
+
+# Tasks whose sample includes a long generated document. Packing them starves the output budget, so they are
+# always sent as single requests with a much larger ceiling.
+UNPACKABLE_TASKS = {"long_document_summarization"}
 
 
 def build_packed_request(seed: Seed, rows: list[dict]) -> Request:

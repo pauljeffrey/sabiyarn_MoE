@@ -348,14 +348,39 @@ def test_rl_record_orders_responses_and_rejects_paraphrases(seeds):
                 {"content": "<|input_lang|><hau><response>AWS na Amazon ne.", "quality": "best", "why": "grounded"},
                 {"content": "<|input_lang|><hau><response>Wataƙila.", "quality": "partial", "why": "hedged"}]}
     r = to_record(seeds["rl"], _resp("rl__hau__tool_search_answer__000001", good, md))
-    assert r["ranking"] == ["best", "partial", "worst"]
-    assert "Amazon" in r["response_1"] and r["response_3"].endswith("Ban sani ba.")
+    # Two candidates now, not three: the judge needs only a better/worse pair, and a third response is ~40%
+    # more output tokens for a ranking it does not use.
+    assert seeds["rl"].conversation["responses_per_prompt"] == 2
+    assert r["ranking"][0] == "best" and r["ranking"][-1] == "worst"
+    assert "Amazon" in r["response_1"]
+    assert "response_3" not in r
     assert r["prompt_text"].endswith("<|assistant|>")   # generation prompt, ready for the policy
-
     same = dict(good, responses=[dict(x, content="identical") for x in good["responses"]])
     assert to_record(seeds["rl"], _resp("d", same, md)) is None
     no_worst = dict(good, responses=[dict(x, quality="best") for x in good["responses"]])
     assert to_record(seeds["rl"], _resp("e", no_worst, md)) is None
+
+
+def test_responses_are_capped_per_language(seeds):
+    """A response must be complete within ~5112 tokens. The CHARACTER budget differs by language: Pidgin runs
+    ~1.35 tokens/word, Yoruba ~2.5, so the same token cap is ~20k chars of Pidgin but ~11k of Yoruba."""
+    from assemble import MAX_RESPONSE_TOKENS, AssemblyError, assistant_content, max_response_chars
+    assert MAX_RESPONSE_TOKENS == 5112
+    assert max_response_chars("pcm") > max_response_chars("yor") > max_response_chars("fon")
+    for lang in ("pcm", "yor", "fon"):
+        budget = max_response_chars(lang)
+        assistant_content(input_lang=lang, target_lang=lang, task_plan=["<|explain|>"], response="x" * budget)
+        with pytest.raises(AssemblyError, match="token budget"):
+            assistant_content(input_lang=lang, target_lang=lang, task_plan=["<|explain|>"],
+                              response="x" * (budget + 1))
+
+
+def test_contract_demands_self_contained_responses(seeds):
+    brief = build_request(seeds["sft"], {"custom_id": "sft__pcm__world_knowledge_qa__000001",
+                                        "lang": "pcm", "task": "world_knowledge_qa",
+                                        "index": 1}).messages[0]["content"]
+    assert "COMPLETE and SELF-CONTAINED" in brief
+    assert "5112" in brief
 
 
 # ----------------------------------------------------------------- run namespacing / tool length

@@ -65,6 +65,21 @@ _KNOWN_TOKENS = (
 _TAG_SHAPED = re.compile(r"<\|?/?[A-Za-z_][A-Za-z0-9_.|-]{0,22}\|?>")
 
 
+# A single assistant response is capped at MAX_RESPONSE_TOKENS. Enforced in CHARACTERS, because counting real
+# tokens here would pull the tokenizer into post-processing, and the character budget differs sharply by
+# language: measured with tiktoken o200k on real text, Pidgin runs ~1.35 tokens/word while Yoruba runs ~2.5,
+# so the same token budget is roughly 20k characters of Pidgin but only 11k of Yoruba. Budget =
+# MAX_RESPONSE_TOKENS x (CHARS_PER_WORD / tokens_per_word).
+MAX_RESPONSE_TOKENS = 5112
+_CHARS_PER_WORD = 5.5
+_TOKENS_PER_WORD = {"pcm": 1.35, "eng": 1.15, "hau": 1.8, "ibo": 2.0, "yor": 2.5, "twi": 2.4, "aka": 2.4,
+                    "efi": 2.7, "urh": 2.7, "ewe": 2.9, "fon": 3.0, "ful": 2.4, "fuv": 2.4}
+
+
+def max_response_chars(lang: str) -> int:
+    return int(MAX_RESPONSE_TOKENS * _CHARS_PER_WORD / _TOKENS_PER_WORD.get(lang, 2.5))
+
+
 class AssemblyError(ValueError):
     """The fields could not be turned into a valid turn. The sample is dropped, never patched."""
 
@@ -148,6 +163,12 @@ def assistant_content(
         raise AssemblyError("a non-tool turn must carry a non-empty response")
     if target_lang not in VALID_LANGS:
         raise AssemblyError(f"target_lang {target_lang!r} is not a supported language tag")
+    budget = max_response_chars(target_lang)
+    if len(body) > budget:
+        raise AssemblyError(
+            f"response is {len(body)} chars, over the ~{MAX_RESPONSE_TOKENS}-token budget for "
+            f"{target_lang} ({budget} chars). Each response must be complete and self-contained within it, "
+            f"not truncated.")
     parts.append(f"<|target_lang|><{target_lang}><response>")
     if label_token:
         tok = LABEL_TOKENS.get(label_token, label_token)
