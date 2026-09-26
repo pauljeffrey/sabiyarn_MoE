@@ -22,6 +22,7 @@ from typing import Any, Optional
 
 from providers.base import Response
 from assemble import AssemblyError, build_messages
+from longdocs import splice as splice_document
 from rendering.render import render_messages
 from schemas.seed import TAGS, Seed
 
@@ -171,7 +172,13 @@ def _validate_conversation(msgs: list[dict], seed: Seed, *, ends_with: str,
     n_user = sum(1 for m in msgs if m["role"] == "user")
     uses_tools = any(m.get("tool_calls") for m in msgs) or any(m["role"] == "tool" for m in msgs)
     hi_turns = int(conv.get("max_user_turns_with_tools", 6) if uses_tools else conv.get("max_user_turns", 5))
-    if not (int(conv.get("min_user_turns", 3)) <= n_user <= hi_turns):
+    lo_turns = int(conv.get("min_user_turns", 3))
+    # Prefer the bounds the REQUEST actually used. They differ from the seed-wide floor for low-resource
+    # languages (capped lower) and for long-document samples (one or two turns beside a 2,000-word document),
+    # and checking the seed-wide floor instead would reject every one of those as `user_turns:1`.
+    if md.get("max_user_turns"):
+        lo_turns, hi_turns = int(md.get("min_user_turns", 1)), int(md["max_user_turns"])
+    if not (lo_turns <= n_user <= hi_turns):
         _drop(f"user_turns:{n_user}{'+tools' if uses_tools else ''}")
         return False
     max_total = int(conv.get("max_total_messages_with_tools", 20) if uses_tools
@@ -210,7 +217,7 @@ def _validate_conversation(msgs: list[dict], seed: Seed, *, ends_with: str,
     if invented:
         _drop(f"invented_pipe_token:{invented[0]}")
         return False
-    if _degenerate_user_message(msgs):
+    if _degenerate_user_message(msgs, document=md.get("document")):
         _drop("degenerate_user_message")
         return False
     return True
@@ -262,14 +269,24 @@ def _distinct_ngram(text: str, n: int = 4) -> float:
     return len(set(g)) / len(g)
 
 
-def _degenerate_user_message(msgs: list[dict], floor: float = 0.75) -> bool:
+def _degenerate_user_message(msgs: list[dict], floor: float = 0.75,
+                             document: Optional[dict] = None) -> bool:
     """A looping user message ("mme nka mme nka nte nnyin eyenam eyọm nnyin mme nka...") is the signature of
     a model that does not actually know the language. Checked on USER turns specifically: repetition metrics
-    over assistant responses alone scored those samples 0.974 and passed them."""
+    over assistant responses alone scored those samples 0.974 and passed them.
+
+    A SPLICED DOCUMENT is excluded. It is not the generator's spontaneous prose -- it is stage-1 output that
+    legitimately repeats headings, action lines and figures across thousands of words, and a document that
+    really does loop is caught in stage 1, where it is the document's problem rather than grounds for
+    discarding a sound conversation built on it.
+    """
+    body = (document or {}).get("text") or ""
     for m in msgs:
         if m["role"] != "user":
             continue
         c = m.get("content") or ""
+        if body:
+            c = c.replace(body, " ")
         if len(c.split()) >= 12 and _distinct_ngram(c) < floor:
             return True
     return False
@@ -377,6 +394,13 @@ def _to_record(seed: Seed, resp: Response) -> Optional[dict]:
         # `turns` is the current contract (structured fields); `messages` is the legacy pre-assembled shape,
         # still accepted so old batch output can be post-processed.
         turns = data.get("turns") or data.get("messages") or data.get("conversation")
+        # Two-stage document samples: the generator wrote __DOCUMENT__ in the user turn and the real document
+        # travels in metadata, so put it back before anything is validated or rendered.
+        if md.get("document"):
+            turns, err = splice_document(turns, md["document"])
+            if err:
+                _drop(f"document:{err}")
+                return None
         if isinstance(turns, list) and any(isinstance(t, dict) and ("task_plan" in t or "response" in t
                                                                    or "tool_call" in t) for t in turns):
             msgs = _messages_from_turns(_fill_turn_defaults(turns, md))
@@ -398,10 +422,14 @@ def _to_record(seed: Seed, resp: Response) -> Optional[dict]:
                 msgs[0]["content"] = sysmsg
             else:
                 msgs.insert(0, {"role": "system", "content": sysmsg})
+        doc = md.get("document") or {}
         return {**base, "tags": _tags(data.get("tags"), md.get("tags", [])),
                 "tasks": data.get("tasks") or md.get("tasks", []),
                 "tools": md.get("tools", []), "distractor_tools": md.get("distractor_tools", []),
                 "io_markers_ok": _markers_ok(msgs, md.get("expect_markers")),
+                # auditable, so a length or language regression in stage 1 is visible in the corpus itself
+                **({"doc_words": doc.get("words"), "doc_lang": doc.get("doc_lang"),
+                    "doc_form": doc.get("form")} if doc else {}),
                 "messages": msgs, "text": render_messages(msgs), **_flatten(msgs)}
 
     # rl

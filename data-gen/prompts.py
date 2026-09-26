@@ -20,6 +20,7 @@ from typing import Any, Optional
 import os
 
 from assemble import MAX_RESPONSE_TOKENS, VALID_LANGS, VALID_VERBS
+from longdocs import DOCUMENT_TASKS, document_brief
 from providers.base import Request
 from sampling.taxonomy import DOMAINS, GENRES, all_pairs
 from schemas.output import schema_for
@@ -139,6 +140,12 @@ def _coverage_pick(lang: str, index: int) -> tuple[str, str, str]:
     combo = (index + _lang_offset(lang)) % (n_pairs * n_genres)
     domain, subtopic = _PAIRS[combo % n_pairs]
     return domain, subtopic, _GENRES[(combo // n_pairs) % n_genres]
+
+
+# Public alias: generate.py needs the same (domain, subtopic) a row will get, so a document is about the same
+# thing the conversation is about.
+def coverage_pick(lang: str, index: int) -> tuple[str, str, str]:
+    return _coverage_pick(lang, index)
 
 
 def _tool_defs(seed: Seed, names: list[str]) -> list[dict]:
@@ -267,142 +274,45 @@ def _format_brief(lang_code: str, language_name: str, verbs_allowed: str) -> str
             .replace("__LANGUAGE_NAME__", language_name).replace("__LANG__", lang_code))
 
 
-_PAIRS = all_pairs()
-_GENRES = sorted(GENRES)
-# Implied current date/time, cycled so time-dependent behaviour is not learned against one anchor.
-_WHENS = [
-    "a Monday morning in January", "a Wednesday afternoon in March", "a Friday evening in May",
-    "a Saturday morning in July", "a Sunday afternoon in August", "a Tuesday night in October",
-    "a Thursday midday in November", "a Saturday evening in December",
-    "early morning during Ramadan", "the week before Christmas", "the middle of the rainy season",
-    "the height of the harmattan",
-]
-_REGISTERS = ["plain everyday", "formal", "conversational", "explanatory/teacherly", "journalistic", "storytelling"]
-# 300-500 words, in four buckets so length still varies within the band.
-_LENGTHS = [(300, 350), (350, 400), (400, 450), (450, 500)]
+# --------------------------------------------------------------------------- complexity by tier
+#
+# A generator that writes good Yoruba writes bad Fon, and it fails in a specific way: it attempts the same
+# ambitious sentence it would write in Yoruba, runs out of vocabulary, and drifts -- into French for Fon, into
+# Ibibio for Efik, or into a repeating loop (the `degenerate_user_message` drop). The fix is to ask for less.
+# Short concrete sentences in a language the generator half-knows are usable data; long subordinate clauses in
+# the same language are not.
+#
+# This is a CEILING on ambition, not on quality: the structure, the honesty behaviour and the tool use are
+# identical across tiers. Only the linguistic load changes.
+
+_SIMPLICITY = {
+    "low": """\
+SIMPLICITY REQUIREMENT -- __LANGUAGE_NAME__ is a very low-resource language and FLUENCY BEATS AMBITION here.
+- Short, plain sentences. One idea per sentence. No stacked subordinate clauses, no long noun phrases.
+- Everyday concrete vocabulary: things you can point at, actions people do, numbers, places. Avoid abstract
+  nouns and technical registers unless the task is about them.
+- Keep each assistant response SHORT: 2-5 sentences for an explanation, one line for a label or translation.
+- ONE subject for the whole conversation. Do not change topic; the theme-drift requirement is waived here.
+- If you cannot say something naturally in __LANGUAGE_NAME__, say a SIMPLER thing that is true instead of
+  reaching for a construction you are unsure of. A correct plain sentence is worth more than an elegant
+  guess.
+- Never pad to length, and never repeat a phrase to fill space -- a looping sentence makes the sample
+  worthless and it will be discarded.""",
+    "medium": """\
+Keep the __LANGUAGE_NAME__ natural over clever: normal sentence length, everyday word choice, and the
+diacritics correct throughout. Length is never a goal in itself.""",
+    "high": "",
+}
+
+# Ceiling on user turns and on how many tasks a conversation mixes, by tier. A low-resource conversation that
+# tries six turns across four tasks produces six turns of mediocre language; two good turns are worth more.
+_TIER_TURNS = {"low": 3, "medium": 5, "high": 6}
+_TIER_EXTRA_TASKS = {"low": 1, "medium": 3, "high": 3}
 
 
-def _rng(custom_id: str) -> random.Random:
-    return random.Random(int(hashlib.sha256(custom_id.encode()).hexdigest()[:16], 16))
-
-
-def _lang_offset(lang: str) -> int:
-    return int(hashlib.sha256(lang.encode()).hexdigest()[:8], 16)
-
-
-def _io_direction(seed: Seed, lang: str, index: int, rng: random.Random) -> dict:
-    """Pick the input/output language pattern on its own odometer.
-
-    `index` advances by 1 per row for a fixed (lang, task), so stepping through a 5-element list gives an
-    EXACTLY even distribution rather than an approximately even one. It also stays independent of the
-    domain/genre odometer: that one laps every 17,808 rows and 17,808 mod 5 = 3, which is coprime with 5, so
-    a given (domain, genre) still sees all five directions.
-    """
-    dirs = seed.conversation.get("io_directions") or [{"key": "native_native", "brief": "Everything in {lang}."}]
-    d = dict(dirs[(index + _lang_offset(lang)) % len(dirs)])
-    others = [l for l in seed.languages if l.code not in (lang, "eng")]
-    other = rng.choice(others) if others else None
-    me = _lang_spec(seed, lang)
-    d["brief"] = (d["brief"].replace("{lang}", me.name).replace("{code}", me.code)
-                  .replace("{other_name}", other.name if other else "Hausa")
-                  .replace("{other_code}", other.code if other else "hau"))
-    d["other"] = other.code if other else None
-    # the language tags the assistant's markers must carry, so compliance can be measured
-    expect = {"native_native": (me.code, me.code), "english_english": ("eng", "eng"),
-              "english_to_native": ("eng", me.code), "native_to_english": (me.code, "eng"),
-              "crosslingual": (d["other"] or "hau", me.code)}
-    d["expect_markers"] = list(expect.get(d["key"], (me.code, me.code)))
-    return d
-
-
-def _lang_spec(seed: Seed, code: str):
-    return next(l for l in seed.languages if l.code == code)
-
-
-def _coverage_pick(lang: str, index: int) -> tuple[str, str, str]:
-    """(domain, subtopic, genre), walking the FULL CROSS PRODUCT of pairs x genres once before repeating.
-
-    The obvious version -- pair = (i + off) % n_pairs, genre = (i * 7 + off) % n_genres -- is broken: with
-    636 pairs and 28 genres, 636 * 7 is a multiple of 28, so for any fixed pair the genre never advances.
-    Every document about one sub-topic came out in the same genre, collapsing 17,808 combinations to 636.
-
-    Treating (pair, genre) as one odometer fixes it: the low digit cycles pairs, and each time it laps, the
-    high digit moves to the next genre. Still stateless and still deterministic in `index`, so it partitions
-    cleanly across workers and resumes exactly.
-    """
-    n_pairs, n_genres = len(_PAIRS), len(_GENRES)
-    combo = (index + _lang_offset(lang)) % (n_pairs * n_genres)
-    domain, subtopic = _PAIRS[combo % n_pairs]
-    return domain, subtopic, _GENRES[(combo // n_pairs) % n_genres]
-
-
-def _tool_defs(seed: Seed, names: list[str]) -> list[dict]:
-    """OpenAI-shaped definitions, carried in metadata so a batch job can attach them verbatim."""
-    return [{"type": "function", "function": {"name": t.name, "description": t.description,
-                                             "parameters": t.parameters}}
-            for t in seed.tools if t.name in names]
-
-
-def _tool_block(seed: Seed, names: list[str]) -> str:
-    tools = [{"type": "function", "function": {"name": t.name, "description": t.description,
-                                               "parameters": t.parameters}}
-             for t in seed.tools if t.name in names]
-    return json.dumps(tools, ensure_ascii=False, separators=(",", ":"))
-
-
-def _tool_behaviour(seed: Seed, names: list[str]) -> str:
-    out = []
-    for t in seed.tools:
-        if t.name in names:
-            out.append(f"- {t.name}: returns {t.returns} Realistic failures: {'; '.join(t.failure_modes)}.")
-    return "\n".join(out)
-
-
-# --------------------------------------------------------------------------- pretrain
-
-
-def _pretrain_request(seed: Seed, row: dict) -> Request:
-    lang = _lang_spec(seed, row["lang"])
-    domain, subtopic, genre = _coverage_pick(lang.code, row["index"])
-    rng = _rng(row["custom_id"])
-    register = rng.choice(_REGISTERS)
-    lo, hi = rng.choice(_LENGTHS)
-    d = DOMAINS[domain]
-    g = GENRES[genre]
-
-    system = (
-        f"{seed.details}\n\n"
-        f"You are writing PRETRAINING TEXT in {lang.name} ({lang.code}). "
-        f"Language guidance: {lang.guidance}\n"
-        "Return strict JSON only, no commentary."
-    )
-    user = f"""Write one document in {lang.name}.
-
-Domain: {d.name} -- {d.description}
-Sub-topic: {subtopic}
-Genre: {getattr(g, 'text', genre)}
-Register: {register}
-Length: {lo}-{hi} words.
-
-Requirements:
-- Entirely in {lang.name}. No English except words the language genuinely borrows.
-- Explain HOW and WHY things work, not just what they are called. Mechanism over name-dropping.
-- Locally grounded: real West African settings, foods, prices, institutions, seasons.
-- No invented statistics, no fake citations, no made-up named people presented as real.
-- Plain continuous prose. No markdown, no headings, no bullet lists, no chat markup.
-
-Return JSON: {{"title": "<short natural title in {lang.name}>", "text": "<the document>", "language_self_check": <true only if the whole text is fluent {lang.name}>, "confidence": <float 0-1: your honest estimate that this text is accurate AND fluent {lang.name}>}}"""
-
-    return Request(
-        custom_id=row["custom_id"],
-        messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
-        # 4 tokens/word is generous for English but tight for diacritic-heavy languages, where 500
-        # words can exceed 1,200 tokens; the floor stops truncation mid-document.
-        max_tokens=max(1800, min(4096, int(hi * 4))), temperature=0.95,
-        response_format={"type": "json_object"},
-        metadata={"kind": "pretrain", "lang": lang.code, "domain": domain, "subtopic": subtopic,
-                  "genre": genre, "register": register, "target_words": [lo, hi]},
-    )
+def _simplicity(lang) -> str:
+    block = _SIMPLICITY.get(lang.tier, "")
+    return ("\n" + block.replace("__LANGUAGE_NAME__", lang.name) + "\n") if block else ""
 
 
 # --------------------------------------------------------------------------- sft / rl
@@ -410,16 +320,42 @@ Return JSON: {{"title": "<short natural title in {lang.name}>", "text": "<the do
 
 # Literal braces below are part of the target model's format, so this uses __PLACEHOLDER__ substitution
 # rather than str.format().
-def _sft_like_request(seed: Seed, row: dict, *, rl: bool) -> Request:
+def _sft_like_request(seed: Seed, row: dict, *, rl: bool, document: Optional[dict] = None) -> Request:
     lang = _lang_spec(seed, row["lang"])
     rng = _rng(row["custom_id"])
     task = next(t for t in seed.tasks if t.name == row["task"])
-    # 1-3 extra tasks so a conversation genuinely mixes themes, as the seed's conversation policy requires.
+    # 1-3 extra tasks so a conversation genuinely mixes themes, as the seed's conversation policy requires --
+    # but at most 1 for a low-resource language, and none at all alongside a long document, which is already
+    # the whole conversation.
     others = [t for t in seed.tasks if t.name != task.name and (not t.languages or lang.code in t.languages)]
-    extra = rng.sample(others, k=min(len(others), rng.randint(1, 3)))
+    max_extra = 0 if document else _TIER_EXTRA_TASKS.get(lang.tier, 3)
+    extra = (rng.sample(others, k=min(len(others), rng.randint(1, max_extra))) if max_extra else [])
     tasks = [task] + extra
     domain, subtopic, _ = _coverage_pick(lang.code, row["index"])
     io = _io_direction(seed, lang.code, row["index"], rng)
+    if document:
+        # What came IN is the document, whatever io_direction would otherwise have said. The markers have to
+        # match reality: an English report summarised into Yoruba is <|input_lang|><eng>, not <yor>. The brief
+        # is rewritten too, or it would tell the generator "everything is in Yoruba" over an English document.
+        src = "eng" if document.get("doc_lang_mode") == "mixed" else (document.get("doc_lang") or "eng")
+        if io["expect_markers"][1] == src and src != lang.code:
+            io["expect_markers"][1] = lang.code      # do not degenerate to an English-in/English-out summary
+        io["expect_markers"][0] = src
+        tgt = io["expect_markers"][1]
+        src_name = _lang_spec(seed, src).name
+        tgt_name = _lang_spec(seed, tgt).name
+        io["brief"] = (
+            f"The document the user pastes is in {src_name}"
+            + (" (mixed with English in places)" if document.get("doc_lang_mode") == "mixed" else "")
+            + f", and the assistant answers in {tgt_name}. What the USER writes around the document -- the "
+            f"request itself -- is in {tgt_name} too, because that is the language they are speaking."
+            + ("" if src == tgt else
+               f" Reading {src_name} and answering in {tgt_name} is the point of this sample.")
+            # Genuinely ambiguous otherwise, and the generator resolved it the other way three times out of
+            # three: the user's own words are Yoruba but the document is thousands of words of English.
+            # input_lang follows the DOCUMENT, because that is almost all of what came in.
+            + f" input_lang is the language of the DOCUMENT ({src}), not of the user's own sentence around it,"
+              f" because the document is nearly all of what came in.")
     identities = seed.conversation.get("identities") or []
     identity = identities[(row["index"] + _lang_offset(lang.code)) % len(identities)] if identities else ""
     # Spread the implied "now" across the year, days of the week and hours so nothing is anchored to one
@@ -496,7 +432,16 @@ def _sft_like_request(seed: Seed, row: dict, *, rl: bool) -> Request:
     # tool conversations get an extra exchange of headroom (see the seed's conversation policy)
     _hi = int(seed.conversation.get("max_user_turns_with_tools", 6) if needs_tools
               else seed.conversation.get("max_user_turns", 5))
-    n_user = rng.randint(int(seed.conversation.get("min_user_turns", 3)), _hi)
+    _lo = int(seed.conversation.get("min_user_turns", 3))
+    # A low-resource language is capped lower: six turns of shaky Fon is six turns of unusable data, and the
+    # generator spends its fluency budget on quantity instead of correctness.
+    _hi = min(_hi, _TIER_TURNS.get(lang.tier, 6))
+    if document:
+        # The sample's purpose is the summary: ask for it, then optionally one or two follow-up questions
+        # answered from the same document, which is the part that teaches grounding over a long context.
+        # More than that and the document stops being the subject of the conversation.
+        _lo, _hi = 1, 3
+    n_user = rng.randint(min(_lo, _hi), _hi)
     verbs = sorted({v for t in tasks for v in t.task_plan}) or ["<|chat|>"]
     fmt = _format_brief(lang.code, lang.name, " ".join(sorted(VALID_VERBS)))
 
@@ -515,7 +460,8 @@ def _sft_like_request(seed: Seed, row: dict, *, rl: bool) -> Request:
     # prefix: constant per (kind, language) and free under vLLM prefix caching.
     want_fewshot = lang.tier == "low" or os.environ.get("DATA_GEN_FEWSHOT") == "1"
     shots = _fewshot_block() if want_fewshot else ""
-    system = (f"{seed.details}\n\n{fmt}{shots}\n"
+    # Part of the shared prefix, so the tier's simplicity ceiling is free under prefix caching.
+    system = (f"{seed.details}\n\n{fmt}{shots}{_simplicity(lang)}\n"
               f"You are generating training conversations in {lang.name} ({lang.code}). "
               f"Language guidance: {lang.guidance}\nReturn strict JSON only, no commentary.")
 
@@ -532,7 +478,8 @@ def _sft_like_request(seed: Seed, row: dict, *, rl: bool) -> Request:
 
     lang_name = lang.name
     if not rl:
-        shape = f"""Produce ONE conversation with EXACTLY {n_user} messages of role "user" -- no more, no
+        _msg = "message" if n_user == 1 else "messages"
+        shape = f"""Produce ONE conversation with EXACTLY {n_user} {_msg} of role "user" -- no more, no
 fewer. Each is answered by the assistant, and the conversation ends on an assistant message. The assistant may
 add tool-call turns and their role="tool" results in between; those are not user messages and do not count.
 Count your user messages before you finish: there must be exactly {n_user}.
@@ -560,14 +507,20 @@ Return JSON:
   "tasks": [...], "tags": [...],
   "confidence": <float 0-1: your honest estimate that the ranking is right and the text is fluent {lang_name}>}}"""
 
+    # A long-document sample covers ONE task, so "change subject at least once" would be self-contradictory.
+    mix_line = ("Task for this conversation:" if len(tasks) == 1 else
+                "Tasks this conversation must cover (mix them, change subject at least once):")
+    doc_section = ("\n" + document_brief(document) + "\n") if document else ""
+
     user = f"""LANGUAGE DIRECTION for this conversation -- {io['key']}:
 {io['brief']}
 Set <|input_lang|> to <{io['expect_markers'][0]}> and <|target_lang|> to <{io['expect_markers'][1]}> on every
 assistant turn that produces a <response>. Where the two differ, that difference is the point of the sample:
 the user asks in one language for an answer in another, and the assistant complies.
 
-Tasks this conversation must cover (mix them, change subject at least once):
+{mix_line}
 {task_lines}
+{doc_section}
 
 {verbs_line}
 
@@ -590,8 +543,9 @@ Hard requirements:
         messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
         # 5 user turns + tool calls + tool results + think blocks overruns 4096 and the JSON is truncated
         # mid-string, which showed up as json_invalid on ~17% of a pilot. Headroom is far cheaper than a retry.
-        # A long-document sample must hold the document AND its summary.
-        max_tokens=16384 if task.name in UNPACKABLE_TASKS else 6144,
+        # A long-document sample needs LESS, not more: the document arrives as input and is referred to by a
+        # placeholder, so this completion holds only the summary and its follow-ups.
+        max_tokens=4096 if document else 6144,
         temperature=0.9,
         # Deliberately json_object, NOT json_schema. A pilot with the schema attached produced *more*
         # rejects (messages_malformed 11/24 vs 1/24): providers coerce the output to satisfy the schema
@@ -611,14 +565,21 @@ Hard requirements:
                   "domain": domain, "subtopic": subtopic, "n_user_turns": n_user,
                   "io_direction": io["key"], "io_other_lang": io["other"],
                   "identity": identity, "when": when,
-                  "expect_markers": io["expect_markers"]},
+                  # The turn bounds this row was actually asked for, so the validator checks the request that
+                  # was made rather than the seed-wide floor -- a long-document sample legitimately has one
+                  # user turn, which the global min_user_turns=3 would reject.
+                  "min_user_turns": _lo, "max_user_turns": _hi,
+                  "document": document, "expect_markers": io["expect_markers"]},
     )
 
 
-def build_request(seed: Seed, row: dict) -> Request:
+def build_request(seed: Seed, row: dict, document: Optional[dict] = None) -> Request:
+    """`document` is a finished stage-1 document (see longdocs.py) for the long-document tasks. Without one,
+    a long-document row still builds -- the generator is then asked to write the document itself, which is
+    the behaviour that produced 635-word "long" documents, so generate.py always supplies one."""
     if seed.kind == "pretrain":
         return _pretrain_request(seed, row)
-    return _sft_like_request(seed, row, rl=(seed.kind == "rl"))
+    return _sft_like_request(seed, row, rl=(seed.kind == "rl"), document=document)
 
 
 # ---------------------------------------------------------------------------------------- packing
@@ -631,9 +592,9 @@ def build_request(seed: Seed, row: dict) -> Request:
 # rather than guessing.
 
 
-# Tasks whose sample includes a long generated document. Packing them starves the output budget, so they are
-# always sent as single requests with a much larger ceiling.
-UNPACKABLE_TASKS = {"long_document_summarization"}
+# Tasks whose sample carries a long document. They are never packed: each already carries 4,000-16,000 tokens
+# of document as input, and they are generated in stages (longdocs.py) rather than in one request.
+UNPACKABLE_TASKS = DOCUMENT_TASKS
 
 
 def build_packed_request(seed: Seed, rows: list[dict]) -> Request:

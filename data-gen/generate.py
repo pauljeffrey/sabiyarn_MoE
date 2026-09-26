@@ -129,6 +129,55 @@ class ShardWriter:
         return paths
 
 
+# --------------------------------------------------------------------------- stage 1: documents
+
+
+def documents_dir(kind: str) -> Path:
+    """Documents are keyed by plan row, not by model or run tag, so a second model generating the same rows
+    reuses them -- which is also what makes a model comparison a comparison of the CONVERSATION rather than of
+    two different documents."""
+    return OUT_ROOT / kind / "_documents"
+
+
+def stage_one_documents(seed: Any, todo: list[dict], provider: Any, *, dry_run: bool = False) -> dict[str, dict]:
+    """Run stage 1 for every long-document row in `todo`. Returns {row custom_id: document}.
+
+    Two stages rather than one because the one-stage version measurably did not work: asked for a conversation
+    containing a 900-3,500-word document, the generator produced 635-647 words, because the document competes
+    with the conversation for the same completion budget. Generated alone it has the whole budget, and stage 2
+    then pays for it in INPUT tokens (3-5x cheaper) instead of output tokens.
+    """
+    from longdocs import DOCUMENT_TASKS, DocumentStore, generate_documents, plan_document
+    from prompts import coverage_pick
+
+    rows = [r for r in todo if r.get("task") in DOCUMENT_TASKS]
+    if not rows:
+        return {}
+    specs = []
+    for r in rows:
+        domain, subtopic, _ = coverage_pick(r["lang"], r["index"])
+        specs.append((r["custom_id"], plan_document(seed, r, domain=domain, subtopic=subtopic)))
+    store = DocumentStore(documents_dir(seed.kind))
+    have = sum(1 for _, s in specs if s.custom_id in store)
+    print(f"  long documents: {len(specs):,} needed, {have:,} already on disk")
+    if dry_run:
+        return {cid: (store.get(s.custom_id) or {"title": "(dry run)", "text": "(dry run)", "words": 0,
+                                                 "doc_lang": s.doc_lang, "doc_lang_mode": s.doc_lang_mode,
+                                                 "form": s.form})
+                for cid, s in specs}
+    try:
+        by_doc = generate_documents(seed, [s for _, s in specs], provider, store)
+    finally:
+        store.close()
+    out = {cid: by_doc[s.custom_id] for cid, s in specs if s.custom_id in by_doc}
+    if len(out) < len(specs):
+        print(f"  stage 1 produced {len(out):,} of {len(specs):,} documents; the rest are skipped this run")
+    if out:
+        w = sorted(d["words"] for d in out.values())
+        print(f"  document words: min {w[0]:,}  median {w[len(w)//2]:,}  max {w[-1]:,}")
+    return out
+
+
 # --------------------------------------------------------------------------- run
 
 
@@ -164,6 +213,19 @@ def run(kind: str, provider_name: str, *, model: Optional[str] = None, langs: Op
         print("nothing to do")
         return 0
 
+    # The provider is needed before the requests are built, because the long-document rows need STAGE 1 run
+    # first and its output goes into their stage-2 prompt.
+    provider = None if dry_run else get_provider(provider_name, model, max_concurrency=concurrency)
+    docs = stage_one_documents(seed, todo, provider, dry_run=dry_run)
+    # A long-document row whose stage 1 failed is DEFERRED, not degraded: building it without a document would
+    # silently fall back to asking the generator to write the document itself, which is the exact behaviour
+    # the two stages exist to replace. It retries on the next run and stage 1 is cheap to repeat.
+    from prompts import UNPACKABLE_TASKS as _DOCTASKS
+    deferred = [r for r in todo if r["task"] in _DOCTASKS and r["custom_id"] not in docs]
+    if deferred:
+        todo = [r for r in todo if r["custom_id"] not in {d["custom_id"] for d in deferred}]
+        print(f"  deferring {len(deferred):,} long-document rows with no document yet")
+
     if pack > 1:
         # Pack only rows that share a language: the shared system prompt is per (kind, language), and mixing
         # languages in one request would both break that and invite cross-contamination between samples.
@@ -178,11 +240,11 @@ def run(kind: str, provider_name: str, *, model: Optional[str] = None, langs: Op
         requests, n_packed, n_single = [], 0, 0
         from prompts import UNPACKABLE_TASKS
         for group in by_lang.values():
-            # Long-document tasks go out singly: packed, the shared output ceiling starves the document and
-            # the model quietly produces a short one instead.
+            # Long-document rows go out singly: each already carries ~2,400 tokens of stage-1 document as
+            # input, and a pack would make one request carry four of them.
             singles = [r for r in group if r["task"] in UNPACKABLE_TASKS]
             group = [r for r in group if r["task"] not in UNPACKABLE_TASKS]
-            requests.extend(build_request(seed, r) for r in singles)
+            requests.extend(build_request(seed, r, docs.get(r["custom_id"])) for r in singles)
             n_single += len(singles)
             for i in range(0, len(group), pack):
                 chunk = group[i:i + pack]
@@ -195,7 +257,7 @@ def run(kind: str, provider_name: str, *, model: Optional[str] = None, langs: Op
         print(f"  {len(todo):,} samples -> {len(requests):,} requests "
               f"({n_packed:,} packed at {pack}/request, {n_single:,} sent singly as remainders)")
     else:
-        requests = [build_request(seed, r) for r in todo]
+        requests = [build_request(seed, r, docs.get(r["custom_id"])) for r in todo]
 
     if dry_run:
         for req in requests[:3]:
@@ -206,7 +268,6 @@ def run(kind: str, provider_name: str, *, model: Optional[str] = None, langs: Op
         print(f"\n(dry run: {len(requests):,} requests would be sent, none were)")
         return 0
 
-    provider = get_provider(provider_name, model, max_concurrency=concurrency)
     shard_tag = (f"w{os.environ['DATA_GEN_SHARD_INDEX']}-{uuid.uuid4().hex[:6]}"
                  if os.environ.get("DATA_GEN_SHARDS", "1") != "1" else None)
     writer = ShardWriter(ns, shard_tag)
