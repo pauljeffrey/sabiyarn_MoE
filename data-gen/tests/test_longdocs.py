@@ -433,3 +433,28 @@ def test_a_looping_document_is_rejected_in_stage_one(seed):
     for the sake of its input."""
     assert L._distinct_ngram("the clinic opened " * 200) < 0.55
     assert L._distinct_ngram(" ".join(f"w{i}" for i in range(500))) > 0.9
+
+
+# --------------------------------------------------------------------------- run planning
+
+
+def test_packed_requests_stay_interleaved_across_languages(seed):
+    """Packing groups by language, which undoes the interleaving `shuffle` exists for: the request list comes
+    out language-by-language and a run that stops on budget has everything for the first few languages and
+    nothing for the last. Measured on a $3 tranche: pcm 617, ibo 180, hau 30, and four languages at zero."""
+    import generate as G
+    langs = ["pcm", "yor", "hau", "ibo", "twi", "eng"]
+    rows = [r for r in G.plan_rows(seed, langs) if r["task"] not in L.DOCUMENT_TASKS][:600]
+    by: dict[str, list] = {}
+    for r in rows:
+        by.setdefault(r["lang"], []).append(r)
+    from prompts import build_packed_request
+    requests = []
+    for group in by.values():
+        for i in range(0, len(group) - 3, 4):
+            requests.append(build_packed_request(seed, group[i:i + 4]))
+    import random as _r
+    _r.Random(4321).shuffle(requests)
+    # In the first quarter of the queue, at least half the languages must already be represented.
+    head = {req.metadata["lang"] for req in requests[:max(4, len(requests) // 4)]}
+    assert len(head) >= len({r["lang"] for r in rows}) // 2, head

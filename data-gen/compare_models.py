@@ -48,17 +48,28 @@ ANY_CLOSER = re.compile(r"</[A-Za-z_|][^>\s]*>")
 THINK = re.compile(r"<think>(.*?)</think>", re.S)
 RESPONSE = re.compile(r"<response>(.*)", re.S)
 
-# Orthographic marks that MUST appear in real text in these languages.
+# Orthographic marks that MUST appear in real text in these languages, i.e. languages whose marks are so
+# frequent that a passage without any is evidence of a problem. Yoruba carries tone marks on nearly every word;
+# Igbo's dotted vowels are similarly unavoidable.
+#
+# HAUSA IS DELIBERATELY NOT HERE. Its hooked letters are ɓ ɗ ƙ ƴ, and a great deal of entirely correct Hausa
+# contains none of them -- "Wannan rahoton na shekarar 2023 ya nuna cewa akwai ƙalubale" happens to, but
+# "A'a, rubutun bai ambaci sunan kowane shugaban kasa ba" legitimately does not. Scoring it the same way
+# reported 26% for Hausa against 82-96% for every other language and made good data look broken; a
+# hand-check found 99 of 120 of those samples carrying three or more common Hausa function words. It is
+# reported below as informational instead.
 DIACRITICS = {
     "yor": set("ọẹṣàáèéìíòóùúńǹ"),
     "ibo": set("ịọụṅ"),
-    "hau": set("ɓɗƙƴ"),
     "twi": set("ɛɔ"), "aka": set("ɛɔ"),
     "ewe": set("ɖƒŋɣʋ"), "fon": set("ɖɛɔ"),
     "ful": set("ɓɗƴŋ"), "fuv": set("ɓɗƴŋ"),
     "efi": set("ọụ"), "urh": set("ẹọ"),
     "pcm": set(),   # English-lexified: no diacritics expected
 }
+# Marks that are correct where they occur but are NOT expected in every passage. Presence is reported, absence
+# is not evidence of anything.
+OPTIONAL_DIACRITICS = {"hau": set("ɓɗƙƴ")}
 ENGLISH_STOPWORDS = {"the", "and", "is", "are", "of", "to", "in", "that", "this", "for", "with", "you",
                      "it", "on", "as", "be", "have", "has", "will", "can", "not", "but", "they", "we"}
 
@@ -104,12 +115,13 @@ def analyse(recs: list[dict], seed: Seed) -> dict[str, Any]:
     m: dict[str, Any] = {
         "n": len(recs), "models": Counter(r.get("model", "?") for r in recs),
         "langs": Counter(r["lang"] for r in recs),
-        "bad_closers": 0, "missing_response": 0,
+        "bad_closers": 0, "missing_response": 0, "html_tool_results": 0,
         "think_total": 0, "think_english": 0, "think_chars": [],
         "with_tools": 0, "calls": 0, "unknown_tool": 0, "missing_args": 0, "distractor_called": 0,
         "user_turns": Counter(), "total_msgs": Counter(),
         "conf": [], "resp_chars": [], "distinct4": [],
-        "diacritics_ok": defaultdict(lambda: [0, 0]), "eng_leak": defaultdict(list),
+        "diacritics_ok": defaultdict(lambda: [0, 0]), "diacritics_opt": defaultdict(lambda: [0, 0]),
+        "eng_leak": defaultdict(list),
         "tags": Counter(),
         # completeness: a "tool result" of "ok" or a two-word assistant reply is technically valid and
         # useless as training data, so measure substance, not just presence.
@@ -150,7 +162,14 @@ def analyse(recs: list[dict], seed: Seed) -> dict[str, Any]:
                 elif msg.get("tool_calls"):
                     m["think_before_tool"] += 1
             prev_was_tool_result = msg["role"] == "tool"
-            m["bad_closers"] += sum(1 for c in ANY_CLOSER.findall(content) if c not in VALID_CLOSERS)
+            # Tool results are VERBATIM payloads and a fetch_page result is supposed to be raw html, so its
+            # </div> and </p> are the feature, not a defect. Counting them here reported 2,407 "invented
+            # closing tags" on a sound 2,272-sample corpus -- every one of them inside a tool result, and
+            # every one of them exactly what fetch_page was specified to return. Counted separately below.
+            if msg["role"] == "tool":
+                m["html_tool_results"] += bool(ANY_CLOSER.search(content))
+            else:
+                m["bad_closers"] += sum(1 for c in ANY_CLOSER.findall(content) if c not in VALID_CLOSERS)
             for th in THINK.findall(content):
                 m["think_total"] += 1
                 m["think_chars"].append(len(th))
@@ -185,6 +204,10 @@ def analyse(recs: list[dict], seed: Seed) -> dict[str, Any]:
                     if want and answers_native:
                         ok, tot = m["diacritics_ok"][r["lang"]]
                         m["diacritics_ok"][r["lang"]] = [ok + bool(set(txt.lower()) & want), tot + 1]
+                    opt = OPTIONAL_DIACRITICS.get(r["lang"], set())
+                    if opt and answers_native:
+                        ok, tot = m["diacritics_opt"][r["lang"]]
+                        m["diacritics_opt"][r["lang"]] = [ok + bool(set(txt.lower()) & opt), tot + 1]
                     if r["lang"] != "pcm" and answers_native:
                         words = re.findall(r"[a-zA-Z]+", txt.lower())
                         if len(words) >= 12:
@@ -216,6 +239,8 @@ def report(results: dict[str, dict[str, Any]]) -> None:
     row("languages", lambda m: len(m["langs"]))
     print("  FORMAT (lower is better)")
     row("invented closing tags", lambda m: m["bad_closers"])
+    # A feature, not a defect: fetch_page is specified to return raw, contaminated markup.
+    row("tool results with html (good)", lambda m: m["html_tool_results"])
     row("final turn missing <response>", lambda m: m["missing_response"])
     print("  THINKING (English is required)")
     row("<think> blocks", lambda m: m["think_total"])
@@ -240,6 +265,13 @@ def report(results: dict[str, dict[str, Any]]) -> None:
             f"{m['diacritics_ok'][L][0]}/{m['diacritics_ok'][L][1]}"
             f" ({m['diacritics_ok'][L][0]/max(m['diacritics_ok'][L][1],1):.0%})"
             if L in m["diacritics_ok"] else "-"))
+    for lang in sorted({l for m in results.values() for l in m["diacritics_opt"]}):
+        # Informational: these marks are correct where they occur but are not expected in every passage, so a
+        # low number is not evidence of a problem. See OPTIONAL_DIACRITICS.
+        row(f"optional marks seen: {lang}", lambda m, L=lang: (
+            f"{m['diacritics_opt'][L][0]}/{m['diacritics_opt'][L][1]}"
+            f" ({m['diacritics_opt'][L][0]/max(m['diacritics_opt'][L][1],1):.0%}, informational)"
+            if L in m["diacritics_opt"] else "-"))
     row("English leak (native-target only)",
         lambda m: f"{_mean([x for v in m['eng_leak'].values() for x in v]):.1%}"
                   f" (n={sum(len(v) for v in m['eng_leak'].values())})")

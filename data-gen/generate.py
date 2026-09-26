@@ -254,6 +254,12 @@ def run(kind: str, provider_name: str, *, model: Optional[str] = None, langs: Op
                 else:
                     requests.extend(build_request(seed, r) for r in chunk)
                     n_single += len(chunk)
+        # Packing groups by language, which UNDOES the interleaving `shuffle` exists to provide: the request
+        # list comes out language-by-language, and since complete_many submits in order, a run that stops on
+        # budget has everything for the first few languages and nothing for the last. Measured on a $3 tranche:
+        # pcm 617, ibo 180, ... hau 30, and eng/ful/urh/fuv zero. Re-shuffling the REQUESTS restores it.
+        # Fixed seed, so every worker still produces the same order and DATA_GEN_SHARDS stays a clean split.
+        random.Random(4321).shuffle(requests)
         print(f"  {len(todo):,} samples -> {len(requests):,} requests "
               f"({n_packed:,} packed at {pack}/request, {n_single:,} sent singly as remainders)")
     else:
