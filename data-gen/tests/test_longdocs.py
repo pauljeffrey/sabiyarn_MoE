@@ -420,8 +420,14 @@ def test_a_gap_between_parts_is_rejected_but_a_short_prefix_is_kept(seed, tmp_pa
                     yield Response(r.custom_id, "", ok=False, metadata=md)
 
     store = L.DocumentStore(tmp_path / "gap")
-    assert L.generate_documents(seed, [spec], FakeProvider({0, 2}), store) == {}   # gap -> rejected
+    # parts [0, 2]: truncate AT the gap and keep part 0, rather than discard work already paid for
+    got = L.generate_documents(seed, [spec], FakeProvider({0, 2}), store)
+    assert got[spec.custom_id]["parts"] == 1
     store.close()
+    store3 = L.DocumentStore(tmp_path / "nofirst")
+    # [1, 2] with no part 0 would open mid-argument, so there is nothing to keep
+    assert L.generate_documents(seed, [spec], FakeProvider({1, 2}), store3) == {}
+    store3.close()
     store2 = L.DocumentStore(tmp_path / "prefix")
     got = L.generate_documents(seed, [spec], FakeProvider({0, 1}), store2)         # prefix -> kept
     store2.close()

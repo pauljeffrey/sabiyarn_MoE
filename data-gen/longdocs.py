@@ -571,15 +571,23 @@ def generate_documents(seed: Any, specs: list[DocSpec], provider: Any,
     for doc_id, got in parts.items():
         spec, o = by_spec[doc_id], outlines[doc_id]
         want = max(1, -(-len(o["sections"]) // SECTIONS_PER_PART))
-        have = sorted(got)
-        # A CONTIGUOUS PREFIX is acceptable: the document covers fewer sections than planned but ends at a
-        # section boundary, so it reads as a document about less rather than a document cut off mid-sentence.
-        # A GAP is not: parts [0, 2] jump from the background straight to the recommendations, and a summary of
-        # that is a summary of something incoherent. (The first version of this rule had it backwards -- it
-        # tolerated gaps and so accepted two-part documents that had simply lost their ending.)
-        if have != list(range(len(have))):
-            gapped += 1
+        # Keep the LONGEST CONTIGUOUS PREFIX. A prefix is acceptable -- the document covers fewer sections than
+        # planned but ends at a section boundary, so it reads as a document about less rather than one cut off
+        # mid-sentence. A GAP is not: parts [0, 2] jump from the background straight to the recommendations,
+        # and a summary of that is a summary of something incoherent. Truncating AT the gap gives the good half
+        # instead of discarding both: measured at 36 of 160 documents in one tranche, all of them already paid
+        # for. (The first version of this rule had it backwards -- it tolerated gaps and so accepted two-part
+        # documents that had simply lost their ending.)
+        have = []
+        for p in range(want):
+            if p not in got:
+                break
+            have.append(p)
+        if not have:
+            gapped += 1          # part 1 missing: the document would open mid-argument
             continue
+        if len(have) < len(got):
+            gapped += 1          # a gap was present; what follows it is dropped
         if len(have) < want:
             ended_early += 1
         text = "\n\n".join(got[p]["text"] for p in have)

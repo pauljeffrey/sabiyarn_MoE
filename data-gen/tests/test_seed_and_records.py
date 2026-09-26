@@ -801,3 +801,20 @@ def test_a_pre_assembled_content_string_is_recovered_into_fields():
     assert out[-1]["content"].count("<|input_lang|>") == 1          # not doubled
     assert out[-1]["content"].endswith("<response>Mi anndaa ngal.")
     assert "<think>Not familiar.</think>" in out[-1]["content"]
+
+
+def test_a_role_with_stray_quotes_or_whitespace_is_normalised():
+    """Measured live as `unknown role "user'\\n"`. The intent is not in doubt."""
+    from assemble import build_messages
+    turns = [{"role": " \"user'\n", "content": "How far?"},
+             {"role": "ASSISTANT ", "task_plan": ["<|chat|>"], "input_lang": "pcm",
+              "target_lang": "pcm", "response": "I dey."}]
+    out = build_messages(turns)
+    assert [m["role"] for m in out] == ["user", "assistant"]
+
+
+def test_an_actually_unknown_role_still_fails():
+    from assemble import AssemblyError, build_messages
+    import pytest as _pt
+    with _pt.raises(AssemblyError):
+        build_messages([{"role": "narrator", "content": "x"}])

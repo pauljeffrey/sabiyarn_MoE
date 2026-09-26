@@ -238,7 +238,11 @@ def build_messages(turns: list[dict[str, Any]]) -> list[dict[str, Any]]:
     for t in turns:
         if not isinstance(t, dict):
             raise AssemblyError("each turn must be an object")
+        # Generators emit stray quotes and newlines around the role -- measured live as
+        # `unknown role "user'\n"`. The intent is not in doubt, so it is normalised.
         role = t.get("role")
+        if isinstance(role, str):
+            role = role.strip().strip("\"'").strip().lower()
         if role == "assistant":
             out.append(assistant_message(t))
         elif role in ("user", "system"):
