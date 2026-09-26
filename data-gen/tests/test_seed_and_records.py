@@ -652,3 +652,75 @@ def test_free_endpoints_get_minutes_of_backoff_and_low_concurrency(monkeypatch):
     # an explicit override still wins
     custom = OpenRouterProvider("google/gemma-4-31b-it:free", retry_base_s=30, retry_max_s=90)
     assert custom.retry_base_s == 30 and custom.retry_max_s == 90
+
+
+# --------------------------------------------------------------------------- determined repairs
+#
+# Each of these was a measured drop on a low-resource pilot where the generator's INTENT was unambiguous and
+# exactly one completion was possible. Anything genuinely ambiguous is still dropped by the assembler.
+
+
+def _md(task="general_chat", lang="pcm"):
+    return {"expect_markers": [lang, lang], "lang": lang, "tasks": [task]}
+
+
+def test_a_label_token_written_inline_is_moved_to_its_field():
+    """10 of 31 drops on a pilot. The token is legal, its position is not, and the assembler emits it in
+    exactly the right place from the field -- so moving it preserves information, unlike stripping it."""
+    from postprocess_gen import _fill_turn_defaults
+    from assemble import build_messages
+    turns = [{"role": "user", "content": "Wetin be the mood?"},
+             {"role": "assistant", "task_plan": ["<classify>"],
+              "response": "<sentiment>negative - the trader vex."}]
+    out = build_messages(_fill_turn_defaults(turns, _md("sentiment_analysis")))
+    assert out[-1]["content"].endswith("<response><sentiment>negative - the trader vex.")
+
+
+def test_every_label_token_is_recognised_inline():
+    from postprocess_gen import _LEADING_LABEL, _LABEL_BY_TOKEN
+    from assemble import LABEL_TOKENS
+    for token in LABEL_TOKENS.values():
+        m = _LEADING_LABEL.match(f"{token} the answer")
+        assert m and _LABEL_BY_TOKEN[m.group(1)] in LABEL_TOKENS, token
+
+
+def test_content_is_accepted_where_response_was_asked_for():
+    """The largest single drop on the same pilot (7 of 31): the generator reuses the `content` key it uses for
+    user turns, and an assistant turn with neither a response nor a tool call is discarded as empty."""
+    from postprocess_gen import _fill_turn_defaults
+    from assemble import build_messages
+    turns = [{"role": "user", "content": "How far?"},
+             {"role": "assistant", "task_plan": ["<|chat|>"], "content": "I dey fine o."}]
+    out = build_messages(_fill_turn_defaults(turns, _md()))
+    assert out[-1]["content"].endswith("<response>I dey fine o.")
+
+
+def test_a_pre_assembled_content_string_is_left_alone():
+    """Content carrying markers is the legacy shape and belongs to the other code path; treating it as a
+    response would double the scaffolding."""
+    from postprocess_gen import _fill_turn_defaults
+    turns = [{"role": "assistant", "task_plan": ["<|chat|>"],
+              "content": "<|input_lang|><pcm><response>already assembled"}]
+    out = _fill_turn_defaults(turns, _md())
+    assert "response" not in out[0]
+
+
+def test_sequence_tasks_may_use_the_tag_token():
+    """An NER answer legitimately IS a stream of `word <tag> LABEL` pairs. The generator never sets the flag,
+    so it is derived from the task."""
+    from postprocess_gen import _fill_turn_defaults
+    from assemble import build_messages
+    turns = [{"role": "user", "content": "Tag am"},
+             {"role": "assistant", "task_plan": ["<NER>"], "response": "Ade <tag> PERSON Eko <tag> LOC"}]
+    out = build_messages(_fill_turn_defaults(turns, _md("ner", "yor")))
+    assert "<tag> PERSON" in out[-1]["content"]
+
+
+def test_a_non_sequence_task_still_rejects_the_tag_token():
+    from postprocess_gen import _fill_turn_defaults
+    from assemble import AssemblyError, build_messages
+    import pytest as _pt
+    turns = [{"role": "user", "content": "Explain"},
+             {"role": "assistant", "task_plan": ["<|explain|>"], "response": "word <tag> NOUN"}]
+    with _pt.raises(AssemblyError):
+        build_messages(_fill_turn_defaults(turns, _md("world_knowledge_qa")))

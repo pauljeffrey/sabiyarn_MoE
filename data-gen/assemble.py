@@ -120,6 +120,24 @@ def normalise_verb(v: str) -> str:
     return _VERB_BY_BARE.get(bare, v)
 
 
+# Several verbs concatenated into ONE list element: task_plan ["<|RAG|><|chat|>"] instead of
+# ["<|RAG|>", "<|chat|>"]. The intent is unambiguous when the tokens tile the string exactly with nothing
+# between them, so it is split rather than the sample dropped. Anything with prose mixed in is left alone and
+# fails validation, because there the intent is NOT clear.
+_VERB_TOKEN = re.compile(r"<\|[^|<>]+\|>|<[A-Za-z_][A-Za-z0-9_]*>")
+
+
+def split_verbs(items: list[str]) -> list[str]:
+    out: list[str] = []
+    for raw in items or []:
+        s = (raw or "").strip()
+        if not s:
+            continue
+        found = _VERB_TOKEN.findall(s)
+        out.extend(found) if len(found) > 1 and "".join(found) == s else out.append(s)
+    return out
+
+
 def assistant_content(
     *,
     input_lang: str,
@@ -141,7 +159,7 @@ def assistant_content(
         if t:
             parts.append(f"<think>{t}</think>")
 
-    verbs = [normalise_verb(v) for v in (task_plan or []) if v]
+    verbs = [normalise_verb(v) for v in split_verbs(task_plan or []) if v]
     bad = [v for v in verbs if v not in VALID_VERBS]
     if bad:
         raise AssemblyError(f"task_plan verb(s) {bad} not in the tokenizer")

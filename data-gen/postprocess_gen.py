@@ -21,7 +21,7 @@ import re
 from typing import Any, Optional
 
 from providers.base import Response
-from assemble import AssemblyError, build_messages
+from assemble import LABEL_TOKENS, AssemblyError, build_messages
 from longdocs import splice as splice_document
 from rendering.render import render_messages
 from schemas.seed import TAGS, Seed
@@ -87,6 +87,14 @@ _PLAN_BY_TOOL = {
 }
 
 
+# Label tokens, longest first so <lang_ID> is not shadowed by a shorter prefix.
+_LABEL_BY_TOKEN = {v: k for k, v in LABEL_TOKENS.items()}
+_LEADING_LABEL = re.compile(r"^\s*(" + "|".join(re.escape(t) for t in
+                                                sorted(_LABEL_BY_TOKEN, key=len, reverse=True)) + r")\s*")
+# Tasks whose answer legitimately IS a stream of `word <tag> LABEL` pairs, so <tag> there is content.
+_SEQUENCE_TASKS = {"ner", "pos_tagging"}
+
+
 def _fill_turn_defaults(turns: Any, md: dict) -> Any:
     """Supply the few fields the generator omits, where the value is determined rather than guessed.
 
@@ -99,6 +107,7 @@ def _fill_turn_defaults(turns: Any, md: dict) -> Any:
     expect = md.get("expect_markers") or []
     src_default = expect[0] if expect else md.get("lang")
     tgt_default = expect[1] if len(expect) > 1 else md.get("lang")
+    sequence = bool(_SEQUENCE_TASKS & set(md.get("tasks") or [md.get("task")]))
     for t in turns:
         if not isinstance(t, dict) or t.get("role") != "assistant":
             continue
@@ -110,6 +119,24 @@ def _fill_turn_defaults(turns: Any, md: dict) -> Any:
             t["task_plan"] = _PLAN_BY_TOOL.get(name, ["<|chat|>"])
         if not call and not t.get("target_lang"):
             t["target_lang"] = tgt_default
+        # `content` where `response` was asked for. An assistant turn with neither a response nor a tool call
+        # is discarded as empty, and this was the single largest drop on a low-resource pilot (7 of 31): the
+        # generator uses the `content` key it uses for user turns. Only when it is plain text -- content
+        # carrying markers is the legacy pre-assembled shape and belongs to the other code path.
+        if not call and not t.get("response") and isinstance(t.get("content"), str):
+            if "<|input_lang|>" not in t["content"]:
+                t["response"] = t.pop("content")
+        # A label token written INLINE instead of in the `label_token` field. The token is legal, the
+        # position is not, and the assembler emits it in exactly the right place from the field -- so moving
+        # it is information-preserving, unlike stripping it. 10 of 31 drops on the same pilot.
+        resp = t.get("response")
+        if isinstance(resp, str) and not t.get("label_token"):
+            m = _LEADING_LABEL.match(resp)
+            if m:
+                t["label_token"] = _LABEL_BY_TOKEN[m.group(1)]
+                t["response"] = resp[m.end():]
+        if sequence:
+            t["sequence_labels"] = True
     return turns
 
 
