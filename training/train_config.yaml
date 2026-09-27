@@ -81,6 +81,29 @@ training:
   # means every token contributes to the loss, completely unmasked.
   use_loss_mask: false
   block_size: 4096
+  # SFT-ONLY overrides. Applied when mode (or TRAIN_MODE) is "sft"; pretraining is untouched.
+  #
+  # SFT trains on much longer sequences than pretraining does. A long_document_summarization sample carries
+  # 4,000-16,000 tokens of document plus its summary, and at block_size 4096 the part that gets truncated is
+  # the summary -- the only part of that sample carrying a training signal. So the model would see a document,
+  # then nothing, and learn to produce a document and stop. 16384 holds the whole generated band
+  # (measured: documents run 1,492-12,481 words, median 4,344).
+  #
+  # 16384 and not more: the positional embedding is LEARNED ABSOLUTE (wpe), so every position only learns from
+  # samples that actually reach it, and nothing in this corpus goes past ~16k. At 16384 wpe costs 12.6M
+  # parameters (4.1% of the model) and attention costs 2.7x the MLP; at 65536 it would be 50.3M (16.4%) and
+  # 10.7x, for positions no sample ever trains. Attention FLOPs overtake the MLP at T = 8 * n_embd = 6,144.
+  #
+  # batch x accum is 48, not 192: what matters for the LR schedule is TOKENS per optimiser step, and
+  # 48 x 16384 = 786,432 is exactly 192 x 4096. Keeping 192 sequences would quadruple the token budget per
+  # step and invalidate the swept schedule. 16 stays divisible by 4 GPUs.
+  #
+  # flex attention is REQUIRED at this length: sdpa_mask builds a (B,1,T,T) boolean mask, which at 16384 is
+  # ~800 MiB per layer per sample.
+  sft_block_size: 16384
+  sft_train_batch_size: 3                   # 3 x 16384 = 49,152 tokens per micro-step, as 12 x 4096 was
+  sft_gradient_accumulation_steps: 16
+  sft_gradient_checkpointing: true          # 4x the activations per sequence; measured headroom needs this
   # Document-causal attention for packed sequences (no attention across </s> boundaries):
   #   sdpa_mask -- a (B,1,T,T) boolean mask per batch; works everywhere, but costs ~4-5 GiB of
   #                activation memory per sample and forces SDPA's slower masked kernel.

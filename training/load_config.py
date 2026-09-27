@@ -504,6 +504,19 @@ def load_train_config(path: Optional[str] = None) -> TrainConfig:
     sampling_cfg = _nested_list_dict(data.get("sampling"))
 
     mode = str(os.environ.get("TRAIN_MODE", training.get("mode", "pretrain"))).lower()
+
+    def _phase(key: str, default):
+        """A `sft_<key>` in the yaml wins when mode is sft, otherwise `<key>`.
+
+        SFT and pretraining genuinely want different sequence lengths -- a long-document SFT sample is
+        4,000-16,000 tokens where a pretraining document is 300-500 words -- and a single block_size means
+        either pretraining wastes most of every window or SFT truncates away the summary it is supposed to
+        learn. Overriding per phase keeps one file and one swept pretraining config.
+        """
+        if mode == "sft" and f"sft_{key}" in training:
+            return training[f"sft_{key}"]
+        return training.get(key, default)
+
     mode_data = _nested_list_dict(data.get(mode, data.get("pretrain", [])))
     if not mode_data and mode != "pretrain":
         mode_data = _nested_list_dict(data.get("pretrain", []))
@@ -545,9 +558,10 @@ def load_train_config(path: Optional[str] = None) -> TrainConfig:
         mode=mode,
         # TRAIN_BATCH_SIZE / GRAD_ACCUM_STEPS override the yaml so a different GPU (which fits a
         # different micro-batch) needs no file edit; keep batch * accum ~= 192 for the same global batch.
-        train_batch_size=int(os.getenv("TRAIN_BATCH_SIZE") or training.get("train_batch_size", 8)),
-        block_size=int(training.get("block_size", 4096)),
-        gradient_accumulation_steps=_safe_int(os.getenv("GRAD_ACCUM_STEPS") or training.get("gradient_accumulation_steps"), 40),
+        train_batch_size=int(os.getenv("TRAIN_BATCH_SIZE") or _phase("train_batch_size", 8)),
+        block_size=int(_phase("block_size", 4096)),
+        gradient_accumulation_steps=_safe_int(os.getenv("GRAD_ACCUM_STEPS")
+                                             or _phase("gradient_accumulation_steps", None), 40),
         max_iters=int(optimizer.get("max_iters", training.get("max_iters", 600_000))),
         learning_rate=float(optimizer.get("learning_rate", 3e-4)),
         weight_decay=float(optimizer.get("weight_decay", 0.1)),
@@ -576,7 +590,7 @@ def load_train_config(path: Optional[str] = None) -> TrainConfig:
         gradient_checkpointing=(
             os.getenv("GRADIENT_CHECKPOINTING").strip().lower() in ("1", "true", "yes")
             if os.getenv("GRADIENT_CHECKPOINTING") is not None
-            else bool(training.get("gradient_checkpointing", False))
+            else bool(_phase("gradient_checkpointing", False))
         ),
         use_loss_mask=bool(training.get("use_loss_mask", True)),
         init_from=str(training.get("init_from", "hf")),

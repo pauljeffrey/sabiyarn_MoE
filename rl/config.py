@@ -45,14 +45,28 @@ class RLConfig:
     dataset_split: str = "train"
     max_samples: int = 0  # 0 = all
     eval_samples: int = 500  # held out from the same file (deterministic, by seed)
-    max_prompt_len: int = 512
-    max_seq_len: int = 1024  # prompt + completion tokens
+    # MEASURED on 4,736 real data-gen SFT records with BeardedMonster/SabiYarn-32k, taking the conversation
+    # prefix as the prompt exactly as encode_answer does:
+    #   prompt        median 1,260  p90 2,034  p99 6,762  max 13,867
+    #   final answer  median    68  p90   121  p99   293  max    716
+    # The previous defaults (512 / 1024) silently dropped 75.7% of prompts and 70.2% of whole samples -- a
+    # tool-calling conversation carries a system message with the tool catalogue plus several tool results, so
+    # a 512-token prompt cap excludes almost the entire corpus by construction, and the only sign was a
+    # `dpo_examples_dropped_too_long` line in the log.
+    # 16384 keeps 100% and matches training/train_config.yaml's sft_block_size, so a sample that fits SFT fits
+    # post-training too. 1,024 tokens of headroom for the completion covers the observed maximum of 716.
+    max_prompt_len: int = 15_360
+    max_seq_len: int = 16_384  # prompt + completion tokens
     languages: list = field(default_factory=list)  # keep only these language codes (data-gen records carry `language`)
     seed: int = 42
 
     # ---- optimisation --------------------------------------------------------------------------------
-    batch_size: int = 4  # per device (DPO: pairs; sft: examples; rl: prompts)
-    grad_accum_steps: int = 4
+    # 1, not 4, because max_seq_len went from 1,024 to 16,384. DPO forwards BOTH candidates, so a batch of
+    # pairs is 2 x batch_size sequences: at 4 pairs that is 8 x 16,384 = 131k tokens per micro-step, against
+    # the 49k that pretraining was swept to fit on an A100-80GB. 1 pair is 32,768 tokens, and accum carries the
+    # effective batch back to the 16 pairs it was.
+    batch_size: int = 1  # per device (DPO: pairs; sft: examples; rl: prompts)
+    grad_accum_steps: int = 16
     epochs: float = 1.0
     max_steps: int = 0  # 0 = epochs decide
     learning_rate: float = 5e-7  # DPO wants ~1e-7..1e-6, SFT ~1e-5, RL ~1e-6
@@ -79,7 +93,12 @@ class RLConfig:
 
     # ---- reward-based RL (group-baseline policy gradient) ---------------------------------------------
     group_size: int = 4  # completions sampled per prompt; advantage = reward - group mean
-    max_new_tokens: int = 128
+    # 128 truncated a tenth of real answers: measured p90 121, p99 293, max 716 tokens over 4,736 records.
+    # A truncated completion is scored as if the model CHOSE to stop there, so the reward is wrong rather than
+    # merely noisy, and the gradient pushes towards whatever the cut-off rewarded. 768 is above the longest
+    # answer in the data, so the policy can reach any length the corpus demonstrates, and
+    # 15,360 + 768 = 16,128 still fits max_seq_len.
+    max_new_tokens: int = 768
     temperature: float = 1.0  # sampling AND scoring temperature; 1.0 keeps the policy-gradient estimator unbiased
     top_p: float = 1.0  # < 1 biases the estimator (it is not part of the scored distribution)
     kl_coef: float = 0.05  # per-token k3 KL penalty against the reference
