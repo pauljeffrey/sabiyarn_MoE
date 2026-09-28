@@ -362,10 +362,13 @@ def test_rl_record_orders_responses_and_rejects_paraphrases(seeds):
 
 
 def test_responses_are_capped_per_language(seeds):
-    """A response must be complete within ~5112 tokens. The CHARACTER budget differs by language: Pidgin runs
-    ~1.35 tokens/word, Yoruba ~2.5, so the same token cap is ~20k chars of Pidgin but ~11k of Yoruba."""
+    """A response must be complete within the PHASE's token budget, which budgets.py derives from the target
+    model's context -- not a hardcoded number, so raising the context raises this with it. The CHARACTER budget
+    differs by language: Pidgin runs ~1.35 tokens/word, Yoruba ~2.5, so the same token cap is ~20k chars of
+    Pidgin but ~11k of Yoruba."""
     from assemble import MAX_RESPONSE_TOKENS, AssemblyError, assistant_content, max_response_chars
-    assert MAX_RESPONSE_TOKENS == 5112
+    from budgets import budget_for
+    assert MAX_RESPONSE_TOKENS == budget_for("sft").max_response_tokens
     assert max_response_chars("pcm") > max_response_chars("yor") > max_response_chars("fon")
     for lang in ("pcm", "yor", "fon"):
         budget = max_response_chars(lang)
@@ -380,7 +383,8 @@ def test_contract_demands_self_contained_responses(seeds):
                                         "lang": "pcm", "task": "world_knowledge_qa",
                                         "index": 1}).messages[0]["content"]
     assert "COMPLETE and SELF-CONTAINED" in brief
-    assert "5112" in brief
+    from assemble import MAX_RESPONSE_TOKENS
+    assert str(MAX_RESPONSE_TOKENS) in brief
 
 
 # ----------------------------------------------------------------- run namespacing / tool length

@@ -31,8 +31,8 @@ def _row(lang="yor", index=3, task="long_document_summarization"):
     return {"custom_id": f"sft__{lang}__{task}__{index:06d}", "lang": lang, "task": task, "index": index}
 
 
-def _spec(seed, lang="yor", index=3):
-    r = _row(lang, index)
+def _spec(seed, lang="yor", index=3, task="long_document_summarization"):
+    r = _row(lang, index, task)
     d, s, _ = coverage_pick(lang, index)
     return r, L.plan_document(seed, r, domain=d, subtopic=s)
 
@@ -52,18 +52,25 @@ def test_word_budget_scales_with_the_language():
     assert w("eng") > w("pcm") > w("yor") > w("fon")
 
 
-def test_token_band_covers_4k_to_16k(seed):
-    """The owner's band. The stride must be coprime with the 10-bucket cycle or most bands are unreachable."""
+def test_token_band_matches_the_phase_budget(seed):
+    """Document sizes come from budgets.py, which derives them from the target model's context, so raising the
+    context raises the documents and nothing else has to change. The stride must be coprime with the 10-bucket
+    language cycle or most bands are unreachable."""
+    from budgets import budget_for
+    lo, hi = budget_for("sft").doc_token_range
     sizes = sorted({_spec(seed, "pcm", i)[1].tokens for i in range(200)})
-    assert min(sizes) >= 4000 and max(sizes) <= 16000
+    assert min(sizes) >= lo and max(sizes) <= hi
+    assert hi > 16_000, "a 32,768 context should allow documents beyond the old 16k ceiling"
     bands = {b for i in range(200) for b in [L._TOKEN_BANDS[(i * L._BAND_STRIDE
                                                             + L._offset("pcm")) % len(L._TOKEN_BANDS)]]}
     assert bands == set(L._TOKEN_BANDS)
 
 
 def test_band_is_weighted_towards_shorter_documents():
-    """A 16,000-token document costs ~7x a 4,000-token one and is ~7x rarer in practice."""
-    assert L._TOKEN_BANDS.count((4000, 6000)) > L._TOKEN_BANDS.count((12000, 16000))
+    """A document at the ceiling costs ~6x one at the floor and is ~6x rarer in practice."""
+    bands = L._TOKEN_BANDS
+    assert bands.count(bands[0]) > bands.count(bands[-1])
+    assert len(bands) == 11, "11 is coprime with the 10-long language cycle; 10 would lock them together"
 
 
 def test_pinning_the_budget_overrides_the_band(seed, monkeypatch):
@@ -106,7 +113,10 @@ def test_section_count_follows_the_word_target(seed):
     for i in range(20):
         _, spec = _spec(seed, "pcm", i)
         assert spec.n_sections >= len(spec.stages)
-        assert spec.n_sections * spec.section_words >= spec.words
+        # The word target is met unless MAX_SECTIONS x _MAX_SECTION_WORDS is the binding limit, which it is for
+        # the longest band: past that point a document is as long as this many sections can honestly carry.
+        ceiling = L.MAX_SECTIONS * L._MAX_SECTION_WORDS
+        assert spec.n_sections * spec.section_words >= min(spec.words, ceiling)
         assert spec.parts == max(1, -(-spec.n_sections // L.SECTIONS_PER_PART))
 
 
@@ -244,11 +254,28 @@ def test_splice_rejects_the_placeholder_in_an_assistant_response():
     assert err == "placeholder_in_response"
 
 
-def test_splice_rejects_the_placeholder_in_a_tool_result():
-    turns = [{"role": "user", "content": f"here {L.PLACEHOLDER}"},
-             {"role": "tool", "name": "search_documents", "content": f"passage: {L.PLACEHOLDER}"}]
+def test_a_summary_document_may_not_arrive_through_a_tool():
+    turns = [{"role": "tool", "name": "search_documents", "content": f"passage: {L.PLACEHOLDER}"}]
     _, err = L.splice(turns, _doc())
-    assert err == "placeholder_in_tool_turn"
+    assert err == "placeholder_in_tool_turn_wanted_user"
+
+
+def test_a_rag_document_arrives_through_the_tool_result_not_the_user():
+    """The point of a RAG sample is that the assistant composes a query and answers from what comes back. A
+    document handed over in the user turn teaches context-stuffing, which is the opposite behaviour."""
+    doc = {**_doc(3000), "rag": True}
+    turns = [{"role": "user", "content": "Wetin the guideline talk about cold chain?"},
+             {"role": "assistant", "input_lang": "pcm", "task_plan": ["<|RAG|>"],
+              "tool_call": {"name": "search_documents", "arguments": {"query": "cold chain"}}},
+             {"role": "tool", "name": "search_documents", "content": L.PLACEHOLDER},
+             {"role": "assistant", "input_lang": "eng", "target_lang": "pcm", "task_plan": ["<|RAG|>"],
+              "response": "Di guideline talk say..."}]
+    out, err = L.splice(turns, doc)
+    assert err is None
+    assert L.PLACEHOLDER not in out[2]["content"] and out[2]["content"].startswith("A Report")
+    # and the same document in a user turn is now the error
+    bad = [{"role": "user", "content": f"here {L.PLACEHOLDER}"}]
+    assert L.splice(bad, doc)[1] == "placeholder_in_user_turn_wanted_tool"
 
 
 # --------------------------------------------------------------------------- stage 2
@@ -368,7 +395,7 @@ def test_a_short_outline_is_rescaled_not_rejected(seed):
     outline = {"sections": [{"heading": f"H{i}"} for i in range(8)], "cast": [], "facts": [],
                "setting": "", "tension": "", "title": "T"}
     assert L.parse_outline(Response("x", json.dumps(outline)), spec) is not None
-    assert L.rescale(spec, outline) > spec.section_words
+    assert L.rescale(spec, outline) >= spec.section_words
     assert L.rescale(spec, outline) <= L._MAX_SECTION_WORDS
 
 
@@ -464,3 +491,36 @@ def test_packed_requests_stay_interleaved_across_languages(seed):
     # In the first quarter of the queue, at least half the languages must already be represented.
     head = {req.metadata["lang"] for req in requests[:max(4, len(requests) // 4)]}
     assert len(head) >= len({r["lang"] for r in rows}) // 2, head
+
+
+# --------------------------------------------------------------------------- RAG contexts
+
+
+def test_rag_contexts_are_2k_to_8k_tokens_and_english(seed):
+    """The owner's spec. A 200-token "passage" teaches nothing about reading a real document, and a retrieved
+    passage is English because that is what a real retrieval corpus looks like for these languages -- the
+    sample exists to teach reading English and answering in the user's language."""
+    from budgets import budget_for
+    lo, hi = budget_for("sft").rag_context_tokens
+    assert (lo, hi) == (2048, 8192)
+    for task in sorted(L.RAG_DOCUMENT_TASKS):
+        specs = [_spec(seed, lang, i, task)[1] for lang in ("yor", "hau", "fon") for i in range(8)]
+        assert all(lo <= s.tokens <= hi for s in specs), task
+        assert all(s.doc_lang == "eng" and s.doc_lang_mode == "eng" for s in specs), task
+        assert all(s.rag for s in specs), task
+
+
+def test_summary_documents_are_not_capped_to_the_rag_band(seed):
+    biggest = max(_spec(seed, "pcm", i)[1].tokens for i in range(200))
+    assert biggest > 8192
+
+
+def test_rag_samples_keep_a_normal_conversation_shape(seed):
+    """A summarisation document IS the conversation; a RAG document is retrieved mid-conversation and must not
+    collapse it to one turn."""
+    doc = {**_doc(3000), "rag": True}
+    req = build_request(seed, _row("yor", 5, "rag_document_qa"), doc)
+    assert req.metadata["min_user_turns"] >= 3
+    assert len(req.metadata["tasks"]) > 1
+    # the user still writes their own language: a tool result does not change what came IN
+    assert req.metadata["expect_markers"][1] == "yor"

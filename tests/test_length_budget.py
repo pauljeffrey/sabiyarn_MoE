@@ -30,6 +30,12 @@ def test_shipped_length_caps_fit_the_real_corpus():
     assert cfg.max_prompt_len >= 13_867          # the longest prompt observed
     assert cfg.max_seq_len >= 14_274             # the longest prompt + answer observed
     assert cfg.max_new_tokens >= 716             # the longest answer observed
+    # And they must match what generation actually produces, or long samples are truncated at train time.
+    import sys
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "data-gen"))
+    from budgets import budget_for
+    assert cfg.max_seq_len >= budget_for("rl").context
+    assert cfg.max_new_tokens >= budget_for("rl").max_response_tokens
 
 
 def test_length_caps_are_internally_consistent():
@@ -46,7 +52,8 @@ def test_dpo_micro_batch_stays_within_the_swept_memory_budget():
     fit on an A100-80GB."""
     from rl.config import RLConfig
     cfg = RLConfig()
-    assert 2 * cfg.batch_size * cfg.max_seq_len <= 49_152 * 1.1
+    # At 32,768 one pair is already 65,536 tokens, so batch_size 1 is the FLOOR rather than a tuning choice.
+    assert cfg.batch_size == 1
     assert cfg.batch_size * cfg.grad_accum_steps >= 16      # effective batch not reduced
 
 
@@ -61,13 +68,25 @@ def test_sft_phase_overrides_block_size_without_touching_pretraining(monkeypatch
     monkeypatch.setenv("TRAIN_MODE", "sft")
     sft = load_train_config("training/train_config.yaml")
 
-    assert pre.block_size == 4096 and sft.block_size == 16_384
+    assert pre.block_size == 4096 and sft.block_size == 32_768
     # Tokens per optimiser step must MATCH, or the swept LR schedule and max_iters no longer apply.
     assert (pre.train_batch_size * pre.block_size * pre.gradient_accumulation_steps
             == sft.train_batch_size * sft.block_size * sft.gradient_accumulation_steps)
     # sdpa_mask would build a (B,1,T,T) mask: ~800 MiB per layer per sample at this length.
     assert sft.attention_impl == "flex"
     assert sft.gradient_checkpointing is True
+
+
+def test_generation_and_training_contexts_agree(monkeypatch):
+    """The failure this prevents is silent: generation produces a 30,000-token sample, the trainer truncates it
+    at block_size, and what is cut off the end is the summary -- the only part carrying a signal."""
+    import sys
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "data-gen"))
+    from budgets import budget_for
+    from training.load_config import load_train_config
+
+    monkeypatch.setenv("TRAIN_MODE", "sft")
+    assert load_train_config("training/train_config.yaml").block_size >= budget_for("sft").context
 
 
 def test_env_override_still_beats_the_sft_phase_value(monkeypatch):

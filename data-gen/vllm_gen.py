@@ -63,19 +63,34 @@ from schemas.seed import Seed                                    # noqa: E402
 # Recommended engine settings per model. `min_gpus_80gb` is what the weights need before any KV cache, so
 # treat it as a floor, not a target -- throughput improves a lot with room for a big cache.
 MODEL_PRESETS: dict[str, dict[str, Any]] = {
+    "google/gemma-4-31b-it": {
+        # Dense 30.8B (60 layers, hidden 5376, intermediate 21504, vocab 262144, tied embeddings), read from
+        # the published config. bf16 weights are ~61.6 GB, so unquantized it needs an 80 GB card.
+        #
+        # Its KV cache is unusually cheap for long context, which is why 32k generation is affordable here:
+        # layer_types is 50 sliding_attention (window 1024) + 10 full_attention, and attention_k_eq_v means K
+        # and V share one tensor. So per sequence:
+        #   full layers    10 x (4 kv heads x 512) x 2 B      = 40,960 B per TOKEN
+        #   sliding layers 50 x (16 x 256) x 1024 x 2 B       = 419 MB FIXED, regardless of length
+        # A 32,768-token sequence is therefore ~1.76 GB, not the ~30 GB a naive all-global estimate gives.
+        "min_gpus_80gb": 1, "max_model_len": 0, "gpu_memory_utilization": 0.90,
+        "kv_bytes_per_token": 40_960, "kv_bytes_fixed": 419_430_400, "weight_gb_bf16": 61.6,
+        "notes": "dense 30.8B; 50/60 layers are sliding-window 1024, so long-context KV is ~1.8 GB at 32k",
+    },
+    "google/gemma-3-27b-it": {
+        "min_gpus_80gb": 1, "max_model_len": 0, "gpu_memory_utilization": 0.90,
+        "kv_bytes_per_token": 32_768, "kv_bytes_fixed": 419_430_400, "weight_gb_bf16": 54.0,
+        "notes": "dense 27B, also sliding-window. Strong in several West African languages.",
+    },
     "openai/gpt-oss-120b": {
         # ~117B total but only ~5B active per token (MoE), and the release weights are MXFP4, so it is far
         # lighter and faster than the parameter count suggests: ~60GB, fits one 80GB card.
         "min_gpus_80gb": 1, "max_model_len": 8192, "gpu_memory_utilization": 0.92,
         "notes": "MoE, ~5B active params. Needs a recent vLLM (>=0.10) for the MXFP4 checkpoint.",
     },
-    "google/gemma-3-27b-it": {
-        # Dense 27B: ~54GB in bf16. One 80GB card, or two smaller ones with --tp 2.
-        "min_gpus_80gb": 1, "max_model_len": 8192, "gpu_memory_utilization": 0.90,
-        "notes": "Dense. Strong in several West African languages, which is why it is worth A/B-ing here.",
-    },
 }
-DEFAULT_PRESET = {"min_gpus_80gb": 1, "max_model_len": 8192, "gpu_memory_utilization": 0.90, "notes": ""}
+DEFAULT_PRESET = {"min_gpus_80gb": 1, "max_model_len": 0, "gpu_memory_utilization": 0.90,
+                  "kv_bytes_per_token": 131_072, "kv_bytes_fixed": 0, "weight_gb_bf16": 0.0, "notes": ""}
 
 
 def preset_for(model: str) -> dict[str, Any]:
@@ -129,7 +144,214 @@ def build_work(kind: str, langs: Optional[list[str]], limit: int) -> tuple[list[
     todo.sort(key=lambda r: (r["lang"], r["task"], r["index"]))
     if limit:
         todo = todo[:limit]
-    return [build_request(seed, r) for r in todo], seed
+    return todo, seed
+
+
+class EngineProvider:
+    """A `Provider`-shaped wrapper around a vLLM engine.
+
+    It exists so the document stages (longdocs.generate_documents) run on the rented GPU exactly as they run
+    against an API. Without it, vllm_gen skipped stages 0 and 1 entirely and every long-document and RAG row
+    silently fell back to asking one request for both the document and the conversation -- the behaviour that
+    measured 635 words against a 4,000-word target.
+    """
+
+    def __init__(self, engine: Any, model: str, params_for: Any):
+        self.engine = engine
+        self.model = model
+        self._params_for = params_for
+        self.prompt_tokens = 0
+        self.completion_tokens = 0
+
+    def complete_many(self, requests, *, on_result=None, progress: bool = True):
+        reqs = list(requests)
+        if not reqs:
+            return
+        for start in range(0, len(reqs), 256):
+            batch = reqs[start:start + 256]
+            outs = _chat_resilient(self.engine, [r.messages for r in batch],
+                                   self._params_for(max(r.max_tokens for r in batch)))
+            for req, out in zip(batch, outs):
+                if out is None:
+                    resp = Response(req.custom_id, "", False, "engine returned nothing",
+                                    metadata=req.metadata)
+                else:
+                    comp = out.outputs[0]
+                    self.prompt_tokens += len(out.prompt_token_ids)
+                    self.completion_tokens += len(comp.token_ids)
+                    resp = Response(req.custom_id, comp.text, True, None, len(out.prompt_token_ids),
+                                    len(comp.token_ids), self.model, metadata=req.metadata)
+                if on_result:
+                    on_result(resp)
+                yield resp
+            if progress:
+                print(f"    [stage] {min(start + len(batch), len(reqs)):,}/{len(reqs):,}", flush=True)
+
+    def usage_line(self) -> str:
+        return f"vllm/{self.model}: {self.prompt_tokens:,} in + {self.completion_tokens:,} out"
+
+
+def stage_one(seed: Seed, todo: list[dict], provider: Optional[EngineProvider]) -> dict[str, dict]:
+    """Documents for every long-document and RAG row, on this GPU. Mirrors generate.stage_one_documents."""
+    from generate import stage_one_documents
+    return stage_one_documents(seed, todo, provider, dry_run=provider is None)
+
+
+# --------------------------------------------------------------------------- hardware
+
+
+def gpu_report() -> list[dict[str, Any]]:
+    """What is actually in this box. Empty list when torch/CUDA is absent, so --plan-only still works."""
+    try:
+        import torch
+    except ImportError:
+        return []
+    if not torch.cuda.is_available():
+        return []
+    out = []
+    for i in range(torch.cuda.device_count()):
+        pr = torch.cuda.get_device_properties(i)
+        out.append({"index": i, "name": pr.name, "total_gb": pr.total_memory / 2**30,
+                    "capability": float(f"{pr.major}.{pr.minor}")})
+    return out
+
+
+# On-the-fly quantization options, in descending quality. AWQ and GPTQ are deliberately NOT here: they need a
+# pre-quantized CHECKPOINT, so they cannot be applied to an arbitrary --model on a rented box. Point --model at
+# an already-quantized repo instead and vLLM detects it from the checkpoint's own config.
+#   none          bf16 weights. Needs weights + KV to fit; for gemma-4-31b that is ~62 GB before any cache.
+#   fp8           ~half the weight bytes, quantized at load. Needs compute capability >= 8.9, so Ada (L40S,
+#                 RTX 4090/5090), Hopper (H100) and Blackwell (GB10) yes; Ampere (A100, A800, A40) NO.
+#   bitsandbytes  ~4-bit, quantized at load, works on ANY CUDA card including Ampere. Markedly slower per
+#                 token than fp8 -- it is the fallback that makes a small card work at all, not a fast path.
+_FP8_MIN_CAPABILITY = 8.9
+# A batch this small wastes the rental: vLLM's continuous batching is what amortises reading 62 GB of weights
+# per decode step, so a box that fits the weights but leaves room for only 5 sequences is slower per dollar
+# than the same box running a quantized copy with room for 40. `auto` therefore picks the highest-precision
+# option that ALSO clears this floor, rather than the highest-precision option that merely loads.
+MIN_CONCURRENCY = 12
+
+
+def _fits(model: str, quant: Optional[str], vram_gb: float) -> bool:
+    w = _weights_gb(model, quant)
+    return not w or vram_gb >= w * 1.15
+
+
+def _weights_gb(model: str, quant: Optional[str]) -> float:
+    w = preset_for(model).get("weight_gb_bf16") or 0.0
+    if quant == "fp8":
+        return w / 2
+    if quant == "bitsandbytes":
+        return w / 3.6            # ~4-bit, plus norms and embeddings that stay in higher precision
+    return w
+
+
+def choose_quantization(model: str, requested: Optional[str], gpus: list[dict[str, Any]], tp: int,
+                        context: int = 32_768, gpu_mem: float = 0.0) -> Optional[str]:
+    """Pick a quantization that loads on THIS box. One command has to work on a 32 GB RTX 5090 and on an 80 GB
+    A100 with nothing edited, which is what `auto` (the default) is for.
+
+    `auto` is QUALITY-FIRST: the highest precision that fits. It does not quietly drop to 4-bit to win
+    throughput, because the entire purpose of this corpus is fluency in languages where the generator is
+    already weakest, and 4-bit quality on Fon or Efik is unmeasured here. Where a lower precision would buy a
+    lot of concurrency, it says so and names the flag, and the decision stays with the operator.
+
+    `--quantization throughput` opts into that trade: the highest precision that ALSO leaves room for
+    MIN_CONCURRENCY sequences. On an 80 GB Ampere card at 32k that is the difference between ~5 concurrent
+    sequences and ~40.
+    """
+    req = (requested or "auto").lower()
+    if req not in ("auto", "", "throughput"):
+        return None if req in ("none", "bf16", "off") else req
+    low = model.lower()
+    if any(k in low for k in ("awq", "gptq", "-fp8", "fp8-", "int4", "w4a16", "mxfp4", "bnb")):
+        print(f"[vllm] {model} looks pre-quantized; letting vLLM read the format from its own config")
+        return None
+    if not gpus:
+        return None                                   # --plan-only, or CPU box: nothing to decide against
+
+    vram = sum(g["total_gb"] for g in gpus[:tp])
+    cap = min(g["capability"] for g in gpus[:tp])
+    candidates: list[Optional[str]] = [None]
+    if cap >= _FP8_MIN_CAPABILITY:
+        candidates.append("fp8")
+    else:
+        print(f"[vllm] compute capability {cap} < {_FP8_MIN_CAPABILITY}: no fp8 kernels on this card "
+              f"(Ampere -- A100, A800, A40). bitsandbytes is the only quantized option here.")
+    candidates.append("bitsandbytes")
+
+    fitting = [q for q in candidates if _fits(model, q, vram)]
+    if not fitting:
+        raise SystemExit(
+            f"[vllm] {model} does not fit in {vram:.0f} GiB even 4-bit. Use --tp with more GPUs, pick a "
+            f"smaller model (google/gemma-4-26b-a4b-it is an MoE with ~4B active), or rent a bigger box.")
+
+    def seqs(q: Optional[str]) -> int:
+        return max_sequences(model, gpus, tp, q, gpu_mem, context)
+
+    if req == "throughput":
+        for q in fitting:
+            if seqs(q) >= MIN_CONCURRENCY:
+                print(f"[vllm] throughput mode -> {q or 'bf16'}: ~{seqs(q)} concurrent {context:,}-token "
+                      f"sequences on {vram:.0f} GiB")
+                return q
+        q = fitting[-1]
+        print(f"[vllm] throughput mode: even {q or 'bf16'} leaves only ~{seqs(q)} sequences at {context:,}. "
+              f"Consider --context 16384 or a bigger card.")
+        return q
+
+    best = fitting[0]
+    print(f"[vllm] {vram:.0f} GiB, capability {cap} -> {best or 'bf16'} (quality first): "
+          f"~{_weights_gb(model, best):.0f} GiB weights, room for ~{seqs(best)} concurrent "
+          f"{context:,}-token sequences")
+    better = next((q for q in fitting[1:] if seqs(q) >= max(seqs(best) * 3, MIN_CONCURRENCY)), None)
+    if better:
+        print(f"[vllm]   NOTE: --quantization {better} would give ~{seqs(better)} concurrent sequences "
+              f"({seqs(better) / max(seqs(best), 1):.0f}x), at unmeasured cost to low-resource fluency. "
+              f"--quantization throughput picks it automatically.")
+    if seqs(best) < 4:
+        print(f"[vllm]   WARNING: ~{seqs(best)} concurrent sequences is near-serial decoding. This rental "
+              f"will be slow; --context 16384 or --quantization throughput is probably the better trade.")
+    return best
+
+
+def kv_free_gib(model: str, gpus: list[dict[str, Any]], tp: int, quant: Optional[str],
+                gpu_mem: float) -> float:
+    """VRAM left for the KV cache after weights, activations and fragmentation."""
+    p = preset_for(model)
+    if not gpus:
+        return 0.0
+    vram = sum(g["total_gb"] for g in gpus[:tp]) * (gpu_mem or p["gpu_memory_utilization"])
+    return max(0.0, vram - _weights_gb(model, quant) - 4.0)   # 4 GiB: activations, CUDA graphs, fragmentation
+
+
+def max_sequences(model: str, gpus: list[dict[str, Any]], tp: int, quant: Optional[str],
+                  gpu_mem: float, context: int) -> int:
+    """How many concurrent `context`-token sequences the KV cache has room for.
+
+    This is what actually bounds throughput, and getting it wrong means an OOM twenty minutes into a rental.
+    Both terms matter for gemma-4:
+      per-token  10 full-attention layers x (4 kv heads x 512) x 2 B          = 40,960 B / token
+      per-SEQUENCE 50 sliding layers x (16 x 256) x window 1024 x 2 B         = 419 MB, length-independent
+    Ignoring the second term overstates concurrency badly: at 11 sequences it is another 4.3 GiB.
+    """
+    p = preset_for(model)
+    per_token = int(p.get("kv_bytes_per_token") or 131_072)
+    fixed = int(p.get("kv_bytes_fixed") or 0)
+    per_seq = per_token * max(context, 1) + fixed
+    if per_seq <= 0:
+        return 0
+    return int(kv_free_gib(model, gpus, tp, quant, gpu_mem) * 2**30 // per_seq)
+
+
+def kv_tokens_available(model: str, gpus: list[dict[str, Any]], tp: int, quant: Optional[str],
+                        gpu_mem: float) -> int:
+    """Total KV tokens the box has room for, ignoring the per-sequence fixed cost. Reported for context only --
+    use max_sequences() for anything that decides a batch size."""
+    per_token = int(preset_for(model).get("kv_bytes_per_token") or 131_072)
+    if not per_token:
+        return 0
+    return int(kv_free_gib(model, gpus, tp, quant, gpu_mem) * 2**30 / per_token)
 
 
 # --------------------------------------------------------------------------- engine
@@ -165,6 +387,39 @@ def load_engine(model: str, *, tp: int, max_model_len: int, gpu_mem: float, quan
     return LLM(**kw)
 
 
+def _chat_resilient(engine: Any, convos: list[list[dict]], params: Any, *, depth: int = 0) -> list[Any]:
+    """engine.chat, but a failure costs a few samples instead of the whole rental.
+
+    A generation run is hours long on a paid box, and the failures that actually happen mid-run are (a) a CUDA
+    OOM when several long sequences land in the same step, and (b) one malformed conversation upsetting the
+    whole batch. Both used to kill the process and lose everything not yet flushed. Now an OOM halves the batch
+    and retries, and a batch that fails at size 1 returns None for that one item and moves on.
+    """
+    if not convos:
+        return []
+    try:
+        return list(engine.chat(convos, params, use_tqdm=(depth == 0)))
+    except Exception as exc:  # noqa: BLE001 -- vLLM raises a wide zoo, and none of it should end the run
+        msg = f"{type(exc).__name__}: {exc}"
+        if len(convos) == 1:
+            print(f"    [vllm] dropping 1 request: {msg[:160]}", flush=True)
+            return [None]
+        oom = any(k in msg.lower() for k in ("out of memory", "oom", "no available block", "kv cache"))
+        half = len(convos) // 2
+        print(f"    [vllm] {'OOM' if oom else 'error'} on a batch of {len(convos)}; splitting to "
+              f"{half}+{len(convos) - half}: {msg[:120]}", flush=True)
+        if oom:
+            try:                       # free what the failed attempt left behind before trying again
+                import gc
+                import torch
+                gc.collect()
+                torch.cuda.empty_cache()
+            except Exception:          # noqa: BLE001
+                pass
+        return (_chat_resilient(engine, convos[:half], params, depth=depth + 1)
+                + _chat_resilient(engine, convos[half:], params, depth=depth + 1))
+
+
 def sampling_params(kind: str, *, temperature: float, top_p: float, max_tokens: int, guided: bool):
     from vllm import SamplingParams
 
@@ -193,20 +448,77 @@ def sampling_params(kind: str, *, temperature: float, top_p: float, max_tokens: 
 def run(kind: str, model: str, *, langs: Optional[list[str]], limit: int, tp: int, max_model_len: int,
         gpu_mem: float, quantization: Optional[str], chunk: int, temperature: float, top_p: float,
         max_tokens: int, guided: bool, push: bool, repo_id: str, gpu_cost: float,
-        plan_only: bool) -> int:
-    reqs, seed = build_work(kind, langs, limit)
-    print(f"[{kind}] {len(reqs):,} requests outstanding for this worker")
-    if not reqs:
+        plan_only: bool, context: Optional[int] = None, run_tag: Optional[str] = None) -> int:
+    from assemble import set_response_budget
+    from budgets import budget_for
+    from generate import namespace
+    import longdocs
+
+    budget = budget_for(kind, context)
+    # One place decides the phase's lengths, and both halves of the pipeline read it: the assembler's response
+    # ceiling, the document size bands, the engine's context window and the completion cap.
+    set_response_budget(budget.max_response_tokens)
+    longdocs.set_context(kind, context)
+    ctx = budget.context
+    max_model_len = max_model_len or ctx
+    max_tokens = max_tokens or budget.max_output_tokens
+    ns = namespace(kind, run_tag)
+    print(f"[{kind}] context {ctx:,} | response<={budget.max_response_tokens:,} | "
+          f"completion<={max_tokens:,} | {budget.notes}")
+
+    rows, seed = build_work(kind, langs, limit)
+    if kind == "judge":
+        reqs, todo = rows, []
+    else:
+        todo = rows
+        reqs = []
+    print(f"[{ns}] {len(rows):,} {'requests' if kind == 'judge' else 'rows'} outstanding for this worker")
+    if not rows:
         print("nothing to do")
         return 0
 
-    in_tok_est = sum(len(m["content"]) for m in reqs[0].messages) / 4
+    gpus = gpu_report()
+    for g in gpus:
+        print(f"[gpu {g['index']}] {g['name']}  {g['total_gb']:.0f} GiB  capability {g['capability']}")
+    if gpus and tp > len(gpus):
+        raise SystemExit(f"--tp {tp} but only {len(gpus)} GPU(s) visible")
+    quant = choose_quantization(model, quantization, gpus, tp, ctx, gpu_mem)
+
     if plan_only:
-        _plan_report(kind, reqs, in_tok_est, max_tokens, gpu_cost, model)
+        in_tok_est = sum(len(m["content"]) for m in
+                         (reqs[0].messages if reqs else build_request(seed, todo[0]).messages)) / 4
+        _plan_report(kind, reqs or [build_request(seed, r) for r in todo[:1]] * len(todo),
+                     in_tok_est, max_tokens, gpu_cost, model)
+        if gpus:
+            seqs = max_sequences(model, gpus, tp, quant, gpu_mem, ctx)
+            print(f"  room for ~{seqs} concurrent {ctx:,}-token sequences with quantization={quant or 'bf16'}")
         return 0
 
-    engine = load_engine(model, tp=tp, max_model_len=max_model_len, gpu_mem=gpu_mem,
-                         quantization=quantization)
+    engine = load_engine(model, tp=tp, max_model_len=max_model_len, gpu_mem=gpu_mem, quantization=quant)
+
+    def params_for(mt: int):
+        # Documents are free-form prose, so they are NOT schema-constrained; conversations are.
+        return sampling_params("document", temperature=temperature, top_p=top_p,
+                               max_tokens=min(mt, max_model_len), guided=False)
+
+    # STAGE 0 + 1: the documents that long-document and RAG rows are built around. Runs on this same engine.
+    docs: dict[str, dict] = {}
+    if kind != "judge" and seed is not None:
+        provider = EngineProvider(engine, model, params_for)
+        docs = stage_one(seed, todo, provider)
+        from longdocs import DOCUMENT_TASKS
+        deferred = {r["custom_id"] for r in todo
+                    if r["task"] in DOCUMENT_TASKS and r["custom_id"] not in docs}
+        if deferred:
+            todo = [r for r in todo if r["custom_id"] not in deferred]
+            print(f"  deferring {len(deferred):,} document rows with no document yet")
+        reqs = [build_request(seed, r, docs.get(r["custom_id"])) for r in todo]
+        # Re-sort AFTER the documents are attached: a row carrying a 20k-token document has a completely
+        # different prompt from its neighbours, so grouping it with them wins nothing. Rows without documents
+        # keep their (lang, task) grouping, which is where the prefix cache pays.
+        reqs.sort(key=lambda r: (bool(r.metadata.get("document")), r.metadata.get("lang", ""),
+                                 r.metadata.get("task", ""), r.custom_id))
+
     params = sampling_params(kind, temperature=temperature, top_p=top_p, max_tokens=max_tokens,
                              guided=guided)
 
@@ -215,7 +527,7 @@ def run(kind: str, model: str, *, langs: Optional[list[str]], limit: int, tp: in
         from judge_gen import JUDGED_KIND, apply_verdict
         writer = ShardWriter(JUDGED_KIND, _shard_tag())
     else:
-        writer = ShardWriter(kind, _shard_tag())
+        writer = ShardWriter(ns, _shard_tag())
 
     kept = failed = 0
     out_tokens = 0
@@ -223,20 +535,23 @@ def run(kind: str, model: str, *, langs: Optional[list[str]], limit: int, tp: in
 
     for start in range(0, len(reqs), chunk):
         batch = reqs[start:start + chunk]
-        convos = [r.messages for r in batch]
         # One engine call per chunk: vLLM does continuous batching internally, so a big chunk is what
         # actually saturates the GPU. Chunking exists only so shards flush and progress is visible.
-        outs = engine.chat(convos, params, use_tqdm=True)
+        outs = _chat_resilient(engine, [r.messages for r in batch], params)
         for req, out in zip(batch, outs):
+            if out is None:
+                failed += 1
+                continue
             comp = out.outputs[0]
             out_tokens += len(comp.token_ids)
             resp = Response(req.custom_id, comp.text, True, None,
                             len(out.prompt_token_ids), len(comp.token_ids), model,
                             metadata=req.metadata)
-            if kind == "judge":
-                rec = apply_verdict(resp)
-            else:
-                rec = to_record(seed, resp)
+            try:
+                rec = apply_verdict(resp) if kind == "judge" else to_record(seed, resp)
+            except Exception as exc:  # noqa: BLE001 -- one malformed sample must not end the rental
+                print(f"    [postprocess] {type(exc).__name__} on {req.custom_id}", flush=True)
+                rec = None
             if rec is None:
                 failed += 1
                 continue
@@ -246,24 +561,22 @@ def run(kind: str, model: str, *, langs: Optional[list[str]], limit: int, tp: in
         tps = out_tokens / max(dt, 1e-9)
         done = start + len(batch)
         cost = gpu_cost * dt / 3600
-        print(f"  [{kind}] {done:,}/{len(reqs):,}  kept {kept:,}  dropped {failed:,}  "
+        print(f"  [{ns}] {done:,}/{len(reqs):,}  kept {kept:,}  dropped {failed:,}  "
               f"{tps:,.0f} out-tok/s  {dt/60:.1f}m  ${cost:.2f} so far"
-              + (f"  (${cost / (out_tokens / 1e6):.3f}/1M out tok)" if out_tokens > 1e5 else ""), flush=True)
+              + (f"  (${cost / (out_tokens / 1e6):.3f}/1M out tok, "
+                 f"${cost / max(kept, 1):.5f}/kept sample)" if out_tokens > 1e5 else ""), flush=True)
         if STATS:
             print("   ", summary(), flush=True)
 
     paths = writer.close()
     dt = time.time() - t0
     total_cost = gpu_cost * dt / 3600
-    yield_rate = kept / max(kept + failed, 1)
-    print(f"\n[{kind}] kept {kept:,}  dropped {failed:,}  (yield {yield_rate:.1%})  in {dt/60:.1f}m")
+    print(f"\n[{ns}] kept {kept:,}  dropped {failed:,}  "
+          f"(yield {kept / max(kept + failed, 1):.1%})  in {dt/60:.1f}m")
     print(f"  {out_tokens:,} output tokens at {out_tokens/max(dt,1e-9):,.0f} tok/s")
-    if out_tokens:
-        per_m = total_cost / (out_tokens / 1e6)
-        print(f"  GPU cost ${total_cost:.2f} = ${per_m:.3f} per 1M output tokens "
-              f"(Together batch is $0.300, standard $0.600)")
-        verdict = "CHEAPER than Together batch" if per_m < 0.300 else "more expensive than Together batch"
-        print(f"  -> self-hosting is {verdict} at this throughput and GPU price")
+    if kept:
+        print(f"  GPU cost ${total_cost:.2f} = ${total_cost / kept:.5f} per kept sample"
+              + (f", ${total_cost / (out_tokens / 1e6):.3f} per 1M output tokens" if out_tokens else ""))
     print(" ", summary())
     for p in paths:
         print(f"  wrote {p}")
@@ -336,7 +649,7 @@ def resolve_langs(seed_kind: str, langs: Optional[str]) -> Optional[list[str]]:
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--kind", required=True, choices=["pretrain", "sft", "rl", "judge"])
-    ap.add_argument("--model", default="openai/gpt-oss-120b")
+    ap.add_argument("--model", default="google/gemma-4-31b-it")
     ap.add_argument("--langs", default=None,
                     help="comma list of language codes to generate for this run, e.g. yor,hau. "
                          "An unknown code is an error listing the valid ones.")
@@ -344,27 +657,36 @@ def main() -> int:
     ap.add_argument("--tp", type=int, default=1, help="tensor_parallel_size = number of GPUs")
     ap.add_argument("--max-model-len", type=int, default=0, help="0 = the model preset")
     ap.add_argument("--gpu-mem", type=float, default=0.0, help="0 = the model preset")
-    ap.add_argument("--quantization", default=None, help="e.g. fp8, awq, bitsandbytes")
+    ap.add_argument("--context", type=int, default=0,
+                    help="target model context: 16384 or 32768 (0 = DATA_GEN_CONTEXT, default 32768). Sets "
+                         "the document sizes, the response ceiling and the engine window together.")
+    ap.add_argument("--quantization", default="auto",
+                    help="auto (default, highest precision that fits) | throughput (highest precision that "
+                         "also leaves room to batch) | none | fp8 | bitsandbytes | any vLLM name. AWQ and "
+                         "GPTQ need a pre-quantized --model; point at that repo and auto detects it.")
     ap.add_argument("--chunk", type=int, default=2048,
                     help="requests per engine call; only affects flush cadence, not batching")
     ap.add_argument("--temperature", type=float, default=0.9)
     ap.add_argument("--top-p", type=float, default=0.95)
-    ap.add_argument("--max-tokens", type=int, default=3072)
+    ap.add_argument("--max-tokens", type=int, default=0, help="0 = the phase budget (budgets.py)")
     ap.add_argument("--no-guided", dest="guided", action="store_false",
                     help="disable grammar-constrained JSON (expect more json_invalid drops)")
     ap.add_argument("--push", action="store_true")
     ap.add_argument("--repo-id", default="BeardedMonster/data-gen")
     ap.add_argument("--gpu-cost", type=float, default=2.0, help="USD per hour for the whole box")
     ap.add_argument("--plan-only", action="store_true", help="cost model only; no GPU, no generation")
+    ap.add_argument("--run-tag", default=None,
+                    help="namespace local shards so several models can generate the same rows independently")
     a = ap.parse_args()
     if a.kind == "judge":
         a.temperature = 0.0  # a ranking should be reproducible
-        a.max_tokens = min(a.max_tokens, 700)
+        a.max_tokens = 700
     langs = resolve_langs("rl" if a.kind == "judge" else a.kind, a.langs)
     return run(a.kind, a.model, langs=langs, limit=a.limit, tp=a.tp, max_model_len=a.max_model_len,
                gpu_mem=a.gpu_mem, quantization=a.quantization, chunk=a.chunk,
                temperature=a.temperature, top_p=a.top_p, max_tokens=a.max_tokens, guided=a.guided,
-               push=a.push, repo_id=a.repo_id, gpu_cost=a.gpu_cost, plan_only=a.plan_only)
+               push=a.push, repo_id=a.repo_id, gpu_cost=a.gpu_cost, plan_only=a.plan_only,
+               context=a.context or None, run_tag=a.run_tag)
 
 
 if __name__ == "__main__":

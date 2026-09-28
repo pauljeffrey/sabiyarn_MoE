@@ -40,24 +40,44 @@ from pathlib import Path
 from typing import Any, Optional
 
 from assemble import _TOKENS_PER_WORD
+from budgets import budget_for
 from providers.base import Request, Response
 
-# Tasks whose sample contains a long generated document, and which therefore go through stages 0 and 1 first.
-DOCUMENT_TASKS = {"long_document_summarization"}
+# Tasks whose sample needs a long generated document first.
+#
+# SUMMARY tasks paste the document into the USER turn. RAG tasks put it in a TOOL RESULT instead: the point of
+# a RAG sample is that the assistant composes a query, receives passages and answers from them, so the
+# document arrives through `search_documents`, not through the user. Both are built by the same stages; only
+# the splice target differs.
+SUMMARY_DOCUMENT_TASKS = {"long_document_summarization"}
+RAG_DOCUMENT_TASKS = {"rag_document_qa", "retrieval_insufficient"}
+DOCUMENT_TASKS = SUMMARY_DOCUMENT_TASKS | RAG_DOCUMENT_TASKS
 
-# What the generator writes in the user turn instead of the document, and what splice() replaces.
+# What the generator writes instead of the document, and what splice() replaces.
 PLACEHOLDER = "__DOCUMENT__"
 
-# Document size in TOKENS, weighted towards the short end. A 16,000-token document costs ~7x a 4,000-token one
-# and is ~7x rarer in practice, so weighting it equally would spend most of the budget on the rarest case.
+# Document size in TOKENS, derived from the phase's context budget (budgets.py) rather than hardcoded, so
+# "what context is the model being trained at" is set in one place. Weighted towards the short end: a document
+# at the ceiling costs ~6x one at the floor and is ~6x rarer in practice, so weighting them equally would spend
+# most of the budget on the rarest case.
 #
 # ELEVEN buckets, not ten, and that is the whole reason for the odd weight on the first band. The document
 # LANGUAGE cycle below is 10 long; a size cycle that is also 10 long has the same period in `index`, so the two
 # are locked together and only 10 of the 30 (language, size) pairs ever occur -- measured: no Fon row ever drew
 # an English document above 12,000 tokens. 11 is coprime with 10, so the pair cycles over all 110.
-_TOKEN_BANDS = [(4000, 6000)] * 5 + [(6000, 9000)] * 3 + [(9000, 12000)] * 2 + [(12000, 16000)]
 _BAND_STRIDE = 7          # coprime with len(_TOKEN_BANDS) == 11, or most bands are unreachable
 _PINNED = int(os.environ.get("DATA_GEN_DOC_TOKENS", "0")) or None
+# Set by set_context() from the driver's --context; the default is the target model's real block_size.
+_TOKEN_BANDS: list[tuple[int, int]] = list(budget_for("sft").doc_token_bands)
+_RAG_TOKENS: tuple[int, int] = budget_for("sft").rag_context_tokens
+
+
+def set_context(kind: str, context: Optional[int] = None) -> None:
+    """Point the document bands at one phase's budget. Called once at startup by the drivers."""
+    global _TOKEN_BANDS, _RAG_TOKENS
+    b = budget_for(kind, context)
+    _TOKEN_BANDS = list(b.doc_token_bands)
+    _RAG_TOKENS = b.rag_context_tokens
 
 _CHARS_PER_WORD = 5.5
 # Sections per stage-1 request. Each section runs ~400 words, so six is ~3,400 output tokens -- comfortably
@@ -80,9 +100,14 @@ MAX_SECTIONS = 20
 _MAX_SECTION_WORDS = 700
 
 
-def _tokens_for(index: int, lang: str) -> tuple[int, int]:
+def _tokens_for(index: int, lang: str, *, rag: bool = False) -> tuple[int, int]:
     if _PINNED:
         return _PINNED, _PINNED
+    if rag:
+        # A RAG context is a document the assistant RETRIEVES FROM, not one it summarises whole, so it is
+        # sized to the owner's 2,048-8,192-token spec rather than to the summarisation band. Small enough that
+        # several passages fit in one conversation, large enough that finding the answer is real work.
+        return _RAG_TOKENS
     return _TOKEN_BANDS[(index * _BAND_STRIDE + _offset(lang)) % len(_TOKEN_BANDS)]
 
 
@@ -153,7 +178,7 @@ class DocSpec:
 
     __slots__ = ("custom_id", "lang", "doc_lang", "doc_lang_mode", "form", "form_desc", "stages",
                  "tokens", "words", "n_sections", "section_words", "min_words", "register", "domain",
-                 "subtopic", "parts")
+                 "subtopic", "parts", "rag")
 
     def __init__(self, **kw: Any) -> None:
         for k in self.__slots__:
@@ -165,16 +190,22 @@ class DocSpec:
 
 def plan_document(seed: Any, row: dict, *, domain: str, subtopic: str) -> DocSpec:
     """Decide form, language, length and section count for this row's document. Pure function of the row."""
+    rag = row.get("task") in RAG_DOCUMENT_TASKS
     lang = row["lang"]
     i = row["index"] + _offset(lang)
     form, form_desc, stages = _FORMS[i % len(_FORMS)]
     mode = _DOC_LANG_CYCLE[(row["index"] * _DOC_LANG_STRIDE + _offset(lang)) % len(_DOC_LANG_CYCLE)]
     if lang == "eng":
         mode = "eng"
+    if rag:
+        # A retrieved passage is English. The rag_document_qa brief already states this and it is what a real
+        # retrieval corpus looks like for these languages: the assistant reads English and answers in the
+        # user's language, which is the behaviour the sample exists to teach.
+        mode = "eng"
     doc_lang = "eng" if mode == "eng" else lang
 
     tier = next((l.tier for l in seed.languages if l.code == lang), "medium")
-    lo, hi = _tokens_for(row["index"], lang)
+    lo, hi = _tokens_for(row["index"], lang, rag=rag)
     tokens = lo + (_offset(row["custom_id"]) % max(1, hi - lo))
     # A document written ENTIRELY in a low-resource language is capped short. The full band asked Fon for
     # 4,775 words, and a generator that half-knows Fon does not produce 4,775 good ones -- it drifts into
@@ -194,7 +225,7 @@ def plan_document(seed: Any, row: dict, *, domain: str, subtopic: str) -> DocSpe
                    form=form, form_desc=form_desc, stages=stages, tokens=tokens, words=words,
                    n_sections=n_sections, section_words=section_words, min_words=_MIN_WORDS[key],
                    register=_REGISTERS[i % len(_REGISTERS)], domain=domain, subtopic=subtopic,
-                   parts=max(1, -(-n_sections // SECTIONS_PER_PART)))
+                   parts=max(1, -(-n_sections // SECTIONS_PER_PART)), rag=rag)
 
 
 def _lang_line(seed: Any, spec: DocSpec) -> str:
@@ -607,7 +638,9 @@ def generate_documents(seed: Any, specs: list[DocSpec], provider: Any,
                    "doc_lang_mode": spec.doc_lang_mode, "form": spec.form,
                    "target_words": spec.words, "target_tokens": spec.tokens,
                    "sections": len(o["sections"]), "parts": len(have), "parts_wanted": want,
-                   "model": provider.model})
+                   # splice() and document_brief() branch on this: a RAG document goes into a tool result,
+                   # a summarisation document into the user turn.
+                   "rag": bool(spec.rag), "model": provider.model})
     if short or gapped or ended_early:
         print(f"    dropped: {short} too short or looping, {gapped} with a gap between parts; "
               f"{ended_early} kept as a shorter contiguous document", flush=True)
@@ -620,23 +653,29 @@ def generate_documents(seed: Any, specs: list[DocSpec], provider: Any,
 def splice(turns: Any, document: dict) -> tuple[Any, Optional[str]]:
     """Put the real document where the generator wrote __DOCUMENT__. Returns (turns, error).
 
-    The placeholder is only legal in a USER turn. In an assistant response it would mean the summary REFERS to
-    the document rather than summarising it, which is exactly the sample being worthless.
+    WHERE the placeholder is legal depends on the sample. A SUMMARY sample has the user paste the document, so
+    it belongs in a user turn. A RAG sample has the assistant retrieve it, so it belongs in a role='tool'
+    result -- the whole point of a RAG sample is that the assistant composes a query, receives passages and
+    answers from those, and a document handed over in the user turn would teach context-stuffing instead.
+
+    In an assistant response it is never legal: that would mean the answer REFERS to the document rather than
+    being grounded in it, which is exactly the sample being worthless.
     """
     if not isinstance(turns, list):
         return turns, "turns_not_a_list"
     body = (f"{document['title']}\n\n{document['text']}" if document.get("title") else document["text"])
+    want_role = "tool" if document.get("rag") else "user"
     found = False
     for t in turns:
         if not isinstance(t, dict):
             continue
+        if t.get("role") == "assistant" and PLACEHOLDER in str(t.get("response") or ""):
+            return turns, "placeholder_in_response"
         content = t.get("content")
         if not isinstance(content, str) or PLACEHOLDER not in content:
-            if t.get("role") == "assistant" and PLACEHOLDER in str(t.get("response") or ""):
-                return turns, "placeholder_in_response"
             continue
-        if t.get("role") != "user":
-            return turns, f"placeholder_in_{t.get('role')}_turn"
+        if t.get("role") != want_role:
+            return turns, f"placeholder_in_{t.get('role')}_turn_wanted_{want_role}"
         t["content"] = content.replace(PLACEHOLDER, body)
         found = True
     if not found:
@@ -646,9 +685,35 @@ def splice(turns: Any, document: dict) -> tuple[Any, Optional[str]]:
 
 def document_brief(document: dict) -> str:
     """The stage-2 instruction block: the document is given, and must be referenced, never repeated."""
-    return f"""THE DOCUMENT IS ALREADY WRITTEN -- it is below, {document.get('words') or 0:,} words of it, and it
-is what the user pastes in. You must NOT retype it, shorten it, or paraphrase it into the user turn. In the
-user turn where the user pastes it, write exactly the placeholder
+    words = document.get("words") or 0
+    if document.get("rag"):
+        return f"""THE DOCUMENT BELOW IS THE KNOWLEDGE BASE for this conversation -- {words:,} words of it. The
+assistant does NOT have it in front of it and the user does NOT paste it. The assistant reaches it only by
+calling search_documents, and what comes back is a role='tool' result.
+
+In the FIRST search_documents tool result, write exactly the placeholder
+
+    {PLACEHOLDER}
+
+and nothing else. The real text is substituted for it afterwards. Use the placeholder EXACTLY ONCE, in a
+role='tool' result, and nowhere else -- not in the user turn, not in an assistant response. Any LATER tool
+result is an ordinary short passage you write yourself.
+
+What this sample has to teach:
+- the assistant composes its own English search query from what the user asked;
+- it reads the returned passages and answers from THEM, saying where the answer came from;
+- asked something the document does not cover, it says the document does not cover it rather than falling
+  back on general knowledge. That refusal is the most valuable turn in the sample.
+The answer goes in whatever language the io_direction calls for, even though the passages are English.
+
+--- THE KNOWLEDGE BASE (the assistant retrieves from this; do not reproduce it) ---
+{document.get('title') or ''}
+
+{document.get('text') or ''}
+--- END OF KNOWLEDGE BASE ---"""
+    return f"""THE DOCUMENT IS ALREADY WRITTEN -- it is below, {words:,} words of it, and it is what the user
+pastes in. You must NOT retype it, shorten it, or paraphrase it into the user turn. In the user turn where the
+user pastes it, write exactly the placeholder
 
     {PLACEHOLDER}
 

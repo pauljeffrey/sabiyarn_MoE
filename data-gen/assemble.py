@@ -70,7 +70,22 @@ _TAG_SHAPED = re.compile(r"<\|?/?[A-Za-z_][A-Za-z0-9_.|-]{0,22}\|?>")
 # language: measured with tiktoken o200k on real text, Pidgin runs ~1.35 tokens/word while Yoruba runs ~2.5,
 # so the same token budget is roughly 20k characters of Pidgin but only 11k of Yoruba. Budget =
 # MAX_RESPONSE_TOKENS x (CHARS_PER_WORD / tokens_per_word).
-MAX_RESPONSE_TOKENS = 5112
+#
+# PHASE-DEPENDENT, not a constant: budgets.py derives it from the target model's context (4,096 for SFT at a
+# 32,768 context, 2,048 for RL where two candidates share the window). The drivers call set_response_budget()
+# once at startup; the default here is the largest case so an importer that forgets cannot accidentally
+# tighten it.
+from budgets import budget_for  # noqa: E402
+
+MAX_RESPONSE_TOKENS = budget_for("sft").max_response_tokens
+
+
+def set_response_budget(tokens: int) -> None:
+    """Set the per-response ceiling for this process. Called by generate.py / vllm_gen.py from the phase."""
+    global MAX_RESPONSE_TOKENS
+    MAX_RESPONSE_TOKENS = int(tokens)
+
+
 _CHARS_PER_WORD = 5.5
 _TOKENS_PER_WORD = {"pcm": 1.35, "eng": 1.15, "hau": 1.8, "ibo": 2.0, "yor": 2.5, "twi": 2.4, "aka": 2.4,
                     "efi": 2.7, "urh": 2.7, "ewe": 2.9, "fon": 3.0, "ful": 2.4, "fuv": 2.4}

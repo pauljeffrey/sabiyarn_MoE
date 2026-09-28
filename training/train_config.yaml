@@ -89,21 +89,25 @@ training:
   # then nothing, and learn to produce a document and stop. 16384 holds the whole generated band
   # (measured: documents run 1,492-12,481 words, median 4,344).
   #
-  # 16384 and not more: the positional embedding is LEARNED ABSOLUTE (wpe), so every position only learns from
-  # samples that actually reach it, and nothing in this corpus goes past ~16k. At 16384 wpe costs 12.6M
-  # parameters (4.1% of the model) and attention costs 2.7x the MLP; at 65536 it would be 50.3M (16.4%) and
-  # 10.7x, for positions no sample ever trains. Attention FLOPs overtake the MLP at T = 8 * n_embd = 6,144.
+  # 32768 is the model's own limit: block_size in sabiyarn/model/configuration.py and in the published
+  # config.json, so the learned absolute position embedding (wpe) already has 32,768 rows and no architectural
+  # change is needed. wpe then costs 25.2M parameters, 8.2% of the model, and attention costs 5.3x the MLP
+  # (attention FLOPs overtake the MLP at T = 8 * n_embd = 6,144). Both are real prices for long-context
+  # ability; going FURTHER than 32768 would need RoPE or ALiBi, since wpe has no rows past it.
   #
-  # batch x accum is 48, not 192: what matters for the LR schedule is TOKENS per optimiser step, and
-  # 48 x 16384 = 786,432 is exactly 192 x 4096. Keeping 192 sequences would quadruple the token budget per
-  # step and invalidate the swept schedule. 16 stays divisible by 4 GPUs.
+  # Generation is sized to match: data-gen/budgets.py derives document lengths from this same number, so
+  # DATA_GEN_CONTEXT=32768 (its default) and sft_block_size must move together or samples get truncated.
+  #
+  # batch x accum is 24, not 192: what matters for the LR schedule is TOKENS per optimiser step, and
+  # 24 x 32768 = 786,432 is exactly 192 x 4096. Keeping 192 sequences would multiply the token budget per step
+  # by eight and invalidate the swept schedule. 24 stays divisible by 4 GPUs (and by 2, 3, 6, 8).
   #
   # flex attention is REQUIRED at this length: sdpa_mask builds a (B,1,T,T) boolean mask, which at 16384 is
   # ~800 MiB per layer per sample.
-  sft_block_size: 16384
-  sft_train_batch_size: 3                   # 3 x 16384 = 49,152 tokens per micro-step, as 12 x 4096 was
-  sft_gradient_accumulation_steps: 16
-  sft_gradient_checkpointing: true          # 4x the activations per sequence; measured headroom needs this
+  sft_block_size: 32768                     # the model's real block_size (configuration.py, config.json)
+  sft_train_batch_size: 1                   # 1 x 32768 tokens per micro-step, inside the 49,152 swept above
+  sft_gradient_accumulation_steps: 24       # 1 x 24 x 32768 = 786,432 = 12 x 16 x 4096, so the LR curve holds
+  sft_gradient_checkpointing: true          # 8x the activations per sequence; required, not optional
   # Document-causal attention for packed sequences (no attention across </s> boundaries):
   #   sdpa_mask -- a (B,1,T,T) boolean mask per batch; works everywhere, but costs ~4-5 GiB of
   #                activation memory per sample and forces SDPA's slower masked kernel.
@@ -384,5 +388,5 @@ modal:
   # gpus_per_node to be the FULL device count Modal offers per physical host
   # for that type (see the clustered() note in training/modal_train.py).
   num_nodes: 1
-  gpus_per_node: 2
+  gpus_per_node: 4
   gpu_type: "A100-80GB"  # 48 GB -- change freely, see the list above

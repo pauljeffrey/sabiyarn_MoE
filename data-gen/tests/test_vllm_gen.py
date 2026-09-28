@@ -9,9 +9,14 @@ from vllm_gen import build_work, preset_for
 
 
 def test_work_is_sorted_for_prefix_cache_hits():
-    """The shared system prompt must arrive consecutively, or prefix caching buys nothing."""
-    reqs, seed = build_work("sft", ["yor", "hau"], limit=400)
-    assert reqs and seed is not None
+    """The shared system prompt must arrive consecutively, or prefix caching buys nothing.
+
+    build_work returns PLAN ROWS, not requests: the requests cannot be built until stage 1 has produced the
+    documents that the long-document and RAG rows carry, and those run on the same engine."""
+    from prompts import build_request
+    rows, seed = build_work("sft", ["yor", "hau"], limit=400)
+    assert rows and seed is not None
+    reqs = [build_request(seed, r) for r in rows]
     keys = [(r.metadata["lang"], r.metadata["task"]) for r in reqs]
     assert keys == sorted(keys), "work is not grouped by (lang, task)"
     # consecutive rows in a group share a byte-identical system message
@@ -39,8 +44,8 @@ def test_work_respects_shard_partitioning(monkeypatch):
 
 
 def test_language_filter_is_honoured():
-    reqs, _ = build_work("pretrain", ["fon"], limit=50)
-    assert reqs and {r.metadata["lang"] for r in reqs} == {"fon"}
+    rows, _ = build_work("pretrain", ["fon"], limit=50)
+    assert rows and {r["lang"] for r in rows} == {"fon"}
 
 
 @pytest.mark.parametrize("kind", ["pretrain", "sft", "rl", "judge"])
@@ -75,9 +80,157 @@ def test_schema_accepts_a_realistic_sample():
     }, schema_for("sft"))
 
 
-def test_model_presets_cover_both_named_models():
-    for m in ("openai/gpt-oss-120b", "google/gemma-3-27b-it"):
+def test_model_presets_cover_the_named_models():
+    for m in ("openai/gpt-oss-120b", "google/gemma-3-27b-it", "google/gemma-4-31b-it"):
         p = preset_for(m)
-        assert p["min_gpus_80gb"] >= 1 and p["max_model_len"] >= 4096 and p["notes"]
+        assert p["min_gpus_80gb"] >= 1 and p["notes"]
     # unknown models fall back rather than crash
-    assert preset_for("some/unreleased-model")["max_model_len"] >= 4096
+    assert "kv_bytes_per_token" in preset_for("some/unreleased-model")
+
+
+def test_gemma4_kv_geometry_matches_the_published_config():
+    """These numbers decide how many sequences fit, which is the difference between saturating a rental and
+    OOMing twenty minutes in. From google/gemma-4-31b-it's own config: 60 layers as 50 sliding_attention
+    (window 1024) + 10 full_attention, num_global_key_value_heads 4, global_head_dim 512, and
+    attention_k_eq_v so K and V share one tensor."""
+    p = preset_for("google/gemma-4-31b-it")
+    assert p["kv_bytes_per_token"] == 10 * 4 * 512 * 2          # full-attention layers only
+    assert p["kv_bytes_fixed"] == 50 * 16 * 256 * 1024 * 2      # sliding layers, capped at the window
+    assert 55 <= p["weight_gb_bf16"] <= 68
+
+
+# --------------------------------------------------------------------------- hardware-agnostic loading
+
+
+BOXES = [("RTX 5090", 32, 12.0), ("L40S 48GB", 48, 8.9), ("A100 40GB", 40, 8.0),
+         ("GB10 119GB", 119, 12.0), ("A800 80GB", 80, 8.0), ("A100 80GB", 80, 8.0)]
+
+
+def _gpus(gb, cap, n=1):
+    return [{"index": i, "name": "x", "total_gb": float(gb), "capability": cap} for i in range(n)]
+
+
+@pytest.mark.parametrize("name,gb,cap", BOXES)
+def test_every_listed_box_gets_a_loadable_choice(name, gb, cap, capsys):
+    """The point of `auto`: one command works on a 32 GB consumer card and on an 80 GB datacentre card with
+    nothing edited. Anything that cannot load must raise with an instruction, never return silently."""
+    from vllm_gen import choose_quantization, _fits
+    q = choose_quantization("google/gemma-4-31b-it", None, _gpus(gb, cap), 1, 32_768)
+    assert _fits("google/gemma-4-31b-it", q, float(gb)), (name, q)
+
+
+def test_fp8_is_never_chosen_on_ampere():
+    """Ampere (A100, A800, A40) has no fp8 kernels -- capability 8.0 < 8.9. Choosing it there is a load
+    failure minutes into a paid rental."""
+    from vllm_gen import choose_quantization
+    for gb in (40, 80):
+        for req in (None, "throughput"):
+            assert choose_quantization("google/gemma-4-31b-it", req, _gpus(gb, 8.0), 1, 32_768) != "fp8"
+
+
+def test_auto_is_quality_first_and_throughput_is_opt_in():
+    """On an 80 GB Ampere card bf16 fits but leaves room for ~5 sequences, and 4-bit leaves room for ~40. That
+    is a quality/throughput trade, so `auto` takes the precision and names the alternative rather than
+    silently dropping to 4-bit on exactly the low-resource languages this corpus exists for."""
+    from vllm_gen import choose_quantization
+    g = _gpus(80, 8.0)
+    assert choose_quantization("google/gemma-4-31b-it", None, g, 1, 32_768) is None
+    assert choose_quantization("google/gemma-4-31b-it", "throughput", g, 1, 32_768) == "bitsandbytes"
+
+
+def test_explicit_quantization_always_wins():
+    from vllm_gen import choose_quantization
+    g = _gpus(80, 8.0)
+    assert choose_quantization("google/gemma-4-31b-it", "fp8", g, 1) == "fp8"
+    assert choose_quantization("google/gemma-4-31b-it", "none", g, 1) is None
+    assert choose_quantization("google/gemma-4-31b-it", "awq", g, 1) == "awq"
+
+
+def test_a_prequantized_checkpoint_is_left_to_vllm():
+    """AWQ and GPTQ cannot be applied on the fly, so a pre-quantized repo must not have a second scheme
+    stacked on top of it."""
+    from vllm_gen import choose_quantization
+    for m in ("some/gemma-4-31b-AWQ", "some/gemma-4-31b-GPTQ-Int4", "some/model-FP8-dynamic"):
+        assert choose_quantization(m, None, _gpus(80, 9.0), 1) is None
+
+
+def test_a_model_too_big_for_the_box_fails_with_an_instruction():
+    from vllm_gen import choose_quantization
+    with pytest.raises(SystemExit, match="does not fit"):
+        choose_quantization("google/gemma-4-31b-it", None, _gpus(8, 8.0), 1, 32_768)
+
+
+def test_concurrency_falls_as_the_context_grows():
+    from vllm_gen import max_sequences
+    g = _gpus(80, 8.0)
+    at16 = max_sequences("google/gemma-4-31b-it", g, 1, "bitsandbytes", 0.0, 16_384)
+    at32 = max_sequences("google/gemma-4-31b-it", g, 1, "bitsandbytes", 0.0, 32_768)
+    assert at16 > at32 >= 1
+
+
+def test_the_per_sequence_sliding_window_cost_is_counted():
+    """gemma-4 has 50 sliding-window layers whose KV is 419 MB per SEQUENCE regardless of length, on top of the
+    per-token cost of its 10 full-attention layers. Ignoring it overstates concurrency by ~30% at 32k, which is
+    an OOM twenty minutes into a paid rental rather than a rounding error."""
+    from vllm_gen import kv_free_gib, max_sequences, preset_for
+    g = _gpus(80, 8.0)
+    free = kv_free_gib("google/gemma-4-31b-it", g, 1, "bitsandbytes", 0.0)
+    p = preset_for("google/gemma-4-31b-it")
+    naive = int(free * 2**30 / p["kv_bytes_per_token"]) // 32_768
+    real = max_sequences("google/gemma-4-31b-it", g, 1, "bitsandbytes", 0.0, 32_768)
+    assert real < naive, "the fixed per-sequence term is not being charged"
+    # and the arithmetic is exactly free / (per_token * context + fixed)
+    assert real == int(free * 2**30 // (p["kv_bytes_per_token"] * 32_768 + p["kv_bytes_fixed"]))
+
+
+# --------------------------------------------------------------------------- resilience
+
+
+def test_an_oom_splits_the_batch_instead_of_ending_the_run():
+    """A generation run is hours long on a paid box. The failures that actually happen are a CUDA OOM when
+    several long sequences land in one step, and one malformed conversation upsetting the batch. Neither may
+    cost more than the samples involved."""
+    from vllm_gen import _chat_resilient
+
+    class Flaky:
+        def __init__(self, limit):
+            self.limit = limit
+            self.calls = 0
+
+        def chat(self, convos, params, use_tqdm=False):
+            self.calls += 1
+            if len(convos) > self.limit:
+                raise RuntimeError("CUDA out of memory: tried to allocate 40.00 GiB")
+            return [f"ok{i}" for i in range(len(convos))]
+
+    eng = Flaky(limit=2)
+    out = _chat_resilient(eng, [[{"role": "user", "content": "x"}]] * 8, None)
+    assert len(out) == 8 and all(o is not None for o in out)
+    assert eng.calls > 1, "the batch was never split"
+
+
+def test_a_single_request_that_always_fails_is_dropped_not_raised():
+    from vllm_gen import _chat_resilient
+
+    class Broken:
+        def chat(self, convos, params, use_tqdm=False):
+            raise ValueError("malformed conversation")
+
+    out = _chat_resilient(Broken(), [[{"role": "user", "content": "x"}]] * 4, None)
+    assert out == [None, None, None, None]
+
+
+# --------------------------------------------------------------------------- phases
+
+
+@pytest.mark.parametrize("kind", ["pretrain", "sft", "rl"])
+@pytest.mark.parametrize("context", [16_384, 32_768])
+def test_every_phase_has_a_coherent_budget(kind, context):
+    from budgets import budget_for
+    b = budget_for(kind, context)
+    assert b.context == context
+    assert b.max_response_tokens < context
+    lo, hi = b.doc_token_range
+    assert 0 < lo <= hi < context
+    assert b.max_output_tokens <= context
+    assert b.rag_context_tokens == (2048, 8192)

@@ -362,12 +362,17 @@ def _sft_like_request(seed: Seed, row: dict, *, rl: bool, document: Optional[dic
     # but at most 1 for a low-resource language, and none at all alongside a long document, which is already
     # the whole conversation.
     others = [t for t in seed.tasks if t.name != task.name and (not t.languages or lang.code in t.languages)]
-    max_extra = 0 if document else _TIER_EXTRA_TASKS.get(lang.tier, 3)
+    # A summarisation document IS the conversation, so it covers one task. A RAG document is retrieved
+    # mid-conversation and mixes normally.
+    max_extra = 0 if (document and not document.get("rag")) else _TIER_EXTRA_TASKS.get(lang.tier, 3)
     extra = (rng.sample(others, k=min(len(others), rng.randint(1, max_extra))) if max_extra else [])
     tasks = [task] + extra
     domain, subtopic, _ = _coverage_pick(lang.code, row["index"])
     io = _io_direction(seed, lang.code, row["index"], rng)
-    if document:
+    # A RAG document reaches the assistant through a TOOL, so it does not change what came IN: the user still
+    # writes in their own language and io_direction is already correct. Only a pasted summarisation document
+    # changes the input language.
+    if document and not document.get("rag"):
         # What came IN is the document, whatever io_direction would otherwise have said. The markers have to
         # match reality: an English report summarised into Yoruba is <|input_lang|><eng>, not <yor>. The brief
         # is rewritten too, or it would tell the generator "everything is in Yoruba" over an English document.
@@ -470,7 +475,7 @@ def _sft_like_request(seed: Seed, row: dict, *, rl: bool, document: Optional[dic
     # A low-resource language is capped lower: six turns of shaky Fon is six turns of unusable data, and the
     # generator spends its fluency budget on quantity instead of correctness.
     _hi = min(_hi, _TIER_TURNS.get(lang.tier, 6))
-    if document:
+    if document and not document.get("rag"):
         # The sample's purpose is the summary: ask for it, then optionally one or two follow-up questions
         # answered from the same document, which is the part that teaches grounding over a long context.
         # More than that and the document stops being the subject of the conversation.

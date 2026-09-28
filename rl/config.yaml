@@ -21,15 +21,15 @@ data:
   #   final answer  median    68  p90   121  p99   293  max    716
   # 512/1024 dropped 75.7% of prompts and 70.2% of samples, visible only as a
   # `dpo_examples_dropped_too_long` log line -- a tool-calling conversation carries the tool catalogue in its
-  # system message plus several tool results, so it cannot fit 512 tokens. 16384 keeps 100% and matches
-  # training/train_config.yaml's sft_block_size.
-  max_prompt_len: 15360
-  max_seq_len: 16384
+  # system message plus several tool results, so it cannot fit 512 tokens. 32768 is the model's own block_size
+  # and matches training/train_config.yaml's sft_block_size, so a sample that fits SFT fits post-training.
+  max_prompt_len: 28672
+  max_seq_len: 32768
 
 train:
-  # 1 pair, because max_seq_len is now 16x larger. DPO forwards chosen AND rejected, so a pair is 2 sequences:
-  # 1 x 2 x 16,384 = 32,768 tokens per micro-step, inside the ~49k the pretraining config was swept to fit on
-  # an A100-80GB. accum 16 keeps the effective batch at the 16 pairs it was before.
+  # 1 pair, because max_seq_len is now 32x larger. DPO forwards chosen AND rejected, so a pair is 2 sequences:
+  # 1 x 2 x 32,768 = 65,536 tokens per micro-step, which is ABOVE the ~49k the pretraining config was swept to
+  # fit on an A100-80GB -- so 1 is the floor and a long run wants checkpointing or a second card.
   batch_size: 1              # pairs per GPU per micro-step  ->  2 sequences (chosen + rejected) per forward
   grad_accum_steps: 16       # effective batch = 1 x 16 x n_gpus pairs
   epochs: 1

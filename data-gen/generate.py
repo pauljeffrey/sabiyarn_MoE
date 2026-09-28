@@ -184,7 +184,18 @@ def stage_one_documents(seed: Any, todo: list[dict], provider: Any, *, dry_run: 
 def run(kind: str, provider_name: str, *, model: Optional[str] = None, langs: Optional[list[str]] = None,
         limit: int = 0, batch: bool = False, dry_run: bool = False, concurrency: int = 16,
         push: bool = False, repo_id: str = "BeardedMonster/data-gen", seed_path: Optional[str] = None,
-        shuffle: bool = True, run_tag: Optional[str] = None, pack: int = 1) -> int:
+        shuffle: bool = True, run_tag: Optional[str] = None, pack: int = 1,
+        context: Optional[int] = None) -> int:
+    from assemble import set_response_budget
+    from budgets import budget_for
+    import longdocs
+
+    # The phase's lengths, from one place, before any request is built (see budgets.py). The API path and the
+    # vLLM path must agree here or a corpus generated half on each has two different document distributions.
+    budget = budget_for(kind, context)
+    set_response_budget(budget.max_response_tokens)
+    longdocs.set_context(kind, context)
+    print(f"[{kind}] context {budget.context:,} | response<={budget.max_response_tokens:,} | {budget.notes}")
     seed = Seed.load(seed_path or kind)
     ns = namespace(kind, run_tag)
     rows = list(plan_rows(seed, langs))
@@ -381,6 +392,9 @@ def main() -> int:
     ap.add_argument("--push", action="store_true", help="push shards to the Hub when done")
     ap.add_argument("--repo-id", default="BeardedMonster/data-gen")
     ap.add_argument("--seed-path", default=None)
+    ap.add_argument("--context", type=int, default=0,
+                    help="target model context: 16384 or 32768 (0 = DATA_GEN_CONTEXT, default 32768). Sets "
+                         "the document sizes and the response ceiling for this phase.")
     ap.add_argument("--pack", type=int, default=1,
                     help="conversations per request. >1 amortises the ~1,200-token shared system prompt, "
                          "which is what makes a 1,000-request/day free tier useful. Sweep it with "
@@ -394,7 +408,7 @@ def main() -> int:
         return fetch(a.kind, a.provider, a.fetch, a.model, a.push, a.repo_id)
     return run(a.kind, a.provider, model=a.model, langs=langs, limit=a.limit, batch=a.batch,
                dry_run=a.dry_run, concurrency=a.concurrency, push=a.push, repo_id=a.repo_id,
-               seed_path=a.seed_path, run_tag=a.run_tag, pack=a.pack)
+               seed_path=a.seed_path, run_tag=a.run_tag, pack=a.pack, context=a.context or None)
 
 
 if __name__ == "__main__":
