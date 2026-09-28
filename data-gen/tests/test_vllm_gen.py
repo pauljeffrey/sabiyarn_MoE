@@ -270,17 +270,72 @@ def test_int8_and_8bit_are_accepted_as_fp8_aliases():
 
 
 def test_pretrain_gets_a_small_engine_window():
-    """vLLM reserves KV per sequence at max_model_len. Pretraining's longest sample is ~5,200 tokens, so asking
-    for 32,768 would throw away most of the cache: 25 concurrent sequences on a GB10 instead of 59."""
+    """vLLM reserves KV per sequence at max_model_len, so the window must come from what a request needs --
+    prompt plus completion -- not from the model's context. Every token saved is concurrency."""
     from budgets import budget_for
     from vllm_gen import max_sequences
     g = _gpus(119, 12.0)
     pre, sft = budget_for("pretrain"), budget_for("sft")
-    assert pre.engine_len == 8_192 and sft.engine_len == 32_768
-    assert pre.engine_len > pre.max_output_tokens + 2_000          # room for the prompt too
+    assert pre.engine_len < 8_192 and sft.engine_len == 32_768
+    # The window must fit the completion AND the ~1,100-token prompt; a 1,000-token document asking for a
+    # 1,000-token window would not fit its own prompt.
+    assert pre.engine_len >= pre.max_output_tokens + 1_500
     wide = max_sequences("google/gemma-4-31b-it", g, 1, None, 0.0, 32_768)
     narrow = max_sequences("google/gemma-4-31b-it", g, 1, None, 0.0, pre.engine_len)
     assert narrow >= wide * 2
+
+
+def test_pretrain_context_sets_the_document_size():
+    """`context` for pretraining IS the document's target size, because a pretraining sample is one document.
+    Setting it must actually change the words asked for, per language."""
+    from budgets import budget_for
+    from prompts import build_request
+    from schemas.seed import Seed
+    seed = Seed.load("pretrain")
+
+    def words(lang, ctx):
+        import budgets
+        saved = budgets._DEFAULT_BY_KIND["pretrain"]
+        budgets._DEFAULT_BY_KIND["pretrain"] = ctx
+        try:
+            row = {"custom_id": f"pretrain__{lang}__doc__000001", "lang": lang, "task": "doc", "index": 1}
+            return build_request(seed, row).metadata["target_words"]
+        finally:
+            budgets._DEFAULT_BY_KIND["pretrain"] = saved
+
+    assert max(words("yor", 1_000)) < max(words("yor", 2_000))
+    assert budget_for("pretrain", 1_000).pretrain_tokens == 1_000
+
+    # Per-language conversion. Averaged over several rows, because each row also draws a length-variation
+    # bucket seeded from its custom_id, and that spread (0.70-1.06) dominates any single comparison -- a single
+    # draw made Yoruba look longer than Pidgin despite costing more tokens per word.
+    def mean_words(lang, ctx, n=24):
+        import budgets
+        saved = budgets._DEFAULT_BY_KIND["pretrain"]
+        budgets._DEFAULT_BY_KIND["pretrain"] = ctx
+        try:
+            tot = 0
+            for i in range(n):
+                row = {"custom_id": f"pretrain__{lang}__doc__{i:06d}", "lang": lang, "task": "doc", "index": i}
+                lo, hi = build_request(seed, row).metadata["target_words"]
+                tot += (lo + hi) / 2
+            return tot / n
+        finally:
+            budgets._DEFAULT_BY_KIND["pretrain"] = saved
+
+    # Fon costs 2.63 tokens/word against Pidgin's 1.24 AND is low-tier, so it gets far fewer words.
+    assert mean_words("fon", 1_000) < mean_words("pcm", 1_000)
+    assert mean_words("ewe", 1_000) < mean_words("hau", 1_000)
+
+
+def test_a_pretrain_document_longer_than_block_size_is_clamped():
+    """Pretraining trains at block_size 4,096, so a longer document is split across windows anyway. The
+    reported band must never be a size the completion cap cannot deliver."""
+    from budgets import budget_for
+    b = budget_for("pretrain", 32_768)
+    assert b.pretrain_tokens < 4_096
+    assert b.doc_token_range[1] == b.pretrain_tokens
+    assert "clamped" in b.notes
 
 
 # --------------------------------------------------------------------------- sample inspection
@@ -355,10 +410,26 @@ def test_limit_output_is_still_grouped_for_prefix_caching():
     assert keys == sorted(keys)
 
 
-def test_an_unsupported_context_is_refused_with_the_valid_values():
-    """--context is the model's context length in TOKENS, not a sample count; 500 must fail loudly rather than
-    be taken as a window nothing is sized for."""
+def test_context_is_free_within_the_models_own_limit():
+    """Any value up to the model's block_size, because its learned absolute position embedding has no rows past
+    32,768 -- a larger context would be untrainable rather than merely expensive."""
+    import pytest as _pt
+    from budgets import MAX_CONTEXT, budget_for
+    assert MAX_CONTEXT == 32_768
+    for ctx in (1_000, 1_024, 4_096, 32_768):
+        assert budget_for("pretrain", ctx).context == ctx
+    with _pt.raises(SystemExit, match="outside"):
+        budget_for("pretrain", 40_000)
+    with _pt.raises(SystemExit, match="outside"):
+        budget_for("pretrain", 100)
+
+
+def test_a_conversation_phase_refuses_a_context_too_small_to_hold_one():
+    """A conversation carries a ~1,200-token tool catalogue plus several tool results before any answer, so a
+    1,000-token context would produce nothing usable -- and silently, because every sample would simply fail
+    assembly."""
     import pytest as _pt
     from budgets import budget_for
-    with _pt.raises(SystemExit, match="16,384, 32,768"):
-        budget_for("pretrain", 500)
+    for kind in ("sft", "rl"):
+        with _pt.raises(SystemExit, match="too small"):
+            budget_for(kind, 1_000)

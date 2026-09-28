@@ -30,9 +30,26 @@ import os
 from dataclasses import dataclass, field
 from typing import Optional
 
-SUPPORTED_CONTEXTS = (16_384, 32_768)
-# The target model's real context: block_size 32768 in the published config. Override with DATA_GEN_CONTEXT.
+# Any value in this range, not a fixed pair. The ceiling is the model's own block_size (32,768 in
+# sabiyarn/model/configuration.py and the published config.json); the learned absolute position embedding has
+# no rows past it, so a larger number would be untrainable rather than merely expensive.
+MIN_CONTEXT = 512
+MAX_CONTEXT = 32_768
+
+# The DEFAULT differs by phase because `context` means something different for each, and for pretraining the two
+# meanings coincide:
+#   sft / rl   the model's training window. A sample is a conversation that must fit inside it, so this is
+#              32,768 and must match training/train_config.yaml's sft_block_size and rl/config.py's max_seq_len.
+#   pretrain   a sample IS one document, so the length of a sample and the context it needs are the same
+#              number. 1,024 tokens is about the 300-500 words this corpus was specified at for the mid-cost
+#              languages -- Yoruba at ~2.5 tokens/word lands at ~400 words, Pidgin at ~1.35 runs longer,
+#              because fixing tokens necessarily varies words and vice versa. It is NOT tied to the SFT window:
+#              pretraining trains at block_size 4,096, and a 32,768-token pretraining document would be four
+#              windows' worth of text in one sample.
+_DEFAULT_BY_KIND = {"pretrain": 1_024, "sft": 32_768, "rl": 32_768}
 DEFAULT_CONTEXT = int(os.environ.get("DATA_GEN_CONTEXT", "32768"))
+# Tokens reserved for the prompt when sizing the engine window. Measured: a pretrain prompt is ~1,106 tokens.
+_PROMPT_RESERVE = 1_536
 
 
 @dataclass(frozen=True)
@@ -51,8 +68,9 @@ class Budget:
     rag_context_tokens: tuple[int, int]
     # Completion ceiling for one generation request (vLLM max_tokens / API max_tokens).
     max_output_tokens: int
-    # Prose documents for pretraining: (lo, hi) words. Independent of context; these are short by design.
-    pretrain_words: tuple[int, int] = (300, 500)
+    # Target size of ONE pretraining document, in tokens. Converted to words per language at request time,
+    # because Yoruba costs ~2.5 tokens/word against English's ~1.15.
+    pretrain_tokens: int = 1_536
     # The window the ENGINE needs, which is not always the model's context. vLLM reserves KV cache for
     # max_model_len per sequence, so asking for 32,768 when the phase's longest sample is 5,200 tokens throws
     # away most of the cache and most of the concurrency: on a GB10 that is 25 concurrent sequences instead of
@@ -117,31 +135,55 @@ def _rl(context: int) -> Budget:
 
 
 def _pretrain(context: int) -> Budget:
-    # Pretraining documents are deliberately short (300-500 words): the goal is breadth of world model across
-    # 636 (domain, sub-topic) pairs, not long-context practice, and short documents pack cleanly into
-    # block_size 4096 windows during pretraining.
+    # A pretraining sample is one document, so `context` IS the document's target size. The goal is breadth of
+    # world model across 636 (domain, sub-topic) pairs, not long-context practice, and short documents pack
+    # cleanly into the block_size 4,096 windows pretraining actually uses.
+    #
+    # The engine window is computed from what a request needs -- prompt plus completion -- and not from the
+    # document size alone, so a 1,000-token document does not ask for a 1,000-token window that its own
+    # ~1,100-token prompt would not fit in. Every token saved here is concurrency: on a GB10, a 3,072-token
+    # window holds ~2.7x the sequences of an 8,192-token one.
+    # A completion has to hold the document plus its title and the JSON scaffolding, and 4,096 is the ceiling
+    # worth paying for: pretraining trains at block_size 4,096, so a longer document is split across windows
+    # anyway. The document target is clamped to what the completion can actually deliver, so the reported band
+    # is never a size the run cannot produce.
+    doc = min(context, int((4_096 - 256) / 1.35))
+    out = _round_up(int(doc * 1.35) + 256, 128)
+    engine = _round_up(_PROMPT_RESERVE + out, 256)
     return Budget(
-        kind="pretrain", context=context, max_response_tokens=2_048,
-        doc_token_bands=((1_000, 2_000),), rag_context_tokens=(2_048, 8_192),
-        max_output_tokens=4_096, pretrain_words=(300, 500),
-        # ~1,100 tokens of prompt plus at most 4,096 of document. 8,192 is comfortable headroom and buys 2.4x
-        # the concurrency of a 32,768 window on the same card, which for the largest phase by volume is the
-        # single biggest throughput lever available.
-        engine_len=8_192,
-        notes="short prose documents; 8,192-token engine window is ample and 2.4x the concurrency",
+        kind="pretrain", context=context, max_response_tokens=min(2_048, out),
+        doc_token_bands=((max(256, doc // 2), doc),), rag_context_tokens=(2_048, 8_192),
+        max_output_tokens=out, pretrain_tokens=doc, engine_len=engine,
+        notes=(f"one ~{doc:,}-token document per sample; {engine:,}-token engine window"
+               + ("" if doc == context else f" (clamped from {context:,}: block_size 4,096 splits longer ones)")),
     )
+
+
+def _round_up(n: int, to: int) -> int:
+    return -(-n // to) * to
 
 
 _BUILDERS = {"sft": _sft, "rl": _rl, "pretrain": _pretrain}
 
 
 def budget_for(kind: str, context: Optional[int] = None) -> Budget:
-    ctx = int(context or DEFAULT_CONTEXT)
-    if ctx not in SUPPORTED_CONTEXTS:
+    if context:
+        ctx = int(context)
+    elif os.environ.get("DATA_GEN_CONTEXT"):
+        ctx = int(os.environ["DATA_GEN_CONTEXT"])
+    else:
+        ctx = _DEFAULT_BY_KIND.get(kind, DEFAULT_CONTEXT)
+    if not MIN_CONTEXT <= ctx <= MAX_CONTEXT:
         raise SystemExit(
-            f"context {ctx:,} is not one of {', '.join(f'{c:,}' for c in SUPPORTED_CONTEXTS)}.\n"
-            f"These are the two the whole pipeline is sized and tested for; anything else needs the training "
-            f"side moved too (training/train_config.yaml sft_block_size, rl/config.py max_seq_len).")
+            f"context {ctx:,} is outside {MIN_CONTEXT:,}-{MAX_CONTEXT:,}.\n"
+            f"{MAX_CONTEXT:,} is the model's own block_size -- its learned absolute position embedding has no "
+            f"rows past it, so a larger context is untrainable, not merely expensive.")
+    if kind in ("sft", "rl") and ctx < 8_192:
+        raise SystemExit(
+            f"context {ctx:,} is too small for {kind}: a conversation carries a system message with the tool "
+            f"catalogue (~1,200 tokens) plus several tool results before any answer. Use 8,192 or more, and "
+            f"remember the TRAINING side must match (training/train_config.yaml sft_block_size, "
+            f"rl/config.py max_seq_len).")
     build = _BUILDERS.get(kind)
     if build is None:
         # `judge` and any future read-only phase: give it the sft shape, which is the largest.
@@ -150,7 +192,8 @@ def budget_for(kind: str, context: Optional[int] = None) -> Budget:
 
 
 def describe(context: Optional[int] = None) -> str:
-    lines = [f"generation budgets at context {int(context or DEFAULT_CONTEXT):,}:"]
+    lines = [f"generation budgets at context {context:,}:" if context else
+             "generation budgets at each phase's default context:"]
     for kind in ("pretrain", "sft", "rl"):
         b = budget_for(kind, context)
         lo, hi = b.doc_token_range
@@ -162,6 +205,11 @@ def describe(context: Optional[int] = None) -> str:
 
 
 if __name__ == "__main__":
-    for c in SUPPORTED_CONTEXTS:
-        print(describe(c))
+    print(describe())
+    print()
+    for c in (1_000, 2_048, 16_384, 32_768):
+        try:
+            print(describe(c))
+        except SystemExit as exc:
+            print(f"context {c:,}: {exc}")
         print()

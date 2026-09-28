@@ -786,8 +786,7 @@ def main() -> int:
     ap.add_argument("--max-model-len", type=int, default=0, help="0 = the model preset")
     ap.add_argument("--gpu-mem", type=float, default=0.0, help="0 = the model preset")
     ap.add_argument("--context", type=int, default=0,
-                    help="target model context: 16384 or 32768 (0 = DATA_GEN_CONTEXT, default 32768). Sets "
-                         "the document sizes, the response ceiling and the engine window together.")
+                    help="target context in TOKENS -- not a sample count (use --limit for that). Max 32768, the model's own block_size. For PRETRAIN this is the size of one document, since a pretraining sample IS one document (default 1024); for SFT and RL it is the training window a conversation must fit in (default 32768, and the training side must match). 0 = the phase default.")
     ap.add_argument("--quantization", default="auto",
                     help="auto (default, highest precision that fits) | throughput (highest precision that "
                          "also leaves room to batch) | none | fp8 | bitsandbytes | any vLLM name. AWQ and "

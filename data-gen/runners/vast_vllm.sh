@@ -9,7 +9,10 @@
 #
 #   KIND     pretrain | sft | rl | judge      (also the first positional argument)
 #   LANGS    comma list, e.g. yor,hau,ibo     (empty = every language in the seed)
-#   CONTEXT  16384 | 32768                    (default 32768, the model's own block_size)
+#   CONTEXT  target context in TOKENS, up to 32768 (the model's own block_size). NOT a sample count -- use
+#            LIMIT for that. For pretrain this is the size of one document, because a pretraining sample IS
+#            one document (default 1024). For sft and rl it is the window a conversation must fit in
+#            (default 32768), and the training config must match it.
 #   MODEL    default google/gemma-4-31b-it
 #   QUANT    auto | throughput | none | fp8 | bitsandbytes   (default auto: highest precision that fits)
 #   TP       GPUs to shard the model across   (default: every GPU the box reports)
@@ -31,7 +34,7 @@ set -euo pipefail
 
 KIND="${1:-${KIND:-sft}}"
 MODEL="${MODEL:-google/gemma-4-31b-it}"
-CONTEXT="${CONTEXT:-32768}"
+CONTEXT="${CONTEXT:-0}"      # 0 = the phase's own default (pretrain 1024, sft/rl 32768)
 QUANT="${QUANT:-auto}"
 LIMIT="${LIMIT:-0}"
 LANGS="${LANGS:-}"
@@ -46,8 +49,12 @@ case "$KIND" in
   pretrain|sft|rl|judge) ;;
   *) echo "KIND must be pretrain, sft, rl or judge (got '$KIND')" >&2; exit 2 ;;
 esac
-if [ "$CONTEXT" != "16384" ] && [ "$CONTEXT" != "32768" ]; then
-  echo "CONTEXT must be 16384 or 32768 (got '$CONTEXT')" >&2; exit 2
+case "$CONTEXT" in
+  ''|*[!0-9]*) echo "CONTEXT must be a whole number of tokens (got '$CONTEXT')" >&2; exit 2 ;;
+esac
+if [ "$CONTEXT" -gt 32768 ]; then
+  echo "CONTEXT $CONTEXT exceeds 32768, the model's own block_size -- its learned position embedding has no" >&2
+  echo "rows past it, so a larger context is untrainable rather than merely expensive." >&2; exit 2
 fi
 if [ -z "${HF_TOKEN:-}" ]; then
   echo "HF_TOKEN is not set: the generator's weights cannot be downloaded." >&2; exit 2
@@ -80,14 +87,15 @@ if [ -z "${TP:-}" ]; then
 fi
 
 echo "=== 4/5 plan (no GPU work, nothing spent)"
-ARGS=(--kind "$KIND" --model "$MODEL" --context "$CONTEXT" --quantization "$QUANT"
+ARGS=(--kind "$KIND" --model "$MODEL" --quantization "$QUANT"
       --tp "$TP" --limit "$LIMIT" --gpu-cost "$GPU_COST")
+[ "$CONTEXT" != "0" ] && ARGS+=(--context "$CONTEXT")
 [ -n "$LANGS" ] && ARGS+=(--langs "$LANGS")
 python3 vllm_gen.py "${ARGS[@]}" --plan-only
 
 echo "=== 5/5 generate"
 [ "$PUSH" = "1" ] && ARGS+=(--push)
-export DATA_GEN_SHARDS="$SHARDS" DATA_GEN_SHARD_INDEX="$SHARD_INDEX" DATA_GEN_CONTEXT="$CONTEXT"
+export DATA_GEN_SHARDS="$SHARDS" DATA_GEN_SHARD_INDEX="$SHARD_INDEX"
 python3 vllm_gen.py "${ARGS[@]}"
 
 echo "=== done. Shards are under data-gen/data/out/$KIND/<lang>/ ."

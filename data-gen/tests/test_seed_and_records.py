@@ -892,18 +892,29 @@ def test_preflight_writes_a_report(tmp_path):
 
 def test_low_resource_pretrain_documents_are_shorter():
     """Asked for 400 words of continuous Fon the generator ran out of vocabulary and cycled: both documents on
-    a pilot were one clause repeated. Less room to loop is the fix; 200 words of good Fon beats 400 that
-    degenerate halfway."""
+    a pilot were one clause repeated. Less room to loop is the fix.
+
+    Asserted against the UNSCALED figure for the same language rather than an absolute word count, because the
+    absolute depends on the measured tokens/word and on --context, both of which move."""
+    from assemble import _TOKENS_PER_WORD
+    from prompts import _LOW_TIER_SCALE
     from schemas.seed import Seed
+    from budgets import budget_for
     from prompts import build_request
     seed = Seed.load("pretrain")
+
     def words(lang, i=1):
         row = {"custom_id": f"pretrain__{lang}__doc__{i:06d}", "lang": lang, "task": "doc", "index": i}
         return build_request(seed, row).metadata["target_words"]
+
+    target = budget_for("pretrain").pretrain_tokens
+    assert _LOW_TIER_SCALE < 1.0
     for low in ("fon", "efi", "urh", "ewe", "ful", "fuv"):
-        assert max(words(low)) <= 260, low
+        unscaled = target / _TOKENS_PER_WORD[low]
+        assert max(words(low)) <= unscaled * _LOW_TIER_SCALE * 1.1, low
     for ok in ("yor", "hau", "ibo", "pcm"):
-        assert min(words(ok)) >= 300, ok
+        unscaled = target / _TOKENS_PER_WORD[ok]
+        assert max(words(ok)) > unscaled * _LOW_TIER_SCALE * 1.1, ok
 
 
 def test_a_verbatim_repeated_sentence_is_caught_where_the_ratios_miss_it():

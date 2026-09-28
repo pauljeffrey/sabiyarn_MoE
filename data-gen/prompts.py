@@ -118,14 +118,6 @@ _WHENS = [
     "the height of the harmattan",
 ]
 _REGISTERS = ["plain everyday", "formal", "conversational", "explanatory/teacherly", "journalistic", "storytelling"]
-# 300-500 words, in four buckets so length still varies within the band.
-_LENGTHS = [(300, 350), (350, 400), (400, 450), (450, 500)]
-# SHORTER for the low-resource tier, and this is a correctness fix rather than a preference. Asked for 400 words
-# of continuous Fon, the generator ran out of vocabulary and cycled: on a 12-document pilot BOTH Fon documents
-# were one clause repeated for ~400 words (distinct-4gram 0.14 and 0.19) while every Yoruba, Hausa and Twi
-# document was clean. A shorter document is less room to fall into a loop, and 200 words of good Fon is worth
-# more to a pretraining corpus than 400 that degenerate halfway.
-_LENGTHS_LOW = [(150, 200), (180, 230), (200, 260)]
 
 
 def _rng(custom_id: str) -> random.Random:
@@ -213,12 +205,34 @@ def _tool_behaviour(seed: Seed, names: list[str]) -> str:
 # --------------------------------------------------------------------------- pretrain
 
 
+# Words per pretraining document, from the phase's TOKEN target and the language's cost per word: Yoruba runs
+# ~2.5 tokens/word against English's ~1.15, so one word figure would either overshoot the budget in Yoruba or
+# waste half of it in English. Four buckets so length still varies within the band.
+_PRETRAIN_SPREAD = ((0.70, 0.82), (0.80, 0.92), (0.88, 1.00), (0.94, 1.06))
+# Low-resource languages get a fraction of it. This is a correctness fix, not a preference: asked for 400 words
+# of continuous Fon the generator ran out of vocabulary and cycled, and on a pilot BOTH Fon documents were one
+# clause repeated for ~400 words while every Yoruba, Hausa and Twi document was clean.
+_LOW_TIER_SCALE = 0.55
+
+
+def _pretrain_length(seed: Seed, lang, rng: random.Random) -> tuple[int, int]:
+    from assemble import _TOKENS_PER_WORD
+    from budgets import budget_for
+
+    target = budget_for("pretrain").pretrain_tokens
+    words = target / _TOKENS_PER_WORD.get(lang.code, 2.5)
+    if lang.tier == "low":
+        words *= _LOW_TIER_SCALE
+    lo_f, hi_f = rng.choice(_PRETRAIN_SPREAD)
+    return max(60, int(words * lo_f)), max(90, int(words * hi_f))
+
+
 def _pretrain_request(seed: Seed, row: dict) -> Request:
     lang = _lang_spec(seed, row["lang"])
     domain, subtopic, genre = _coverage_pick(lang.code, row["index"])
     rng = _rng(row["custom_id"])
     register = rng.choice(_REGISTERS)
-    lo, hi = rng.choice(_LENGTHS_LOW if lang.tier == "low" else _LENGTHS)
+    lo, hi = _pretrain_length(seed, lang, rng)
     d = DOMAINS[domain]
     g = GENRES[genre]
 

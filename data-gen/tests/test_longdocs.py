@@ -46,10 +46,16 @@ def _doc(words=1500, lang="eng", mode="eng"):
 
 
 def test_word_budget_scales_with_the_language():
-    """One word figure cannot serve both: Yoruba costs ~2.5 tokens/word against English's ~1.15, so the same
-    token budget is twice as many English words. A single figure would truncate Yoruba or waste the budget."""
-    w = lambda lg: L.words_for_tokens(8000, lg)                      # noqa: E731
-    assert w("eng") > w("pcm") > w("yor") > w("fon")
+    """One word figure cannot serve every language: measured with SabiYarn-32k, Fon costs 2.63 tokens/word
+    against Pidgin's 1.24, so the same token budget is half the words. Asserted as the RELATIONSHIP rather than
+    a frozen chain, because the ratios are measurements and will be re-measured (the first table was calibrated
+    against a generic tokenizer and was wrong by up to 2x)."""
+    from assemble import _TOKENS_PER_WORD
+    for a, b in [("pcm", "fon"), ("yor", "ewe"), ("hau", "twi")]:
+        assert _TOKENS_PER_WORD[a] < _TOKENS_PER_WORD[b], (a, b)
+        assert L.words_for_tokens(8000, a) > L.words_for_tokens(8000, b)
+    # and the conversion is the ratio, not an approximation of it
+    assert L.words_for_tokens(8000, "fon") == int(8000 / _TOKENS_PER_WORD["fon"])
 
 
 def test_token_band_matches_the_phase_budget(seed):

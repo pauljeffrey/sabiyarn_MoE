@@ -401,8 +401,7 @@ def main() -> int:
     ap.add_argument("--repo-id", default="BeardedMonster/data-gen")
     ap.add_argument("--seed-path", default=None)
     ap.add_argument("--context", type=int, default=0,
-                    help="target model context: 16384 or 32768 (0 = DATA_GEN_CONTEXT, default 32768). Sets "
-                         "the document sizes and the response ceiling for this phase.")
+                    help="target context in TOKENS -- not a sample count (use --limit for that). Max 32768, the model's own block_size. For PRETRAIN this is the size of one document, since a pretraining sample IS one document (default 1024); for SFT and RL it is the training window a conversation must fit in (default 32768, and the training side must match). 0 = the phase default.")
     ap.add_argument("--pack", type=int, default=1,
                     help="conversations per request. >1 amortises the ~1,200-token shared system prompt, "
                          "which is what makes a 1,000-request/day free tier useful. Sweep it with "
