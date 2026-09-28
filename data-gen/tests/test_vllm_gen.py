@@ -234,3 +234,88 @@ def test_every_phase_has_a_coherent_budget(kind, context):
     assert 0 < lo <= hi < context
     assert b.max_output_tokens <= context
     assert b.rag_context_tokens == (2048, 8192)
+
+
+# --------------------------------------------------------------------------- 8-bit policy
+
+
+def test_auto_takes_fp8_over_bf16_when_it_buys_throughput():
+    """On a GB10 (119 GiB, Blackwell) bf16 fits, but fp8 gives ~1.7x the sequences AND halves the bytes read
+    per decode step, so ~3.5x the throughput. fp8's per-tensor W8A8 degradation is small and well
+    characterised, which makes it worth taking automatically where 4-bit is not."""
+    from vllm_gen import choose_quantization
+    gb10 = _gpus(119, 12.0)
+    assert choose_quantization("google/gemma-4-31b-it", None, gb10, 1, 8_192) == "fp8"
+    assert choose_quantization("google/gemma-4-31b-it", None, gb10, 1, 32_768) == "fp8"
+    # and it remains overridable
+    assert choose_quantization("google/gemma-4-31b-it", "none", gb10, 1, 8_192) is None
+
+
+def test_auto_never_takes_4bit_while_a_higher_precision_fits():
+    """4-bit fluency on Fon or Efik is unmeasured here, so it is the operator's call, not a default."""
+    from vllm_gen import choose_quantization
+    for gpus in (_gpus(119, 12.0), _gpus(80, 8.0), _gpus(48, 8.9)):
+        assert choose_quantization("google/gemma-4-31b-it", None, gpus, 1, 32_768) != "bitsandbytes"
+
+
+def test_int8_and_8bit_are_accepted_as_fp8_aliases():
+    """vLLM's only on-the-fly 8-bit path is fp8; W8A8-int8 needs a pre-quantized compressed-tensors
+    checkpoint, so asking for `int8` and silently getting bf16 would be the wrong surprise."""
+    from vllm_gen import choose_quantization
+    g = _gpus(119, 12.0)
+    for alias in ("int8", "8bit", "w8a8"):
+        assert choose_quantization("google/gemma-4-31b-it", alias, g, 1) == "fp8"
+    for alias in ("4bit", "nf4"):
+        assert choose_quantization("google/gemma-4-31b-it", alias, g, 1) == "bitsandbytes"
+
+
+def test_pretrain_gets_a_small_engine_window():
+    """vLLM reserves KV per sequence at max_model_len. Pretraining's longest sample is ~5,200 tokens, so asking
+    for 32,768 would throw away most of the cache: 25 concurrent sequences on a GB10 instead of 59."""
+    from budgets import budget_for
+    from vllm_gen import max_sequences
+    g = _gpus(119, 12.0)
+    pre, sft = budget_for("pretrain"), budget_for("sft")
+    assert pre.engine_len == 8_192 and sft.engine_len == 32_768
+    assert pre.engine_len > pre.max_output_tokens + 2_000          # room for the prompt too
+    wide = max_sequences("google/gemma-4-31b-it", g, 1, None, 0.0, 32_768)
+    narrow = max_sequences("google/gemma-4-31b-it", g, 1, None, 0.0, pre.engine_len)
+    assert narrow >= wide * 2
+
+
+# --------------------------------------------------------------------------- sample inspection
+
+
+def test_a_record_is_printable_without_dumping_a_20k_token_document():
+    """One random kept record per chunk makes a multi-hour run watchable; printing a whole long-document sample
+    would fill the terminal instead."""
+    from inspect_sample import format_record
+    rec = {"id": "sft__yor__long_document_summarization__000001", "lang": "yor",
+           "io_direction": "english_to_native", "confidence": 0.95, "doc_words": 4300,
+           "tasks": ["long_document_summarization"],
+           "messages": [{"role": "user", "content": "Summarise: " + ("word " * 5000)},
+                        {"role": "assistant", "content": "<|input_lang|><eng><response>Ìwé yìí..."}]}
+    out = format_record(rec)
+    assert "sft__yor__long_document_summarization__000001" in out
+    assert "doc_words=4300" in out
+    assert "Ìwé yìí" in out
+    assert len(out) < 4_000, "a long document was dumped in full"
+    assert "+" in out and "chars]" in out, "the elision is not reported"
+
+
+def test_a_tool_call_and_its_result_are_both_shown():
+    from inspect_sample import format_record
+    rec = {"id": "x", "lang": "pcm", "messages": [
+        {"role": "assistant", "content": "<|input_lang|><pcm>",
+         "tool_calls": [{"function": {"name": "search_documents", "arguments": {"query": "cold chain"}}}]},
+        {"role": "tool", "name": "search_documents", "content": "Passage 1: the fridge failed."},
+        {"role": "assistant", "content": "<response>Di fridge spoil."}]}
+    out = format_record(rec)
+    assert "search_documents" in out and "cold chain" in out and "fridge failed" in out
+
+
+def test_pretrain_records_print_their_prose():
+    from inspect_sample import format_record
+    out = format_record({"id": "p", "lang": "hau", "title": "Yadda ake noma", "text": "word " * 400},
+                        kind="pretrain")
+    assert "Yadda ake noma" in out and "400 words" in out

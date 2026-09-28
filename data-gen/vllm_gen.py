@@ -46,6 +46,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import random
 import sys
 import time
 from pathlib import Path
@@ -220,10 +221,17 @@ def gpu_report() -> list[dict[str, Any]]:
 # pre-quantized CHECKPOINT, so they cannot be applied to an arbitrary --model on a rented box. Point --model at
 # an already-quantized repo instead and vLLM detects it from the checkpoint's own config.
 #   none          bf16 weights. Needs weights + KV to fit; for gemma-4-31b that is ~62 GB before any cache.
-#   fp8           ~half the weight bytes, quantized at load. Needs compute capability >= 8.9, so Ada (L40S,
-#                 RTX 4090/5090), Hopper (H100) and Blackwell (GB10) yes; Ampere (A100, A800, A40) NO.
-#   bitsandbytes  ~4-bit, quantized at load, works on ANY CUDA card including Ampere. Markedly slower per
-#                 token than fp8 -- it is the fallback that makes a small card work at all, not a fast path.
+#   fp8           8-BIT: ~half the weight bytes, quantized at load, with fused W8A8 kernels. Needs compute
+#                 capability >= 8.9, so Ada (L40S, RTX 4090/5090), Hopper (H100) and Blackwell (GB10) yes;
+#                 Ampere (A100, A800, A40) NO -- there is no fp8 hardware path on Ampere.
+#                 Per-tensor scales make its degradation small and well characterised, which is why `auto`
+#                 will choose it over bf16 when it buys real concurrency. `int8` and `8bit` are accepted as
+#                 aliases: vLLM's on-the-fly 8-bit path IS fp8, and W8A8-int8 requires a pre-quantized
+#                 compressed-tensors checkpoint instead.
+#   bitsandbytes  ~4-bit, quantized at load, works on ANY CUDA card including Ampere. It dequantizes inside
+#                 the matmul with general-purpose kernels, so it buys memory rather than speed -- the fallback
+#                 that makes a small card work at all. `auto` never selects it while a higher precision fits;
+#                 4-bit fluency on Fon or Efik is unmeasured here and that is the operator's call.
 _FP8_MIN_CAPABILITY = 8.9
 # A batch this small wastes the rental: vLLM's continuous batching is what amortises reading 62 GB of weights
 # per decode step, so a box that fits the weights but leaves room for only 5 sequences is slower per dollar
@@ -261,6 +269,9 @@ def choose_quantization(model: str, requested: Optional[str], gpus: list[dict[st
     sequences and ~40.
     """
     req = (requested or "auto").lower()
+    # vLLM's only on-the-fly 8-bit path is fp8; W8A8-int8 needs a pre-quantized checkpoint.
+    req = {"int8": "fp8", "8bit": "fp8", "w8a8": "fp8", "4bit": "bitsandbytes",
+           "nf4": "bitsandbytes"}.get(req, req)
     if req not in ("auto", "", "throughput"):
         return None if req in ("none", "bf16", "off") else req
     low = model.lower()
@@ -301,14 +312,33 @@ def choose_quantization(model: str, requested: Optional[str], gpus: list[dict[st
         return q
 
     best = fitting[0]
+    # 8-bit is worth taking automatically; 4-bit is not. fp8's per-tensor W8A8 degradation is small and well
+    # characterised, and on a bandwidth-poor card halving the bytes read per decode step is most of the
+    # throughput. bitsandbytes 4-bit is a different proposition -- unmeasured on these languages, and its
+    # kernels give back much of the saving -- so it stays an explicit choice.
+    # Compare THROUGHPUT, not concurrency. A decode step reads every weight once and emits one token per
+    # sequence, so tokens/s is proportional to sequences / weight_bytes -- fp8 wins on both terms at once, and
+    # judging it on concurrency alone understated it by 2x. (This assumes the decode is bandwidth-bound, which
+    # holds for a 31B dense model at these batch sizes; it would not at very large batch.)
+    def tput(q: Optional[str]) -> float:
+        w = _weights_gb(model, q)
+        return seqs(q) / w if w else 0.0
+
+    if best is None and "fp8" in fitting and tput("fp8") >= tput(None) * 1.5:
+        print(f"[vllm] {vram:.0f} GiB, capability {cap}: bf16 fits, but fp8 gives ~{seqs('fp8')} concurrent "
+              f"{context:,}-token sequences against ~{seqs(None)} AND halves the bytes read per decode step "
+              f"-> ~{tput('fp8') / max(tput(None), 1e-9):.1f}x throughput -> fp8")
+        print(f"[vllm]   fp8 is 8-bit with fused W8A8 kernels: a small, well-characterised quality cost for "
+              f"most of the throughput. --quantization none forces bf16.")
+        return "fp8"
     print(f"[vllm] {vram:.0f} GiB, capability {cap} -> {best or 'bf16'} (quality first): "
           f"~{_weights_gb(model, best):.0f} GiB weights, room for ~{seqs(best)} concurrent "
           f"{context:,}-token sequences")
     better = next((q for q in fitting[1:] if seqs(q) >= max(seqs(best) * 3, MIN_CONCURRENCY)), None)
     if better:
         print(f"[vllm]   NOTE: --quantization {better} would give ~{seqs(better)} concurrent sequences "
-              f"({seqs(better) / max(seqs(best), 1):.0f}x), at unmeasured cost to low-resource fluency. "
-              f"--quantization throughput picks it automatically.")
+              f"({seqs(better) / max(seqs(best), 1):.0f}x). 4-bit fluency on the low-resource languages is "
+              f"unmeasured here, so it is opt-in: --quantization throughput picks it automatically.")
     if seqs(best) < 4:
         print(f"[vllm]   WARNING: ~{seqs(best)} concurrent sequences is near-serial decoding. This rental "
               f"will be slow; --context 16384 or --quantization throughput is probably the better trade.")
@@ -460,11 +490,13 @@ def run(kind: str, model: str, *, langs: Optional[list[str]], limit: int, tp: in
     set_response_budget(budget.max_response_tokens)
     longdocs.set_context(kind, context)
     ctx = budget.context
-    max_model_len = max_model_len or ctx
+    # The ENGINE window, not the model's context: vLLM reserves KV per sequence at max_model_len, so a phase
+    # whose longest sample is 5,200 tokens must not ask for 32,768 (see Budget.engine_len).
+    max_model_len = max_model_len or budget.engine_len or ctx
     max_tokens = max_tokens or budget.max_output_tokens
     ns = namespace(kind, run_tag)
-    print(f"[{kind}] context {ctx:,} | response<={budget.max_response_tokens:,} | "
-          f"completion<={max_tokens:,} | {budget.notes}")
+    print(f"[{kind}] context {ctx:,} | engine window {max_model_len:,} | "
+          f"response<={budget.max_response_tokens:,} | completion<={max_tokens:,} | {budget.notes}")
 
     rows, seed = build_work(kind, langs, limit)
     if kind == "judge":
@@ -482,7 +514,7 @@ def run(kind: str, model: str, *, langs: Optional[list[str]], limit: int, tp: in
         print(f"[gpu {g['index']}] {g['name']}  {g['total_gb']:.0f} GiB  capability {g['capability']}")
     if gpus and tp > len(gpus):
         raise SystemExit(f"--tp {tp} but only {len(gpus)} GPU(s) visible")
-    quant = choose_quantization(model, quantization, gpus, tp, ctx, gpu_mem)
+    quant = choose_quantization(model, quantization, gpus, tp, max_model_len, gpu_mem)
 
     if plan_only:
         in_tok_est = sum(len(m["content"]) for m in
@@ -490,7 +522,7 @@ def run(kind: str, model: str, *, langs: Optional[list[str]], limit: int, tp: in
         _plan_report(kind, reqs or [build_request(seed, r) for r in todo[:1]] * len(todo),
                      in_tok_est, max_tokens, gpu_cost, model)
         if gpus:
-            seqs = max_sequences(model, gpus, tp, quant, gpu_mem, ctx)
+            seqs = max_sequences(model, gpus, tp, quant, gpu_mem, max_model_len)
             print(f"  room for ~{seqs} concurrent {ctx:,}-token sequences with quantization={quant or 'bf16'}")
         return 0
 
@@ -532,9 +564,14 @@ def run(kind: str, model: str, *, langs: Optional[list[str]], limit: int, tp: in
     kept = failed = 0
     out_tokens = 0
     t0 = time.time()
+    # One random kept record per chunk, so a multi-hour run is watchable. Random rather than the first: work is
+    # sorted by (lang, task) for prefix-cache locality, so the first record of every chunk has the same shape.
+    from inspect_sample import print_one
+    peek_rng = random.Random(0)
 
     for start in range(0, len(reqs), chunk):
         batch = reqs[start:start + chunk]
+        chunk_kept: list[dict] = []
         # One engine call per chunk: vLLM does continuous batching internally, so a big chunk is what
         # actually saturates the GPU. Chunking exists only so shards flush and progress is visible.
         outs = _chat_resilient(engine, [r.messages for r in batch], params)
@@ -556,6 +593,7 @@ def run(kind: str, model: str, *, langs: Optional[list[str]], limit: int, tp: in
                 failed += 1
                 continue
             writer.write(rec["lang"], rec)
+            chunk_kept.append(rec)
             kept += 1
         dt = time.time() - t0
         tps = out_tokens / max(dt, 1e-9)
@@ -567,6 +605,7 @@ def run(kind: str, model: str, *, langs: Optional[list[str]], limit: int, tp: in
                  f"${cost / max(kept, 1):.5f}/kept sample)" if out_tokens > 1e5 else ""), flush=True)
         if STATS:
             print("   ", summary(), flush=True)
+        print_one(chunk_kept, kind=kind, rng=peek_rng)
 
     paths = writer.close()
     dt = time.time() - t0

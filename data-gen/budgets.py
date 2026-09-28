@@ -53,6 +53,11 @@ class Budget:
     max_output_tokens: int
     # Prose documents for pretraining: (lo, hi) words. Independent of context; these are short by design.
     pretrain_words: tuple[int, int] = (300, 500)
+    # The window the ENGINE needs, which is not always the model's context. vLLM reserves KV cache for
+    # max_model_len per sequence, so asking for 32,768 when the phase's longest sample is 5,200 tokens throws
+    # away most of the cache and most of the concurrency: on a GB10 that is 25 concurrent sequences instead of
+    # 59. Set per phase from what the phase actually produces.
+    engine_len: int = 0
     notes: str = ""
 
     @property
@@ -87,6 +92,9 @@ def _sft(context: int) -> Budget:
         # One request produces the conversation only -- the document arrives as INPUT via the placeholder --
         # so this holds the summary, the follow-ups and the JSON scaffolding, not the document.
         max_output_tokens=min(context, resp * 2 + 2_048),
+        # A summarisation sample fills the context by construction: doc_ceiling was derived as
+        # context - overhead, so document + overhead is exactly the context.
+        engine_len=context,
         notes=f"documents {bands[0][0]:,}-{doc_ceiling:,} tokens inside a {context:,} context",
     )
 
@@ -101,6 +109,9 @@ def _rl(context: int) -> Budget:
         kind="rl", context=context, max_response_tokens=resp,
         doc_token_bands=((2_048, 8_192),), rag_context_tokens=(2_048, 8_192),
         max_output_tokens=min(context, resp * 2 + 2_048),
+        # A prefix can carry an 8,192-token RAG context on top of a conversation that measured p99 6,762, plus
+        # two candidates: it genuinely can approach the full context.
+        engine_len=context,
         notes="prefix + two rankable candidates",
     )
 
@@ -113,7 +124,11 @@ def _pretrain(context: int) -> Budget:
         kind="pretrain", context=context, max_response_tokens=2_048,
         doc_token_bands=((1_000, 2_000),), rag_context_tokens=(2_048, 8_192),
         max_output_tokens=4_096, pretrain_words=(300, 500),
-        notes="short prose documents; context is not the binding constraint here",
+        # ~1,100 tokens of prompt plus at most 4,096 of document. 8,192 is comfortable headroom and buys 2.4x
+        # the concurrency of a 32,768 window on the same card, which for the largest phase by volume is the
+        # single biggest throughput lever available.
+        engine_len=8_192,
+        notes="short prose documents; 8,192-token engine window is ample and 2.4x the concurrency",
     )
 
 
@@ -141,8 +156,8 @@ def describe(context: Optional[int] = None) -> str:
         lo, hi = b.doc_token_range
         lines.append(
             f"  {kind:9s} response<={b.max_response_tokens:>6,}  documents {lo:>6,}-{hi:<6,}  "
-            f"rag context {b.rag_context_tokens[0]:,}-{b.rag_context_tokens[1]:,}  "
-            f"completion<={b.max_output_tokens:,}")
+            f"rag ctx {b.rag_context_tokens[0]:,}-{b.rag_context_tokens[1]:,}  "
+            f"completion<={b.max_output_tokens:>6,}  engine window {b.engine_len:,}")
     return "\n".join(lines)
 
 

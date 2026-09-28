@@ -292,9 +292,14 @@ def run(kind: str, provider_name: str, *, model: Optional[str] = None, langs: Op
 
     kept = failed = 0
     t0 = time.time()
+    # One random kept record every PEEK_EVERY samples, so a long run is watchable rather than a counter.
+    from inspect_sample import print_one
+    peek_rng = random.Random(0)
+    PEEK_EVERY = 200
+    peek_at = PEEK_EVERY
 
     def handle(resp: Response) -> None:
-        nonlocal kept, failed
+        nonlocal kept, failed, peek_at
         n_expected = len((resp.metadata or {}).get("custom_ids", [])) or 1
         if not resp.ok:
             failed += n_expected
@@ -304,6 +309,9 @@ def run(kind: str, provider_name: str, *, model: Optional[str] = None, langs: Op
             writer.write(rec["lang"], rec)
         kept += len(recs)
         failed += max(0, n_expected - len(recs))
+        if recs and kept >= peek_at:
+            peek_at = kept + PEEK_EVERY
+            print_one(recs, kind=kind, rng=peek_rng)
 
     if batch:
         if not provider.supports_batch:

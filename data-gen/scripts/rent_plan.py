@@ -114,15 +114,26 @@ def plan(box: Box, kind: str, context: int, budget_usd: float, mode: str = "auto
     if not options:
         return {"box": box, "fits": False}
     quant = options[0]
+    window0 = budget_for(kind, context).engine_len or context
+
+    def _tput(q):
+        w = _weights_gb(MODEL, q)
+        return (max(1, max_sequences(MODEL, gpus, 1, q, 0.0, window0)) / w) if w else 0.0
+
+    # Mirror choose_quantization's `auto`: take fp8 over bf16 when it buys >=1.5x throughput, never take 4-bit
+    # automatically while a higher precision fits.
+    if mode == "auto" and quant is None and "fp8" in options and _tput("fp8") >= _tput(None) * 1.5:
+        quant = "fp8"
     if mode == "throughput":
         best, best_tps = quant, -1.0
         for q in options:
-            s = max(1, max_sequences(MODEL, gpus, 1, q, 0.0, context))
+            s = max(1, max_sequences(MODEL, gpus, 1, q, 0.0, window0))
             tps = decode_tokens_per_s(box, q, s)
             if tps > best_tps:
                 best, best_tps = q, tps
         quant = best
-    seqs = max(1, max_sequences(MODEL, gpus, 1, quant, 0.0, context))
+    window = budget_for(kind, context).engine_len or context
+    seqs = max(1, max_sequences(MODEL, gpus, 1, quant, 0.0, window))
     m = MEASURED[kind]
     out_per_sample = m["out"] + DOC_OVERHEAD[kind]
     tps = decode_tokens_per_s(box, quant, seqs)
