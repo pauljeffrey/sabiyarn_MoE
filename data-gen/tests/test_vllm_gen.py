@@ -319,3 +319,46 @@ def test_pretrain_records_print_their_prose():
     out = format_record({"id": "p", "lang": "hau", "title": "Yadda ake noma", "text": "word " * 400},
                         kind="pretrain")
     assert "Yadda ake noma" in out and "400 words" in out
+
+
+# --------------------------------------------------------------------------- --limit
+
+
+def test_limit_keeps_every_language_represented():
+    """A plain rows[:limit] is wrong on THIS path: it sorts by (lang, task) so identical prefixes arrive
+    together, and truncating a language-sorted list takes only the first language. Measured: --limit 500 across
+    eight languages returned 500 rows of Ewe and nothing else, so a pilot measured one language and the
+    preflight had nothing to compare."""
+    langs = ["pcm", "yor", "hau", "ibo", "twi", "ewe", "ful", "fuv"]
+    for limit in (8, 56, 500):
+        rows, _ = build_work("pretrain", langs, limit)
+        assert len(rows) == limit
+        got = {r["lang"] for r in rows}
+        assert got == set(langs), (limit, sorted(set(langs) - got))
+
+
+def test_limit_preserves_the_seeds_proportions():
+    """The mix a pilot sees should be the mix the full run produces, or the pilot measures the wrong corpus."""
+    import collections
+    langs = ["pcm", "twi", "ewe"]
+    rows, seed = build_work("pretrain", langs, 400)
+    got = collections.Counter(r["lang"] for r in rows)
+    planned = {l.code: l.samples for l in seed.languages if l.code in langs}
+    total = sum(planned.values())
+    for lg in langs:
+        assert abs(got[lg] / 400 - planned[lg] / total) < 0.06, (lg, got[lg])
+
+
+def test_limit_output_is_still_grouped_for_prefix_caching():
+    rows, _ = build_work("pretrain", ["pcm", "yor", "hau"], 120)
+    keys = [(r["lang"], r["task"]) for r in rows]
+    assert keys == sorted(keys)
+
+
+def test_an_unsupported_context_is_refused_with_the_valid_values():
+    """--context is the model's context length in TOKENS, not a sample count; 500 must fail loudly rather than
+    be taken as a window nothing is sized for."""
+    import pytest as _pt
+    from budgets import budget_for
+    with _pt.raises(SystemExit, match="16,384, 32,768"):
+        budget_for("pretrain", 500)

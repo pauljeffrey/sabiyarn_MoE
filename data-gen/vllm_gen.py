@@ -144,8 +144,53 @@ def build_work(kind: str, langs: Optional[list[str]], limit: int) -> tuple[list[
     # API path only because there the prefix costs the same either way.
     todo.sort(key=lambda r: (r["lang"], r["task"], r["index"]))
     if limit:
-        todo = todo[:limit]
+        todo = _balanced_slice(todo, limit)
     return todo, seed
+
+
+def _balanced_slice(rows: list[dict], limit: int) -> list[dict]:
+    """Take `limit` rows while keeping every language represented, in the seed's proportions.
+
+    A plain rows[:limit] is wrong HERE specifically. This path sorts by (lang, task) so identical prompt
+    prefixes arrive together -- that is what makes prefix caching pay -- and truncating a language-sorted list
+    takes only the first language: `--limit 500` across eight languages returned 500 rows of Ewe and nothing
+    else, so a pilot measured one language and the preflight had nothing to compare.
+
+    Proportional rather than equal, so the mix a pilot sees is the mix the full run would produce, with a floor
+    of one row per language so nothing silently vanishes at a small limit. The result is re-sorted, so
+    prefix-cache locality holds within the selection.
+    """
+    if limit <= 0 or len(rows) <= limit:
+        return rows
+    by_lang: dict[str, list[dict]] = {}
+    for r in rows:
+        by_lang.setdefault(r["lang"], []).append(r)
+    total = len(rows)
+    quota = {lg: max(1, round(limit * len(rs) / total)) for lg, rs in by_lang.items()}
+    picked: list[dict] = []
+    for lg, rs in by_lang.items():
+        picked += rs[:quota[lg]]
+    # Rounding and the per-language floor can overshoot or undershoot; settle it by taking from the largest
+    # languages, which is where a row matters least.
+    if len(picked) > limit:
+        order = sorted(by_lang, key=lambda lg: -len(by_lang[lg]))
+        keep = {lg: quota[lg] for lg in quota}
+        i = 0
+        while sum(keep.values()) > limit:
+            lg = order[i % len(order)]
+            if keep[lg] > 1:
+                keep[lg] -= 1
+            i += 1
+        picked = [r for lg in by_lang for r in by_lang[lg][:keep[lg]]]
+    elif len(picked) < limit:
+        seen = {id(r) for r in picked}
+        for r in rows:
+            if len(picked) >= limit:
+                break
+            if id(r) not in seen:
+                picked.append(r)
+    picked.sort(key=lambda r: (r["lang"], r["task"], r["index"]))
+    return picked
 
 
 class EngineProvider:
