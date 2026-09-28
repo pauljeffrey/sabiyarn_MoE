@@ -433,3 +433,43 @@ def test_a_conversation_phase_refuses_a_context_too_small_to_hold_one():
     for kind in ("sft", "rl"):
         with _pt.raises(SystemExit, match="too small"):
             budget_for(kind, 1_000)
+
+
+# --------------------------------------------------------------------------- weights download
+
+
+def test_a_full_disk_is_caught_before_the_engine_starts(tmp_path, monkeypatch):
+    """vLLM downloads weights inside engine startup, so a disk problem surfaces as ~200 lines of engine-core
+    traceback with the real cause on the last line:
+
+        RuntimeError: File reconstruction error: Internal Writer Error: Background writer channel closed
+
+    which is huggingface_hub's Xet backend reporting that the writer could not write. HF_HOME defaults to
+    ~/.cache/huggingface -- the small root filesystem on a rented box -- so 62 GB of weights has nowhere to go.
+    Checking first turns forty minutes of downloading into an instant, readable error.
+    """
+    from vllm_gen import ensure_weights
+    monkeypatch.setenv("HF_HOME", str(tmp_path / "hf"))
+    with pytest.raises(SystemExit) as exc:
+        ensure_weights("google/gemma-4-31b-it", expected_gb=10_000_000)
+    msg = str(exc.value)
+    assert "Background writer channel closed" in msg      # names the symptom it prevents
+    assert "export HF_HOME=" in msg                       # and the fix
+    assert "Nothing has been spent on GPU time yet" in msg
+
+
+def test_the_disk_check_passes_when_there_is_room(tmp_path, monkeypatch):
+    """It must not block a box that is actually fine; the download itself is then attempted separately."""
+    from vllm_gen import ensure_weights
+    monkeypatch.setenv("HF_HOME", str(tmp_path / "hf"))
+    import sys as _sys
+    monkeypatch.setitem(_sys.modules, "huggingface_hub", None)   # skip the real download
+    try:
+        ensure_weights("google/gemma-4-31b-it", expected_gb=0.001)
+    except SystemExit as exc:                                    # pragma: no cover
+        pytest.fail(f"blocked a box with room: {exc}")
+
+
+def test_the_suggested_mount_is_the_one_with_the_most_space():
+    from vllm_gen import _biggest_writable_mount
+    assert _biggest_writable_mount().startswith("/")

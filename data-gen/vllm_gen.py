@@ -432,6 +432,82 @@ def kv_tokens_available(model: str, gpus: list[dict[str, Any]], tp: int, quant: 
 # --------------------------------------------------------------------------- engine
 
 
+def ensure_weights(model: str, *, expected_gb: float = 0.0) -> None:
+    """Download the weights BEFORE starting the engine, with the disk checked first and Xet disabled on retry.
+
+    vLLM downloads the weights inside engine startup, and when that fails the traceback is ~200 lines of
+    engine-core plumbing with the real cause on the last line. The observed failure was
+
+        RuntimeError: File reconstruction error: Internal Writer Error: Background writer channel closed
+
+    from huggingface_hub's Xet backend -- which is what it reports when the writer cannot write, i.e. the disk
+    filled. HF_HOME defaults to ~/.cache/huggingface, which on a rented box is usually the small root
+    filesystem while the large volume is mounted elsewhere, so 62 GB of weights has nowhere to go.
+
+    Checking here turns forty minutes of downloading into an instant, readable error, and a rental is billed by
+    the second.
+    """
+    import shutil
+
+    expected_gb = expected_gb or (preset_for(model).get("weight_gb_bf16") or 0.0)
+    cache = Path(os.environ.get("HF_HOME") or (Path.home() / ".cache" / "huggingface"))
+    cache.mkdir(parents=True, exist_ok=True)
+    free_gb = shutil.disk_usage(cache).free / 2**30
+    # The download needs room for the files plus Xet's staging copies; 1.4x is the margin that has held.
+    need = expected_gb * 1.4
+    print(f"[weights] cache {cache}  free {free_gb:,.0f} GiB  need ~{need:,.0f} GiB for {model}")
+    if expected_gb and free_gb < need:
+        biggest = _biggest_writable_mount()
+        raise SystemExit(
+            f"[weights] only {free_gb:,.0f} GiB free where the HF cache lives ({cache}), and {model} needs "
+            f"~{need:,.0f} GiB.\n"
+            f"This is what produces 'Internal Writer Error: Background writer channel closed' forty minutes "
+            f"into a download.\n"
+            f"Point the cache at the big volume before starting:\n"
+            f"    export HF_HOME={biggest}/hf\n"
+            f"and re-run. Nothing has been spent on GPU time yet.")
+
+    try:
+        from huggingface_hub import snapshot_download
+    except ImportError:
+        return
+    last = ""
+    for attempt in range(3):
+        # Xet is the default transfer backend and is where the observed failure came from. Fall back to the
+        # plain HTTP path on the second attempt rather than retrying the same way three times.
+        if attempt == 1:
+            os.environ["HF_HUB_DISABLE_XET"] = "1"
+            print("[weights] retrying with HF_HUB_DISABLE_XET=1 (classic HTTP transfer)", flush=True)
+        try:
+            snapshot_download(model, allow_patterns=["*.json", "*.safetensors", "*.model", "*.txt"],
+                              max_workers=4)
+            print(f"[weights] {model} is present", flush=True)
+            return
+        except Exception as exc:  # noqa: BLE001
+            last = f"{type(exc).__name__}: {exc}"
+            print(f"[weights] attempt {attempt + 1}/3 failed: {last[:200]}", flush=True)
+            time.sleep(5 * (attempt + 1))
+    raise SystemExit(
+        f"[weights] could not download {model} after 3 attempts.\n  last error: {last[:400]}\n"
+        f"Check: HF_TOKEN is set and has accepted the model's licence; there is disk space where HF_HOME "
+        f"points; and the box has outbound network. Nothing has been spent on GPU time yet.")
+
+
+def _biggest_writable_mount() -> str:
+    """The mount with the most free space, for the HF_HOME suggestion above."""
+    import shutil
+
+    best, best_free = "/workspace", 0.0
+    for cand in ("/workspace", "/data", "/mnt", "/scratch", "/root", "/tmp", "/"):
+        try:
+            free = shutil.disk_usage(cand).free
+        except OSError:
+            continue
+        if free > best_free:
+            best, best_free = cand, free
+    return best
+
+
 def load_engine(model: str, *, tp: int, max_model_len: int, gpu_mem: float, quantization: Optional[str],
                 seed: int = 0):
     try:
@@ -572,6 +648,9 @@ def run(kind: str, model: str, *, langs: Optional[list[str]], limit: int, tp: in
             print(f"  room for ~{seqs} concurrent {ctx:,}-token sequences with quantization={quant or 'bf16'}")
         return 0
 
+    # Weights first, with the disk checked: a failure here is instant and readable, whereas the same failure
+    # inside engine startup is 200 lines of plumbing with the cause on the last line.
+    ensure_weights(model)
     engine = load_engine(model, tp=tp, max_model_len=max_model_len, gpu_mem=gpu_mem, quantization=quant)
 
     def params_for(mt: int):

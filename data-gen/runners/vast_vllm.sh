@@ -60,6 +60,32 @@ if [ -z "${HF_TOKEN:-}" ]; then
   echo "HF_TOKEN is not set: the generator's weights cannot be downloaded." >&2; exit 2
 fi
 
+# The HF cache must live on the BIG volume. It defaults to ~/.cache/huggingface, which on a rented box is
+# usually the small root filesystem, and gemma-4-31b is ~62 GB of weights. When it does not fit, the failure
+# surfaces forty minutes into the download as huggingface_hub's
+#     Internal Writer Error: Background writer channel closed
+# buried under 200 lines of vLLM engine-core traceback.
+if [ -z "${HF_HOME:-}" ]; then
+  BIG=""
+  BIG_FREE=0
+  for m in /workspace /data /mnt /scratch /root /; do
+    [ -d "$m" ] || continue
+    f=$(df -Pk "$m" 2>/dev/null | awk 'NR==2{print $4}')
+    [ -n "$f" ] && [ "$f" -gt "$BIG_FREE" ] && { BIG="$m"; BIG_FREE="$f"; }
+  done
+  export HF_HOME="${BIG:-/workspace}/hf"
+  echo "HF_HOME not set -> using $HF_HOME ($((BIG_FREE/1024/1024)) GiB free on ${BIG:-/workspace})"
+fi
+mkdir -p "$HF_HOME"
+FREE_GIB=$(df -Pk "$HF_HOME" | awk 'NR==2{print int($4/1024/1024)}')
+if [ "$FREE_GIB" -lt 90 ]; then
+  echo "Only ${FREE_GIB} GiB free at HF_HOME=$HF_HOME. $MODEL needs ~90 GiB to download safely." >&2
+  echo "Set HF_HOME to a larger volume, or rent an instance with more disk." >&2
+  df -h >&2
+  exit 2
+fi
+echo "HF_HOME=$HF_HOME (${FREE_GIB} GiB free)"
+
 echo "=== 1/5 system deps"
 if command -v apt-get >/dev/null 2>&1; then
   apt-get update -qq && apt-get install -y -qq git python3-pip >/dev/null
