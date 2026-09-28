@@ -287,11 +287,40 @@ def _resp(custom_id, payload, md):
 
 def test_pretrain_record(seeds):
     md = {"kind": "pretrain", "lang": "yor", "domain": "health_medicine", "subtopic": "malaria", "genre": "article"}
+    # Distinct words: the same word 120 times is a LOOP and is now rejected, which is the point of the test
+    # below. This fixture has to be prose-shaped to exercise the happy path at all.
+    prose = " ".join(f"ọ̀rọ̀{i}" for i in range(120))
     r = to_record(seeds["pretrain"], _resp("pretrain__yor__doc__000001", {
-        "title": "Ìbà", "text": " ".join(["ọ̀rọ̀"] * 120), "language_self_check": True}, md))
+        "title": "Ìbà", "text": prose, "language_self_check": True}, md))
     assert r["lang"] == "yor" and r["title"] == "Ìbà" and len(r["text"].split()) == 120
+    assert r["distinct_4gram"] > 0.9
     assert to_record(seeds["pretrain"], _resp("x", {"title": "t", "text": "too short",
                                                    "language_self_check": True}, md)) is None
+
+
+def test_a_looping_pretrain_document_is_rejected(seeds):
+    """The single most important gate on this path, and it did not exist. Measured on a 24-document pilot
+    across the six low-resource languages: 12 were one clause repeated for hundreds of words, and they
+    self-reported `confidence` up to 0.9 -- so the generator's own estimate is worthless for a language it does
+    not really know. A model pretrained on looped text learns to loop, so this is worse than having no data for
+    that language."""
+    md = {"kind": "pretrain", "lang": "fon", "domain": "music", "subtopic": "drums", "genre": "explainer"}
+    loop = "Waka wɛ nyí gǎn-tò mǐ mɛ tòn lɔ́ ɖé mɛ́ tɔn ɖò mǐ mɛ́ sín gǎn-tò kpo. " * 30
+    assert to_record(seeds["pretrain"], _resp("y", {"title": "t", "text": loop,
+                                                   "language_self_check": True}, md)) is None
+    assert any(k.startswith("degenerate_text") for k in STATS)
+
+
+def test_pretrain_text_may_arrive_as_a_list_or_an_object(seeds):
+    """A model that returns the paragraphs as a list is giving the same document in a different container.
+    .strip() on it raised AttributeError, which the catch-all turned into an opaque postprocess_error and
+    discarded the document."""
+    md = {"kind": "pretrain", "lang": "hau", "domain": "music", "subtopic": "drums", "genre": "explainer"}
+    a = " ".join(f"kalma{i}" for i in range(90))
+    b = " ".join(f"wata{i}" for i in range(90))
+    for payload in ({"title": "T", "text": [a, b]}, {"title": "T", "text": {"Farko": a, "Karshe": b}}):
+        rec = to_record(seeds["pretrain"], _resp("z", {**payload, "language_self_check": True}, md))
+        assert rec is not None and len(rec["text"].split()) >= 180
 
 
 def _sft_payload():
@@ -558,7 +587,7 @@ def test_packing_refuses_mixed_languages(seeds):
 
 
 def test_packed_response_splits_into_records(seeds):
-    from postprocess_gen import to_records
+    from postprocess_gen import STATS, to_records
     from prompts import build_packed_request
     rows = [{"custom_id": f"sft__yor__general_chat__{i:06d}", "lang": "yor",
              "task": "general_chat", "index": i} for i in range(2)]
@@ -573,7 +602,7 @@ def test_packed_response_splits_into_records(seeds):
 
 def test_a_pack_that_loses_ordering_is_discarded(seeds):
     """More samples than specs means the model lost track and nothing can be trusted to match its spec."""
-    from postprocess_gen import to_records
+    from postprocess_gen import STATS, to_records
     from prompts import build_packed_request
     rows = [{"custom_id": f"sft__yor__general_chat__{i:06d}", "lang": "yor",
              "task": "general_chat", "index": i} for i in range(2)]
@@ -822,3 +851,90 @@ def test_an_actually_unknown_role_still_fails():
     import pytest as _pt
     with _pt.raises(AssemblyError):
         build_messages([{"role": "narrator", "content": "x"}])
+
+
+# --------------------------------------------------------------------------- preflight
+
+
+def test_preflight_drops_only_the_languages_that_fail():
+    """Measured clean rates for pretrain: ewe 83%, ful 50%, fuv 42%, fon 17%, urh 17%, efi 8%. Aborting the
+    whole run because Efik is hard would be as wrong as silently spending the budget on it."""
+    from preflight import run_preflight
+    measured = {"ewe": (10, 12), "ful": (6, 12), "fuv": (5, 12),
+                "fon": (2, 12), "urh": (2, 12), "efi": (1, 12)}
+    keep = run_preflight("pretrain", list(measured), generate=lambda l, n: measured)
+    assert keep == ["ewe", "ful", "fuv"]
+
+
+def test_preflight_aborts_when_nothing_passes():
+    """If no language survives, the rental would be spent producing output the post-processor rejects."""
+    import pytest as _pt
+    from preflight import run_preflight
+    with _pt.raises(SystemExit, match="NO language reached"):
+        run_preflight("pretrain", ["fon", "efi"], generate=lambda l, n: {"fon": (0, 8), "efi": (1, 8)})
+
+
+def test_preflight_floor_can_be_disabled():
+    from preflight import run_preflight
+    keep = run_preflight("pretrain", ["fon"], generate=lambda l, n: {"fon": (1, 8)}, min_rate=0.0)
+    assert keep == ["fon"]
+
+
+def test_preflight_writes_a_report(tmp_path):
+    import json as _json
+    from preflight import run_preflight
+    run_preflight("pretrain", ["ewe", "efi"], generate=lambda l, n: {"ewe": (7, 8), "efi": (0, 8)},
+                  out_dir=tmp_path)
+    report = _json.loads((tmp_path / "preflight.json").read_text())
+    assert report["kept"] == ["ewe"] and report["dropped"] == ["efi"]
+    assert report["results"]["efi"] == [0, 8]
+
+
+def test_low_resource_pretrain_documents_are_shorter():
+    """Asked for 400 words of continuous Fon the generator ran out of vocabulary and cycled: both documents on
+    a pilot were one clause repeated. Less room to loop is the fix; 200 words of good Fon beats 400 that
+    degenerate halfway."""
+    from schemas.seed import Seed
+    from prompts import build_request
+    seed = Seed.load("pretrain")
+    def words(lang, i=1):
+        row = {"custom_id": f"pretrain__{lang}__doc__{i:06d}", "lang": lang, "task": "doc", "index": i}
+        return build_request(seed, row).metadata["target_words"]
+    for low in ("fon", "efi", "urh", "ewe", "ful", "fuv"):
+        assert max(words(low)) <= 260, low
+    for ok in ("yor", "hau", "ibo", "pcm"):
+        assert min(words(ok)) >= 300, ok
+
+
+def test_a_verbatim_repeated_sentence_is_caught_where_the_ratios_miss_it():
+    """The sharpest of the three checks, and the one the n-gram ratios needed. A 121-word Ewe document with one
+    14-word sentence repeated THREE times scored 4-gram 0.63 and 8-gram 0.70 -- above both floors, because the
+    surrounding text dilutes the ratio in a short document. On the same batch the four sound documents had zero
+    repeats across 16-18 sentences each."""
+    from postprocess_gen import degenerate_reason, repeated_sentence
+    dup = "Ne xoyea do fe mokpo kpo kpo, eyae fe dzesi do fomea fe nonome me."
+    text = " ".join([dup, "Something entirely different is said here about the market and the price of yam.",
+                     dup, "A third sentence adds another concrete detail about the rainy season in Kumasi.",
+                     dup])
+    assert repeated_sentence(text) is not None
+    assert (degenerate_reason(text) or "").startswith("repeated_sentence")
+
+
+def test_short_stock_phrases_are_not_counted_as_repeats():
+    """Headings and stock phrases legitimately recur; only sentences of 8+ words count."""
+    from postprocess_gen import repeated_sentence
+    body = " ".join(f"unique{i} words here about the harvest and the price" for i in range(20))
+    assert repeated_sentence(f"Thank you. {body} Thank you. Note. Note.") is None
+
+
+def test_the_word_floor_is_stated_as_hard_in_the_prompt():
+    """A first attempt told the generator to STOP EARLY rather than pad, and it obliged: 7 of 14 documents came
+    back under the 60-word floor and were discarded. The instruction has to close both exits -- no padding AND
+    no stopping short -- and point at more specifics as the way through."""
+    from schemas.seed import Seed
+    from prompts import build_request
+    body = build_request(Seed.load("pretrain"),
+                         {"custom_id": "pretrain__fon__doc__000001", "lang": "fon", "task": "doc",
+                          "index": 1}).messages[1]["content"]
+    assert "HARD FLOOR" in body and "NEVER REPEAT YOURSELF" in body
+    assert "STOP EARLY" not in body

@@ -478,7 +478,8 @@ def sampling_params(kind: str, *, temperature: float, top_p: float, max_tokens: 
 def run(kind: str, model: str, *, langs: Optional[list[str]], limit: int, tp: int, max_model_len: int,
         gpu_mem: float, quantization: Optional[str], chunk: int, temperature: float, top_p: float,
         max_tokens: int, guided: bool, push: bool, repo_id: str, gpu_cost: float,
-        plan_only: bool, context: Optional[int] = None, run_tag: Optional[str] = None) -> int:
+        plan_only: bool, context: Optional[int] = None, run_tag: Optional[str] = None,
+        preflight_n: int = 0, min_clean_rate: float = 0.35) -> int:
     from assemble import set_response_budget
     from budgets import budget_for
     from generate import namespace
@@ -555,6 +556,49 @@ def run(kind: str, model: str, *, langs: Optional[list[str]], limit: int, tp: in
                              guided=guided)
 
     from postprocess_gen import STATS, summary, to_record
+
+    # PREFLIGHT: prove each language before spending the rest of the rental on it. Measured on the API path,
+    # pretrain's clean rate ranged from 83% (ewe) to 8% (efi) -- at 8% a 30,000-document target needs ~375,000
+    # requests, and discovering that forty hours in with nobody watching is what this prevents.
+    if preflight_n and kind != "judge" and seed is not None and reqs:
+        from preflight import run_preflight
+
+        present = sorted({r.metadata.get("lang", "") for r in reqs} - {""})
+
+        def _probe(probe_langs: list[str], n: int) -> dict[str, tuple[int, int]]:
+            sample: list[Request] = []
+            for lg in probe_langs:
+                sample += [r for r in reqs if r.metadata.get("lang") == lg][:n]
+            if not sample:
+                return {}
+            outs = _chat_resilient(engine, [r.messages for r in sample], params)
+            tally: dict[str, list[int]] = {lg: [0, 0] for lg in probe_langs}
+            for req, out in zip(sample, outs):
+                lg = req.metadata.get("lang", "")
+                tally.setdefault(lg, [0, 0])[1] += 1
+                if out is None:
+                    continue
+                comp = out.outputs[0]
+                rec = to_record(seed, Response(req.custom_id, comp.text, True, None,
+                                              len(out.prompt_token_ids), len(comp.token_ids), model,
+                                              metadata=req.metadata))
+                if rec:
+                    tally[lg][0] += 1
+                    # The probe's output is real data: keep it rather than paying for it twice.
+                    writer.write(rec["lang"], rec)
+            return {k: (v[0], v[1]) for k, v in tally.items()}
+
+        keep = run_preflight(kind, present, generate=_probe, per_lang=preflight_n,
+                             out_dir=OUT_ROOT / kind, min_rate=min_clean_rate)
+        STATS.clear()                      # the probe's drops are reported above; do not double-count them
+        before = len(reqs)
+        reqs = [r for r in reqs if r.metadata.get("lang") in set(keep)]
+        if len(reqs) != before:
+            print(f"  preflight removed {before - len(reqs):,} of {before:,} requests", flush=True)
+        if not reqs:
+            print("nothing left after preflight")
+            writer.close()
+            return 0
     if kind == "judge":
         from judge_gen import JUDGED_KIND, apply_verdict
         writer = ShardWriter(JUDGED_KIND, _shard_tag())
@@ -714,6 +758,13 @@ def main() -> int:
     ap.add_argument("--repo-id", default="BeardedMonster/data-gen")
     ap.add_argument("--gpu-cost", type=float, default=2.0, help="USD per hour for the whole box")
     ap.add_argument("--plan-only", action="store_true", help="cost model only; no GPU, no generation")
+    ap.add_argument("--preflight", type=int, default=8, metavar="N",
+                    help="probe N samples per language first and DROP languages whose clean rate is below "
+                         "--min-clean-rate. 0 disables. The probe's output is kept, not thrown away. Measured: "
+                         "pretrain clean rates ran from 83%% (ewe) to 8%% (efi), and at 8%% a 30,000-document "
+                         "target needs ~375,000 requests.")
+    ap.add_argument("--min-clean-rate", type=float, default=0.35,
+                    help="preflight floor. 0 keeps every language regardless.")
     ap.add_argument("--run-tag", default=None,
                     help="namespace local shards so several models can generate the same rows independently")
     a = ap.parse_args()
@@ -725,7 +776,8 @@ def main() -> int:
                gpu_mem=a.gpu_mem, quantization=a.quantization, chunk=a.chunk,
                temperature=a.temperature, top_p=a.top_p, max_tokens=a.max_tokens, guided=a.guided,
                push=a.push, repo_id=a.repo_id, gpu_cost=a.gpu_cost, plan_only=a.plan_only,
-               context=a.context or None, run_tag=a.run_tag)
+               context=a.context or None, run_tag=a.run_tag, preflight_n=a.preflight,
+               min_clean_rate=a.min_clean_rate)
 
 
 if __name__ == "__main__":

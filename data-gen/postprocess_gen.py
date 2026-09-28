@@ -23,6 +23,7 @@ from typing import Any, Optional
 from providers.base import Response
 from assemble import LABEL_TOKENS, AssemblyError, build_messages
 from disassemble import looks_pre_assembled, turn_from_assistant
+from longdocs import _text_from
 from longdocs import splice as splice_document
 from rendering.render import render_messages
 from schemas.seed import TAGS, Seed
@@ -321,6 +322,56 @@ def _distinct_ngram(text: str, n: int = 4) -> float:
     return len(set(g)) / len(g)
 
 
+# Repetition floors. A looping passage is the signature of a generator writing in a language it half-knows: it
+# runs out of vocabulary and cycles. Two measures, because they fail differently --
+#   4-gram  catches a short clause repeated over and over (the Fon case: 0.14 against a healthy 0.96);
+#   8-gram  catches whole sentences repeated verbatim, which is almost never legitimate prose even in an FAQ.
+# The floors sit between the measured failures and the measured legitimate cases: on a 12-document pilot the
+# worst acceptable document was a Twi how-to at 4-gram 0.705 / 8-gram 0.791, and the failures were at
+# 0.14-0.19 / 0.17-0.22.
+DEGENERATE_4GRAM_FLOOR = 0.60
+DEGENERATE_8GRAM_FLOOR = 0.50
+
+
+# A whole sentence repeated word for word. This is the sharpest of the three, and the n-gram ratios miss it:
+# a 121-word Ewe document with one 14-word sentence repeated THREE times scored 4-gram 0.63 and 8-gram 0.70 --
+# above both floors, because the surrounding text is varied enough to dilute the ratio in a short document.
+# Measured on the same batch, the four sound documents had 0 repeats across 16-18 sentences each, so this
+# separates cleanly. 8 words is the floor for a "sentence" so that headings and stock phrases ("Thank you.",
+# section labels) are not counted.
+_SENTENCE = re.compile(r"[^.!?\n]+")
+_MIN_SENTENCE_WORDS = 8
+
+
+def repeated_sentence(text: str) -> Optional[str]:
+    seen: dict[str, int] = {}
+    for raw in _SENTENCE.findall(text or ""):
+        s = " ".join(raw.split()).lower()
+        if len(s.split()) < _MIN_SENTENCE_WORDS:
+            continue
+        seen[s] = seen.get(s, 0) + 1
+        if seen[s] > 1:
+            return s[:60]
+    return None
+
+
+def degenerate_reason(text: str, *, min_words: int = 40) -> Optional[str]:
+    """Why this passage looks looped, or None if it is fine."""
+    words = (text or "").split()
+    if len(words) < min_words:
+        return None
+    d4 = _distinct_ngram(text, 4)
+    if d4 < DEGENERATE_4GRAM_FLOOR:
+        return f"4gram={d4:.2f}"
+    d8 = _distinct_ngram(text, 8)
+    if d8 < DEGENERATE_8GRAM_FLOOR:
+        return f"8gram={d8:.2f}"
+    dup = repeated_sentence(text)
+    if dup:
+        return f"repeated_sentence:{dup}"
+    return None
+
+
 def _degenerate_user_message(msgs: list[dict], floor: float = 0.75,
                              document: Optional[dict] = None) -> bool:
     """A looping user message ("mme nka mme nka nte nnyin eyenam eyọm nnyin mme nka...") is the signature of
@@ -433,14 +484,28 @@ def _to_record(seed: Seed, resp: Response) -> Optional[dict]:
             "model": resp.model, "domain": md.get("domain", ""), "subtopic": md.get("subtopic", "")}
 
     if seed.kind == "pretrain":
-        text = (data.get("text") or "").strip()
+        # `text` arriving as a list of paragraphs or an object of section->prose is the same document in a
+        # different container, and .strip() on it raised AttributeError -- which the catch-all turned into an
+        # opaque `postprocess_error` and threw the document away. Reuse the document reader, which already
+        # flattens every container longdocs sees.
+        text = _text_from(data).strip()
         if len(text.split()) < 60:
             _drop("too_short")
             return None
         if data.get("language_self_check") is False:
             _drop("language_self_check_false")
             return None
-        return {**base, "genre": md.get("genre", ""), "title": (data.get("title") or "").strip(), "text": text}
+        bad = degenerate_reason(text)
+        if bad:
+            # THE most important gate on this path, and it did not exist. Measured on a 12-document pilot: both
+            # Fon documents were the same clause repeated for 400 words, distinct-4gram 0.143 and 0.191 -- and
+            # they self-reported `confidence` 0.9 and 0.7, so the generator's own estimate is worthless for a
+            # language it does not really know. 30,000 documents like that do not merely waste the run: a model
+            # pretrained on looped text learns to loop.
+            _drop(f"degenerate_text:{bad}")
+            return None
+        return {**base, "genre": md.get("genre", ""), "title": (data.get("title") or "").strip(),
+                "distinct_4gram": round(_distinct_ngram(text), 3), "text": text}
 
     if seed.kind == "sft":
         # `turns` is the current contract (structured fields); `messages` is the legacy pre-assembled shape,

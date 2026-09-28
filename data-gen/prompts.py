@@ -120,6 +120,12 @@ _WHENS = [
 _REGISTERS = ["plain everyday", "formal", "conversational", "explanatory/teacherly", "journalistic", "storytelling"]
 # 300-500 words, in four buckets so length still varies within the band.
 _LENGTHS = [(300, 350), (350, 400), (400, 450), (450, 500)]
+# SHORTER for the low-resource tier, and this is a correctness fix rather than a preference. Asked for 400 words
+# of continuous Fon, the generator ran out of vocabulary and cycled: on a 12-document pilot BOTH Fon documents
+# were one clause repeated for ~400 words (distinct-4gram 0.14 and 0.19) while every Yoruba, Hausa and Twi
+# document was clean. A shorter document is less room to fall into a loop, and 200 words of good Fon is worth
+# more to a pretraining corpus than 400 that degenerate halfway.
+_LENGTHS_LOW = [(150, 200), (180, 230), (200, 260)]
 
 
 def _rng(custom_id: str) -> random.Random:
@@ -212,7 +218,7 @@ def _pretrain_request(seed: Seed, row: dict) -> Request:
     domain, subtopic, genre = _coverage_pick(lang.code, row["index"])
     rng = _rng(row["custom_id"])
     register = rng.choice(_REGISTERS)
-    lo, hi = rng.choice(_LENGTHS)
+    lo, hi = rng.choice(_LENGTHS_LOW if lang.tier == "low" else _LENGTHS)
     d = DOMAINS[domain]
     g = GENRES[genre]
 
@@ -220,6 +226,7 @@ def _pretrain_request(seed: Seed, row: dict) -> Request:
         f"{seed.details}\n\n"
         f"You are writing PRETRAINING TEXT in {lang.name} ({lang.code}). "
         f"Language guidance: {lang.guidance}\n"
+        f"{_simplicity(lang)}"
         "Return strict JSON only, no commentary."
     )
     user = f"""Write one document in {lang.name}.
@@ -236,6 +243,12 @@ Requirements:
 - Locally grounded: real West African settings, foods, prices, institutions, seasons.
 - No invented statistics, no fake citations, no made-up named people presented as real.
 - Plain continuous prose. No markdown, no headings, no bullet lists, no chat markup.
+- NEVER REPEAT YOURSELF. Every sentence must say something the previous ones did not, and no sentence may
+  appear twice. Padding with a repeated clause makes the whole document worthless and it will be discarded.
+- If you cannot fill {lo} words without repeating, write about a DIFFERENT, more concrete aspect of the
+  sub-topic -- one person's day, one tool, one season, one price -- rather than restating. {lo} words is a
+  HARD FLOOR: a document shorter than that is discarded too, so neither padding nor stopping early works.
+  The way through is more specifics.
 
 Return JSON: {{"title": "<short natural title in {lang.name}>", "text": "<the document>", "language_self_check": <true only if the whole text is fluent {lang.name}>, "confidence": <float 0-1: your honest estimate that this text is accurate AND fluent {lang.name}>}}"""
 

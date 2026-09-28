@@ -296,7 +296,7 @@ def run(kind: str, provider_name: str, *, model: Optional[str] = None, langs: Op
     from inspect_sample import print_one
     peek_rng = random.Random(0)
     PEEK_EVERY = 200
-    peek_at = PEEK_EVERY
+    peek_at = 1          # print the FIRST kept record too: a short run would otherwise show none at all
 
     def handle(resp: Response) -> None:
         nonlocal kept, failed, peek_at
