@@ -45,8 +45,24 @@ class OpenRouterProvider(Provider):
         "gpt-oss-120b": (0.15, 0.60),
         "gpt-oss-20b": (0.02, 0.09),
     }
-    # A ':free' suffix means exactly that, but the endpoints are heavily rate-limited upstream and will
-    # 429 for long stretches; useful for smoke tests, not for a 225k-request run.
+    # A ':free' suffix means exactly that. MEASURED 2026-09-29 on TWO SEPARATE ACCOUNTS, both with paid credit
+    # and both with the daily allowance confirmed untouched (free_model_daily_requests: used 0 of 1000), so the
+    # 1,000/day quota is real and is NOT what bites:
+    #
+    #   * google/gemma-4-31b-it:free and google/gemma-4-26b-a4b-it:free returned an INSTANT HTTP 429
+    #     ("temporarily rate-limited upstream", 0.2-0.3s, so no queue was ever joined) on every one of 26
+    #     attempts across both accounts. A 45-minute packed run against the 31b endpoint produced 0 documents
+    #     across 18 cooldowns. Upstream capacity is the constraint, and backoff cannot create capacity.
+    #   * 10 of the 16 free models DO respond. None can write this corpus. Tested on real pretrain generation
+    #     in yor/hau/ibo, 18 documents each:
+    #         nemotron-3-ultra-550b-a55b  4/18 (22%)      nemotron-3-super-120b-a12b      0/18
+    #         poolside/laguna-s-2.1       3/18 (17%)      nemotron-3-nano-omni-30b        0/18
+    #     and the survivors are 69-248 words against a 376-424 target, leak 8-18% English into native-language
+    #     documents, are semantically empty ("I have known something good"), and laguna emitted the SAME Hausa
+    #     document twice inside one pack. Against google/gemma-4-31b-it paid: 75% yield, 400-900 words, 0%
+    #     English leak, real mechanism-first prose.
+    #
+    # So the free tier is a smoke-test facility, not a generation route -- for two independent reasons.
     FREE_SUFFIX = ":free"
 
     default_pricing = (0.30, 0.80)
