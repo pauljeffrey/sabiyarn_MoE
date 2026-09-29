@@ -28,8 +28,10 @@
 #   * a listing's headline GB is sometimes SYSTEM RAM, not VRAM. A "CMP 170HX 64GB" has 8 GB of VRAM; the 64
 #     is the host. Check the VRAM figure, and `--plan-only` below prints what the box actually reports before
 #     you spend anything.
-# The script is billed by the second, so it pushes incrementally: if the box dies or you are outbid you lose
-# only the chunk in flight, and re-running skips every row already written.
+# A rental is billed by the second and a spot box can be outbid at any moment, so set PUSH=1: with it the run
+# uploads every few chunks (--push-every) rather than only at the end, and a box that dies loses at most that.
+# WITHOUT PUSH=1 nothing is uploaded at all and the shards die with the instance. Re-running skips every row
+# already written, so an interrupted run resumes rather than repeats.
 set -euo pipefail
 
 KIND="${1:-${KIND:-sft}}"

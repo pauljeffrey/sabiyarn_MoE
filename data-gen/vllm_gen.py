@@ -716,7 +716,7 @@ def run(kind: str, model: str, *, langs: Optional[list[str]], limit: int, tp: in
         gpu_mem: float, quantization: Optional[str], chunk: int, temperature: float, top_p: float,
         max_tokens: int, guided: bool, push: bool, repo_id: str, gpu_cost: float,
         plan_only: bool, context: Optional[int] = None, run_tag: Optional[str] = None,
-        preflight_n: int = 0, min_clean_rate: float = 0.35) -> int:
+        preflight_n: int = 0, min_clean_rate: float = 0.35, push_every: int = 5) -> int:
     from assemble import set_response_budget
     from budgets import budget_for
     from generate import namespace
@@ -848,13 +848,14 @@ def run(kind: str, model: str, *, langs: Optional[list[str]], limit: int, tp: in
 
     kept = failed = 0
     out_tokens = 0
+    pushed = 0
     t0 = time.time()
     # One random kept record per chunk, so a multi-hour run is watchable. Random rather than the first: work is
     # sorted by (lang, task) for prefix-cache locality, so the first record of every chunk has the same shape.
     from inspect_sample import print_one
     peek_rng = random.Random(0)
 
-    for start in range(0, len(reqs), chunk):
+    for chunk_no, start in enumerate(range(0, len(reqs), chunk)):
         batch = reqs[start:start + chunk]
         chunk_kept: list[dict] = []
         # One engine call per chunk: vLLM does continuous batching internally, so a big chunk is what
@@ -892,6 +893,24 @@ def run(kind: str, model: str, *, langs: Optional[list[str]], limit: int, tp: in
             print("   ", summary(), flush=True)
         print_one(chunk_kept, kind=kind, rng=peek_rng)
 
+        # INCREMENTAL PUSH. The push used to happen only after the whole run, so a box that died -- or was
+        # outbid, which is the normal way a spot rental ends -- lost everything generated. Pushing mid-run needs
+        # the shard ROTATED rather than re-uploaded: hub.push_shards skips a path that already exists, on the
+        # premise that shards are immutable, so re-pushing a growing file would silently upload nothing. Closing
+        # the writer and opening a new one keeps every shard complete and immutable, and caps the loss at
+        # push_every chunks.
+        if push and push_every and (chunk_no + 1) % push_every == 0:
+            done_paths = writer.close()
+            if done_paths:
+                from hub import push_shards
+                try:
+                    push_shards(JUDGED_KIND if kind == "judge" else kind, done_paths, repo_id=repo_id)
+                    pushed += len(done_paths)
+                except Exception as exc:  # noqa: BLE001 -- a Hub hiccup must not end a paid run
+                    print(f"  [hub] push failed, keeping the shards locally and carrying on: "
+                          f"{type(exc).__name__}: {str(exc)[:160]}", flush=True)
+            writer = ShardWriter(JUDGED_KIND if kind == "judge" else ns, _shard_tag())
+
     paths = writer.close()
     dt = time.time() - t0
     total_cost = gpu_cost * dt / 3600
@@ -906,7 +925,17 @@ def run(kind: str, model: str, *, langs: Optional[list[str]], limit: int, tp: in
         print(f"  wrote {p}")
     if push and paths:
         from hub import push_shards
-        push_shards(JUDGED_KIND if kind == "judge" else kind, paths, repo_id=repo_id)
+        try:
+            push_shards(JUDGED_KIND if kind == "judge" else kind, paths, repo_id=repo_id)
+            pushed += len(paths)
+        except Exception as exc:  # noqa: BLE001
+            print(f"  [hub] final push failed: {type(exc).__name__}: {str(exc)[:200]}\n"
+                  f"  the shards are on disk; push them with hub.push_shards when the Hub is reachable.",
+                  flush=True)
+    if push:
+        print(f"  pushed {pushed} shard file(s) to {repo_id} in total")
+    elif paths:
+        print(f"  NOT pushed (--push was not given). Shards are under {OUT_ROOT / kind}/<lang>/")
     return 0
 
 
@@ -994,7 +1023,12 @@ def main() -> int:
     ap.add_argument("--max-tokens", type=int, default=0, help="0 = the phase budget (budgets.py)")
     ap.add_argument("--no-guided", dest="guided", action="store_false",
                     help="disable grammar-constrained JSON (expect more json_invalid drops)")
-    ap.add_argument("--push", action="store_true")
+    ap.add_argument("--push", action="store_true",
+                    help="push shards to the Hub. Without this NOTHING is uploaded and the shards stay on the "
+                         "box -- which is lost when the rental ends.")
+    ap.add_argument("--push-every", type=int, default=5, metavar="CHUNKS",
+                    help="with --push, also push every CHUNKS chunks rather than only at the end, so a box "
+                         "that dies or is outbid loses at most that much. 0 = only at the end.")
     ap.add_argument("--repo-id", default="BeardedMonster/data-gen")
     ap.add_argument("--gpu-cost", type=float, default=2.0, help="USD per hour for the whole box")
     ap.add_argument("--plan-only", action="store_true", help="cost model only; no GPU, no generation")
@@ -1017,7 +1051,7 @@ def main() -> int:
                temperature=a.temperature, top_p=a.top_p, max_tokens=a.max_tokens, guided=a.guided,
                push=a.push, repo_id=a.repo_id, gpu_cost=a.gpu_cost, plan_only=a.plan_only,
                context=a.context or None, run_tag=a.run_tag, preflight_n=a.preflight,
-               min_clean_rate=a.min_clean_rate)
+               min_clean_rate=a.min_clean_rate, push_every=a.push_every)
 
 
 if __name__ == "__main__":

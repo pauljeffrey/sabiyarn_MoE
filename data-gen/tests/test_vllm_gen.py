@@ -558,3 +558,37 @@ def test_a_discrete_gpu_with_ample_host_ram_is_not_warned(capsys):
              "host_ram_gb": 250.0}]
     warn_slow_load("google/gemma-4-31b-it", a100, 0.0)
     assert capsys.readouterr().out == ""
+
+
+# --------------------------------------------------------------------------- incremental push
+
+
+def test_pushing_mid_run_requires_rotating_the_shard_not_re_uploading_it():
+    """hub.push_shards SKIPS a path that already exists in the repo, on the premise that shards are immutable.
+    So pushing a growing shard file repeatedly would upload nothing after the first time -- silently. Mid-run
+    pushing therefore has to close the writer and start a new file, which keeps every shard complete and caps
+    the loss from a dead box at one push interval."""
+    import inspect
+    from hub import push_shards
+    src = inspect.getsource(push_shards)
+    assert "if dest in have" in src and "continue" in src, "the skip this works around has moved"
+
+    from generate import ShardWriter
+    a, b = ShardWriter("pretrain"), ShardWriter("pretrain")
+    assert a.tag != b.tag, "two writers must not collide, or a rotation would overwrite the previous shard"
+
+
+def test_a_hub_failure_does_not_end_a_paid_run():
+    """A Hub hiccup twenty hours into a rental must cost the upload, not the run."""
+    import inspect
+    from vllm_gen import run
+    src = inspect.getsource(run)
+    assert "push failed, keeping the shards locally and carrying on" in src
+    assert "final push failed" in src
+
+
+def test_not_passing_push_says_so_at_the_end():
+    """The shards live on the box and the box goes away. Silence here has cost people whole runs."""
+    import inspect
+    from vllm_gen import run
+    assert "NOT pushed (--push was not given)" in inspect.getsource(run)
