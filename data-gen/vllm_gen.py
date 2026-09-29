@@ -254,12 +254,47 @@ def gpu_report() -> list[dict[str, Any]]:
         return []
     if not torch.cuda.is_available():
         return []
+    cuda = getattr(torch.version, "cuda", None) or "0.0"
+    try:
+        cuda_ver = float(".".join(cuda.split(".")[:2]))
+    except ValueError:
+        cuda_ver = 0.0
     out = []
     for i in range(torch.cuda.device_count()):
         pr = torch.cuda.get_device_properties(i)
         out.append({"index": i, "name": pr.name, "total_gb": pr.total_memory / 2**30,
-                    "capability": float(f"{pr.major}.{pr.minor}")})
+                    "capability": float(f"{pr.major}.{pr.minor}"), "cuda": cuda_ver,
+                    "host_ram_gb": _host_ram_gb()})
     return out
+
+
+def _host_ram_gb() -> float:
+    """Total host RAM. On a unified-memory box (GB10 and the Grace-Blackwell family) this is the SAME pool the
+    GPU allocates from, which is why gpu_memory_utilization there also decides how much page cache is left to
+    stream the checkpoint through."""
+    try:
+        return os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES") / 2**30
+    except (ValueError, OSError, AttributeError):
+        return 0.0
+
+
+# fp8 needs the hardware AND a toolkit that can build for it. Blackwell (SM 12.x) kernels require CUDA >= 12.9;
+# with an older toolkit vLLM logs "Failed to get device capability: SM 12.x requires CUDA >= 12.9" and the fp8
+# path is unreliable -- which is worse than slow, because it surfaces as wrong output or a crash mid-run rather
+# than a refusal at startup.
+_SM_MIN_CUDA = ((12.0, 12.9), (10.0, 12.8), (9.0, 12.0))
+
+
+def cuda_supports_fp8(capability: float, cuda_ver: float) -> tuple[bool, str]:
+    if capability < _FP8_MIN_CAPABILITY:
+        return False, f"compute capability {capability} < {_FP8_MIN_CAPABILITY} (no fp8 hardware)"
+    for sm, need in _SM_MIN_CUDA:
+        if capability >= sm:
+            if cuda_ver and cuda_ver < need:
+                return False, (f"SM {capability} needs CUDA >= {need} for fp8 kernels, but torch was built "
+                               f"against CUDA {cuda_ver}")
+            break
+    return True, ""
 
 
 # On-the-fly quantization options, in descending quality. AWQ and GPTQ are deliberately NOT here: they need a
@@ -356,12 +391,17 @@ def choose_quantization(model: str, requested: Optional[str], gpus: list[dict[st
 
     vram = sum(g["total_gb"] for g in gpus[:tp])
     cap = min(g["capability"] for g in gpus[:tp])
+    cuda_ver = min((g.get("cuda") or 0.0) for g in gpus[:tp])
     candidates: list[Optional[str]] = [None]
-    if cap >= _FP8_MIN_CAPABILITY:
+    fp8_ok, fp8_why = cuda_supports_fp8(cap, cuda_ver)
+    if fp8_ok:
         candidates.append("fp8")
     else:
-        print(f"[vllm] compute capability {cap} < {_FP8_MIN_CAPABILITY}: no fp8 kernels on this card "
-              f"(Ampere -- A100, A800, A40). bitsandbytes is the only quantized option here.")
+        print(f"[vllm] fp8 unavailable: {fp8_why}.")
+        if cap >= _FP8_MIN_CAPABILITY:
+            print(f"[vllm]   the hardware has fp8 but this CUDA build cannot target it. Either use a newer "
+                  f"image, or accept bf16/bitsandbytes. Forcing --quantization fp8 anyway risks failing "
+                  f"mid-run rather than at startup.")
     candidates.append("bitsandbytes")
 
     fitting = [q for q in candidates if _fits(model, q, vram)]
@@ -543,6 +583,47 @@ def _biggest_writable_mount() -> str:
     return best
 
 
+def warn_slow_load(model: str, gpus: list[dict[str, Any]], gpu_mem: float) -> None:
+    """Say up front when the weights will take many minutes to load, and why.
+
+    vLLM streams the checkpoint through the host page cache, and disables its own prefetch when the checkpoint
+    does not fit:
+
+        Filesystem type for checkpoints: OVERLAY. Checkpoint size: 58.25 GiB. Available RAM: 44.57 GiB.
+        Auto-prefetch is disabled because ... the checkpoint size exceeds 90% of available RAM
+
+    after which "Loading safetensors checkpoint shards 0/2" sits still for 10-25 minutes. That is normal and it
+    IS progressing, but with no message saying so it looks like a hang, and on a box billed by the second the
+    natural reaction is to kill it and start again -- paying the cost twice.
+
+    On a UNIFIED-MEMORY box (GB10 and the Grace-Blackwell family) there is a second effect: the GPU allocates
+    from the same LPDDR5X as the host, so gpu_memory_utilization also decides how much page cache is left to
+    stream through. Reserving 0.90 there can leave less RAM than the checkpoint.
+    """
+    if not gpus:
+        return
+    weights_gb = preset_for(model).get("weight_gb_bf16") or 0.0
+    ram = gpus[0].get("host_ram_gb") or 0.0
+    vram = sum(g["total_gb"] for g in gpus)
+    if not weights_gb or not ram:
+        return
+    util = gpu_mem or preset_for(model)["gpu_memory_utilization"]
+    # Unified memory shows host RAM and VRAM as the same size; treat within 15% as the same pool.
+    unified = abs(ram - vram) / max(ram, 1) < 0.15
+    spare = ram * (1 - util) if unified else ram
+    if spare < weights_gb:
+        print(f"[vllm] the weights ({weights_gb:.0f} GiB) do not fit the {spare:.0f} GiB of RAM left for the "
+              f"page cache, so vLLM will stream them from disk.")
+        print(f"[vllm]   EXPECT 10-25 MINUTES at 'Loading safetensors checkpoint shards 0/N'. It is not hung; "
+              f"nvidia-smi will show memory climbing. This happens once per process start.")
+        if unified:
+            lower = max(0.55, round(1 - (weights_gb * 1.25 / max(ram, 1)), 2))
+            print(f"[vllm]   this box looks UNIFIED-MEMORY ({ram:.0f} GiB shared between host and GPU), so "
+                  f"--gpu-mem {util} leaves only {spare:.0f} GiB for the page cache.")
+            print(f"[vllm]   --gpu-mem {lower} would leave ~{ram * (1 - lower):.0f} GiB and load faster, at "
+                  f"the cost of some KV cache. Worth trying if startup dominates a short run.", flush=True)
+
+
 def load_engine(model: str, *, tp: int, max_model_len: int, gpu_mem: float, quantization: Optional[str],
                 seed: int = 0):
     try:
@@ -672,6 +753,7 @@ def run(kind: str, model: str, *, langs: Optional[list[str]], limit: int, tp: in
     if gpus and tp > len(gpus):
         raise SystemExit(f"--tp {tp} but only {len(gpus)} GPU(s) visible")
     quant = choose_quantization(model, quantization, gpus, tp, max_model_len, gpu_mem)
+    warn_slow_load(model, gpus, gpu_mem)
 
     if plan_only:
         in_tok_est = sum(len(m["content"]) for m in

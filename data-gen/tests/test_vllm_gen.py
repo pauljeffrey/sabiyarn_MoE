@@ -508,3 +508,53 @@ def test_whitespace_around_the_value_is_tolerated():
     from vllm_gen import choose_quantization
     assert choose_quantization("google/gemma-4-31b-it", "  FP8  ", _gpus(119, 12.0), 1) == "fp8"
     assert choose_quantization("google/gemma-4-31b-it", " none ", _gpus(119, 12.0), 1) is None
+
+
+# --------------------------------------------------------------------------- Blackwell / unified memory
+
+
+def test_fp8_requires_a_cuda_build_that_can_target_the_hardware():
+    """The hardware having fp8 is not enough. A GB10 run logged
+
+        Failed to get device capability: SM 12.x requires CUDA >= 12.9
+
+    and Blackwell fp8 kernels need that toolkit. Choosing fp8 anyway fails mid-run rather than at startup,
+    which on a paid box is the expensive way to find out."""
+    from vllm_gen import cuda_supports_fp8
+    assert cuda_supports_fp8(12.0, 12.9)[0]
+    assert not cuda_supports_fp8(12.0, 12.8)[0]
+    assert "CUDA >= 12.9" in cuda_supports_fp8(12.0, 12.8)[1]
+    assert cuda_supports_fp8(9.0, 12.4)[0]                 # Hopper is fine on an older toolkit
+    assert not cuda_supports_fp8(8.0, 12.9)[0]             # Ampere has no fp8 hardware at any CUDA version
+
+
+def test_auto_falls_back_when_the_cuda_build_is_too_old_for_fp8():
+    from vllm_gen import choose_quantization
+    old = [{"index": 0, "name": "GB10", "total_gb": 119.0, "capability": 12.0, "cuda": 12.8,
+            "host_ram_gb": 119.0}]
+    new = [{**old[0], "cuda": 12.9}]
+    assert choose_quantization("google/gemma-4-31b-it", None, old, 1, 3_328) is None       # bf16
+    assert choose_quantization("google/gemma-4-31b-it", None, new, 1, 3_328) == "fp8"
+
+
+def test_a_unified_memory_box_is_warned_about_slow_weight_loading(capsys):
+    """On a GB10 the GPU allocates from the same LPDDR5X as the host, so gpu_memory_utilization also decides how
+    much page cache is left to stream the checkpoint through. vLLM then disables its prefetch and sits at
+    'Loading safetensors checkpoint shards 0/N' for 10-25 minutes, which looks exactly like a hang -- and on a
+    box billed by the second the natural reaction is to kill it and pay the cost twice."""
+    from vllm_gen import warn_slow_load
+    gb10 = [{"index": 0, "name": "GB10", "total_gb": 119.0, "capability": 12.0, "cuda": 12.9,
+             "host_ram_gb": 119.0}]
+    warn_slow_load("google/gemma-4-31b-it", gb10, 0.0)
+    out = capsys.readouterr().out
+    assert "not hung" in out and "UNIFIED-MEMORY" in out
+    assert "--gpu-mem" in out
+
+
+def test_a_discrete_gpu_with_ample_host_ram_is_not_warned(capsys):
+    """It must not cry wolf on a box where loading really is fast."""
+    from vllm_gen import warn_slow_load
+    a100 = [{"index": 0, "name": "A100", "total_gb": 80.0, "capability": 8.0, "cuda": 12.4,
+             "host_ram_gb": 250.0}]
+    warn_slow_load("google/gemma-4-31b-it", a100, 0.0)
+    assert capsys.readouterr().out == ""
