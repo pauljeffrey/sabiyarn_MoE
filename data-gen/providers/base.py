@@ -143,9 +143,13 @@ class Provider:
             print(f"  [{self.name}] {model} is a FREE endpoint: concurrency capped at "
                   f"{self.max_concurrency}, backoff {self.retry_base_s:.0f}-{self.retry_max_s:.0f}s, "
                   f"{self.max_retries} attempts.\n"
-                  f"  MEASURED 2026-09-24: google/gemma-4-31b-it:free produced 0 of 24 samples in 163 "
-                  f"minutes, exhausting all 8 retries on every request with ~5m cooldowns. It is useful for "
-                  f"a smoke test and unusable for volume -- expect to fall back to the paid endpoint.",
+                  f"  MEASURED TWICE. 2026-09-24: google/gemma-4-31b-it:free produced 0 of 24 samples in 163 "
+                  f"minutes, exhausting all 8 retries on every request. 2026-09-29, with $10 of credit on the "
+                  f"account and the daily allowance confirmed UNUSED (free_model_daily_requests used 0 of "
+                  f"1000): 20 attempts across both gemma free endpoints over 7 minutes, every one an instant "
+                  f"HTTP 429 'temporarily rate-limited upstream'.\n"
+                  f"  The 1,000/day allowance is real; UPSTREAM CAPACITY is the binding constraint, and no "
+                  f"amount of backoff creates capacity. Useful for a smoke test, unusable for volume.",
                   flush=True)
         self._lock = threading.Lock()
         self.prompt_tokens = 0

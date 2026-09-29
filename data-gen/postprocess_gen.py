@@ -595,7 +595,8 @@ def to_records(seed: Seed, resp: Response) -> list[dict]:
     if data is None:
         _drop("json_invalid")
         return []
-    items = data.get("samples") or data.get("conversations") or []
+    # `documents` is the pretrain pack's key; `samples`/`conversations` are sft/rl's.
+    items = data.get("samples") or data.get("conversations") or data.get("documents") or []
     if not isinstance(items, list):
         _drop("pack_not_a_list")
         return []

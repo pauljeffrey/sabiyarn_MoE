@@ -949,3 +949,62 @@ def test_the_word_floor_is_stated_as_hard_in_the_prompt():
                           "index": 1}).messages[1]["content"]
     assert "HARD FLOOR" in body and "NEVER REPEAT YOURSELF" in body
     assert "STOP EARLY" not in body
+
+
+# --------------------------------------------------------------------------- pretrain packing
+
+
+def test_pretrain_packs_n_documents_into_one_request():
+    """Worth doing wherever the limit is REQUESTS rather than tokens -- an API's free tier has a 1,000/day
+    allowance, and the system prompt is ~850 of a single request's ~1,150 input tokens and byte-identical for
+    every row of the same language. Packing turns 1,000 requests/day into 1,000 x N documents."""
+    import random
+    from schemas.seed import Seed
+    from generate import plan_rows
+    from prompts import build_packed_request
+    seed = Seed.load("pretrain")
+    rows = [r for r in plan_rows(seed, ["yor"])][:2000]
+    random.Random(1234).shuffle(rows)
+    pack = rows[:6]
+    req = build_packed_request(seed, pack)
+    assert req.metadata["packed"] is True
+    assert req.metadata["custom_ids"] == [r["custom_id"] for r in pack]
+    assert len(req.metadata["members"]) == 6
+    body = req.messages[1]["content"]
+    assert "6 SEPARATE documents" in body
+    assert body.count("--- DOCUMENT ") == 6
+    assert '"documents"' in body                      # the key to_records splits on
+
+
+def test_a_pretrain_pack_asks_for_varied_documents():
+    """Consecutive plan rows share a domain and a genre -- the coverage odometer only advances the genre when
+    the sub-topic list laps -- so a pack built from consecutive indices would be six documents on one subject
+    while the prompt insists they share nothing. The driver shuffles first; this asserts the result."""
+    import random
+    import re
+    from schemas.seed import Seed
+    from generate import plan_rows
+    from prompts import build_packed_request
+    seed = Seed.load("pretrain")
+    rows = [r for r in plan_rows(seed, ["yor"])][:2000]
+    random.Random(1234).shuffle(rows)
+    body = build_packed_request(seed, rows[:6]).messages[1]["content"]
+    domains = re.findall(r"Domain: (.+?) --", body)
+    assert len(set(domains)) >= 4, domains
+
+
+def test_a_pretrain_pack_splits_back_into_one_record_each(seeds):
+    from postprocess_gen import to_records
+    from providers.base import Response
+    import json as _json
+    members = [{"kind": "pretrain", "lang": "yor", "domain": "health_medicine", "subtopic": "malaria",
+                "genre": "explainer"} for _ in range(3)]
+    docs = [{"title": f"T{i}", "text": " ".join(f"ọ̀rọ̀{i}_{w}" for w in range(120)),
+             "language_self_check": True, "confidence": 0.9} for i in range(3)]
+    resp = Response("pack__a|b|c", _json.dumps({"documents": docs}), True, None, 0, 0, "m", None,
+                    {"packed": True, "kind": "pretrain", "lang": "yor", "members": members,
+                     "custom_ids": ["a", "b", "c"]})
+    recs = to_records(seeds["pretrain"], resp)
+    assert len(recs) == 3
+    assert [r["id"] for r in recs] == ["a", "b", "c"]
+    assert all(r["lang"] == "yor" and len(r["text"].split()) == 120 for r in recs)

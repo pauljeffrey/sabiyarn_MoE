@@ -663,13 +663,84 @@ def build_request(seed: Seed, row: dict, document: Optional[dict] = None) -> Req
 UNPACKABLE_TASKS = DOCUMENT_TASKS
 
 
+def _packed_pretrain_request(seed: Seed, rows: list[dict]) -> Request:
+    """N pretraining documents in one request.
+
+    Worth doing wherever the limit is REQUESTS rather than tokens -- an API's free tier, or a daily quota. The
+    system prompt is the seed brief plus the language's guidance, ~850 of a single request's ~1,150 input
+    tokens and byte-identical for every row of the same language, so N documents in one call pay it once and
+    turn a 1,000-request/day allowance into 1,000 x N documents.
+
+    NOT used on the vLLM path, deliberately: there `enable_prefix_caching` already computes that shared prefix
+    once per group, achieving the same saving without the failure mode packing brings -- one malformed reply
+    costing N samples instead of one.
+    """
+    singles = [_pretrain_request(seed, r) for r in rows]
+    system = singles[0].messages[0]["content"]      # identical by construction; that is the point
+    lang = _lang_spec(seed, rows[0]["lang"])
+
+    specs = []
+    for i, req in enumerate(singles, start=1):
+        md = req.metadata
+        d = DOMAINS[md["domain"]]
+        g = GENRES[md["genre"]]
+        lo, hi = md["target_words"]
+        specs.append(
+            f"--- DOCUMENT {i} of {len(rows)} ---\n"
+            f"Domain: {d.name} -- {d.description}\n"
+            f"Sub-topic: {md['subtopic']}\n"
+            f"Genre: {getattr(g, 'text', md['genre'])}\n"
+            f"Register: {md['register']}\n"
+            f"Length: {lo}-{hi} words.")
+
+    user = (
+        f"Write {len(rows)} SEPARATE documents in {lang.name}, one for each specification below.\n\n"
+        f"They share nothing. Different sub-topics, different genres, different registers. Do not let them echo "
+        f"one another: no repeated openings, no reused names, numbers, villages or examples across documents. A "
+        f"reader must not be able to tell they were written together.\n\n"
+        + "\n\n".join(specs)
+        + f"""
+
+Every document must meet the same bar:
+- Entirely in {lang.name}. No English except words the language genuinely borrows.
+- Explain HOW and WHY things work, not just what they are called. Mechanism over name-dropping.
+- Locally grounded: real West African settings, foods, prices, institutions, seasons.
+- No invented statistics, no fake citations, no made-up named people presented as real.
+- Plain continuous prose. No markdown, no headings, no bullet lists, no chat markup.
+- NEVER REPEAT YOURSELF, within a document or across them. No sentence may appear twice anywhere in this
+  reply. A repeated clause makes that document worthless and it will be discarded.
+- If you cannot fill a document's word range without repeating, write about a more concrete aspect of its
+  sub-topic -- one person's day, one tool, one season, one price. The lower bound is a HARD FLOOR: a shorter
+  document is discarded too, so neither padding nor stopping early works.
+
+Return strict JSON: {{"documents": [ ... {len(rows)} objects, in the order given above ... ]}}
+Each object: {{"title": "<short natural title in {lang.name}>", "text": "<the document>",
+"language_self_check": <true only if the whole text is fluent {lang.name}>,
+"confidence": <float 0-1: your honest estimate that this text is accurate AND fluent {lang.name}>}}
+If you cannot complete one properly, still emit an object for it with an empty text rather than shifting the
+others out of order."""
+    )
+    return Request(
+        custom_id="pack__" + "|".join(r["custom_id"] for r in rows),
+        messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
+        max_tokens=min(32_000, sum(r.max_tokens for r in singles) + 512),
+        temperature=0.95, top_p=0.95,
+        response_format={"type": "json_object"},
+        metadata={"packed": True, "kind": "pretrain", "lang": rows[0]["lang"],
+                  "members": [r.metadata for r in singles],
+                  "custom_ids": [r["custom_id"] for r in rows]},
+    )
+
+
 def build_packed_request(seed: Seed, rows: list[dict]) -> Request:
-    """One Request carrying `len(rows)` independent conversation specs. Rows must share a language."""
+    """One Request carrying `len(rows)` independent specs. Rows must share a language."""
     if not rows:
         raise ValueError("no rows")
     langs = {r["lang"] for r in rows}
     if len(langs) != 1:
         raise ValueError(f"a packed request must be single-language, got {sorted(langs)}")
+    if seed.kind == "pretrain":
+        return _packed_pretrain_request(seed, rows)
     singles = [_sft_like_request(seed, r, rl=(seed.kind == "rl")) for r in rows]
     system = singles[0].messages[0]["content"]          # identical by construction; this is the whole point
 
