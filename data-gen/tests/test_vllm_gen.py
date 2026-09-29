@@ -473,3 +473,38 @@ def test_the_disk_check_passes_when_there_is_room(tmp_path, monkeypatch):
 def test_the_suggested_mount_is_the_one_with_the_most_space():
     from vllm_gen import _biggest_writable_mount
     assert _biggest_writable_mount().startswith("/")
+
+
+def test_an_unknown_quantization_is_rejected_here_not_by_vllm():
+    """vLLM only rejects it after resolving the architecture and reading the config -- minutes of paid time on a
+    rented box -- and its error is a pydantic ValidationError wrapping a 30-item list.
+
+    The value that provoked this was "aut": a pasted command wrapped mid-word, so the shell passed "aut" and
+    then tried to run "o" as a command. The message therefore says so explicitly, because the traceback gives
+    no hint that the input was truncated rather than wrong."""
+    from vllm_gen import choose_quantization
+    g = _gpus(119, 12.0)
+    with pytest.raises(SystemExit) as exc:
+        choose_quantization("google/gemma-4-31b-it", "aut", g, 1, 3_328)
+    msg = str(exc.value)
+    assert "wrap mid-word" in msg and "auto (default)" in msg
+
+
+def test_a_near_miss_quantization_suggests_the_right_one():
+    from vllm_gen import choose_quantization
+    with pytest.raises(SystemExit, match="did you mean: fp8"):
+        choose_quantization("google/gemma-4-31b-it", "fp88", _gpus(119, 12.0), 1)
+
+
+def test_vllms_own_backend_names_pass_through():
+    """Anyone needing a backend this script does not special-case must not be blocked by our validation."""
+    from vllm_gen import choose_quantization
+    g = _gpus(119, 12.0)
+    for name in ("awq", "gptq_marlin", "compressed-tensors", "modelopt_fp4", "mxfp4"):
+        assert choose_quantization("google/gemma-4-31b-it", name, g, 1) == name
+
+
+def test_whitespace_around_the_value_is_tolerated():
+    from vllm_gen import choose_quantization
+    assert choose_quantization("google/gemma-4-31b-it", "  FP8  ", _gpus(119, 12.0), 1) == "fp8"
+    assert choose_quantization("google/gemma-4-31b-it", " none ", _gpus(119, 12.0), 1) is None

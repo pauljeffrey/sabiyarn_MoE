@@ -277,6 +277,19 @@ def gpu_report() -> list[dict[str, Any]]:
 #                 the matmul with general-purpose kernels, so it buys memory rather than speed -- the fallback
 #                 that makes a small card work at all. `auto` never selects it while a higher precision fits;
 #                 4-bit fluency on Fon or Efik is unmeasured here and that is the operator's call.
+# What --quantization accepts. Ours are the policies and aliases this script implements; the vLLM set is
+# passed straight through for anyone who needs a backend we do not special-case. Kept so a typo is caught here
+# in milliseconds instead of by vLLM after it has resolved the architecture and read the config.
+_OUR_QUANTIZATIONS = {"fp8", "bitsandbytes", "int8", "8bit", "w8a8", "4bit", "nf4"}
+_VLLM_QUANTIZATIONS = {
+    "awq", "auto_awq", "awq_marlin", "gptq", "auto_gptq", "gptq_marlin", "fp8", "fbgemm_fp8", "fp_quant",
+    "modelopt", "modelopt_fp4", "modelopt_mxfp8", "modelopt_mixed", "compressed-tensors", "experts_int8",
+    "quark", "moe_wna16", "torchao", "inc", "mxfp4", "gpt_oss_mxfp4", "bitsandbytes", "online",
+    "fp8_per_tensor", "fp8_per_block", "fp8_per_channel", "int8_per_channel_weight_only", "nvfp4_per_token",
+    "mxfp8", "deepseek_v4_fp8", "humming",
+}
+_KNOWN_QUANTIZATIONS = _OUR_QUANTIZATIONS | _VLLM_QUANTIZATIONS
+
 _FP8_MIN_CAPABILITY = 8.9
 # A batch this small wastes the rental: vLLM's continuous batching is what amortises reading 62 GB of weights
 # per decode step, so a box that fits the weights but leaves room for only 5 sequences is slower per dollar
@@ -313,12 +326,27 @@ def choose_quantization(model: str, requested: Optional[str], gpus: list[dict[st
     MIN_CONCURRENCY sequences. On an 80 GB Ampere card at 32k that is the difference between ~5 concurrent
     sequences and ~40.
     """
-    req = (requested or "auto").lower()
+    req = (requested or "auto").strip().lower()
     # vLLM's only on-the-fly 8-bit path is fp8; W8A8-int8 needs a pre-quantized checkpoint.
     req = {"int8": "fp8", "8bit": "fp8", "w8a8": "fp8", "4bit": "bitsandbytes",
            "nf4": "bitsandbytes"}.get(req, req)
     if req not in ("auto", "", "throughput"):
-        return None if req in ("none", "bf16", "off") else req
+        if req in ("none", "bf16", "off"):
+            return None
+        # Validate HERE rather than letting vLLM reject it. It only finds out after resolving the
+        # architecture and reading the config, which on a rented box is minutes of paid time, and its error is
+        # a pydantic ValidationError wrapping a 30-item list. The value that provoked this was "aut": a pasted
+        # command had wrapped mid-word, so the shell passed "aut" and then tried to run "o" as a command.
+        if req not in _KNOWN_QUANTIZATIONS:
+            near = [k for k in sorted(_OUR_QUANTIZATIONS) if k.startswith(req[:2]) or req in k]
+            raise SystemExit(
+                f"[vllm] --quantization {requested!r} is not a quantization this script or vLLM knows.\n"
+                + (f"  did you mean: {', '.join(near)}?\n" if near else "")
+                + f"  ours:  auto (default) | throughput | none | {' | '.join(sorted(_OUR_QUANTIZATIONS))}\n"
+                f"  vLLM's own names are also accepted: {', '.join(sorted(_VLLM_QUANTIZATIONS)[:10])}, ...\n"
+                f"  If the value looks truncated, check the command did not wrap mid-word -- a shell that "
+                f"splits 'auto' passes 'aut' and then runs 'o' as a command.")
+        return req
     low = model.lower()
     if any(k in low for k in ("awq", "gptq", "-fp8", "fp8-", "int4", "w4a16", "mxfp4", "bnb")):
         print(f"[vllm] {model} looks pre-quantized; letting vLLM read the format from its own config")
@@ -449,6 +477,13 @@ def ensure_weights(model: str, *, expected_gb: float = 0.0) -> None:
     """
     import shutil
 
+    if not (os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")):
+        # A public model still downloads, but unauthenticated requests are rate-limited and slower, and a gated
+        # one fails with a 401 that looks nothing like a licence problem. Worth saying before 62 GB of transfer.
+        print("[weights] WARNING: HF_TOKEN is not set in this process. Downloads will be rate-limited, and a "
+              "gated model will fail with a 401.\n"
+              "          export HF_TOKEN=... (a shell that ran `export` in a DIFFERENT window does not "
+              "share it).", flush=True)
     expected_gb = expected_gb or (preset_for(model).get("weight_gb_bf16") or 0.0)
     cache = Path(os.environ.get("HF_HOME") or (Path.home() / ".cache" / "huggingface"))
     cache.mkdir(parents=True, exist_ok=True)
