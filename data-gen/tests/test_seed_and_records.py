@@ -1064,14 +1064,24 @@ def test_a_recycled_vocabulary_is_caught_where_the_ngram_gates_pass_it():
 
     The n-gram measures miss it precisely because the surroundings vary; the vocabulary does not. Its
     type-token ratio was 0.188 against a minimum of 0.265 across 55 documents already judged good."""
-    from postprocess_gen import (DEGENERATE_4GRAM_FLOOR, degenerate_reason, type_token_ratio,
-                                 _distinct_ngram)
-    looped = ("Nu le hafie me, woanye dzo nu le voto me. Nu le hafie me, woanye dzo nu le voto me, eye wo "
-              "nye dokple. Eye woanye dzo nu le hafie me be wo nyae nu, be wo nyae nu. Nu le hafie me, wo "
-              "nyae nu. Wo dzo nu le voto me, eye wo nye dokple. Woanye dzo nu le hafie me be wo nyae nu, "
-              "eye woanye dzo nu le voto me be wo nyae nu. Nu le hafie me, woanye dzo nu le voto me.")
+    from postprocess_gen import (DEGENERATE_4GRAM_FLOOR, _distinct_ngram, degenerate_reason,
+                                 repeated_sentence, type_token_ratio)
+    # The ACTUAL document from that run. A shortened paraphrase will not do: condensing it pushes the
+    # 4-gram ratio below the floor, so the very thing being demonstrated -- that the n-gram gates pass
+    # it -- stops being true.
+    looped = (
+        'Tèwò hã, eye woanye dzɔ nu le hafié me, woanye ʋɔtɔ, miake wò nyae nu. Esi ɖe nu le hafié me le'
+        ' hãfiãtɔwoe be wònyae nu. Eƒe wo le hafié me, wò dzɔ kɔlɔ gbã, eye wò nye dɔkple. Aʋavé, woanye'
+        ' dzɔ nu le hafié me be wò nyae nu, eye woanye dzɔ hafiãtɔ le hafié me be wò nyae nu. Nu le hafi'
+        'é me, woanye dzɔ nu le ʋɔtɔ me. Nu le hafié me, woanye dzɔ nu le ʋɔtɔ me, eye wò nye dɔkple. Ey'
+        'e woanye dzɔ nu le hafié me be wò nyae nu, be wò nyae nu. Nu le hafié me, wò nyae nu. Wò dzɔ nu'
+        ' le ʋɔtɔ me, eye wò nye dɔkple. Woanye dzɔ nu le hafié me be wò nyae nu, eye woanye dzɔ nu le ʋ'
+        'ɔtɔ me be wò nyae nu.'
+    )
+    looped = "".join(looped) if isinstance(looped, tuple) else looped
     assert _distinct_ngram(looped, 4) > DEGENERATE_4GRAM_FLOOR, "the n-gram gate should pass this"
-    assert type_token_ratio(looped) < 0.25
+    assert repeated_sentence(looped) is None, "no sentence repeats verbatim either"
+    assert type_token_ratio(looped) < 0.20
     assert (degenerate_reason(looped) or "").startswith("ttr=")
 
 
@@ -1079,9 +1089,16 @@ def test_the_ttr_floor_does_not_reject_good_documents():
     """Calibrated on 55 documents already judged good, whose ratios run 0.265-0.379. A floor that rejected
     real prose would be worse than no floor."""
     from postprocess_gen import DEGENERATE_TTR_FLOOR, degenerate_reason, type_token_ratio
-    healthy = " ".join(
-        f"the {w} farmer in Kumasi weighed {w} bags before dawn and priced them again at dusk"
-        for w in ("first", "second", "third", "fourth", "fifth", "sixth", "seventh", "eighth"))
+    # Real prose from an earlier run, kept because a synthetic fixture built by repeating a template is itself
+    # low-TTR -- the first attempt at this test failed for exactly that reason.
+    healthy = (
+        "Obinna be small boy wey get strong interest for how things dey work. Him papa tell am say book na "
+        "good thing, but a hand wey sabi work no go ever hunger. For him neighborhood for Enugu, there be one "
+        "technical school wey dey teach people how to fix motor and electrical work. Obinna decide say him go "
+        "learn how to wire house because him tired as their small room dey always dark when NEPA take light. "
+        "The teacher show am say electricity be like water wey dey flow inside pipe. If the wire no connect "
+        "well, the power no go reach the bulb. Copper allow the current pass through am fast without making "
+        "the wire hot like fire.")
     assert type_token_ratio(healthy) > DEGENERATE_TTR_FLOOR
     assert degenerate_reason(healthy) is None
 
