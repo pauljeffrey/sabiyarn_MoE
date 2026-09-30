@@ -226,6 +226,8 @@ def run(kind: str, provider_name: str, *, model: Optional[str] = None, langs: Op
 
     # The provider is needed before the requests are built, because the long-document rows need STAGE 1 run
     # first and its output goes into their stage-2 prompt.
+    from providers.base import warn_if_wrong_model_for_phase
+    warn_if_wrong_model_for_phase(model or "", kind, langs)
     provider = None if dry_run else get_provider(provider_name, model, max_concurrency=concurrency)
     docs = stage_one_documents(seed, todo, provider, dry_run=dry_run)
     # A long-document row whose stage 1 failed is DEFERRED, not degraded: building it without a document would

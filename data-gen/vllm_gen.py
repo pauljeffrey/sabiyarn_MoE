@@ -81,7 +81,8 @@ MODEL_PRESETS: dict[str, dict[str, Any]] = {
     "google/gemma-3-27b-it": {
         "min_gpus_80gb": 1, "max_model_len": 0, "gpu_memory_utilization": 0.90,
         "kv_bytes_per_token": 32_768, "kv_bytes_fixed": 419_430_400, "weight_gb_bf16": 54.0,
-        "notes": "dense 27B, also sliding-window. Strong in several West African languages.",
+        "notes": ("dense 27B, also sliding-window. THE MODEL FOR LOW-RESOURCE PRETRAINING: 89% clean against "
+                  "gemma-4-31b's 6% on fon/ewe/efi/urh/ful/fuv (measured 2026-09-29, unpacked, n=18 each)."),
     },
     "openai/gpt-oss-120b": {
         # ~117B total but only ~5B active per token (MoE), and the release weights are MXFP4, so it is far
@@ -753,6 +754,8 @@ def run(kind: str, model: str, *, langs: Optional[list[str]], limit: int, tp: in
     if gpus and tp > len(gpus):
         raise SystemExit(f"--tp {tp} but only {len(gpus)} GPU(s) visible")
     quant = choose_quantization(model, quantization, gpus, tp, max_model_len, gpu_mem)
+    from providers.base import warn_if_wrong_model_for_phase
+    warn_if_wrong_model_for_phase(model, kind, langs)
     warn_slow_load(model, gpus, gpu_mem)
 
     if plan_only:
@@ -1002,7 +1005,10 @@ def resolve_langs(seed_kind: str, langs: Optional[str]) -> Optional[list[str]]:
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--kind", required=True, choices=["pretrain", "sft", "rl", "judge"])
-    ap.add_argument("--model", default="google/gemma-4-31b-it")
+    ap.add_argument("--model", default=None,
+                    help="default is the measured best for the phase: google/gemma-3-27b-it for pretrain "
+                         "(89%% clean on the low-resource languages against gemma-4-31b's 6%%), "
+                         "google/gemma-4-31b-it for sft and rl.")
     ap.add_argument("--langs", default=None,
                     help="comma list of language codes to generate for this run, e.g. yor,hau. "
                          "An unknown code is an error listing the valid ones.")
@@ -1045,6 +1051,10 @@ def main() -> int:
     if a.kind == "judge":
         a.temperature = 0.0  # a ranking should be reproducible
         a.max_tokens = 700
+    if not a.model:
+        from providers.base import RECOMMENDED_MODEL
+        a.model = RECOMMENDED_MODEL.get(a.kind, "google/gemma-4-31b-it")
+        print(f"[model] no --model given; using the measured best for {a.kind}: {a.model}")
     langs = resolve_langs("rl" if a.kind == "judge" else a.kind, a.langs)
     return run(a.kind, a.model, langs=langs, limit=a.limit, tp=a.tp, max_model_len=a.max_model_len,
                gpu_mem=a.gpu_mem, quantization=a.quantization, chunk=a.chunk,

@@ -94,6 +94,51 @@ def warn_if_reasoning_model(model: str) -> None:
               f"(e.g. google/gemma-4-31b-it) for sft/rl.", flush=True)
 
 
+# Which generator to use, per phase, and it is NOT the same one. Measured 2026-09-29 on pretraining prose in
+# the six low-resource languages (fon, ewe, efi, urh, ful, fuv), 18 documents each, unpacked:
+#
+#     google/gemma-3-27b-it   16/18   89%      $0.00027 per kept document
+#     openai/gpt-oss-20b       1/18    6%      $0.00297 per kept document
+#     google/gemma-4-31b-it    1/18    6%      no usable output at any price
+#
+# Packing does not explain it: at pack=6 over 36 documents the same three scored 83%, 3% and 0%. gemma-4-31b
+# simply cannot sustain prose in these languages, and gemma-3-27b can -- while also scoring 100% on
+# yor/hau/ibo, costing less per kept document and running twice as fast.
+#
+# This does NOT overturn gemma-4-31b for SFT, where it was chosen on conversation structure and tool use over a
+# much larger sample. Pretraining is a different task: several hundred words of unbroken native-language prose,
+# with no scaffolding to get right.
+RECOMMENDED_MODEL = {
+    "pretrain": "google/gemma-3-27b-it",
+    "sft": "google/gemma-4-31b-it",
+    "rl": "google/gemma-4-31b-it",
+}
+# Models measured as unable to produce low-resource pretraining prose, with what to use instead.
+_POOR_FOR_LOW_RESOURCE_PRETRAIN = {
+    "gemma-4-31b": "6% clean on fon/ewe/efi/urh/ful/fuv (n=18)",
+    "gemma-4-26b": "same family as gemma-4-31b; untested but expected to behave alike",
+    "gpt-oss": "6% clean, and its reasoning tokens are billed as output",
+}
+
+
+def warn_if_wrong_model_for_phase(model: str, kind: str, langs: Optional[list] = None) -> None:
+    """Say so BEFORE a run, not after. A 3% yield discovered at the end of a rental is the expensive way."""
+    low = model.lower()
+    if kind != "pretrain":
+        return
+    hard = {"fon", "ewe", "efi", "urh", "ful", "fuv"}
+    if langs and not (hard & set(langs)):
+        return
+    for key, why in _POOR_FOR_LOW_RESOURCE_PRETRAIN.items():
+        if key in low:
+            print(f"  WARNING: {model} measured {why} for pretraining prose.\n"
+                  f"  Use {RECOMMENDED_MODEL['pretrain']} for pretrain: 89% clean on the same languages, "
+                  f"cheaper per kept document and about twice as fast.\n"
+                  f"  (gemma-4-31b remains the choice for sft and rl, where it was measured on conversation "
+                  f"structure rather than long native-language prose.)", flush=True)
+            return
+
+
 def _parse_batch_line(row: dict, meta: dict, model: str) -> Response:
     cid = row.get("custom_id", "")
     md = meta.get(cid, {})

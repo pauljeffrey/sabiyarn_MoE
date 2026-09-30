@@ -592,3 +592,35 @@ def test_not_passing_push_says_so_at_the_end():
     import inspect
     from vllm_gen import run
     assert "NOT pushed (--push was not given)" in inspect.getsource(run)
+
+
+# --------------------------------------------------------------------------- model per phase
+
+
+def test_the_recommended_model_differs_by_phase():
+    """Measured 2026-09-29 on pretraining prose in fon/ewe/efi/urh/ful/fuv, 18 documents each, unpacked:
+    gemma-3-27b 16/18 (89%), gpt-oss-20b 1/18, gemma-4-31b 1/18. At pack=6 over 36: 83%, 3%, 0%. So packing
+    does not explain it -- gemma-4-31b cannot sustain prose in these languages while gemma-3-27b can, and
+    gemma-3 also scored 100% on yor/hau/ibo, cost less per kept document and ran twice as fast.
+
+    This does not overturn gemma-4-31b for SFT, which was chosen on conversation structure and tool use."""
+    from providers.base import RECOMMENDED_MODEL
+    assert RECOMMENDED_MODEL["pretrain"] == "google/gemma-3-27b-it"
+    assert RECOMMENDED_MODEL["sft"] == "google/gemma-4-31b-it"
+    assert RECOMMENDED_MODEL["rl"] == "google/gemma-4-31b-it"
+
+
+def test_the_wrong_model_for_low_resource_pretrain_is_flagged(capsys):
+    """A 6% yield discovered at the end of a rental is the expensive way to learn it."""
+    from providers.base import warn_if_wrong_model_for_phase as warn
+    warn("google/gemma-4-31b-it", "pretrain", ["fon", "ewe"])
+    out = capsys.readouterr().out
+    assert "6% clean" in out and "google/gemma-3-27b-it" in out
+
+
+def test_the_flag_is_silent_where_it_does_not_apply(capsys):
+    from providers.base import warn_if_wrong_model_for_phase as warn
+    warn("google/gemma-4-31b-it", "pretrain", ["yor", "hau"])   # easy languages: gemma-4 is fine
+    warn("google/gemma-4-31b-it", "sft", ["fon"])               # sft is a different task
+    warn("google/gemma-3-27b-it", "pretrain", ["fon"])          # the recommended model
+    assert capsys.readouterr().out == ""
