@@ -102,8 +102,8 @@
       "samples": 13000,
       "guidance": "Plain, concrete English. No flowery register."
     },
-    "swa": {
-      "code": "swa",
+    "swh": {
+      "code": "swh",
       "name": "Swahili",
       "tier": "medium",
       "samples": 8000,

@@ -35,9 +35,9 @@ samples_per_language:
   # added language outranks a home language. French IS population-scaled, on AFRICAN French speakers
   # (~150M) rather than global (~320M): a Parisian speaker is not this corpus's audience, and using
   # the global figure would make French 3.2x Swahili and dominate the added set.
-  # Speakers used: fra 150M (Africa), swa 100M, orm 37M, zul 28M, som 24M, kin 15M, sna 15M.
+  # Speakers used: fra 150M (Africa), swh 100M, orm 37M, zul 28M, som 24M, kin 15M, sna 15M.
   # ALL EIGHT need the model's vocab_size raised past 52050 before training; see build_seeds.py.
-  swa: 6000
+  swh: 6000
   fra: 9000
   orm: 2200
   zul: 1700

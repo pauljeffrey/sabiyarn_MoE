@@ -133,7 +133,10 @@ _LANG_META = {
     #     <zu> 52059  <sn> 52066  <som> 52075  <amh> 52079  <kin> 52080  <fra> 52089  <orm> 52112
     # and Swahili has NO tag at all -- it needs one added. The text generates fine either way; it is the marker
     # that cannot be embedded, so the data can be built now and used once the embedding is resized.
-    "swa": ("Swahili", "medium", "Standard Kiswahili. Keep it East African, not a Nigerian idiom translated."),
+    # swh, NOT swa: <swh> is the tag that exists in BeardedMonster/SabiYarn-32k, at id 52049 -- the last slot
+    # below vocab_size 52050, so Swahili is the ONE added language usable without resizing the embedding. <swa>
+    # is not in the tokenizer at all, so using that code would have emitted junk sub-words into the corpus.
+    "swh": ("Swahili", "medium", "Standard Kiswahili. Keep it East African, not a Nigerian idiom translated."),
     "fra": ("French", "high", "West African French as written in Benin, Togo, Senegal and Cote d'Ivoire -- not "
                               "Parisian register. Keep the accents correct: e-acute, e-grave, a-grave, "
                               "u-circumflex, c-cedilla."),

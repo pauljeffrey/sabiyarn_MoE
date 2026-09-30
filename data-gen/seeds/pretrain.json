@@ -95,8 +95,8 @@
       "samples": 30000,
       "guidance": "Nigerian variety specifically, distinct from Pular/Fuuta."
     },
-    "swa": {
-      "code": "swa",
+    "swh": {
+      "code": "swh",
       "name": "Swahili",
       "tier": "medium",
       "samples": 20000,
