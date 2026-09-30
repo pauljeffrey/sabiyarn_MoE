@@ -27,4 +27,18 @@ samples_per_language:
   ful: 12000
   fuv: 12000
   eng: 13000
-# total: 250,000
+  # ---- beyond West Africa. Proportional to L1+L2 speakers, scaled so the largest (Swahili,
+  # ~100M) sits at 12,000 -- the SMALLEST volume any Nigerian language has in this phase -- so no
+  # added language outranks a home language. French is not population-scaled: it is the regional
+  # lingua franca for the Fon, Ewe and Fulfulde-speaking countries.
+  # Speakers used: swa 100M, amh 57M, orm 37M, zul 28M, som 24M, kin 15M, sna 15M.
+  # ALL EIGHT need the model's vocab_size raised past 52050 before training; see build_seeds.py.
+  swa: 12000
+  fra: 4800
+  amh: 6800
+  orm: 4400
+  zul: 3400
+  som: 2900
+  kin: 1800
+  sna: 1800
+# total (recomputed by build_seeds.py)

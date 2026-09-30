@@ -94,6 +94,62 @@
       "tier": "low",
       "samples": 30000,
       "guidance": "Nigerian variety specifically, distinct from Pular/Fuuta."
+    },
+    "swa": {
+      "code": "swa",
+      "name": "Swahili",
+      "tier": "medium",
+      "samples": 30000,
+      "guidance": "Standard Kiswahili. Keep it East African, not a Nigerian idiom translated."
+    },
+    "fra": {
+      "code": "fra",
+      "name": "French",
+      "tier": "high",
+      "samples": 12000,
+      "guidance": "West African French as written in Benin, Togo, Senegal and Cote d'Ivoire -- not Parisian register. Keep accents correct: e a e u c."
+    },
+    "amh": {
+      "code": "amh",
+      "name": "Amharic",
+      "tier": "low",
+      "samples": 17100,
+      "guidance": "Ethiopic script (Fidel). Short concrete sentences: this script tokenises at ~8.75 tokens/word here, so every word is expensive."
+    },
+    "orm": {
+      "code": "orm",
+      "name": "Oromo",
+      "tier": "low",
+      "samples": 11100,
+      "guidance": "Afaan Oromoo in Qubee (Latin) with gemination and doubled vowels preserved."
+    },
+    "zul": {
+      "code": "zul",
+      "name": "Zulu",
+      "tier": "medium",
+      "samples": 8400,
+      "guidance": "isiZulu with correct noun-class prefixes and hlonipha where a register calls for it. Do not drift into Xhosa."
+    },
+    "som": {
+      "code": "som",
+      "name": "Somali",
+      "tier": "low",
+      "samples": 7200,
+      "guidance": "Latin-script Somali with the correct doubled vowels and the letters c, x, q, dh. Do not drop them."
+    },
+    "kin": {
+      "code": "kin",
+      "name": "Kinyarwanda",
+      "tier": "low",
+      "samples": 4500,
+      "guidance": "Correct noun classes and the k/c, g/j alternations. Prefer short concrete sentences."
+    },
+    "sna": {
+      "code": "sna",
+      "name": "Shona",
+      "tier": "low",
+      "samples": 4500,
+      "guidance": "Standard Shona. Keep the sv, zv, tsv digraphs; do not drift into Ndebele."
     }
   },
   "tasks": [],

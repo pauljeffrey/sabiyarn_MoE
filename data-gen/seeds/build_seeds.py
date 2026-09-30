@@ -122,7 +122,34 @@ _LANG_META = {
     "ful": ("Fulah", "low", "Uses ɓ ɗ ƴ ŋ. Latin script only -- not Adlam."),
     "fuv": ("Nigerian Fulfulde", "low", "Nigerian variety specifically, distinct from Pular/Fuuta."),
     "eng": ("English", "high", "Plain, concrete English. No flowery register."),
+    # ---- beyond West Africa. Volumes are proportional to L1+L2 speakers and capped below EVERY Nigerian
+    # language (see volumes/*.yaml), so the corpus stays Nigeria-first while covering the continent's largest
+    # languages. French is the exception: it is not population-scaled but included as the regional lingua
+    # franca, because Fon, Ewe and Fulfulde speakers live in Benin, Togo, Niger, Burkina and Cote d'Ivoire and
+    # conduct official business in it.
+    #
+    # ALL EIGHT NEED THE MODEL'S VOCABULARY RESIZED BEFORE THEY CAN BE TRAINED ON. Their language tags exist in
+    # BeardedMonster/SabiYarn-32k but sit ABOVE vocab_size 52050, so they cannot be embedded:
+    #     <zu> 52059  <sn> 52066  <som> 52075  <amh> 52079  <kin> 52080  <fra> 52089  <orm> 52112
+    # and Swahili has NO tag at all -- it needs one added. The text generates fine either way; it is the marker
+    # that cannot be embedded, so the data can be built now and used once the embedding is resized.
+    "swa": ("Swahili", "medium", "Standard Kiswahili. Keep it East African, not a Nigerian idiom translated."),
+    "fra": ("French", "high", "West African French as written in Benin, Togo, Senegal and Cote d'Ivoire -- not "
+                              "Parisian register. Keep accents correct: e a e u c."),
+    "zul": ("Zulu", "medium", "isiZulu with correct noun-class prefixes and hlonipha where a register calls "
+                              "for it. Do not drift into Xhosa."),
+    "amh": ("Amharic", "low", "Ethiopic script (Fidel). Short concrete sentences: this script tokenises at "
+                              "~8.75 tokens/word here, so every word is expensive."),
+    "som": ("Somali", "low", "Latin-script Somali with the correct doubled vowels and the letters c, x, q, "
+                             "dh. Do not drop them."),
+    "orm": ("Oromo", "low", "Afaan Oromoo in Qubee (Latin) with gemination and doubled vowels preserved."),
+    "kin": ("Kinyarwanda", "low", "Correct noun classes and the k/c, g/j alternations. Prefer short concrete "
+                                  "sentences."),
+    "sna": ("Shona", "low", "Standard Shona. Keep the sv, zv, tsv digraphs; do not drift into Ndebele."),
 }
+# Languages spoken principally in Nigeria. The new languages are capped at or below the smallest of these in
+# every phase, so adding continental coverage never outranks the corpus's home languages.
+NIGERIAN_LANGUAGES = ("pcm", "yor", "hau", "ibo", "efi", "urh", "fuv")
 
 
 def _load_volumes(kind: str) -> tuple[dict[str, int], dict[str, float]]:

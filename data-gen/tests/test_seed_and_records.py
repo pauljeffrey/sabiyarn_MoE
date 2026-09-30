@@ -1,6 +1,8 @@
 """Seed schema, deterministic planning, prompt building and record post-processing -- all offline."""
 import json
 
+from pathlib import Path
+
 import pytest
 
 from postprocess_gen import STATS, to_record
@@ -34,10 +36,37 @@ LOW_RESOURCE = ("efi", "urh", "fon", "ewe", "ful", "fuv")
 
 
 def test_pretrain_has_no_english(seeds):
-    """Pretraining is for the 12 target languages only."""
-    assert "eng" not in {l.code for l in seeds["pretrain"].languages}
-    assert len(seeds["pretrain"].languages) == 12
-    assert seeds["pretrain"].format["text_words"] == [300, 500]
+    """English is excluded from pretraining: the base model already has it, and the budget is better spent on
+    languages it does not. FRENCH is not excluded, deliberately -- it is the regional lingua franca for the
+    Fon, Ewe and Fulfulde-speaking countries, and the model has far less of it than of English."""
+    codes = {l.code for l in seeds["pretrain"].languages}
+    assert "eng" not in codes
+    assert "fra" in codes
+    assert len(codes) == 20, sorted(codes)          # 12 West African + 8 continental, minus English
+
+
+def test_added_languages_never_outrank_a_nigerian_one(seeds):
+    """The corpus stays Nigeria-first. Volumes for the eight continental languages are proportional to L1+L2
+    speakers, scaled so the largest (Swahili) sits at the SMALLEST volume any Nigerian language has in that
+    phase -- so no added language can outrank a home language in any phase."""
+    import sys as _sys
+    _sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "seeds"))
+    from build_seeds import NIGERIAN_LANGUAGES
+    added = {"swa", "fra", "zul", "amh", "som", "orm", "kin", "sna"}
+    for kind in ("pretrain", "sft", "rl"):
+        counts = {l.code: l.samples for l in seeds[kind].languages}
+        nigerian_floor = min(counts[c] for c in NIGERIAN_LANGUAGES if c in counts)
+        for code in added & set(counts):
+            assert counts[code] <= nigerian_floor, f"{kind}: {code}={counts[code]} > {nigerian_floor}"
+
+
+def test_added_language_volumes_track_speaker_numbers(seeds):
+    """Swahili has ~4x Kinyarwanda's speakers and gets ~4x the samples. French is the one exception and is
+    sized as a bridge language rather than by population."""
+    counts = {l.code: l.samples for l in seeds["pretrain"].languages}
+    assert counts["swa"] > counts["amh"] > counts["orm"] > counts["zul"] > counts["som"] > counts["kin"]
+    assert counts["kin"] == counts["sna"]           # equal speaker estimates, equal volume
+    assert abs(counts["swa"] / counts["kin"] - 100 / 15) < 1.5
 
 
 def test_seeds_load_and_validate(seeds):

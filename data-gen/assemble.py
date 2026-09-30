@@ -41,6 +41,12 @@ VALID_VERBS = {
 # Language tags that exist AND are below the model's vocab_size (52050); everything from <ibb> (52050) up
 # can never be embedded.
 VALID_LANGS = {"eng", "yor", "hau", "ibo", "efi", "urh", "twi", "fon", "pcm", "ewe", "aka", "ful", "fuv"}
+# Beyond West Africa. Their tags exist in the tokenizer but ALL sit above vocab_size 52050 and so cannot be
+# embedded yet (<zu> 52059, <sn> 52066, <som> 52075, <amh> 52079, <kin> 52080, <fra> 52089, <orm> 52112), and
+# Swahili has no tag at all. The generated TEXT is unaffected -- only the marker is -- so the corpus can be
+# built now and becomes trainable once the embedding is resized.
+PENDING_VOCAB_LANGS = {"swa", "fra", "zul", "amh", "som", "orm", "kin", "sna"}
+VALID_LANGS |= PENDING_VOCAB_LANGS
 # Label tokens a classification answer may legitimately open with.
 LABEL_TOKENS = {"sentiment": "<sentiment>", "topic": "<topic>", "intent": "<intent>", "toxic": "<toxic>",
                 "lang_id": "<lang_ID>", "ner": "<tag>", "answer": "<answer>", "summary": "<summary>",
@@ -100,7 +106,14 @@ _CHARS_PER_WORD = 5.5
 # ewe 1.6k, ful 1.3k, fuv 0.9k, efi 0.7k, urh 0.7k. The last four are thin -- re-measure them once there is
 # more text, with scripts/measure_tokens_per_word.py.
 _TOKENS_PER_WORD = {"pcm": 1.24, "eng": 1.28, "hau": 1.30, "ibo": 1.32, "yor": 1.31, "twi": 2.11, "aka": 2.06,
-                    "efi": 2.05, "urh": 1.53, "ewe": 2.50, "fon": 2.63, "ful": 1.99, "fuv": 1.99}
+                    "efi": 2.05, "urh": 1.53, "ewe": 2.50, "fon": 2.63, "ful": 1.99, "fuv": 1.99,
+                    # Measured the same way, on one representative sentence each. These are far worse than the
+                    # West African languages because the tokenizer was not trained on them: Yoruba costs 1.06
+                    # tokens/word, Zulu 3.50, and AMHARIC 8.75 -- its Ethiopic script falls back to bytes, so
+                    # every Amharic word costs about seven times a Yoruba one. Re-measure with
+                    # scripts/measure_tokens_per_word.py once there is real generated text.
+                    "fra": 2.08, "swa": 2.25, "zul": 3.50, "kin": 3.10, "som": 2.92, "orm": 2.91,
+                    "sna": 3.30, "amh": 8.75}
 
 
 def max_response_chars(lang: str) -> int:
