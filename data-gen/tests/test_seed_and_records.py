@@ -42,7 +42,7 @@ def test_pretrain_has_no_english(seeds):
     codes = {l.code for l in seeds["pretrain"].languages}
     assert "eng" not in codes
     assert "fra" in codes
-    assert len(codes) == 20, sorted(codes)          # 12 West African + 8 continental, minus English
+    assert len(codes) == 19, sorted(codes)          # 12 West African + 7 continental, minus English
 
 
 def test_added_languages_never_outrank_a_nigerian_one(seeds):
@@ -52,7 +52,7 @@ def test_added_languages_never_outrank_a_nigerian_one(seeds):
     import sys as _sys
     _sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "seeds"))
     from build_seeds import NIGERIAN_LANGUAGES
-    added = {"swa", "fra", "zul", "amh", "som", "orm", "kin", "sna"}
+    added = {"swa", "fra", "zul", "som", "orm", "kin", "sna"}
     for kind in ("pretrain", "sft", "rl"):
         counts = {l.code: l.samples for l in seeds[kind].languages}
         nigerian_floor = min(counts[c] for c in NIGERIAN_LANGUAGES if c in counts)
@@ -64,8 +64,10 @@ def test_added_language_volumes_track_speaker_numbers(seeds):
     """Every added language including French is scaled on speakers. French uses AFRICAN French (~150M) rather
     than global (~320M), because a Parisian speaker is not this corpus's audience."""
     counts = {l.code: l.samples for l in seeds["pretrain"].languages}
-    assert (counts["fra"] > counts["swa"] > counts["amh"] > counts["orm"]
+    assert (counts["fra"] > counts["swa"] > counts["orm"]
             > counts["zul"] > counts["som"] > counts["kin"])
+    # Amharic was removed: 7.55 tokens/word against Pidgin's 1.24 left a 75-word document at this budget.
+    assert "amh" not in counts
     assert counts["kin"] == counts["sna"]           # equal speaker estimates, equal volume
     assert abs(counts["fra"] / counts["kin"] - 150 / 15) < 1.5
 

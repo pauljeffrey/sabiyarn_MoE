@@ -139,8 +139,11 @@ _LANG_META = {
                               "u-circumflex, c-cedilla."),
     "zul": ("Zulu", "medium", "isiZulu with correct noun-class prefixes and hlonipha where a register calls "
                               "for it. Do not drift into Xhosa."),
-    "amh": ("Amharic", "low", "Ethiopic script (Fidel). Short concrete sentences: this script tokenises at "
-                              "~8.75 tokens/word here, so every word is expensive."),
+    # AMHARIC WAS REMOVED, and should not be re-added until the tokenizer covers Fidel. Measured on real
+    # generated text: its Ethiopic script falls back to bytes in BeardedMonster/SabiYarn-32k at 7.55 tokens per
+    # word, against Pidgin's 1.24 -- so one Amharic word costs 6.1 Pidgin words. At the 1,024-token budget that
+    # leaves a 75-word document, which is too short to teach anything, and no amount of prompting fixes an
+    # encoding cost. Extending the tokenizer to cover Fidel is the prerequisite, not more spend.
     "som": ("Somali", "low", "Latin-script Somali with the correct doubled vowels and the letters c, x, q, "
                              "dh. Do not drop them."),
     "orm": ("Oromo", "low", "Afaan Oromoo in Qubee (Latin) with gemination and doubled vowels preserved."),

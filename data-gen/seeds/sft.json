@@ -116,13 +116,6 @@
       "samples": 12000,
       "guidance": "West African French as written in Benin, Togo, Senegal and Cote d'Ivoire -- not Parisian register. Keep the accents correct: e-acute, e-grave, a-grave, u-circumflex, c-cedilla."
     },
-    "amh": {
-      "code": "amh",
-      "name": "Amharic",
-      "tier": "low",
-      "samples": 4600,
-      "guidance": "Ethiopic script (Fidel). Short concrete sentences: this script tokenises at ~8.75 tokens/word here, so every word is expensive."
-    },
     "orm": {
       "code": "orm",
       "name": "Oromo",

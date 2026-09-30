@@ -42,10 +42,10 @@ VALID_VERBS = {
 # can never be embedded.
 VALID_LANGS = {"eng", "yor", "hau", "ibo", "efi", "urh", "twi", "fon", "pcm", "ewe", "aka", "ful", "fuv"}
 # Beyond West Africa. Their tags exist in the tokenizer but ALL sit above vocab_size 52050 and so cannot be
-# embedded yet (<zu> 52059, <sn> 52066, <som> 52075, <amh> 52079, <kin> 52080, <fra> 52089, <orm> 52112), and
+# embedded yet (<zu> 52059, <sn> 52066, <som> 52075, <kin> 52080, <fra> 52089, <orm> 52112), and
 # Swahili has no tag at all. The generated TEXT is unaffected -- only the marker is -- so the corpus can be
 # built now and becomes trainable once the embedding is resized.
-PENDING_VOCAB_LANGS = {"swa", "fra", "zul", "amh", "som", "orm", "kin", "sna"}
+PENDING_VOCAB_LANGS = {"swa", "fra", "zul", "som", "orm", "kin", "sna"}
 VALID_LANGS |= PENDING_VOCAB_LANGS
 # Label tokens a classification answer may legitimately open with.
 LABEL_TOKENS = {"sentiment": "<sentiment>", "topic": "<topic>", "intent": "<intent>", "toxic": "<toxic>",
@@ -110,11 +110,11 @@ _TOKENS_PER_WORD = {"pcm": 1.24, "eng": 1.28, "hau": 1.30, "ibo": 1.32, "yor": 1
                     # MEASURED on real generated text (73 pretraining documents from gemma-3-27b), not on a
                     # single sentence -- the first estimates were within ~20% but these are what the budgets
                     # spend. All are worse than the West African languages because the tokenizer was not trained
-                    # on them, and Amharic is in a different category: its Ethiopic script falls back to bytes,
-                    # so one Amharic word costs 6.1 Pidgin words. At a 1,024-token budget that leaves an Amharic
-                    # document ~75 words long, which is not worth generating.
+                    # on them. Amharic was REMOVED over exactly this: it measured 7.55 tokens/word because its
+                    # Ethiopic script falls back to bytes, so one Amharic word cost 6.1 Pidgin words and a
+                    # 1,024-token budget left a 75-word document. It stays out until the tokenizer covers Fidel.
                     "fra": 2.09, "som": 2.39, "swa": 2.45, "orm": 2.69, "kin": 2.90, "sna": 3.12,
-                    "zul": 3.55, "amh": 7.55}
+                    "zul": 3.55}
 
 
 def max_response_chars(lang: str) -> int:
