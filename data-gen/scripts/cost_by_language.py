@@ -20,6 +20,10 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(HERE))
 sys.path.insert(0, str(HERE / "seeds"))
+# Seed.load() takes a KIND and resolves it relative to the working directory, so "rl" run from the repo root
+# finds the rl/ package directory instead of data-gen/seeds/rl.json. Load by explicit path instead, so this
+# script works from anywhere.
+_SEED_PATH = {k: str(HERE / "seeds" / f"{k}.json") for k in ("pretrain", "sft", "rl")}
 
 from assemble import _TOKENS_PER_WORD                       # noqa: E402
 from schemas.seed import Seed                               # noqa: E402
@@ -57,7 +61,7 @@ def main() -> int:
                     help="USD per 1M tokens; default is google/gemma-3-27b-it")
     a = ap.parse_args()
     pin, pout = a.price
-    S = {k: Seed.load(k) for k in ("pretrain", "sft", "rl")}
+    S = {k: Seed.load(_SEED_PATH[k]) for k in ("pretrain", "sft", "rl")}
     tiers = {l.code: l.tier for l in S["sft"].languages}
     codes = sorted({l.code for s in S.values() for l in s.languages})
 
