@@ -1053,3 +1053,40 @@ def test_a_pretrain_pack_splits_back_into_one_record_each(seeds):
     assert len(recs) == 3
     assert [r["id"] for r in recs] == ["a", "b", "c"]
     assert all(r["lang"] == "yor" and len(r["text"].split()) == 120 for r in recs)
+
+
+def test_a_recycled_vocabulary_is_caught_where_the_ngram_gates_pass_it():
+    """The fourth gate, and the one that caught what the other three let through. A live run's first printed
+    sample was an Ewe document recycling about thirty words across 138, with the same phrases reappearing in
+    slightly different company each time:
+
+        d4 = 0.644 (above the 0.60 floor)   d8 = 0.901   no verbatim sentence repeat   ->  PASSED
+
+    The n-gram measures miss it precisely because the surroundings vary; the vocabulary does not. Its
+    type-token ratio was 0.188 against a minimum of 0.265 across 55 documents already judged good."""
+    from postprocess_gen import (DEGENERATE_4GRAM_FLOOR, degenerate_reason, type_token_ratio,
+                                 _distinct_ngram)
+    looped = ("Nu le hafie me, woanye dzo nu le voto me. Nu le hafie me, woanye dzo nu le voto me, eye wo "
+              "nye dokple. Eye woanye dzo nu le hafie me be wo nyae nu, be wo nyae nu. Nu le hafie me, wo "
+              "nyae nu. Wo dzo nu le voto me, eye wo nye dokple. Woanye dzo nu le hafie me be wo nyae nu, "
+              "eye woanye dzo nu le voto me be wo nyae nu. Nu le hafie me, woanye dzo nu le voto me.")
+    assert _distinct_ngram(looped, 4) > DEGENERATE_4GRAM_FLOOR, "the n-gram gate should pass this"
+    assert type_token_ratio(looped) < 0.25
+    assert (degenerate_reason(looped) or "").startswith("ttr=")
+
+
+def test_the_ttr_floor_does_not_reject_good_documents():
+    """Calibrated on 55 documents already judged good, whose ratios run 0.265-0.379. A floor that rejected
+    real prose would be worse than no floor."""
+    from postprocess_gen import DEGENERATE_TTR_FLOOR, degenerate_reason, type_token_ratio
+    healthy = " ".join(
+        f"the {w} farmer in Kumasi weighed {w} bags before dawn and priced them again at dusk"
+        for w in ("first", "second", "third", "fourth", "fifth", "sixth", "seventh", "eighth"))
+    assert type_token_ratio(healthy) > DEGENERATE_TTR_FLOOR
+    assert degenerate_reason(healthy) is None
+
+
+def test_the_ttr_gate_ignores_short_passages():
+    """Type-token ratio is length-dependent, so it is only applied where it means something."""
+    from postprocess_gen import degenerate_reason
+    assert degenerate_reason("ade ade ade ade ade ade ade ade ade ade ade ade") is None

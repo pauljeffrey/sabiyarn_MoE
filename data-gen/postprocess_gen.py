@@ -331,6 +331,20 @@ def _distinct_ngram(text: str, n: int = 4) -> float:
 # 0.14-0.19 / 0.17-0.22.
 DEGENERATE_4GRAM_FLOOR = 0.60
 DEGENERATE_8GRAM_FLOOR = 0.50
+# TYPE-TOKEN RATIO: unique words over total words. The fourth gate, and the one that caught what the other
+# three let through -- a live run's first printed sample was an Ewe document recycling about thirty words for
+# 138, with "nu le hafié me" and "woanye dzɔ" reappearing in slightly different company each time:
+#
+#     d4 = 0.644 (above the 0.60 floor)   d8 = 0.901   no verbatim sentence repeat   ->  PASSED
+#     type-token ratio = 0.188
+#
+# The n-gram measures miss it precisely because the SURROUNDINGS vary; the vocabulary does not. Calibrated
+# against 55 documents already judged good, whose ratios run min 0.265, 5th percentile 0.283, median 0.379. A
+# floor of 0.25 sits below every one of them and above the failure, and holds across the 60-420 word range these
+# documents occupy (a fixed floor would be wrong over a much wider range, since longer text naturally repeats
+# more function words).
+DEGENERATE_TTR_FLOOR = 0.25
+_TTR_MIN_WORDS = 80
 
 
 # A whole sentence repeated word for word. This is the sharpest of the three, and the n-gram ratios miss it:
@@ -355,11 +369,21 @@ def repeated_sentence(text: str) -> Optional[str]:
     return None
 
 
+def type_token_ratio(text: str) -> float:
+    words = [w.lower().strip(".,;:!?'\u2019\"()") for w in (text or "").split()]
+    words = [w for w in words if w]
+    return len(set(words)) / max(len(words), 1)
+
+
 def degenerate_reason(text: str, *, min_words: int = 40) -> Optional[str]:
     """Why this passage looks looped, or None if it is fine."""
     words = (text or "").split()
     if len(words) < min_words:
         return None
+    if len(words) >= _TTR_MIN_WORDS:
+        ttr = type_token_ratio(text)
+        if ttr < DEGENERATE_TTR_FLOOR:
+            return f"ttr={ttr:.2f}"
     d4 = _distinct_ngram(text, 4)
     if d4 < DEGENERATE_4GRAM_FLOOR:
         return f"4gram={d4:.2f}"
