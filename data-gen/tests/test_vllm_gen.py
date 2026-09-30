@@ -303,7 +303,11 @@ def test_pretrain_context_sets_the_document_size():
         finally:
             budgets._DEFAULT_BY_KIND["pretrain"] = saved
 
-    assert max(words("yor", 1_000)) < max(words("yor", 2_000))
+    # Below the word CEILING, a larger context buys a longer document; above it, nothing does, because
+    # gemma-3-27b writes ~350 words whatever it is asked for (see prompts._MAX_PRETRAIN_WORDS).
+    from prompts import _MAX_PRETRAIN_WORDS
+    assert max(words("yor", 512)) < max(words("yor", 1_024))
+    assert max(words("yor", 4_000)) <= _MAX_PRETRAIN_WORDS * 1.1
     assert budget_for("pretrain", 1_000).pretrain_tokens == 1_000
 
     # Per-language conversion. Averaged over several rows, because each row also draws a length-variation

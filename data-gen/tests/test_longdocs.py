@@ -524,8 +524,11 @@ def test_summary_documents_are_not_capped_to_the_rag_band(seed):
 def test_rag_samples_keep_a_normal_conversation_shape(seed):
     """A summarisation document IS the conversation; a RAG document is retrieved mid-conversation and must not
     collapse it to one turn."""
+    # rag_document_qa lives in the RL seed now: its lesson is a comparison between two replies, which SFT
+    # cannot express. The document machinery is identical either way.
+    from schemas.seed import Seed
     doc = {**_doc(3000), "rag": True}
-    req = build_request(seed, _row("yor", 5, "rag_document_qa"), doc)
+    req = build_request(Seed.load("rl"), _row("yor", 5, "rag_document_qa"), doc)
     assert req.metadata["min_user_turns"] >= 3
     assert len(req.metadata["tasks"]) > 1
     # the user still writes their own language: a tool result does not change what came IN

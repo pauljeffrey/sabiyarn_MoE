@@ -304,10 +304,25 @@ def _task(name, tags, share, description, plan=(), flags=(), tools=False, think=
                     languages=langs, notes=notes)
 
 
-# Every tag in schemas.seed.TAGS gets its own task, so each is separately countable, auditable and
-# holdable-out. The three knowledge-boundary behaviours total ~22% -- the largest block -- because they are
-# the point of the project and the hardest thing to teach.
-SFT_TASKS = [
+# ---------------------------------------------------------------------------
+# WHICH PHASE TEACHES WHAT. Revised: behaviour is shaped in RL, competence in SFT.
+#
+# The knowledge-boundary behaviours -- looking something up rather than guessing, admitting ignorance, noticing
+# that a retrieval did not answer the question -- are PREFERENCES between two possible replies, not a single
+# correct string. SFT can only show one answer and say "imitate this"; it cannot express that a confident
+# invention is WORSE than an admission, which is the entire lesson. A preference pair can, so these tasks
+# belong in RL where a judge ranks them.
+#
+# SFT keeps what does have a single good answer: explaining how the world works, translating, summarising,
+# labelling, writing. Competence first, then the behaviour that governs when to use it.
+#
+# Every tag in schemas.seed.TAGS still gets a task somewhere, so each stays separately countable, auditable and
+# holdable-out.
+BEHAVIOUR_TASKS = {
+    "tool_search_answer", "tool_chain_insufficient", "no_tool_admit_unknown", "retrieval_insufficient",
+    "rag_document_qa", "tool_compute", "tool_database", "action_tool_use",
+}
+ALL_TASKS = [
     # ---- knowledge boundary: the reason this corpus exists
     _task("tool_search_answer", ["tool-calling", "knowledge-boundary", "qa"], 9.0,
           "User asks about something the assistant plainly has not learned (a product, company, acronym, "
@@ -461,13 +476,36 @@ SFT_TASKS = [
           plan=["<|chat|>"]),
 ]
 
-# RL reuses the same task vocabulary but concentrates on what a judge can actually separate: honesty under
-# uncertainty, correct tool choice, and grounding.
+# SFT: everything that has ONE good answer. The behaviour tasks are excluded and re-weighted proportionally,
+# so world knowledge -- the base the whole design rests on -- becomes the largest block rather than a third of
+# the corpus being spent on preferences SFT cannot express.
+_SFT_EXTRA_WEIGHT = {
+    # Where the freed share goes. World knowledge takes most of it: a 306M model that cannot explain how a
+    # generator works has nothing to be honest ABOUT, and this is the phase that teaches that.
+    "world_knowledge_qa": 22.0, "health_education": 8.0, "health_triage": 5.0,
+    "translation_english": 8.0, "translation_interlanguage": 6.0, "summarization": 5.0,
+    "long_document_summarization": 5.0, "rephrasing_and_writing": 7.0, "general_chat": 5.0,
+    "structured_output": 5.0, "financial_analysis": 4.0,
+}
+SFT_TASKS = [
+    TaskSpec(t.name, t.tags, t.description, share=_SFT_EXTRA_WEIGHT.get(t.name, t.share),
+             task_plan=t.task_plan, domain_flags=t.domain_flags, uses_tools=t.uses_tools,
+             requires_think=t.requires_think, languages=t.languages, notes=t.notes)
+    for t in ALL_TASKS if t.name not in BEHAVIOUR_TASKS
+]
+
+# RL: the behaviour. These are the tasks where the lesson is a COMPARISON -- an honest admission beats a
+# confident invention, a grounded answer beats one built from an irrelevant snippet, and over-refusal when the
+# answer was available is its own failure. None of those can be expressed by a single target string, which is
+# why they moved here. A handful of non-behaviour tasks stay at low weight so the policy is not optimised
+# purely on refusal and forgets how to answer.
 _RL_WEIGHTS = {
-    "tool_search_answer": 15.0, "no_tool_admit_unknown": 12.0, "retrieval_insufficient": 14.0,
-    "rag_document_qa": 13.0, "tool_compute": 6.0, "tool_database": 5.0, "action_tool_use": 6.0,
-    "world_knowledge_qa": 9.0, "health_advice": 6.0, "health_triage": 5.0, "financial_analysis": 4.0,
-    "structured_output": 2.0, "translation_english": 2.0, "translation_interlanguage": 1.0,
+    # the behaviour, ~78%
+    "tool_search_answer": 16.0, "retrieval_insufficient": 15.0, "no_tool_admit_unknown": 14.0,
+    "rag_document_qa": 13.0, "tool_chain_insufficient": 10.0, "action_tool_use": 4.0,
+    "tool_compute": 3.0, "tool_database": 3.0,
+    # competence held in, ~22%, so the policy does not learn that refusing is always safe
+    "world_knowledge_qa": 12.0, "health_advice": 4.0, "health_triage": 3.0, "financial_analysis": 3.0,
 }
 RL_TASKS = [
     TaskSpec(t.name, t.tags, t.description, share=_RL_WEIGHTS[t.name], task_plan=t.task_plan,
@@ -476,7 +514,7 @@ RL_TASKS = [
              notes="Candidates must differ in a way a judge can rank: one grounded and honest, one "
                    "confidently wrong or invented. Never two paraphrases of the same answer. Over-refusal "
                    "where the answer WAS available counts as the wrong one.")
-    for t in SFT_TASKS if t.name in _RL_WEIGHTS
+    for t in ALL_TASKS if t.name in _RL_WEIGHTS
 ]
 
 # The input/output language pattern. Sampled on its own odometer so the distribution is EXACTLY even across

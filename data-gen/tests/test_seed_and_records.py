@@ -4,6 +4,19 @@ import json
 import pytest
 
 from postprocess_gen import STATS, to_record
+
+
+def seed_with(seeds, task):
+    """The seed that owns `task`.
+
+    Behaviour tasks -- tool use, retrieval, admitting ignorance -- moved from sft to rl, because their lesson is
+    a COMPARISON between two replies (a confident invention is worse than an admission) and an SFT target can
+    only show one. A test about those has to ask the rl seed; the task no longer exists in sft at all.
+    """
+    for kind in ("sft", "rl"):
+        if any(t.name == task for t in seeds[kind].tasks):
+            return seeds[kind]
+    raise AssertionError(f"no seed owns {task!r}")
 from prompts import build_request
 from providers.base import Response
 from schemas.seed import TAGS, Seed
@@ -44,11 +57,17 @@ def test_seeds_load_and_validate(seeds):
 
 def test_requested_volumes_meet_the_agreed_floors(seeds):
     sft = {l.code: l.samples for l in seeds["sft"].languages}
-    assert 150_000 <= seeds["sft"].total_samples() <= 200_000, seeds["sft"].total_samples()
+    rl = {l.code: l.samples for l in seeds["rl"].languages}
+    assert seeds["sft"].total_samples() >= 200_000, seeds["sft"].total_samples()
     assert sft["pcm"] >= 50_000
     for c in LOW_RESOURCE + ("yor", "twi", "ibo", "hau"):
         assert sft[c] >= 10_000, f"sft {c} = {sft[c]}, below the 10k floor"
-    assert 60_000 <= seeds["rl"].total_samples() <= 70_000, seeds["rl"].total_samples()
+    # RL carries the BEHAVIOUR now, so it is no longer a light polish on top of SFT: the knowledge-boundary
+    # tasks moved here because their lesson is a comparison between two replies, and the phase has to be big
+    # enough to teach them.
+    assert seeds["rl"].total_samples() >= 150_000, seeds["rl"].total_samples()
+    for c in LOW_RESOURCE + ("yor", "twi", "ibo", "hau", "pcm", "eng"):
+        assert rl[c] >= 9_000, f"rl {c} = {rl[c]}"
 
 
 def test_yield_budget_over_requests_so_the_target_lands(seeds):
@@ -62,12 +81,17 @@ def test_yield_budget_over_requests_so_the_target_lands(seeds):
 
 
 def test_every_tag_has_its_own_task(seeds):
-    """Bundled tags cannot be counted or held out separately, so each gets a task."""
-    for kind in ("sft",):
-        covered = {t for task in seeds[kind].tasks for t in task.tags}
-        assert covered == set(TAGS), f"{kind} missing {sorted(set(TAGS) - covered)}"
-
-
+    """Every tag stays separately countable, auditable and holdable-out -- but now across the UNION of sft and
+    rl, not sft alone. The knowledge-boundary tags moved to rl with the behaviour tasks, because their lesson
+    is a comparison between two replies and an SFT target can only show one."""
+    covered = {g for kind in ("sft", "rl") for task in seeds[kind].tasks for g in task.tags}
+    missing = set(TAGS) - covered
+    assert not missing, f"no task in any phase carries {sorted(missing)}"
+    sft_tags = {g for task in seeds["sft"].tasks for g in task.tags}
+    rl_tags = {g for task in seeds["rl"].tasks for g in task.tags}
+    for behaviour in ("knowledge-boundary", "insufficient-context", "rag", "extractive-qa"):
+        assert behaviour in rl_tags, f"{behaviour} should be in rl"
+        assert behaviour not in sft_tags, f"{behaviour} should have left sft"
 def test_translation_covers_english_and_interlanguage(seeds):
     names = {t.name for t in seeds["sft"].tasks}
     assert {"translation_english", "translation_interlanguage"} <= names
@@ -92,14 +116,25 @@ def test_plan_totals_match_per_language_volumes(seeds):
             assert sum(plan[lang.code].values()) == s.requests_for(lang), f"{kind}/{lang.code}"
 
 
-def test_knowledge_boundary_is_the_biggest_block(seeds):
-    """The behaviours the project exists to teach must dominate the mix, or this is just another chat corpus."""
-    shares = seeds["sft"].task_shares()
-    boundary = sum(shares[t.name] for t in seeds["sft"].tasks
-                   if {"knowledge-boundary", "insufficient-context"} & set(t.tags))
-    assert boundary > 0.20, f"knowledge-boundary tasks are only {boundary:.0%} of the mix"
+def test_knowledge_boundary_is_the_biggest_block_of_RL(seeds):
+    """It used to be the biggest block of SFT. It moved, because the lesson in each of those tasks is that one
+    reply is WORSE than another -- a confident invention against an admission -- and a single SFT target cannot
+    express a comparison. SFT is now dominated by world knowledge instead: a model that cannot explain how a
+    generator works has nothing to be honest about."""
+    behaviour = {"tool_search_answer", "retrieval_insufficient", "no_tool_admit_unknown", "rag_document_qa",
+                 "tool_chain_insufficient", "action_tool_use", "tool_compute", "tool_database"}
+    rl = seeds["rl"]
+    rl_total = sum(t.share for t in rl.tasks)
+    got = sum(t.share for t in rl.tasks if t.name in behaviour) / rl_total
+    assert got > 0.70, f"behaviour is only {got:.0%} of rl"
+    # and competence is held in, so the policy does not learn that refusing is always safe
+    assert sum(t.share for t in rl.tasks if t.name not in behaviour) / rl_total > 0.15
 
-
+    sft = seeds["sft"]
+    sft_total = sum(t.share for t in sft.tasks)
+    wk = next(t for t in sft.tasks if t.name == "world_knowledge_qa")
+    assert wk.share / sft_total > 0.20, "world knowledge should be the largest block of sft"
+    assert not (behaviour & {t.name for t in sft.tasks}), "a behaviour task is still in sft"
 def test_seed_rejects_unknown_keys(tmp_path):
     bad = tmp_path / "bad.json"
     bad.write_text(json.dumps({"kind": "sft", "details": "x", "languages": {}, "nonsense": 1}))
@@ -147,10 +182,11 @@ def test_languages_get_different_slices_of_the_taxonomy(seeds):
 
 
 def test_prompt_building_is_deterministic_and_covers_the_taxonomy(seeds):
-    row = {"custom_id": "sft__yor__rag_document_qa__000001", "lang": "yor",
+    row = {"custom_id": "rl__yor__rag_document_qa__000001", "lang": "yor",
            "task": "rag_document_qa", "index": 1}
-    a = build_request(seeds["sft"], row)
-    b = build_request(seeds["sft"], row)
+    rag = seed_with(seeds, "rag_document_qa")
+    a = build_request(rag, row)
+    b = build_request(rag, row)
     assert a.messages == b.messages and a.metadata == b.metadata
 
     # index walks distinct (domain, subtopic) pairs rather than resampling the same few
@@ -164,8 +200,9 @@ def test_prompt_building_is_deterministic_and_covers_the_taxonomy(seeds):
 def test_the_contract_asks_for_fields_not_marker_strings(seeds):
     """The generator got the finished marker string wrong in 88 of 108 published records, so it is no longer
     asked for one: it returns fields and assemble.py builds the scaffolding."""
-    req = build_request(seeds["sft"], {"custom_id": "sft__fon__tool_search_answer__000003",
-                                       "lang": "fon", "task": "tool_search_answer", "index": 3})
+    req = build_request(seed_with(seeds, "tool_search_answer"),
+                        {"custom_id": "rl__fon__tool_search_answer__000003",
+                         "lang": "fon", "task": "tool_search_answer", "index": 3})
     brief = req.messages[0]["content"]
     assert "OUTPUT CONTRACT" in brief
     assert "never write <|input_lang|>" in brief
@@ -180,8 +217,9 @@ def test_distractors_are_withheld_from_the_generator(seeds):
     """Distractors are injected at post-processing, not shown to the generator: it called them 12 times in
     35 once few-shot was added, and their definitions cost 300-1,200 input tokens for no generative benefit."""
     for i in range(30):
-        req = build_request(seeds["sft"], {"custom_id": f"sft__ibo__action_tool_use__{i:06d}",
-                                           "lang": "ibo", "task": "action_tool_use", "index": i})
+        req = build_request(seed_with(seeds, "action_tool_use"),
+                            {"custom_id": f"rl__ibo__action_tool_use__{i:06d}",
+                             "lang": "ibo", "task": "action_tool_use", "index": i})
         md = req.metadata
         d = md["distractor_tools"]
         assert 2 <= len(d) <= 3, d
@@ -253,12 +291,12 @@ def test_tools_referenced_by_a_task_are_in_scope(seeds):
     for i in range(60):
         row = {"custom_id": f"sft__hau__financial_analysis__{i:06d}", "lang": "hau",
                "task": "financial_analysis", "index": i}
-        md = build_request(seeds["sft"], row).metadata
+        md = build_request(seed_with(seeds, "financial_analysis"), row).metadata
         assert "get_exchange_rate" in md["tools"] and "calculate" in md["tools"]
     for i in range(40):
-        row = {"custom_id": f"sft__ibo__rag_document_qa__{i:06d}", "lang": "ibo",
+        row = {"custom_id": f"rl__ibo__rag_document_qa__{i:06d}", "lang": "ibo",
                "task": "rag_document_qa", "index": i}
-        assert "search_documents" in build_request(seeds["sft"], row).metadata["tools"]
+        assert "search_documents" in build_request(seed_with(seeds, "rag_document_qa"), row).metadata["tools"]
 
 
 def test_only_usable_special_tokens_are_asked_for(seeds):
@@ -542,16 +580,18 @@ def test_expected_markers_match_the_direction(seeds):
 
 
 def test_rag_context_is_specified_as_english(seeds):
-    rag = next(t for t in seeds["sft"].tasks if t.name == "rag_document_qa")
+    seed = seed_with(seeds, "rag_document_qa")
+    rag = next(t for t in seed.tasks if t.name == "rag_document_qa")
     assert "ALWAYS IN ENGLISH" in rag.description
-    req = build_request(seeds["sft"], {"custom_id": "sft__fon__rag_document_qa__000001",
-                                      "lang": "fon", "task": "rag_document_qa", "index": 1})
+    req = build_request(seed, {"custom_id": "rl__fon__rag_document_qa__000001",
+                               "lang": "fon", "task": "rag_document_qa", "index": 1})
     assert "ALWAYS IN ENGLISH" in req.messages[0]["content"]
 
 
 def test_think_is_allowed_before_and_after_tool_use(seeds):
-    brief = build_request(seeds["sft"], {"custom_id": "sft__yor__tool_search_answer__000001",
-                                        "lang": "yor", "task": "tool_search_answer", "index": 1}
+    brief = build_request(seed_with(seeds, "tool_search_answer"),
+                          {"custom_id": "rl__yor__tool_search_answer__000001",
+                           "lang": "yor", "task": "tool_search_answer", "index": 1}
                           ).messages[0]["content"]
     # a tool round trip is two assistant turns, and the second gets its own think
     assert "takes ANOTHER turn" in brief and "fresh `think`" in brief
@@ -587,7 +627,7 @@ def test_packing_refuses_mixed_languages(seeds):
 
 
 def test_packed_response_splits_into_records(seeds):
-    from postprocess_gen import STATS, to_records
+    from postprocess_gen import to_records
     from prompts import build_packed_request
     rows = [{"custom_id": f"sft__yor__general_chat__{i:06d}", "lang": "yor",
              "task": "general_chat", "index": i} for i in range(2)]
@@ -602,7 +642,8 @@ def test_packed_response_splits_into_records(seeds):
 
 def test_a_pack_that_loses_ordering_is_discarded(seeds):
     """More samples than specs means the model lost track and nothing can be trusted to match its spec."""
-    from postprocess_gen import STATS, to_records
+    from postprocess_gen import STATS, to_record
+    from postprocess_gen import to_records
     from prompts import build_packed_request
     rows = [{"custom_id": f"sft__yor__general_chat__{i:06d}", "lang": "yor",
              "task": "general_chat", "index": i} for i in range(2)]
@@ -627,9 +668,10 @@ def test_fewshot_attaches_only_to_the_low_resource_tier(seeds, monkeypatch):
         pytest.skip("seeds/fewshot.json not built")
 
     def sysmsg(lang):
-        return build_request(seeds["sft"], {"custom_id": f"sft__{lang}__rag_document_qa__000001",
-                                           "lang": lang, "task": "rag_document_qa",
-                                           "index": 1}).messages[0]["content"]
+        return build_request(seed_with(seeds, "rag_document_qa"),
+                             {"custom_id": f"rl__{lang}__rag_document_qa__000001",
+                              "lang": lang, "task": "rag_document_qa",
+                              "index": 1}).messages[0]["content"]
 
     assert "WORKED EXAMPLES" in sysmsg("efi")      # low
     assert "WORKED EXAMPLES" in sysmsg("fon")      # low
@@ -913,7 +955,10 @@ def test_low_resource_pretrain_documents_are_shorter():
         unscaled = target / _TOKENS_PER_WORD[low]
         assert max(words(low)) <= unscaled * _LOW_TIER_SCALE * 1.1, low
     for ok in ("yor", "hau", "ibo", "pcm"):
-        unscaled = target / _TOKENS_PER_WORD[ok]
+        # The word ceiling can bind before the tier scale does, so compare against the scaled figure the
+        # ceiling allows rather than the raw conversion.
+        from prompts import _MAX_PRETRAIN_WORDS
+        unscaled = min(target / _TOKENS_PER_WORD[ok], _MAX_PRETRAIN_WORDS)
         assert max(words(ok)) > unscaled * _LOW_TIER_SCALE * 1.1, ok
 
 

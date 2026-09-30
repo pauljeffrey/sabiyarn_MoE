@@ -215,6 +215,49 @@ _PRETRAIN_SPREAD = ((0.70, 0.82), (0.80, 0.92), (0.88, 1.00), (0.94, 1.06))
 _LOW_TIER_SCALE = 0.55
 
 
+# CONCRETE ANGLES the document must cover. A word count alone does not produce words: gemma-3-27b wrote a
+# median of 111 against a ~209-word target because "write 209 words" is not a plan, it is a quota. Naming three
+# or four specific things to say turns one vague instruction into small tasks the model can each finish -- the
+# same mechanism that took long documents from 635 to 4,344 words, scaled down.
+#
+# Deliberately mechanism-and-specifics led, which is also the corpus's own brief: how and why over what it is
+# called. None of them require inventing statistics or naming real people.
+_ANGLES = [
+    "how it actually works, step by step, in the order the steps happen",
+    "what it costs, with real prices in naira, cedi or CFA, and what you get for that money",
+    "who does this work, at what time of day or season, and what they handle it with",
+    "what commonly goes wrong, and WHY it goes wrong rather than just that it does",
+    "how you can tell it has been done properly, and what a bad job looks like",
+    "what people did before, and what changed",
+    "one concrete example followed all the way through from start to finish",
+    "how it differs between a town and a village, or between the rainy and dry season",
+    "what a beginner gets wrong on their first attempt",
+    "how it connects to something else in daily life that the reader already knows",
+]
+# Words one angle carries. A document is given ceil(target / this) angles, bounded, so a short one is not
+# fragmented and a long one is not asked to fill 800 words from a single idea.
+_WORDS_PER_ANGLE = 70
+_MIN_ANGLES, _MAX_ANGLES = 2, 6
+# CEILING on the words a pretraining document is asked for, and it is a measurement rather than a preference.
+# gemma-3-27b writes ~350 words whatever it is told: asked for 543-828 on yor/hau/ibo/pcm it produced medians of
+# 232-388, and asked for ~209 on the low-resource six it produced 128. Adding concrete angles to cover moved the
+# low-resource median from 111 to 128 and no further. It is a habitual length, not a comprehension failure.
+#
+# Asking for more than that is worse than pointless: it makes every document look like an under-delivery, and it
+# invites padding, which the repetition gates then discard. So the ask is capped at what is actually produced.
+#
+# This costs pretraining little. The corpus is concatenated and cut into block_size 4096 windows anyway, so what
+# matters is BREADTH -- 636 (domain, sub-topic) pairs x 28 genres -- not the length of any one document. Long
+# documents matter for SFT summarisation, and that phase already builds them in stages (longdocs.py), which is
+# the fix for a model that will not write to length in one pass.
+_MAX_PRETRAIN_WORDS = 420
+
+
+def _angles_for(target_words: int, rng: random.Random) -> list[str]:
+    n = max(_MIN_ANGLES, min(_MAX_ANGLES, -(-target_words // _WORDS_PER_ANGLE)))
+    return rng.sample(_ANGLES, k=min(n, len(_ANGLES)))
+
+
 def _pretrain_length(seed: Seed, lang, rng: random.Random) -> tuple[int, int]:
     from assemble import _TOKENS_PER_WORD
     from budgets import budget_for
@@ -223,6 +266,7 @@ def _pretrain_length(seed: Seed, lang, rng: random.Random) -> tuple[int, int]:
     words = target / _TOKENS_PER_WORD.get(lang.code, 2.5)
     if lang.tier == "low":
         words *= _LOW_TIER_SCALE
+    words = min(words, _MAX_PRETRAIN_WORDS)
     lo_f, hi_f = rng.choice(_PRETRAIN_SPREAD)
     return max(60, int(words * lo_f)), max(90, int(words * hi_f))
 
@@ -233,6 +277,7 @@ def _pretrain_request(seed: Seed, row: dict) -> Request:
     rng = _rng(row["custom_id"])
     register = rng.choice(_REGISTERS)
     lo, hi = _pretrain_length(seed, lang, rng)
+    angles = "\n".join(f"  {n}. {a}" for n, a in enumerate(_angles_for(hi, rng), start=1))
     d = DOMAINS[domain]
     g = GENRES[genre]
 
@@ -250,6 +295,9 @@ Sub-topic: {subtopic}
 Genre: {getattr(g, 'text', genre)}
 Register: {register}
 Length: {lo}-{hi} words.
+
+COVER THESE, each in its own paragraph, in this order:
+{angles}
 
 Requirements:
 - Entirely in {lang.name}. No English except words the language genuinely borrows.
@@ -274,7 +322,8 @@ Return JSON: {{"title": "<short natural title in {lang.name}>", "text": "<the do
         max_tokens=max(1800, min(4096, int(hi * 4))), temperature=0.95,
         response_format={"type": "json_object"},
         metadata={"kind": "pretrain", "lang": lang.code, "domain": domain, "subtopic": subtopic,
-                  "genre": genre, "register": register, "target_words": [lo, hi]},
+                  "genre": genre, "register": register, "target_words": [lo, hi],
+                  "angles": angles.count("\n") + 1},
     )
 
 
@@ -685,13 +734,16 @@ def _packed_pretrain_request(seed: Seed, rows: list[dict]) -> Request:
         d = DOMAINS[md["domain"]]
         g = GENRES[md["genre"]]
         lo, hi = md["target_words"]
+        angles = _angles_for(hi, _rng(req.custom_id + "angles"))
         specs.append(
             f"--- DOCUMENT {i} of {len(rows)} ---\n"
             f"Domain: {d.name} -- {d.description}\n"
             f"Sub-topic: {md['subtopic']}\n"
             f"Genre: {getattr(g, 'text', md['genre'])}\n"
             f"Register: {md['register']}\n"
-            f"Length: {lo}-{hi} words.")
+            f"Length: {lo}-{hi} words.\n"
+            f"Cover these, each in its own paragraph:\n"
+            + "\n".join(f"    {n}. {a}" for n, a in enumerate(angles, start=1)))
 
     user = (
         f"Write {len(rows)} SEPARATE documents in {lang.name}, one for each specification below.\n\n"

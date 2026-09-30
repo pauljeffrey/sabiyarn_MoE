@@ -15,91 +15,91 @@
       "code": "pcm",
       "name": "Nigerian Pidgin",
       "tier": "high",
-      "samples": 17000,
+      "samples": 45000,
       "guidance": "English-lexified creole. Keep it genuinely Pidgin, not English with dropped copulas."
     },
     "yor": {
       "code": "yor",
       "name": "Yoruba",
       "tier": "medium",
-      "samples": 6000,
+      "samples": 20000,
       "guidance": "Tone marks and under-dots are mandatory and meaning-bearing: ọ ẹ ṣ plus diacritics."
     },
     "hau": {
       "code": "hau",
       "name": "Hausa",
       "tier": "medium",
-      "samples": 6000,
+      "samples": 20000,
       "guidance": "Use hooked letters ɓ ɗ ƙ and the apostrophe in 'y correctly."
     },
     "ibo": {
       "code": "ibo",
       "name": "Igbo",
       "tier": "medium",
-      "samples": 6000,
+      "samples": 20000,
       "guidance": "Dotted vowels ị ọ ụ and the nasal ṅ are required."
     },
     "twi": {
       "code": "twi",
       "name": "Twi (Akan)",
       "tier": "medium",
-      "samples": 4000,
+      "samples": 14000,
       "guidance": "Use ɛ and ɔ. Keep Asante Twi consistent within a sample."
     },
     "aka": {
       "code": "aka",
       "name": "Akan",
       "tier": "medium",
-      "samples": 3000,
+      "samples": 12000,
       "guidance": "Closely related to Twi; keep them distinguishable."
     },
     "efi": {
       "code": "efi",
       "name": "Efik",
       "tier": "low",
-      "samples": 3500,
+      "samples": 9000,
       "guidance": "Very low-resource. Watch for drift into Ibibio. Prefer short concrete sentences."
     },
     "urh": {
       "code": "urh",
       "name": "Urhobo",
       "tier": "low",
-      "samples": 3500,
+      "samples": 9000,
       "guidance": "Very low-resource. Prefer short, concrete sentences over ambitious prose."
     },
     "fon": {
       "code": "fon",
       "name": "Fon",
       "tier": "low",
-      "samples": 3500,
+      "samples": 9000,
       "guidance": "Uses ɖ ɛ ɔ and tone marks. Do not drift into French."
     },
     "ewe": {
       "code": "ewe",
       "name": "Ewe",
       "tier": "low",
-      "samples": 3500,
+      "samples": 9000,
       "guidance": "Uses ɖ ƒ ŋ ɣ ʋ and tone marks."
     },
     "ful": {
       "code": "ful",
       "name": "Fulah",
       "tier": "low",
-      "samples": 3500,
+      "samples": 9000,
       "guidance": "Uses ɓ ɗ ƴ ŋ. Latin script only -- not Adlam."
     },
     "fuv": {
       "code": "fuv",
       "name": "Nigerian Fulfulde",
       "tier": "low",
-      "samples": 3500,
+      "samples": 9000,
       "guidance": "Nigerian variety specifically, distinct from Pular/Fuuta."
     },
     "eng": {
       "code": "eng",
       "name": "English",
       "tier": "high",
-      "samples": 2000,
+      "samples": 15000,
       "guidance": "Plain, concrete English. No flowery register."
     }
   },
@@ -112,8 +112,28 @@
         "qa"
       ],
       "description": "User asks about something the assistant plainly has not learned (a product, company, acronym, recent event, technical term). It thinks -- noting it does not recognise the term -- calls search_internet with a tight query, reads the snippets, and answers in the user's language, attributing what it found. It must NOT pretend prior familiarity.",
-      "share": 15.0,
+      "share": 16.0,
       "task_plan": [
+        "<|explain|>"
+      ],
+      "domain_flags": [],
+      "uses_tools": true,
+      "requires_think": true,
+      "languages": null,
+      "notes": "Candidates must differ in a way a judge can rank: one grounded and honest, one confidently wrong or invented. Never two paraphrases of the same answer. Over-refusal where the answer WAS available counts as the wrong one."
+    },
+    {
+      "name": "tool_chain_insufficient",
+      "tags": [
+        "insufficient-context",
+        "knowledge-boundary",
+        "tool-calling"
+      ],
+      "description": "A TECHNICAL question the assistant does not know (a product, protocol, API, framework, device). It searches, gets a list of links, fetches one or two pages, reads past the navigation and adverts -- and the content still does not answer the question, or contradicts itself. After two or three honest attempts it says what it looked at, what it found, and that it still cannot answer. It must NOT stitch a confident answer out of fragments that do not support one. Each tool round trip gets its own <think>, and the plan is REVISED between attempts.",
+      "share": 10.0,
+      "task_plan": [
+        "<|plan|>",
+        "<|analyze|>",
         "<|explain|>"
       ],
       "domain_flags": [],
@@ -129,7 +149,7 @@
         "qa"
       ],
       "description": "A TECHNICAL or specialist question -- a named product, an acronym, a recent release, a piece of jargon -- where NO tool in scope could help (or there are no tools at all). The assistant thinks, concludes it neither knows nor can look it up, and says so plainly and briefly. It may offer what general reasoning it can (what kind of thing the name looks like) without inventing facts, and does not apologise at length.",
-      "share": 12.0,
+      "share": 14.0,
       "task_plan": [
         "<|chat|>"
       ],
@@ -147,7 +167,7 @@
         "tool-calling"
       ],
       "description": "A tool is called and the result does NOT answer the question -- empty, a different sense of the term, or topically adjacent. The assistant must notice this in <think>, say that what it found does not answer the question, and stop. Optionally one better re-query, then admit failure. Inventing an answer from an irrelevant snippet is the exact failure this prevents.",
-      "share": 14.0,
+      "share": 15.0,
       "task_plan": [
         "<|explain|>"
       ],
@@ -182,7 +202,7 @@
         "structured-output"
       ],
       "description": "Quantitative questions answered with run_statistics / calculate / convert_units rather than mental arithmetic: average rainfall over a season, price change between two months, bags to tonnes, spread of test scores. The assistant shows the numbers it passed in and interprets the result in one sentence.",
-      "share": 6.0,
+      "share": 3.0,
       "task_plan": [
         "<|math|>",
         "<|analyze|>"
@@ -200,7 +220,7 @@
         "structured-output"
       ],
       "description": "Record keeping with search_db / db_get_record / db_insert_record: look up a customer's balance, find stock below a threshold, save a new patient visit or sale. Before writing, the assistant confirms the values in words; after writing, it echoes what was stored. Includes zero-result searches and rejected writes.",
-      "share": 5.0,
+      "share": 3.0,
       "task_plan": [
         "<|data_extract|>",
         "<|plan|>"
@@ -217,7 +237,7 @@
         "tool-calling"
       ],
       "description": "The user asks for an action: send a message, set a reminder, check a route or a forecast. The assistant confirms any ambiguous parameter FIRST, then emits the call, then reports the result -- including cases where the tool fails and it explains the failure plainly.",
-      "share": 6.0,
+      "share": 4.0,
       "task_plan": [
         "<|plan|>"
       ],
@@ -234,7 +254,7 @@
         "multi-turn-chat"
       ],
       "description": "Everyday how-and-why questions a curious 16-year-old could answer unaided: why bread rises, how a generator makes electricity, why the harmattan is dusty, how loan interest works, why boiling water makes it safe. Concrete, mechanism-first, no tools, no hedging.",
-      "share": 9.0,
+      "share": 12.0,
       "task_plan": [
         "<|explain|>"
       ],
@@ -251,7 +271,7 @@
         "tool-calling"
       ],
       "description": "A non-urgent symptom, and what to do about it. Calls lookup_health_guidance, then gives practical home care AND explicit signs that mean going to a clinic. Never diagnoses, never names a prescription dose, never discourages seeking care.",
-      "share": 6.0,
+      "share": 4.0,
       "task_plan": [
         "<|recommend|>"
       ],
@@ -269,7 +289,7 @@
         "health-triaging"
       ],
       "description": "Symptoms that may be serious. The job is sorting urgency: go now, go today, watch at home. Danger signs stated concretely (a child too weak to drink, bleeding in pregnancy, chest pain with breathlessness, a convulsion). Always errs toward seeking care.",
-      "share": 5.0,
+      "share": 3.0,
       "task_plan": [
         "<|recommend|>"
       ],
@@ -288,7 +308,7 @@
         "tool-calling"
       ],
       "description": "Small-trader and household money questions: margin on a sack of rice, whether a loan is worth it, daily contribution savings, currency conversion, market price trends. Uses calculate / get_exchange_rate / get_market_prices / run_statistics rather than mental arithmetic, and shows the working.",
-      "share": 4.0,
+      "share": 3.0,
       "task_plan": [
         "<|math|>",
         "<|analyze|>"
@@ -297,55 +317,6 @@
         "<|is_financial|>"
       ],
       "uses_tools": true,
-      "requires_think": true,
-      "languages": null,
-      "notes": "Candidates must differ in a way a judge can rank: one grounded and honest, one confidently wrong or invented. Never two paraphrases of the same answer. Over-refusal where the answer WAS available counts as the wrong one."
-    },
-    {
-      "name": "structured_output",
-      "tags": [
-        "structured-output"
-      ],
-      "description": "Return strictly-valid JSON matching a schema stated in the prompt -- extracting fields from a passage, or formatting an answer. Emits the JSON and nothing around it.",
-      "share": 2.0,
-      "task_plan": [
-        "<|JSON|>",
-        "<|data_extract|>"
-      ],
-      "domain_flags": [],
-      "uses_tools": false,
-      "requires_think": false,
-      "languages": null,
-      "notes": "Candidates must differ in a way a judge can rank: one grounded and honest, one confidently wrong or invented. Never two paraphrases of the same answer. Over-refusal where the answer WAS available counts as the wrong one."
-    },
-    {
-      "name": "translation_english",
-      "tags": [
-        "translation"
-      ],
-      "description": "Translate between this language and English, in BOTH directions (X->English and English->X). Preserve register, names and numbers. The <|input_lang|> and <|target_lang|> markers must differ and must match the actual direction.",
-      "share": 2.0,
-      "task_plan": [
-        "<translate>"
-      ],
-      "domain_flags": [],
-      "uses_tools": false,
-      "requires_think": false,
-      "languages": null,
-      "notes": "Candidates must differ in a way a judge can rank: one grounded and honest, one confidently wrong or invented. Never two paraphrases of the same answer. Over-refusal where the answer WAS available counts as the wrong one."
-    },
-    {
-      "name": "translation_interlanguage",
-      "tags": [
-        "translation"
-      ],
-      "description": "Translate between two of the supported African languages WITHOUT going through English in the output (e.g. Yoruba->Hausa, Twi->Ewe, Pidgin->Igbo). State both languages in the markers. This is the hardest translation direction and the one no public corpus covers.",
-      "share": 1.0,
-      "task_plan": [
-        "<translate>"
-      ],
-      "domain_flags": [],
-      "uses_tools": false,
       "requires_think": true,
       "languages": null,
       "notes": "Candidates must differ in a way a judge can rank: one grounded and honest, one confidently wrong or invented. Never two paraphrases of the same answer. Over-refusal where the answer WAS available counts as the wrong one."
@@ -1074,8 +1045,8 @@
     "column_notes": "messages/prompt_messages are the source of truth (role/content dicts, with tool_calls on assistant turns and role='tool' results). text/prompt_text is the chat-template rendering. instruction/input/context/response are flattened conveniences derived from the LAST exchange, for tooling that expects the Alpaca shape; they are lossy for multi-turn samples and must not be trained on instead of messages."
   },
   "yield_by_tier": {
-    "high": 0.92,
-    "medium": 0.85,
-    "low": 0.72
+    "high": 0.9,
+    "medium": 0.82,
+    "low": 0.65
   }
 }

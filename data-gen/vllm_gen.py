@@ -625,6 +625,36 @@ def warn_slow_load(model: str, gpus: list[dict[str, Any]], gpu_mem: float) -> No
                   f"the cost of some KV cache. Worth trying if startup dominates a short run.", flush=True)
 
 
+def _set_jit_env() -> None:
+    """Keep vLLM's optional JIT-compiled kernels from killing startup on a newer or less common GPU.
+
+    Two failures observed on a GB10 (Blackwell, SM 12.1, aarch64), both AFTER the weights had loaded:
+
+      RuntimeError: FlashInfer requires GPUs with sm75 or higher
+          from flashinfer.jit.core.check_cuda_arch, reached while warming up the sampler. The card is SM 12.1,
+          far above sm75 -- the check fails because it reads TORCH_CUDA_ARCH_LIST and cannot make sense of an
+          arch it does not know, so the guard misfires rather than the hardware being unsuitable. FlashInfer's
+          sampler is an optimisation over vLLM's native top-k/top-p, so switching it off costs a little speed
+          and buys a startup that works.
+
+      Failed to get device capability: SM 12.x requires CUDA >= 12.9
+          from DeepGEMM's JIT probing for a compiler. Harmless -- it recovered -- but it comes from the same
+          cause and TORCH_CUDA_ARCH_LIST fixes it too.
+
+    Both are set with setdefault, so an operator who wants FlashInfer can export VLLM_USE_FLASHINFER_SAMPLER=1.
+    """
+    gpus = gpu_report()
+    if gpus and "TORCH_CUDA_ARCH_LIST" not in os.environ:
+        # "12.1+PTX" style, from the real capability, so a JIT that reads this compiles for the right target.
+        arch = ";".join(sorted({f"{g['capability']}" for g in gpus}))
+        os.environ["TORCH_CUDA_ARCH_LIST"] = f"{arch}+PTX"
+        print(f"[vllm] TORCH_CUDA_ARCH_LIST={os.environ['TORCH_CUDA_ARCH_LIST']} (from the detected GPU)")
+    if os.environ.setdefault("VLLM_USE_FLASHINFER_SAMPLER", "0") == "0":
+        print("[vllm] VLLM_USE_FLASHINFER_SAMPLER=0: using vLLM's native top-k/top-p sampler. FlashInfer's is "
+              "faster but its arch check misfires on newer cards and takes the whole engine down at warmup. "
+              "Export VLLM_USE_FLASHINFER_SAMPLER=1 to try it.")
+
+
 def load_engine(model: str, *, tp: int, max_model_len: int, gpu_mem: float, quantization: Optional[str],
                 seed: int = 0):
     try:
@@ -635,6 +665,7 @@ def load_engine(model: str, *, tp: int, max_model_len: int, gpu_mem: float, quan
             "    pip install vllm\n"
             "Nothing else in data-gen needs it -- the API path (generate.py) works without it, and\n"
             "`--plan-only` here works without a GPU.")
+    _set_jit_env()
     p = preset_for(model)
     kw: dict[str, Any] = {
         "model": model,

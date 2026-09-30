@@ -1,25 +1,33 @@
-# Sample counts for RL preference data. Edit here, then re-run `python seeds/build_seeds.py`.
-# Counts are PROMPTS; each gets `responses_per_prompt` candidate final replies, then the judge pass
-# (seeds/../judge_gen.py) reduces them to response_1 (better) / response_2 (worse).
+# Sample counts for RL. Edit here, then re-run `python seeds/build_seeds.py`.
+# Counts are PREFERENCE SAMPLES: a conversation prefix plus two rankable candidate replies.
+#
+# RAISED SUBSTANTIALLY, because RL now carries the BEHAVIOUR. The knowledge-boundary tasks -- look it up,
+# admit you cannot, notice the retrieval missed -- moved here from SFT, since the lesson in each is a
+# COMPARISON between two replies and SFT can only show one. 78% of this phase is those tasks, so the phase has
+# to be big enough to teach them: it is no longer a light polish on top of SFT.
+#
+# Ratios follow the same logic as the other phases: pcm transfers fastest and has the largest floor, yor/hau/ibo
+# have the most downstream use, the low-resource six get equal shares at a level the generator can actually
+# sustain, and English is present so the behaviour generalises rather than binding to one language.
 kind: rl
 
 yield_by_tier:
-  high: 0.92
-  medium: 0.85
-  low: 0.72
+  high: 0.90
+  medium: 0.82
+  low: 0.65      # two rankable candidates in Fon is harder than one answer; expect real drop
 
 samples_per_language:
-  pcm: 17000
-  yor: 6000
-  hau: 6000
-  ibo: 6000
-  twi: 4000
-  aka: 3000
-  efi: 3500
-  urh: 3500
-  fon: 3500
-  ewe: 3500
-  ful: 3500
-  fuv: 3500
-  eng: 2000
-# total: 65,000
+  pcm: 45000
+  yor: 20000
+  hau: 20000
+  ibo: 20000
+  twi: 14000
+  aka: 12000
+  efi: 9000
+  urh: 9000
+  fon: 9000
+  ewe: 9000
+  ful: 9000
+  fuv: 9000
+  eng: 15000
+# total: 200,000

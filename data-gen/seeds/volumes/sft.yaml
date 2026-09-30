@@ -1,24 +1,30 @@
 # Sample counts for SFT. Edit here, then re-run `python seeds/build_seeds.py`.
-# Counts are CONVERSATIONS (6-10 messages each, 2-4 tasks each, ending on the assistant).
+# Counts are CONVERSATIONS (3-6 user turns each, 2-4 tasks each, ending on the assistant).
+#
+# SFT now teaches COMPETENCE, not behaviour: the knowledge-boundary tasks moved to RL, where a preference pair
+# can express that an honest admission beats a confident invention. What is left has one good answer --
+# explaining how the world works (23% of the phase, the largest block), translating in both directions and
+# between the African languages, summarising, labelling, writing. A model that cannot explain how a generator
+# works has nothing to be honest about, and this is the phase that fixes that.
 kind: sft
 
 yield_by_tier:
   high: 0.92
   medium: 0.85
-  low: 0.72      # 6-10 turn tool-calling conversations in Fon/Efik are hard; expect real drop
+  low: 0.72
 
 samples_per_language:
-  pcm: 50000     # floor requested: 50k
-  yor: 15000
-  hau: 15000
-  ibo: 15000
-  twi: 12000
-  aka: 10000
-  efi: 10000     # floor requested: 10k for the low-resource set
-  urh: 10000
-  fon: 10000
-  ewe: 10000
-  ful: 10000
-  fuv: 10000
-  eng: 8000
-# total: 185,000
+  pcm: 60000
+  yor: 24000
+  hau: 24000
+  ibo: 24000
+  twi: 18000
+  aka: 15000
+  efi: 12000
+  urh: 12000
+  fon: 12000
+  ewe: 12000
+  ful: 12000
+  fuv: 12000
+  eng: 13000
+# total: 250,000
