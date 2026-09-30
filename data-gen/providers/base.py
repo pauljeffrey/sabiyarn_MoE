@@ -105,6 +105,23 @@ def warn_if_reasoning_model(model: str) -> None:
 # simply cannot sustain prose in these languages, and gemma-3-27b can -- while also scoring 100% on
 # yor/hau/ibo, costing less per kept document and running twice as fast.
 #
+# EIGHT MODELS, same six languages, 36 documents each at pack=6, ranked by cost per KEPT document:
+#
+#   model                    kept        $/kept    420k corpus   notes
+#   google/gemma-3-27b-it   30/36  83%  $0.00027         $113    all 6 languages; documents short (med 111w)
+#   meta-llama/llama-3.1-8b  6/36  17%  $0.00055         $233    med 72w, mostly one language
+#   meta-llama/llama-3.3-70b 4/36  11%  $0.00178         $746    d4 0.66 -- repetitive even when kept
+#   gemini-3.1-flash-lite   18/36  50%  $0.00262       $1,102    med 211w, hits the target length; 5 of 6 langs
+#   openai/gpt-oss-20b       1/36   3%  $0.00297       $1,249    reasoning tokens billed as output
+#   gemini-3.8-flash        12/36  33%  $0.01791       $7,524    only ful and fuv; fails the other four
+#   google/gemma-4-31b-it    0/36   0%        --          --     no usable output at any price
+#   gemini-2.5-flash-lite    0/36   0%        --          --     no usable output at any price
+#
+# gemma-3-27b wins by 10-66x on cost per kept document, and is the only model to produce all six languages.
+# The one thing it loses on is LENGTH: its documents run ~111 words against a ~209-word target, where
+# gemini-3.1-flash-lite reaches 211. That is worth 2x the words at 10x the price, so it is not a trade worth
+# taking -- and it points at a prompting fix for gemma-3 rather than a different model.
+#
 # This does NOT overturn gemma-4-31b for SFT, where it was chosen on conversation structure and tool use over a
 # much larger sample. Pretraining is a different task: several hundred words of unbroken native-language prose,
 # with no scaffolding to get right.
