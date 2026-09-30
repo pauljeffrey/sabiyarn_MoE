@@ -61,12 +61,13 @@ def test_added_languages_never_outrank_a_nigerian_one(seeds):
 
 
 def test_added_language_volumes_track_speaker_numbers(seeds):
-    """Swahili has ~4x Kinyarwanda's speakers and gets ~4x the samples. French is the one exception and is
-    sized as a bridge language rather than by population."""
+    """Every added language including French is scaled on speakers. French uses AFRICAN French (~150M) rather
+    than global (~320M), because a Parisian speaker is not this corpus's audience."""
     counts = {l.code: l.samples for l in seeds["pretrain"].languages}
-    assert counts["swa"] > counts["amh"] > counts["orm"] > counts["zul"] > counts["som"] > counts["kin"]
+    assert (counts["fra"] > counts["swa"] > counts["amh"] > counts["orm"]
+            > counts["zul"] > counts["som"] > counts["kin"])
     assert counts["kin"] == counts["sna"]           # equal speaker estimates, equal volume
-    assert abs(counts["swa"] / counts["kin"] - 100 / 15) < 1.5
+    assert abs(counts["fra"] / counts["kin"] - 150 / 15) < 1.5
 
 
 def test_seeds_load_and_validate(seeds):

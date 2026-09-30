@@ -26,15 +26,16 @@ samples_per_language:
   fuv: 30000
   # ---- beyond West Africa. Proportional to L1+L2 speakers, scaled so the largest (Swahili,
   # ~100M) sits at 30,000 -- the SMALLEST volume any Nigerian language has in this phase -- so no
-  # added language outranks a home language. French is not population-scaled: it is the regional
-  # lingua franca for the Fon, Ewe and Fulfulde-speaking countries.
-  # Speakers used: swa 100M, amh 57M, orm 37M, zul 28M, som 24M, kin 15M, sna 15M.
+  # added language outranks a home language. French IS population-scaled, on AFRICAN French speakers
+  # (~150M) rather than global (~320M): a Parisian speaker is not this corpus's audience, and using
+  # the global figure would make French 3.2x Swahili and dominate the added set.
+  # Speakers used: fra 150M (Africa), swa 100M, amh 57M, orm 37M, zul 28M, som 24M, kin 15M, sna 15M.
   # ALL EIGHT need the model's vocab_size raised past 52050 before training; see build_seeds.py.
-  swa: 30000
-  fra: 12000
-  amh: 17100
-  orm: 11100
-  zul: 8400
-  som: 7200
-  kin: 4500
-  sna: 4500
+  swa: 20000
+  fra: 30000
+  amh: 11400
+  orm: 7400
+  zul: 5600
+  som: 4800
+  kin: 3000
+  sna: 3000

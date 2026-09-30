@@ -135,7 +135,8 @@ _LANG_META = {
     # that cannot be embedded, so the data can be built now and used once the embedding is resized.
     "swa": ("Swahili", "medium", "Standard Kiswahili. Keep it East African, not a Nigerian idiom translated."),
     "fra": ("French", "high", "West African French as written in Benin, Togo, Senegal and Cote d'Ivoire -- not "
-                              "Parisian register. Keep accents correct: e a e u c."),
+                              "Parisian register. Keep the accents correct: e-acute, e-grave, a-grave, "
+                              "u-circumflex, c-cedilla."),
     "zul": ("Zulu", "medium", "isiZulu with correct noun-class prefixes and hlonipha where a register calls "
                               "for it. Do not drift into Xhosa."),
     "amh": ("Amharic", "low", "Ethiopic script (Fidel). Short concrete sentences: this script tokenises at "

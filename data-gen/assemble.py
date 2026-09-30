@@ -107,13 +107,14 @@ _CHARS_PER_WORD = 5.5
 # more text, with scripts/measure_tokens_per_word.py.
 _TOKENS_PER_WORD = {"pcm": 1.24, "eng": 1.28, "hau": 1.30, "ibo": 1.32, "yor": 1.31, "twi": 2.11, "aka": 2.06,
                     "efi": 2.05, "urh": 1.53, "ewe": 2.50, "fon": 2.63, "ful": 1.99, "fuv": 1.99,
-                    # Measured the same way, on one representative sentence each. These are far worse than the
-                    # West African languages because the tokenizer was not trained on them: Yoruba costs 1.06
-                    # tokens/word, Zulu 3.50, and AMHARIC 8.75 -- its Ethiopic script falls back to bytes, so
-                    # every Amharic word costs about seven times a Yoruba one. Re-measure with
-                    # scripts/measure_tokens_per_word.py once there is real generated text.
-                    "fra": 2.08, "swa": 2.25, "zul": 3.50, "kin": 3.10, "som": 2.92, "orm": 2.91,
-                    "sna": 3.30, "amh": 8.75}
+                    # MEASURED on real generated text (73 pretraining documents from gemma-3-27b), not on a
+                    # single sentence -- the first estimates were within ~20% but these are what the budgets
+                    # spend. All are worse than the West African languages because the tokenizer was not trained
+                    # on them, and Amharic is in a different category: its Ethiopic script falls back to bytes,
+                    # so one Amharic word costs 6.1 Pidgin words. At a 1,024-token budget that leaves an Amharic
+                    # document ~75 words long, which is not worth generating.
+                    "fra": 2.09, "som": 2.39, "swa": 2.45, "orm": 2.69, "kin": 2.90, "sna": 3.12,
+                    "zul": 3.55, "amh": 7.55}
 
 
 def max_response_chars(lang: str) -> int:

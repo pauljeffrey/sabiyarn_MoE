@@ -99,56 +99,56 @@
       "code": "swa",
       "name": "Swahili",
       "tier": "medium",
-      "samples": 30000,
+      "samples": 20000,
       "guidance": "Standard Kiswahili. Keep it East African, not a Nigerian idiom translated."
     },
     "fra": {
       "code": "fra",
       "name": "French",
       "tier": "high",
-      "samples": 12000,
-      "guidance": "West African French as written in Benin, Togo, Senegal and Cote d'Ivoire -- not Parisian register. Keep accents correct: e a e u c."
+      "samples": 30000,
+      "guidance": "West African French as written in Benin, Togo, Senegal and Cote d'Ivoire -- not Parisian register. Keep the accents correct: e-acute, e-grave, a-grave, u-circumflex, c-cedilla."
     },
     "amh": {
       "code": "amh",
       "name": "Amharic",
       "tier": "low",
-      "samples": 17100,
+      "samples": 11400,
       "guidance": "Ethiopic script (Fidel). Short concrete sentences: this script tokenises at ~8.75 tokens/word here, so every word is expensive."
     },
     "orm": {
       "code": "orm",
       "name": "Oromo",
       "tier": "low",
-      "samples": 11100,
+      "samples": 7400,
       "guidance": "Afaan Oromoo in Qubee (Latin) with gemination and doubled vowels preserved."
     },
     "zul": {
       "code": "zul",
       "name": "Zulu",
       "tier": "medium",
-      "samples": 8400,
+      "samples": 5600,
       "guidance": "isiZulu with correct noun-class prefixes and hlonipha where a register calls for it. Do not drift into Xhosa."
     },
     "som": {
       "code": "som",
       "name": "Somali",
       "tier": "low",
-      "samples": 7200,
+      "samples": 4800,
       "guidance": "Latin-script Somali with the correct doubled vowels and the letters c, x, q, dh. Do not drop them."
     },
     "kin": {
       "code": "kin",
       "name": "Kinyarwanda",
       "tier": "low",
-      "samples": 4500,
+      "samples": 3000,
       "guidance": "Correct noun classes and the k/c, g/j alternations. Prefer short concrete sentences."
     },
     "sna": {
       "code": "sna",
       "name": "Shona",
       "tier": "low",
-      "samples": 4500,
+      "samples": 3000,
       "guidance": "Standard Shona. Keep the sv, zv, tsv digraphs; do not drift into Ndebele."
     }
   },
