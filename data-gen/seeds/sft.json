@@ -15,7 +15,7 @@
       "code": "pcm",
       "name": "Nigerian Pidgin",
       "tier": "high",
-      "samples": 60000,
+      "samples": 25000,
       "guidance": "English-lexified creole. Keep it genuinely Pidgin, not English with dropped copulas."
     },
     "yor": {

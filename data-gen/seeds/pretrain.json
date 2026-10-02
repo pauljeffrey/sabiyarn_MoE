@@ -113,7 +113,7 @@
       "code": "orm",
       "name": "Oromo",
       "tier": "low",
-      "samples": 7400,
+      "samples": 25000,
       "guidance": "Afaan Oromoo in Qubee (Latin) with gemination and doubled vowels preserved."
     },
     "zul": {

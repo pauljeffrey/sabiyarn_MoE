@@ -40,7 +40,16 @@ class OpenRouterProvider(Provider):
         "gemma-3-12b-it": (0.05, 0.15),
         "llama-3.3-70b-instruct": (0.10, 0.32),
         "llama-3.1-70b-instruct": (0.40, 0.40),
-        # :batch is markedly cheaper than Together's batch tier -- see README.
+        # BATCH TIERS COMPARED (verified 2026-10-01), for the models this corpus actually uses:
+    #   Doubleword batch   gemma-4-31b   $0.06 / $0.18   -- cheapest; gemma-3-27b NOT offered
+    #   Together batch     ~27-31B tier  $0.04 / $0.225
+    #   OpenRouter         gemma-4-31b   $0.09 / $0.34   (no :batch endpoint for gemma at all)
+    #   OpenRouter         gemma-3-27b   $0.08 / $0.45
+    # Doubleword wins because output dominates this workload, and it also gives 20M free tokens to a new
+    # account (~15,000 pretraining samples, or ~3,200 sft ones). But it has only gemma-4-31b, which measured
+    # 6% clean on low-resource pretraining against gemma-3-27b's 89% -- so it is the right place to buy sft and
+    # rl, and the wrong place to buy pretraining for anything but the strong languages.
+    # :batch is markedly cheaper than Together's batch tier -- see README.
         "gpt-oss-120b:batch": (0.03, 0.14),
         "gpt-oss-120b": (0.15, 0.60),
         "gpt-oss-20b": (0.02, 0.09),

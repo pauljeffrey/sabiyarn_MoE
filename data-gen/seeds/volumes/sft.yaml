@@ -14,7 +14,7 @@ yield_by_tier:
   low: 0.72
 
 samples_per_language:
-  pcm: 60000
+  pcm: 25000
   yor: 24000
   hau: 24000
   ibo: 24000

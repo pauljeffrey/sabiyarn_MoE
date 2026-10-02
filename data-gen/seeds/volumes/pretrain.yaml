@@ -33,7 +33,7 @@ samples_per_language:
   # ALL EIGHT need the model's vocab_size raised past 52050 before training; see build_seeds.py.
   swh: 20000
   fra: 30000
-  orm: 7400
+  orm: 25000
   zul: 5600
   som: 4800
   kin: 3000

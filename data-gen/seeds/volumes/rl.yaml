@@ -17,7 +17,7 @@ yield_by_tier:
   low: 0.65      # two rankable candidates in Fon is harder than one answer; expect real drop
 
 samples_per_language:
-  pcm: 45000
+  pcm: 25000
   yor: 20000
   hau: 20000
   ibo: 20000

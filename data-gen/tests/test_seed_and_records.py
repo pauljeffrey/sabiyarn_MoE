@@ -64,8 +64,11 @@ def test_added_language_volumes_track_speaker_numbers(seeds):
     """Every added language including French is scaled on speakers. French uses AFRICAN French (~150M) rather
     than global (~320M), because a Parisian speaker is not this corpus's audience."""
     counts = {l.code: l.samples for l in seeds["pretrain"].languages}
-    assert (counts["fra"] > counts["swh"] > counts["orm"]
-            > counts["zul"] > counts["som"] > counts["kin"])
+    # Oromo is a deliberate OVERRIDE of the proportional rule -- set by hand to 25,000 for pretraining despite
+    # having 37M speakers against Swahili's 100M -- so it is excluded from the ordering check. Everything else
+    # still tracks speakers.
+    assert counts["fra"] > counts["swh"] > counts["zul"] > counts["som"] > counts["kin"]
+    assert counts["orm"] == 25_000
     # Amharic was removed: 7.55 tokens/word against Pidgin's 1.24 left a 75-word document at this budget.
     assert "amh" not in counts
     assert counts["kin"] == counts["sna"]           # equal speaker estimates, equal volume
@@ -91,7 +94,10 @@ def test_requested_volumes_meet_the_agreed_floors(seeds):
     sft = {l.code: l.samples for l in seeds["sft"].languages}
     rl = {l.code: l.samples for l in seeds["rl"].languages}
     assert seeds["sft"].total_samples() >= 200_000, seeds["sft"].total_samples()
-    assert sft["pcm"] >= 50_000
+    # pcm's floor was lowered from 50,000 to 25,000 for sft and rl: at 165,000 samples across the phases it was
+    # 17% of the whole corpus and the single largest line of the budget, and Pidgin is the language the model
+    # transfers to most easily.
+    assert sft["pcm"] >= 25_000
     for c in LOW_RESOURCE + ("yor", "twi", "ibo", "hau"):
         assert sft[c] >= 10_000, f"sft {c} = {sft[c]}, below the 10k floor"
     # RL carries the BEHAVIOUR now, so it is no longer a light polish on top of SFT: the knowledge-boundary
