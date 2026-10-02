@@ -9,6 +9,14 @@ from (`reference`, `source`, ... as the dataset provides them) and `completions[
              optimising it hard finds its blind spots (reward hacking), so keep the KL penalty on, hold out
              chrF++/BLEU (eval_suite) as the honest measure, and look at samples. See rl/comet_worker.py for why it
              runs in its own process by default.
+  verifier   The programmatic scorers in rl/verifiers.py, driven by the `checks` each RL sample carries from
+             the seed. No model in the loop: it scores procedure and form -- did it call a tool before
+             claiming to know, is that figure actually in the document, was the stated constraint obeyed --
+             which is most of what this phase teaches. Cheap, reproducible, and the only reward here that is
+             not itself a learned metric with blind spots to exploit.
+  verifier+africomet
+             Both, blended by `reward_blend` (default 0.5). The sensible default for a mixed corpus: the
+             verifier carries the behaviour and reasoning tasks, AfriCOMET the translation ones.
 """
 
 from __future__ import annotations
@@ -116,19 +124,75 @@ class CometInProcessReward:
         return scores
 
 
+class VerifierReward:
+    """The programmatic checks from rl/verifiers.py, one reward per (item, completion).
+
+    Each item carries its own `checks` (written into the seed by data-gen/rewards_spec.py), so a reasoning
+    sample and a summarisation sample are scored by different predicates without this class knowing which is
+    which. An item with no checks scores `neutral` rather than 0: a missing-checks row is a gap in the data,
+    and scoring it zero would train the policy to avoid whatever that row happened to contain.
+    """
+
+    def __init__(self, neutral: float = 0.5, log_every: int = 0):
+        from rl.verifiers import score  # local import: keeps torch-free callers torch-free
+
+        self._score = score
+        self.neutral = neutral
+        self.log_every = log_every
+        self._n = 0
+
+    def __call__(self, items, completions):
+        out: list[float] = []
+        for item, completion in zip(items, completions):
+            checks = item.get("checks") or []
+            if not checks:
+                out.append(self.neutral)
+                continue
+            r, detail = self._score(completion, item, checks)
+            out.append(r)
+            self._n += 1
+            if self.log_every and self._n % self.log_every == 0:
+                LOG.info("verifier", reward=round(r, 3), task=(item.get("tasks") or [None])[0],
+                         lang=item.get("lang"), detail=detail)
+        return out
+
+
+class BlendedReward:
+    """Weighted sum of two rewards on the same batch. `w` is the weight on the FIRST."""
+
+    def __init__(self, first: RewardFn, second: RewardFn, w: float = 0.5):
+        self.first, self.second, self.w = first, second, max(0.0, min(1.0, w))
+
+    def __call__(self, items, completions):
+        a = self.first(items, completions)
+        b = self.second(items, completions)
+        return [self.w * x + (1.0 - self.w) * y for x, y in zip(a, b)]
+
+
+def _africomet(cfg: RLConfig, device: str) -> RewardFn:
+    if cfg.reward_python:
+        return CometWorkerReward(cfg.reward_python, cfg.reward_id, cfg.reward_batch_size, cfg.reward_gpu)
+    try:
+        return CometInProcessReward(cfg.reward_id, cfg.reward_batch_size, device, cfg.reward_gpu)
+    except ImportError as exc:
+        raise SystemExit(
+            "reward: africomet needs `unbabel-comet`, which requires transformers<5 and so cannot share this "
+            "environment. Create a second one and point `reward_python` at it:\n"
+            "    python -m venv .venv-comet && .venv-comet/bin/pip install unbabel-comet\n"
+            "    (config: reward_python: .venv-comet/bin/python   or   RL_REWARD_PYTHON=...)\n"
+            f"original error: {exc}")
+
+
 def build_reward(cfg: RLConfig, device: str = "cpu") -> Callable[[list[dict], list[str]], list[float]]:
     if cfg.reward == "chrf":
         return ChrfReward()
+    if cfg.reward == "verifier":
+        return VerifierReward(log_every=getattr(cfg, "reward_log_every", 0))
+    if cfg.reward in ("verifier+africomet", "africomet+verifier"):
+        blend = float(getattr(cfg, "reward_blend", 0.5))
+        return BlendedReward(VerifierReward(log_every=getattr(cfg, "reward_log_every", 0)),
+                             _africomet(cfg, device), w=blend)
     if cfg.reward == "africomet":
-        if cfg.reward_python:
-            return CometWorkerReward(cfg.reward_python, cfg.reward_id, cfg.reward_batch_size, cfg.reward_gpu)
-        try:
-            return CometInProcessReward(cfg.reward_id, cfg.reward_batch_size, device, cfg.reward_gpu)
-        except ImportError as exc:
-            raise SystemExit(
-                "reward: africomet needs `unbabel-comet`, which requires transformers<5 and so cannot share this "
-                "environment. Create a second one and point `reward_python` at it:\n"
-                "    python -m venv .venv-comet && .venv-comet/bin/pip install unbabel-comet\n"
-                "    (config: reward_python: .venv-comet/bin/python   or   RL_REWARD_PYTHON=...)\n"
-                f"original error: {exc}")
-    raise ValueError(f"unknown reward {cfg.reward!r}")
+        return _africomet(cfg, device)
+    raise ValueError(
+        f"unknown reward {cfg.reward!r} -- expected one of: chrf, africomet, verifier, verifier+africomet")

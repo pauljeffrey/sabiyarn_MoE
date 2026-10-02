@@ -45,6 +45,12 @@ class Source:
     min_words: int = 3
     max_words: int = 120
     require_terminal: bool = False  # web text must look like prose; curated sentence sets need not
+    # --- v2 (large-scale) fields; ignored by the v1 builder ---
+    kind: str = "curated"           # curated | news | encyclopedia | web | bible
+    lid: bool = False               # verify every sentence with GlotLID (web text)
+    priority: int = 50              # cross-source de-duplication order: lower wins
+    quota: Optional[int] = None     # stop after this many windows
+    stream: bool = False            # english-style: one deficit-balanced window per paragraph, honouring `quota`
 
 
 # ----------------------------------------------------------------------------------------------------------------

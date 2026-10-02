@@ -627,12 +627,28 @@ think, task_plan, input_lang, target_lang, response (or tool_call). Write the FI
 special tokens or the marker string yourself, and do NOT put a JSON string there: the markers are assembled
 for you, exactly as they are for the turns in "prompt_turns".
 
+Also return a "verifier" object: the GROUND TRUTH a program needs to score an answer without reading it.
+This is what makes the sample checkable, so it must describe the prefix you actually wrote:
+  - "expected_answer": for a question with ONE correct value (arithmetic, a count, a date), that value as a
+    bare string -- "4500", "12", "1960". Omit when the task has no single correct value.
+  - "constraint": when the user imposed a checkable rule, as {{"kind": ..., "value": ...}} where kind is one
+    of "max_words" | "exactly_sentences" | "list_items" | "forbidden_word" | "required_word", e.g.
+    {{"kind": "exactly_sentences", "value": 3}} or {{"kind": "forbidden_word", "value": "money"}}. Omit if
+    the user imposed none.
+  - "brief_elements": for a writing brief, the things the piece MUST contain -- names, places, the required
+    ending -- as a list of short strings. Omit when there was no brief.
+  - "max_words": when the user asked for a length, the number of words. Omit otherwise.
+These must be EXACT: "expected_answer" has to be the value the best reply states, and a "forbidden_word" has
+to be a word the best reply genuinely avoids. A wrong verifier is worse than no verifier -- it would score
+the good answer as bad -- so omit a field you are unsure of rather than guessing it.
+
 Return JSON:
 {{"prompt_turns": [ ...turn objects exactly as the OUTPUT CONTRACT describes... ],
   "responses": [
     {{"content": {{ ...assistant turn FIELDS... }}, "quality": "best",  "why": "<one line, English>"}},
     {{"content": {{ ...assistant turn FIELDS... }}, "quality": "worst", "why": "<one line, English>"}}
   ],
+  "verifier": {{ ...only the fields that apply, omit the rest... }},
   "tasks": [...], "tags": [...],
   "confidence": <float 0-1: your honest estimate that the ranking is right and the text is fluent {lang_name}>}}"""
 

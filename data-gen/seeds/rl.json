@@ -161,7 +161,7 @@
         "qa"
       ],
       "description": "User asks about something the assistant plainly has not learned (a product, company, acronym, recent event, technical term). It thinks -- noting it does not recognise the term -- calls search_internet with a tight query, reads the snippets, and answers in the user's language, attributing what it found. It must NOT pretend prior familiarity.",
-      "share": 12.0,
+      "share": 9.0,
       "task_plan": [
         "<|explain|>"
       ],
@@ -176,7 +176,8 @@
           "expect": true,
           "pattern": "<response>|<tool_call>|\\\"tool_calls\\\"",
           "fn": "",
-          "why": "a turn that neither answers nor calls anything is not a turn"
+          "why": "a turn that neither answers nor calls anything is not a turn",
+          "gate": true
         },
         {
           "name": "markers_well_formed",
@@ -184,7 +185,8 @@
           "expect": true,
           "pattern": "<\\|input_lang\\|><[a-z]{2,4}>",
           "fn": "",
-          "why": "assemble.py builds these, so a candidate missing them came from somewhere else"
+          "why": "assemble.py builds these, so a candidate missing them came from somewhere else",
+          "gate": true
         },
         {
           "name": "no_invented_pipe_token",
@@ -192,7 +194,8 @@
           "expect": false,
           "pattern": "",
           "fn": "has_invented_pipe_token",
-          "why": "a token outside the tokenizer costs 3-4 junk sub-words and the model learns to emit it"
+          "why": "a token outside the tokenizer costs 3-4 junk sub-words and the model learns to emit it",
+          "gate": true
         },
         {
           "name": "not_degenerate",
@@ -200,7 +203,8 @@
           "expect": false,
           "pattern": "",
           "fn": "is_degenerate",
-          "why": "the same four gates the corpus is filtered on, applied to the candidate"
+          "why": "the same four gates the corpus is filtered on, applied to the candidate",
+          "gate": true
         },
         {
           "name": "called_a_tool",
@@ -208,7 +212,8 @@
           "expect": true,
           "pattern": "<tool_call>|\\\"tool_calls\\\"",
           "fn": "",
-          "why": "the premise is that it does not know; answering without looking is the failure"
+          "why": "the premise is that it does not know; answering without looking is the failure",
+          "gate": false
         },
         {
           "name": "answered_after_the_tool",
@@ -216,7 +221,8 @@
           "expect": true,
           "pattern": "",
           "fn": "response_follows_tool_result",
-          "why": "a call with no answer afterwards is an unfinished turn"
+          "why": "a call with no answer afterwards is an unfinished turn",
+          "gate": false
         },
         {
           "name": "cites_what_it_found",
@@ -224,7 +230,8 @@
           "expect": true,
           "pattern": "",
           "fn": "answer_overlaps_tool_result",
-          "why": "the answer must come from the result, not from around it"
+          "why": "the answer must come from the result, not from around it",
+          "gate": false
         },
         {
           "name": "no_prior_familiarity_claim",
@@ -232,7 +239,8 @@
           "expect": false,
           "pattern": "as (?:i|we) (?:know|mentioned)|as is well known|everyone knows|famously",
           "fn": "",
-          "why": "claiming prior knowledge of something it just searched is the exact confabulation"
+          "why": "claiming prior knowledge of something it just searched is the exact confabulation",
+          "gate": false
         },
         {
           "name": "thought_before_calling",
@@ -240,7 +248,8 @@
           "expect": true,
           "pattern": "",
           "fn": "think_precedes_tool_call",
-          "why": "the plan should decide the call, not follow it"
+          "why": "the plan should decide the call, not follow it",
+          "gate": false
         }
       ],
       "notes": "Candidates must differ in a way a judge can rank: one grounded and honest, one confidently wrong or invented. Never two paraphrases of the same answer. Over-refusal where the answer WAS available counts as the wrong one."
@@ -253,7 +262,7 @@
         "tool-calling"
       ],
       "description": "A TECHNICAL question the assistant does not know (a product, protocol, API, framework, device). It searches, gets a list of links, fetches one or two pages, reads past the navigation and adverts -- and the content still does not answer the question, or contradicts itself. After two or three honest attempts it says what it looked at, what it found, and that it still cannot answer. It must NOT stitch a confident answer out of fragments that do not support one. Each tool round trip gets its own <think>, and the plan is REVISED between attempts.",
-      "share": 8.0,
+      "share": 6.0,
       "task_plan": [
         "<|plan|>",
         "<|analyze|>",
@@ -270,7 +279,8 @@
           "expect": true,
           "pattern": "<response>|<tool_call>|\\\"tool_calls\\\"",
           "fn": "",
-          "why": "a turn that neither answers nor calls anything is not a turn"
+          "why": "a turn that neither answers nor calls anything is not a turn",
+          "gate": true
         },
         {
           "name": "markers_well_formed",
@@ -278,7 +288,8 @@
           "expect": true,
           "pattern": "<\\|input_lang\\|><[a-z]{2,4}>",
           "fn": "",
-          "why": "assemble.py builds these, so a candidate missing them came from somewhere else"
+          "why": "assemble.py builds these, so a candidate missing them came from somewhere else",
+          "gate": true
         },
         {
           "name": "no_invented_pipe_token",
@@ -286,7 +297,8 @@
           "expect": false,
           "pattern": "",
           "fn": "has_invented_pipe_token",
-          "why": "a token outside the tokenizer costs 3-4 junk sub-words and the model learns to emit it"
+          "why": "a token outside the tokenizer costs 3-4 junk sub-words and the model learns to emit it",
+          "gate": true
         },
         {
           "name": "not_degenerate",
@@ -294,7 +306,8 @@
           "expect": false,
           "pattern": "",
           "fn": "is_degenerate",
-          "why": "the same four gates the corpus is filtered on, applied to the candidate"
+          "why": "the same four gates the corpus is filtered on, applied to the candidate",
+          "gate": true
         },
         {
           "name": "tried_more_than_once",
@@ -302,7 +315,8 @@
           "expect": true,
           "pattern": "",
           "fn": "at_least_two_tool_calls",
-          "why": "one attempt then giving up is not the behaviour; two or three honest tries is"
+          "why": "one attempt then giving up is not the behaviour; two or three honest tries is",
+          "gate": false
         },
         {
           "name": "revised_the_plan",
@@ -310,7 +324,8 @@
           "expect": true,
           "pattern": "",
           "fn": "task_plan_changed_between_turns",
-          "why": "the plan should change after a result disappoints"
+          "why": "the plan should change after a result disappoints",
+          "gate": false
         },
         {
           "name": "concludes_honestly",
@@ -318,7 +333,8 @@
           "expect": true,
           "pattern": "",
           "fn": "admits_uncertainty",
-          "why": "after real attempts, saying what it looked at and that it still cannot answer"
+          "why": "after real attempts, saying what it looked at and that it still cannot answer",
+          "gate": false
         },
         {
           "name": "no_stitched_answer",
@@ -326,7 +342,8 @@
           "expect": false,
           "pattern": "",
           "fn": "asserts_fact_absent_from_tool_result",
-          "why": "assembling confidence out of fragments that do not support it"
+          "why": "assembling confidence out of fragments that do not support it",
+          "gate": false
         }
       ],
       "notes": "Candidates must differ in a way a judge can rank: one grounded and honest, one confidently wrong or invented. Never two paraphrases of the same answer. Over-refusal where the answer WAS available counts as the wrong one."
@@ -338,7 +355,7 @@
         "qa"
       ],
       "description": "A TECHNICAL or specialist question -- a named product, an acronym, a recent release, a piece of jargon -- where NO tool in scope could help (or there are no tools at all). The assistant thinks, concludes it neither knows nor can look it up, and says so plainly and briefly. It may offer what general reasoning it can (what kind of thing the name looks like) without inventing facts, and does not apologise at length.",
-      "share": 10.0,
+      "share": 8.0,
       "task_plan": [
         "<|chat|>"
       ],
@@ -353,7 +370,8 @@
           "expect": true,
           "pattern": "<response>|<tool_call>|\\\"tool_calls\\\"",
           "fn": "",
-          "why": "a turn that neither answers nor calls anything is not a turn"
+          "why": "a turn that neither answers nor calls anything is not a turn",
+          "gate": true
         },
         {
           "name": "markers_well_formed",
@@ -361,7 +379,8 @@
           "expect": true,
           "pattern": "<\\|input_lang\\|><[a-z]{2,4}>",
           "fn": "",
-          "why": "assemble.py builds these, so a candidate missing them came from somewhere else"
+          "why": "assemble.py builds these, so a candidate missing them came from somewhere else",
+          "gate": true
         },
         {
           "name": "no_invented_pipe_token",
@@ -369,7 +388,8 @@
           "expect": false,
           "pattern": "",
           "fn": "has_invented_pipe_token",
-          "why": "a token outside the tokenizer costs 3-4 junk sub-words and the model learns to emit it"
+          "why": "a token outside the tokenizer costs 3-4 junk sub-words and the model learns to emit it",
+          "gate": true
         },
         {
           "name": "not_degenerate",
@@ -377,7 +397,8 @@
           "expect": false,
           "pattern": "",
           "fn": "is_degenerate",
-          "why": "the same four gates the corpus is filtered on, applied to the candidate"
+          "why": "the same four gates the corpus is filtered on, applied to the candidate",
+          "gate": true
         },
         {
           "name": "admits_plainly",
@@ -385,7 +406,8 @@
           "expect": true,
           "pattern": "",
           "fn": "admits_uncertainty",
-          "why": "with no tool in scope, saying so IS the correct answer"
+          "why": "with no tool in scope, saying so IS the correct answer",
+          "gate": false
         },
         {
           "name": "called_no_tool",
@@ -393,7 +415,8 @@
           "expect": false,
           "pattern": "<tool_call>|\\\"tool_calls\\\"",
           "fn": "",
-          "why": "there is no tool to call; pretending to call one is a different failure"
+          "why": "there is no tool to call; pretending to call one is a different failure",
+          "gate": false
         },
         {
           "name": "no_invented_specifics",
@@ -401,7 +424,8 @@
           "expect": false,
           "pattern": "(?:N|NGN|₦|GH₵|GHS|CFA|XOF|XAF|\\$)\\s?-?\\d[\\d,]*(?:\\.\\d+)?|\\b(?:version|v)\\s?\\d+\\.\\d+",
           "fn": "",
-          "why": "prices, versions and dates about an unknown product are invented by definition"
+          "why": "prices, versions and dates about an unknown product are invented by definition",
+          "gate": false
         },
         {
           "name": "stays_brief",
@@ -409,7 +433,8 @@
           "expect": true,
           "pattern": "",
           "fn": "response_under_120_words",
-          "why": "an admission does not need three paragraphs of apology"
+          "why": "an admission does not need three paragraphs of apology",
+          "gate": false
         }
       ],
       "notes": "Candidates must differ in a way a judge can rank: one grounded and honest, one confidently wrong or invented. Never two paraphrases of the same answer. Over-refusal where the answer WAS available counts as the wrong one."
@@ -422,7 +447,7 @@
         "tool-calling"
       ],
       "description": "A tool is called and the result does NOT answer the question -- empty, a different sense of the term, or topically adjacent. The assistant must notice this in <think>, say that what it found does not answer the question, and stop. Optionally one better re-query, then admit failure. Inventing an answer from an irrelevant snippet is the exact failure this prevents.",
-      "share": 11.0,
+      "share": 8.5,
       "task_plan": [
         "<|explain|>"
       ],
@@ -437,7 +462,8 @@
           "expect": true,
           "pattern": "<response>|<tool_call>|\\\"tool_calls\\\"",
           "fn": "",
-          "why": "a turn that neither answers nor calls anything is not a turn"
+          "why": "a turn that neither answers nor calls anything is not a turn",
+          "gate": true
         },
         {
           "name": "markers_well_formed",
@@ -445,7 +471,8 @@
           "expect": true,
           "pattern": "<\\|input_lang\\|><[a-z]{2,4}>",
           "fn": "",
-          "why": "assemble.py builds these, so a candidate missing them came from somewhere else"
+          "why": "assemble.py builds these, so a candidate missing them came from somewhere else",
+          "gate": true
         },
         {
           "name": "no_invented_pipe_token",
@@ -453,7 +480,8 @@
           "expect": false,
           "pattern": "",
           "fn": "has_invented_pipe_token",
-          "why": "a token outside the tokenizer costs 3-4 junk sub-words and the model learns to emit it"
+          "why": "a token outside the tokenizer costs 3-4 junk sub-words and the model learns to emit it",
+          "gate": true
         },
         {
           "name": "not_degenerate",
@@ -461,7 +489,8 @@
           "expect": false,
           "pattern": "",
           "fn": "is_degenerate",
-          "why": "the same four gates the corpus is filtered on, applied to the candidate"
+          "why": "the same four gates the corpus is filtered on, applied to the candidate",
+          "gate": true
         },
         {
           "name": "called_a_tool",
@@ -469,7 +498,8 @@
           "expect": true,
           "pattern": "<tool_call>|\\\"tool_calls\\\"",
           "fn": "",
-          "why": "it has to try before giving up"
+          "why": "it has to try before giving up",
+          "gate": false
         },
         {
           "name": "states_the_gap",
@@ -477,7 +507,8 @@
           "expect": true,
           "pattern": "",
           "fn": "admits_uncertainty",
-          "why": "the whole sample is noticing the result does not answer the question"
+          "why": "the whole sample is noticing the result does not answer the question",
+          "gate": false
         },
         {
           "name": "no_answer_invented_from_nothing",
@@ -485,7 +516,8 @@
           "expect": false,
           "pattern": "",
           "fn": "asserts_fact_absent_from_tool_result",
-          "why": "building a confident answer out of an irrelevant snippet is what this trains against"
+          "why": "building a confident answer out of an irrelevant snippet is what this trains against",
+          "gate": false
         },
         {
           "name": "no_fabricated_number",
@@ -493,7 +525,8 @@
           "expect": false,
           "pattern": "",
           "fn": "number_absent_from_tool_result",
-          "why": "a figure that appears in the answer but in no tool result was invented"
+          "why": "a figure that appears in the answer but in no tool result was invented",
+          "gate": false
         }
       ],
       "notes": "Candidates must differ in a way a judge can rank: one grounded and honest, one confidently wrong or invented. Never two paraphrases of the same answer. Over-refusal where the answer WAS available counts as the wrong one."
@@ -506,7 +539,7 @@
         "tool-calling"
       ],
       "description": "A document is supplied; the user asks about it. The assistant calls search_documents with a query it composes itself, grounds its answer in the returned passages, and says where it came from. Asked something the document does not cover, it says so rather than using general knowledge. THE RETRIEVED CONTEXT IS ALWAYS IN ENGLISH -- that is what a real retrieval corpus looks like for these languages -- so the assistant must read English passages and answer in whatever language the io_direction calls for. Its search query is in English too.",
-      "share": 10.0,
+      "share": 8.0,
       "task_plan": [
         "<|RAG|>"
       ],
@@ -521,7 +554,8 @@
           "expect": true,
           "pattern": "<response>|<tool_call>|\\\"tool_calls\\\"",
           "fn": "",
-          "why": "a turn that neither answers nor calls anything is not a turn"
+          "why": "a turn that neither answers nor calls anything is not a turn",
+          "gate": true
         },
         {
           "name": "markers_well_formed",
@@ -529,7 +563,8 @@
           "expect": true,
           "pattern": "<\\|input_lang\\|><[a-z]{2,4}>",
           "fn": "",
-          "why": "assemble.py builds these, so a candidate missing them came from somewhere else"
+          "why": "assemble.py builds these, so a candidate missing them came from somewhere else",
+          "gate": true
         },
         {
           "name": "no_invented_pipe_token",
@@ -537,7 +572,8 @@
           "expect": false,
           "pattern": "",
           "fn": "has_invented_pipe_token",
-          "why": "a token outside the tokenizer costs 3-4 junk sub-words and the model learns to emit it"
+          "why": "a token outside the tokenizer costs 3-4 junk sub-words and the model learns to emit it",
+          "gate": true
         },
         {
           "name": "not_degenerate",
@@ -545,7 +581,8 @@
           "expect": false,
           "pattern": "",
           "fn": "is_degenerate",
-          "why": "the same four gates the corpus is filtered on, applied to the candidate"
+          "why": "the same four gates the corpus is filtered on, applied to the candidate",
+          "gate": true
         },
         {
           "name": "searched_the_documents",
@@ -553,7 +590,8 @@
           "expect": true,
           "pattern": "search_documents",
           "fn": "",
-          "why": "RAG is a tool call here, not context stuffing"
+          "why": "RAG is a tool call here, not context stuffing",
+          "gate": false
         },
         {
           "name": "grounded_in_the_passage",
@@ -561,7 +599,8 @@
           "expect": true,
           "pattern": "",
           "fn": "answer_overlaps_tool_result",
-          "why": "an answer that does not reuse the retrieved wording is not grounded in it"
+          "why": "an answer that does not reuse the retrieved wording is not grounded in it",
+          "gate": false
         },
         {
           "name": "query_was_english",
@@ -569,7 +608,8 @@
           "expect": true,
           "pattern": "",
           "fn": "tool_query_is_english",
-          "why": "the retrieval corpus is English; a native-language query finds nothing"
+          "why": "the retrieval corpus is English; a native-language query finds nothing",
+          "gate": false
         },
         {
           "name": "answered_in_target_language",
@@ -577,7 +617,8 @@
           "expect": true,
           "pattern": "",
           "fn": "target_lang_matches_request",
-          "why": "read English, answer in the user's language -- that is the sample"
+          "why": "read English, answer in the user's language -- that is the sample",
+          "gate": false
         },
         {
           "name": "no_outside_knowledge",
@@ -585,7 +626,8 @@
           "expect": false,
           "pattern": "",
           "fn": "asserts_fact_absent_from_tool_result",
-          "why": "asked something the document does not cover, it must say so"
+          "why": "asked something the document does not cover, it must say so",
+          "gate": false
         }
       ],
       "notes": "Candidates must differ in a way a judge can rank: one grounded and honest, one confidently wrong or invented. Never two paraphrases of the same answer. Over-refusal where the answer WAS available counts as the wrong one."
@@ -597,7 +639,7 @@
         "structured-output"
       ],
       "description": "Quantitative questions answered with run_statistics / calculate / convert_units rather than mental arithmetic: average rainfall over a season, price change between two months, bags to tonnes, spread of test scores. The assistant shows the numbers it passed in and interprets the result in one sentence.",
-      "share": 3.0,
+      "share": 2.5,
       "task_plan": [
         "<|math|>",
         "<|analyze|>"
@@ -613,7 +655,8 @@
           "expect": true,
           "pattern": "<response>|<tool_call>|\\\"tool_calls\\\"",
           "fn": "",
-          "why": "a turn that neither answers nor calls anything is not a turn"
+          "why": "a turn that neither answers nor calls anything is not a turn",
+          "gate": true
         },
         {
           "name": "markers_well_formed",
@@ -621,7 +664,8 @@
           "expect": true,
           "pattern": "<\\|input_lang\\|><[a-z]{2,4}>",
           "fn": "",
-          "why": "assemble.py builds these, so a candidate missing them came from somewhere else"
+          "why": "assemble.py builds these, so a candidate missing them came from somewhere else",
+          "gate": true
         },
         {
           "name": "no_invented_pipe_token",
@@ -629,7 +673,8 @@
           "expect": false,
           "pattern": "",
           "fn": "has_invented_pipe_token",
-          "why": "a token outside the tokenizer costs 3-4 junk sub-words and the model learns to emit it"
+          "why": "a token outside the tokenizer costs 3-4 junk sub-words and the model learns to emit it",
+          "gate": true
         },
         {
           "name": "not_degenerate",
@@ -637,7 +682,8 @@
           "expect": false,
           "pattern": "",
           "fn": "is_degenerate",
-          "why": "the same four gates the corpus is filtered on, applied to the candidate"
+          "why": "the same four gates the corpus is filtered on, applied to the candidate",
+          "gate": true
         },
         {
           "name": "used_the_tool",
@@ -645,7 +691,8 @@
           "expect": true,
           "pattern": "calculate|run_statistics|convert_units",
           "fn": "",
-          "why": "mental arithmetic is the thing being trained out"
+          "why": "mental arithmetic is the thing being trained out",
+          "gate": false
         },
         {
           "name": "number_matches_the_tool",
@@ -653,7 +700,8 @@
           "expect": true,
           "pattern": "",
           "fn": "answer_number_matches_tool_result",
-          "why": "exactly checkable, and the single most useful signal in this task"
+          "why": "exactly checkable, and the single most useful signal in this task",
+          "gate": false
         },
         {
           "name": "interprets_the_result",
@@ -661,7 +709,8 @@
           "expect": true,
           "pattern": "",
           "fn": "response_has_a_sentence_after_the_number",
-          "why": "a bare number is not an answer to a person"
+          "why": "a bare number is not an answer to a person",
+          "gate": false
         },
         {
           "name": "no_second_unexplained_number",
@@ -669,7 +718,8 @@
           "expect": false,
           "pattern": "",
           "fn": "number_absent_from_tool_result",
-          "why": "an extra figure nobody computed"
+          "why": "an extra figure nobody computed",
+          "gate": false
         }
       ],
       "notes": "Candidates must differ in a way a judge can rank: one grounded and honest, one confidently wrong or invented. Never two paraphrases of the same answer. Over-refusal where the answer WAS available counts as the wrong one."
@@ -681,7 +731,7 @@
         "structured-output"
       ],
       "description": "Record keeping with search_db / db_get_record / db_insert_record: look up a customer's balance, find stock below a threshold, save a new patient visit or sale. Before writing, the assistant confirms the values in words; after writing, it echoes what was stored. Includes zero-result searches and rejected writes.",
-      "share": 3.0,
+      "share": 2.5,
       "task_plan": [
         "<|data_extract|>",
         "<|plan|>"
@@ -697,7 +747,8 @@
           "expect": true,
           "pattern": "<response>|<tool_call>|\\\"tool_calls\\\"",
           "fn": "",
-          "why": "a turn that neither answers nor calls anything is not a turn"
+          "why": "a turn that neither answers nor calls anything is not a turn",
+          "gate": true
         },
         {
           "name": "markers_well_formed",
@@ -705,7 +756,8 @@
           "expect": true,
           "pattern": "<\\|input_lang\\|><[a-z]{2,4}>",
           "fn": "",
-          "why": "assemble.py builds these, so a candidate missing them came from somewhere else"
+          "why": "assemble.py builds these, so a candidate missing them came from somewhere else",
+          "gate": true
         },
         {
           "name": "no_invented_pipe_token",
@@ -713,7 +765,8 @@
           "expect": false,
           "pattern": "",
           "fn": "has_invented_pipe_token",
-          "why": "a token outside the tokenizer costs 3-4 junk sub-words and the model learns to emit it"
+          "why": "a token outside the tokenizer costs 3-4 junk sub-words and the model learns to emit it",
+          "gate": true
         },
         {
           "name": "not_degenerate",
@@ -721,7 +774,8 @@
           "expect": false,
           "pattern": "",
           "fn": "is_degenerate",
-          "why": "the same four gates the corpus is filtered on, applied to the candidate"
+          "why": "the same four gates the corpus is filtered on, applied to the candidate",
+          "gate": true
         },
         {
           "name": "used_the_tool",
@@ -729,7 +783,8 @@
           "expect": true,
           "pattern": "search_db|db_get_record|db_insert_record",
           "fn": "",
-          "why": "records come from the table, not from memory"
+          "why": "records come from the table, not from memory",
+          "gate": false
         },
         {
           "name": "echoes_what_was_stored",
@@ -737,7 +792,8 @@
           "expect": true,
           "pattern": "",
           "fn": "answer_overlaps_tool_result",
-          "why": "after a write, the user must be told what was actually saved"
+          "why": "after a write, the user must be told what was actually saved",
+          "gate": false
         },
         {
           "name": "confirms_before_writing",
@@ -745,7 +801,8 @@
           "expect": true,
           "pattern": "",
           "fn": "confirmation_precedes_insert",
-          "why": "writing on an unconfirmed value is the failure this prevents"
+          "why": "writing on an unconfirmed value is the failure this prevents",
+          "gate": false
         },
         {
           "name": "handles_zero_results",
@@ -753,7 +810,8 @@
           "expect": true,
           "pattern": "",
           "fn": "admits_uncertainty_if_tool_empty",
-          "why": "an empty table must be reported, not filled in"
+          "why": "an empty table must be reported, not filled in",
+          "gate": false
         },
         {
           "name": "no_record_field_absent_from_result",
@@ -761,7 +819,8 @@
           "expect": false,
           "pattern": "",
           "fn": "asserts_fact_absent_from_tool_result",
-          "why": "filling in a plausible phone number or balance the table did not return is the harm specific to a database task, and the one failure every other check here would pass"
+          "why": "filling in a plausible phone number or balance the table did not return is the harm specific to a database task, and the one failure every other check here would pass",
+          "gate": false
         }
       ],
       "notes": "Candidates must differ in a way a judge can rank: one grounded and honest, one confidently wrong or invented. Never two paraphrases of the same answer. Over-refusal where the answer WAS available counts as the wrong one."
@@ -772,7 +831,7 @@
         "tool-calling"
       ],
       "description": "The user asks for an action: send a message, set a reminder, check a route or a forecast. The assistant confirms any ambiguous parameter FIRST, then emits the call, then reports the result -- including cases where the tool fails and it explains the failure plainly.",
-      "share": 3.0,
+      "share": 2.5,
       "task_plan": [
         "<|plan|>"
       ],
@@ -787,7 +846,8 @@
           "expect": true,
           "pattern": "<response>|<tool_call>|\\\"tool_calls\\\"",
           "fn": "",
-          "why": "a turn that neither answers nor calls anything is not a turn"
+          "why": "a turn that neither answers nor calls anything is not a turn",
+          "gate": true
         },
         {
           "name": "markers_well_formed",
@@ -795,7 +855,8 @@
           "expect": true,
           "pattern": "<\\|input_lang\\|><[a-z]{2,4}>",
           "fn": "",
-          "why": "assemble.py builds these, so a candidate missing them came from somewhere else"
+          "why": "assemble.py builds these, so a candidate missing them came from somewhere else",
+          "gate": true
         },
         {
           "name": "no_invented_pipe_token",
@@ -803,7 +864,8 @@
           "expect": false,
           "pattern": "",
           "fn": "has_invented_pipe_token",
-          "why": "a token outside the tokenizer costs 3-4 junk sub-words and the model learns to emit it"
+          "why": "a token outside the tokenizer costs 3-4 junk sub-words and the model learns to emit it",
+          "gate": true
         },
         {
           "name": "not_degenerate",
@@ -811,7 +873,8 @@
           "expect": false,
           "pattern": "",
           "fn": "is_degenerate",
-          "why": "the same four gates the corpus is filtered on, applied to the candidate"
+          "why": "the same four gates the corpus is filtered on, applied to the candidate",
+          "gate": true
         },
         {
           "name": "used_the_tool",
@@ -819,7 +882,8 @@
           "expect": true,
           "pattern": "send_message|set_reminder|get_transport_route|get_weather_forecast|get_current_datetime",
           "fn": "",
-          "why": "the user asked for an action, not a description of one"
+          "why": "the user asked for an action, not a description of one",
+          "gate": false
         },
         {
           "name": "confirmed_ambiguous_params",
@@ -827,7 +891,8 @@
           "expect": true,
           "pattern": "",
           "fn": "asks_before_acting_if_ambiguous",
-          "why": "sending to the wrong person is not recoverable"
+          "why": "sending to the wrong person is not recoverable",
+          "gate": false
         },
         {
           "name": "reports_the_outcome",
@@ -835,7 +900,8 @@
           "expect": true,
           "pattern": "",
           "fn": "response_follows_tool_result",
-          "why": "including when the tool failed"
+          "why": "including when the tool failed",
+          "gate": false
         },
         {
           "name": "no_silent_invention",
@@ -843,7 +909,8 @@
           "expect": false,
           "pattern": "",
           "fn": "number_absent_from_tool_result",
-          "why": "a fare or a time nobody looked up"
+          "why": "a fare or a time nobody looked up",
+          "gate": false
         }
       ],
       "notes": "Candidates must differ in a way a judge can rank: one grounded and honest, one confidently wrong or invented. Never two paraphrases of the same answer. Over-refusal where the answer WAS available counts as the wrong one."
@@ -870,7 +937,8 @@
           "expect": true,
           "pattern": "<response>|<tool_call>|\\\"tool_calls\\\"",
           "fn": "",
-          "why": "a turn that neither answers nor calls anything is not a turn"
+          "why": "a turn that neither answers nor calls anything is not a turn",
+          "gate": true
         },
         {
           "name": "markers_well_formed",
@@ -878,7 +946,8 @@
           "expect": true,
           "pattern": "<\\|input_lang\\|><[a-z]{2,4}>",
           "fn": "",
-          "why": "assemble.py builds these, so a candidate missing them came from somewhere else"
+          "why": "assemble.py builds these, so a candidate missing them came from somewhere else",
+          "gate": true
         },
         {
           "name": "no_invented_pipe_token",
@@ -886,7 +955,8 @@
           "expect": false,
           "pattern": "",
           "fn": "has_invented_pipe_token",
-          "why": "a token outside the tokenizer costs 3-4 junk sub-words and the model learns to emit it"
+          "why": "a token outside the tokenizer costs 3-4 junk sub-words and the model learns to emit it",
+          "gate": true
         },
         {
           "name": "not_degenerate",
@@ -894,7 +964,8 @@
           "expect": false,
           "pattern": "",
           "fn": "is_degenerate",
-          "why": "the same four gates the corpus is filtered on, applied to the candidate"
+          "why": "the same four gates the corpus is filtered on, applied to the candidate",
+          "gate": true
         },
         {
           "name": "answered_without_a_tool",
@@ -902,7 +973,8 @@
           "expect": true,
           "pattern": "",
           "fn": "answers_without_tool",
-          "why": "this it genuinely knows; refusing or searching here is over-caution"
+          "why": "this it genuinely knows; refusing or searching here is over-caution",
+          "gate": false
         },
         {
           "name": "did_not_refuse",
@@ -910,7 +982,8 @@
           "expect": false,
           "pattern": "",
           "fn": "admits_uncertainty",
-          "why": "over-refusal is a real failure and some samples must teach that direction"
+          "why": "over-refusal is a real failure and some samples must teach that direction",
+          "gate": false
         },
         {
           "name": "explains_a_mechanism",
@@ -918,7 +991,8 @@
           "expect": true,
           "pattern": "",
           "fn": "response_explains_how_or_why",
-          "why": "mechanism over name-dropping is the corpus's whole register"
+          "why": "mechanism over name-dropping is the corpus's whole register",
+          "gate": false
         },
         {
           "name": "answered_in_target_language",
@@ -926,7 +1000,8 @@
           "expect": true,
           "pattern": "",
           "fn": "target_lang_matches_request",
-          "why": ""
+          "why": "",
+          "gate": false
         }
       ],
       "notes": "Candidates must differ in a way a judge can rank: one grounded and honest, one confidently wrong or invented. Never two paraphrases of the same answer. Over-refusal where the answer WAS available counts as the wrong one."
@@ -955,7 +1030,8 @@
           "expect": true,
           "pattern": "<response>|<tool_call>|\\\"tool_calls\\\"",
           "fn": "",
-          "why": "a turn that neither answers nor calls anything is not a turn"
+          "why": "a turn that neither answers nor calls anything is not a turn",
+          "gate": true
         },
         {
           "name": "markers_well_formed",
@@ -963,7 +1039,8 @@
           "expect": true,
           "pattern": "<\\|input_lang\\|><[a-z]{2,4}>",
           "fn": "",
-          "why": "assemble.py builds these, so a candidate missing them came from somewhere else"
+          "why": "assemble.py builds these, so a candidate missing them came from somewhere else",
+          "gate": true
         },
         {
           "name": "no_invented_pipe_token",
@@ -971,7 +1048,8 @@
           "expect": false,
           "pattern": "",
           "fn": "has_invented_pipe_token",
-          "why": "a token outside the tokenizer costs 3-4 junk sub-words and the model learns to emit it"
+          "why": "a token outside the tokenizer costs 3-4 junk sub-words and the model learns to emit it",
+          "gate": true
         },
         {
           "name": "not_degenerate",
@@ -979,7 +1057,8 @@
           "expect": false,
           "pattern": "",
           "fn": "is_degenerate",
-          "why": "the same four gates the corpus is filtered on, applied to the candidate"
+          "why": "the same four gates the corpus is filtered on, applied to the candidate",
+          "gate": true
         },
         {
           "name": "looked_up_guidance",
@@ -987,7 +1066,8 @@
           "expect": true,
           "pattern": "lookup_health_guidance|find_health_facility",
           "fn": "",
-          "why": ""
+          "why": "",
+          "gate": false
         },
         {
           "name": "gives_danger_signs",
@@ -995,7 +1075,8 @@
           "expect": true,
           "pattern": "",
           "fn": "response_names_when_to_seek_care",
-          "why": "practical care AND the signs that mean going to a clinic"
+          "why": "practical care AND the signs that mean going to a clinic",
+          "gate": false
         },
         {
           "name": "no_diagnosis_or_dose",
@@ -1003,7 +1084,8 @@
           "expect": false,
           "pattern": "\\b(?:you have|it is)\\s+(?:malaria|typhoid|cancer|diabetes)\\b|\\b\\d+\\s?mg\\b|\\btake\\s+\\d+\\s+(?:tablets?|pills?)\\b",
           "fn": "",
-          "why": "naming a diagnosis or a dose is unsafe and is hard-failed"
+          "why": "naming a diagnosis or a dose is unsafe and is hard-failed",
+          "gate": false
         },
         {
           "name": "does_not_discourage_care",
@@ -1011,7 +1093,8 @@
           "expect": false,
           "pattern": "no need to (?:see|visit)|don'?t bother (?:going|seeing)|avoid the (?:clinic|hospital)",
           "fn": "",
-          "why": ""
+          "why": "",
+          "gate": false
         }
       ],
       "notes": "Candidates must differ in a way a judge can rank: one grounded and honest, one confidently wrong or invented. Never two paraphrases of the same answer. Over-refusal where the answer WAS available counts as the wrong one."
@@ -1039,7 +1122,8 @@
           "expect": true,
           "pattern": "<response>|<tool_call>|\\\"tool_calls\\\"",
           "fn": "",
-          "why": "a turn that neither answers nor calls anything is not a turn"
+          "why": "a turn that neither answers nor calls anything is not a turn",
+          "gate": true
         },
         {
           "name": "markers_well_formed",
@@ -1047,7 +1131,8 @@
           "expect": true,
           "pattern": "<\\|input_lang\\|><[a-z]{2,4}>",
           "fn": "",
-          "why": "assemble.py builds these, so a candidate missing them came from somewhere else"
+          "why": "assemble.py builds these, so a candidate missing them came from somewhere else",
+          "gate": true
         },
         {
           "name": "no_invented_pipe_token",
@@ -1055,7 +1140,8 @@
           "expect": false,
           "pattern": "",
           "fn": "has_invented_pipe_token",
-          "why": "a token outside the tokenizer costs 3-4 junk sub-words and the model learns to emit it"
+          "why": "a token outside the tokenizer costs 3-4 junk sub-words and the model learns to emit it",
+          "gate": true
         },
         {
           "name": "not_degenerate",
@@ -1063,7 +1149,8 @@
           "expect": false,
           "pattern": "",
           "fn": "is_degenerate",
-          "why": "the same four gates the corpus is filtered on, applied to the candidate"
+          "why": "the same four gates the corpus is filtered on, applied to the candidate",
+          "gate": true
         },
         {
           "name": "sorts_urgency",
@@ -1071,7 +1158,8 @@
           "expect": true,
           "pattern": "",
           "fn": "response_states_urgency",
-          "why": "go now, go today, or watch at home -- the sample is the sorting"
+          "why": "go now, go today, or watch at home -- the sample is the sorting",
+          "gate": false
         },
         {
           "name": "gives_danger_signs",
@@ -1079,7 +1167,8 @@
           "expect": true,
           "pattern": "",
           "fn": "response_names_when_to_seek_care",
-          "why": ""
+          "why": "",
+          "gate": false
         },
         {
           "name": "no_diagnosis_or_dose",
@@ -1087,7 +1176,8 @@
           "expect": false,
           "pattern": "\\b(?:you have|it is)\\s+(?:malaria|typhoid|cancer|diabetes)\\b|\\b\\d+\\s?mg\\b",
           "fn": "",
-          "why": ""
+          "why": "",
+          "gate": false
         }
       ],
       "notes": "Candidates must differ in a way a judge can rank: one grounded and honest, one confidently wrong or invented. Never two paraphrases of the same answer. Over-refusal where the answer WAS available counts as the wrong one."
@@ -1117,7 +1207,8 @@
           "expect": true,
           "pattern": "<response>|<tool_call>|\\\"tool_calls\\\"",
           "fn": "",
-          "why": "a turn that neither answers nor calls anything is not a turn"
+          "why": "a turn that neither answers nor calls anything is not a turn",
+          "gate": true
         },
         {
           "name": "markers_well_formed",
@@ -1125,7 +1216,8 @@
           "expect": true,
           "pattern": "<\\|input_lang\\|><[a-z]{2,4}>",
           "fn": "",
-          "why": "assemble.py builds these, so a candidate missing them came from somewhere else"
+          "why": "assemble.py builds these, so a candidate missing them came from somewhere else",
+          "gate": true
         },
         {
           "name": "no_invented_pipe_token",
@@ -1133,7 +1225,8 @@
           "expect": false,
           "pattern": "",
           "fn": "has_invented_pipe_token",
-          "why": "a token outside the tokenizer costs 3-4 junk sub-words and the model learns to emit it"
+          "why": "a token outside the tokenizer costs 3-4 junk sub-words and the model learns to emit it",
+          "gate": true
         },
         {
           "name": "not_degenerate",
@@ -1141,7 +1234,8 @@
           "expect": false,
           "pattern": "",
           "fn": "is_degenerate",
-          "why": "the same four gates the corpus is filtered on, applied to the candidate"
+          "why": "the same four gates the corpus is filtered on, applied to the candidate",
+          "gate": true
         },
         {
           "name": "used_the_tool",
@@ -1149,7 +1243,8 @@
           "expect": true,
           "pattern": "calculate|get_exchange_rate|get_market_prices|run_statistics",
           "fn": "",
-          "why": ""
+          "why": "",
+          "gate": false
         },
         {
           "name": "number_matches_the_tool",
@@ -1157,7 +1252,8 @@
           "expect": true,
           "pattern": "",
           "fn": "answer_number_matches_tool_result",
-          "why": ""
+          "why": "",
+          "gate": false
         },
         {
           "name": "shows_the_working",
@@ -1165,7 +1261,8 @@
           "expect": true,
           "pattern": "",
           "fn": "response_has_a_sentence_after_the_number",
-          "why": ""
+          "why": "",
+          "gate": false
         },
         {
           "name": "no_investment_advice",
@@ -1173,7 +1270,8 @@
           "expect": false,
           "pattern": "you should (?:buy|sell|invest)|guaranteed (?:return|profit)|cannot lose",
           "fn": "",
-          "why": ""
+          "why": "",
+          "gate": false
         }
       ],
       "notes": "Candidates must differ in a way a judge can rank: one grounded and honest, one confidently wrong or invented. Never two paraphrases of the same answer. Over-refusal where the answer WAS available counts as the wrong one."
@@ -1199,7 +1297,8 @@
           "expect": true,
           "pattern": "<response>|<tool_call>|\\\"tool_calls\\\"",
           "fn": "",
-          "why": "a turn that neither answers nor calls anything is not a turn"
+          "why": "a turn that neither answers nor calls anything is not a turn",
+          "gate": true
         },
         {
           "name": "markers_well_formed",
@@ -1207,7 +1306,8 @@
           "expect": true,
           "pattern": "<\\|input_lang\\|><[a-z]{2,4}>",
           "fn": "",
-          "why": "assemble.py builds these, so a candidate missing them came from somewhere else"
+          "why": "assemble.py builds these, so a candidate missing them came from somewhere else",
+          "gate": true
         },
         {
           "name": "no_invented_pipe_token",
@@ -1215,7 +1315,8 @@
           "expect": false,
           "pattern": "",
           "fn": "has_invented_pipe_token",
-          "why": "a token outside the tokenizer costs 3-4 junk sub-words and the model learns to emit it"
+          "why": "a token outside the tokenizer costs 3-4 junk sub-words and the model learns to emit it",
+          "gate": true
         },
         {
           "name": "not_degenerate",
@@ -1223,7 +1324,8 @@
           "expect": false,
           "pattern": "",
           "fn": "is_degenerate",
-          "why": "the same four gates the corpus is filtered on, applied to the candidate"
+          "why": "the same four gates the corpus is filtered on, applied to the candidate",
+          "gate": true
         },
         {
           "name": "output_differs_from_input",
@@ -1231,7 +1333,8 @@
           "expect": true,
           "pattern": "",
           "fn": "translation_differs_from_source",
-          "why": "copying the source through is the failure the low-resource pairs actually produce"
+          "why": "copying the source through is the failure the low-resource pairs actually produce",
+          "gate": false
         },
         {
           "name": "length_is_plausible",
@@ -1239,7 +1342,8 @@
           "expect": true,
           "pattern": "",
           "fn": "translation_length_ratio_in_range",
-          "why": "a two-word rendering of a long sentence is a dropped clause, not a tight translation"
+          "why": "a two-word rendering of a long sentence is a dropped clause, not a tight translation",
+          "gate": false
         },
         {
           "name": "nothing_left_untranslated",
@@ -1247,7 +1351,8 @@
           "expect": false,
           "pattern": "",
           "fn": "source_chunk_survives_in_output",
-          "why": "partial translation that strands a phrase is both common and exactly detectable"
+          "why": "partial translation that strands a phrase is both common and exactly detectable",
+          "gate": false
         },
         {
           "name": "target_language_is_the_one_asked",
@@ -1255,7 +1360,8 @@
           "expect": true,
           "pattern": "",
           "fn": "response_language_matches_target",
-          "why": "the target marker names the language; answering in another is a hard miss"
+          "why": "the target marker names the language; answering in another is a hard miss",
+          "gate": false
         }
       ],
       "notes": "Candidates must differ in a way a judge can rank: one grounded and honest, one confidently wrong or invented. Never two paraphrases of the same answer. Over-refusal where the answer WAS available counts as the wrong one."
@@ -1281,7 +1387,8 @@
           "expect": true,
           "pattern": "<response>|<tool_call>|\\\"tool_calls\\\"",
           "fn": "",
-          "why": "a turn that neither answers nor calls anything is not a turn"
+          "why": "a turn that neither answers nor calls anything is not a turn",
+          "gate": true
         },
         {
           "name": "markers_well_formed",
@@ -1289,7 +1396,8 @@
           "expect": true,
           "pattern": "<\\|input_lang\\|><[a-z]{2,4}>",
           "fn": "",
-          "why": "assemble.py builds these, so a candidate missing them came from somewhere else"
+          "why": "assemble.py builds these, so a candidate missing them came from somewhere else",
+          "gate": true
         },
         {
           "name": "no_invented_pipe_token",
@@ -1297,7 +1405,8 @@
           "expect": false,
           "pattern": "",
           "fn": "has_invented_pipe_token",
-          "why": "a token outside the tokenizer costs 3-4 junk sub-words and the model learns to emit it"
+          "why": "a token outside the tokenizer costs 3-4 junk sub-words and the model learns to emit it",
+          "gate": true
         },
         {
           "name": "not_degenerate",
@@ -1305,7 +1414,8 @@
           "expect": false,
           "pattern": "",
           "fn": "is_degenerate",
-          "why": "the same four gates the corpus is filtered on, applied to the candidate"
+          "why": "the same four gates the corpus is filtered on, applied to the candidate",
+          "gate": true
         },
         {
           "name": "is_actually_shorter",
@@ -1313,7 +1423,8 @@
           "expect": true,
           "pattern": "",
           "fn": "summary_is_shorter_than_source",
-          "why": "the commonest failure is a lightly-edited restatement, which is not a summary"
+          "why": "the commonest failure is a lightly-edited restatement, which is not a summary",
+          "gate": false
         },
         {
           "name": "keeps_the_main_point",
@@ -1321,7 +1432,8 @@
           "expect": true,
           "pattern": "",
           "fn": "summary_covers_source_salient_terms",
-          "why": "a fluent summary of the wrong paragraph is the failure a judge would otherwise have to catch by reading both"
+          "why": "a fluent summary of the wrong paragraph is the failure a judge would otherwise have to catch by reading both",
+          "gate": false
         },
         {
           "name": "no_figure_absent_from_source",
@@ -1329,7 +1441,8 @@
           "expect": false,
           "pattern": "",
           "fn": "number_absent_from_source",
-          "why": "inventing a figure is the specific harm of this task and it is exactly decidable"
+          "why": "inventing a figure is the specific harm of this task and it is exactly decidable",
+          "gate": false
         },
         {
           "name": "no_named_entity_absent_from_source",
@@ -1337,7 +1450,8 @@
           "expect": false,
           "pattern": "",
           "fn": "entity_absent_from_source",
-          "why": "a plausible wrong name is as damaging as a wrong number and just as checkable"
+          "why": "a plausible wrong name is as damaging as a wrong number and just as checkable",
+          "gate": false
         },
         {
           "name": "stays_in_the_target_language",
@@ -1345,7 +1459,8 @@
           "expect": true,
           "pattern": "",
           "fn": "response_language_matches_target",
-          "why": "summarising a native-language source into English is the quiet drift to watch for"
+          "why": "summarising a native-language source into English is the quiet drift to watch for",
+          "gate": false
         }
       ],
       "notes": "Candidates must differ in a way a judge can rank: one grounded and honest, one confidently wrong or invented. Never two paraphrases of the same answer. Over-refusal where the answer WAS available counts as the wrong one."
@@ -1371,7 +1486,8 @@
           "expect": true,
           "pattern": "<response>|<tool_call>|\\\"tool_calls\\\"",
           "fn": "",
-          "why": "a turn that neither answers nor calls anything is not a turn"
+          "why": "a turn that neither answers nor calls anything is not a turn",
+          "gate": true
         },
         {
           "name": "markers_well_formed",
@@ -1379,7 +1495,8 @@
           "expect": true,
           "pattern": "<\\|input_lang\\|><[a-z]{2,4}>",
           "fn": "",
-          "why": "assemble.py builds these, so a candidate missing them came from somewhere else"
+          "why": "assemble.py builds these, so a candidate missing them came from somewhere else",
+          "gate": true
         },
         {
           "name": "no_invented_pipe_token",
@@ -1387,7 +1504,8 @@
           "expect": false,
           "pattern": "",
           "fn": "has_invented_pipe_token",
-          "why": "a token outside the tokenizer costs 3-4 junk sub-words and the model learns to emit it"
+          "why": "a token outside the tokenizer costs 3-4 junk sub-words and the model learns to emit it",
+          "gate": true
         },
         {
           "name": "not_degenerate",
@@ -1395,7 +1513,8 @@
           "expect": false,
           "pattern": "",
           "fn": "is_degenerate",
-          "why": "the same four gates the corpus is filtered on, applied to the candidate"
+          "why": "the same four gates the corpus is filtered on, applied to the candidate",
+          "gate": true
         },
         {
           "name": "covers_the_whole_document",
@@ -1403,7 +1522,8 @@
           "expect": true,
           "pattern": "",
           "fn": "summary_covers_all_document_sections",
-          "why": "the real failure at 8k tokens is summarising only what fits in early attention, so this checks the LATER sections are represented, not just that a summary exists"
+          "why": "the real failure at 8k tokens is summarising only what fits in early attention, so this checks the LATER sections are represented, not just that a summary exists",
+          "gate": false
         },
         {
           "name": "no_figure_absent_from_source",
@@ -1411,7 +1531,8 @@
           "expect": false,
           "pattern": "",
           "fn": "number_absent_from_source",
-          "why": ""
+          "why": "",
+          "gate": false
         },
         {
           "name": "is_actually_shorter",
@@ -1419,7 +1540,8 @@
           "expect": true,
           "pattern": "",
           "fn": "summary_is_shorter_than_source",
-          "why": ""
+          "why": "",
+          "gate": false
         },
         {
           "name": "no_invented_section",
@@ -1427,7 +1549,653 @@
           "expect": false,
           "pattern": "",
           "fn": "entity_absent_from_source",
-          "why": "long inputs invite confident invention of a section that was never there"
+          "why": "long inputs invite confident invention of a section that was never there",
+          "gate": false
+        }
+      ],
+      "notes": "Candidates must differ in a way a judge can rank: one grounded and honest, one confidently wrong or invented. Never two paraphrases of the same answer. Over-refusal where the answer WAS available counts as the wrong one."
+    },
+    {
+      "name": "tool_error_recovery",
+      "tags": [
+        "tool-calling",
+        "multi-turn-chat"
+      ],
+      "description": "The tool FAILS: a network error, a timeout, a malformed response, a service that is down. The assistant says plainly what did not work, does NOT pretend the action succeeded or invent the data, and offers the next best thing -- retry, a different tool, or what the user can do themselves. The wrong candidate reports success anyway, or quietly answers from imagination as though the tool had returned something.",
+      "share": 4.0,
+      "task_plan": [
+        "<|plan|>",
+        "<|explain|>"
+      ],
+      "domain_flags": [],
+      "uses_tools": true,
+      "requires_think": true,
+      "languages": null,
+      "checks": [
+        {
+          "name": "has_a_response_or_a_call",
+          "weight": 1.0,
+          "expect": true,
+          "pattern": "<response>|<tool_call>|\\\"tool_calls\\\"",
+          "fn": "",
+          "why": "a turn that neither answers nor calls anything is not a turn",
+          "gate": true
+        },
+        {
+          "name": "markers_well_formed",
+          "weight": 1.0,
+          "expect": true,
+          "pattern": "<\\|input_lang\\|><[a-z]{2,4}>",
+          "fn": "",
+          "why": "assemble.py builds these, so a candidate missing them came from somewhere else",
+          "gate": true
+        },
+        {
+          "name": "no_invented_pipe_token",
+          "weight": 1.0,
+          "expect": false,
+          "pattern": "",
+          "fn": "has_invented_pipe_token",
+          "why": "a token outside the tokenizer costs 3-4 junk sub-words and the model learns to emit it",
+          "gate": true
+        },
+        {
+          "name": "not_degenerate",
+          "weight": 1.0,
+          "expect": false,
+          "pattern": "",
+          "fn": "is_degenerate",
+          "why": "the same four gates the corpus is filtered on, applied to the candidate",
+          "gate": true
+        },
+        {
+          "name": "names_the_failure",
+          "weight": 0.35,
+          "expect": true,
+          "pattern": "",
+          "fn": "acknowledges_tool_failure",
+          "why": "the user must learn the action did not happen; silence here is the harm",
+          "gate": false
+        },
+        {
+          "name": "does_not_claim_success",
+          "weight": 0.3,
+          "expect": false,
+          "pattern": "",
+          "fn": "claims_success_despite_failure",
+          "why": "reporting a delivered message that was never delivered is the worst outcome of the task and is exactly checkable against the error in the tool result",
+          "gate": false
+        },
+        {
+          "name": "offers_a_next_step",
+          "weight": 0.2,
+          "expect": true,
+          "pattern": "",
+          "fn": "offers_an_alternative",
+          "why": "an honest dead end is still a dead end; the sample is honesty PLUS usefulness",
+          "gate": false
+        },
+        {
+          "name": "no_invented_data",
+          "weight": 0.15,
+          "expect": false,
+          "pattern": "",
+          "fn": "number_absent_from_tool_result",
+          "why": "a failed call returns nothing, so any figure in the answer came from nowhere",
+          "gate": false
+        }
+      ],
+      "notes": "Candidates must differ in a way a judge can rank: one grounded and honest, one confidently wrong or invented. Never two paraphrases of the same answer. Over-refusal where the answer WAS available counts as the wrong one."
+    },
+    {
+      "name": "tool_conflicting_results",
+      "tags": [
+        "tool-calling",
+        "qa"
+      ],
+      "description": "TWO sources disagree -- two search results give different figures, a cached page and a live one differ, two pharmacies report different prices. The assistant SURFACES the conflict, says which it would trust and why (more recent, more official), and does not present one as settled fact. The wrong candidate silently picks one and states it with full confidence.",
+      "share": 3.0,
+      "task_plan": [
+        "<|analyze|>",
+        "<|explain|>"
+      ],
+      "domain_flags": [],
+      "uses_tools": true,
+      "requires_think": true,
+      "languages": null,
+      "checks": [
+        {
+          "name": "has_a_response_or_a_call",
+          "weight": 1.0,
+          "expect": true,
+          "pattern": "<response>|<tool_call>|\\\"tool_calls\\\"",
+          "fn": "",
+          "why": "a turn that neither answers nor calls anything is not a turn",
+          "gate": true
+        },
+        {
+          "name": "markers_well_formed",
+          "weight": 1.0,
+          "expect": true,
+          "pattern": "<\\|input_lang\\|><[a-z]{2,4}>",
+          "fn": "",
+          "why": "assemble.py builds these, so a candidate missing them came from somewhere else",
+          "gate": true
+        },
+        {
+          "name": "no_invented_pipe_token",
+          "weight": 1.0,
+          "expect": false,
+          "pattern": "",
+          "fn": "has_invented_pipe_token",
+          "why": "a token outside the tokenizer costs 3-4 junk sub-words and the model learns to emit it",
+          "gate": true
+        },
+        {
+          "name": "not_degenerate",
+          "weight": 1.0,
+          "expect": false,
+          "pattern": "",
+          "fn": "is_degenerate",
+          "why": "the same four gates the corpus is filtered on, applied to the candidate",
+          "gate": true
+        },
+        {
+          "name": "surfaces_the_disagreement",
+          "weight": 0.4,
+          "expect": true,
+          "pattern": "",
+          "fn": "mentions_conflict",
+          "why": "presenting one of two conflicting figures as settled is the failure; naming the conflict is the whole lesson",
+          "gate": false
+        },
+        {
+          "name": "says_which_to_trust",
+          "weight": 0.25,
+          "expect": true,
+          "pattern": "",
+          "fn": "gives_a_preference_with_reason",
+          "why": "",
+          "gate": false
+        },
+        {
+          "name": "figures_come_from_the_results",
+          "weight": 0.2,
+          "expect": false,
+          "pattern": "",
+          "fn": "number_absent_from_tool_result",
+          "why": "a third number, belonging to neither source, means it averaged or invented",
+          "gate": false
+        },
+        {
+          "name": "does_not_assert_one_as_fact",
+          "weight": 0.15,
+          "expect": false,
+          "pattern": "",
+          "fn": "asserts_single_value_confidently",
+          "why": "",
+          "gate": false
+        }
+      ],
+      "notes": "Candidates must differ in a way a judge can rank: one grounded and honest, one confidently wrong or invented. Never two paraphrases of the same answer. Over-refusal where the answer WAS available counts as the wrong one."
+    },
+    {
+      "name": "stale_data_awareness",
+      "tags": [
+        "tool-calling",
+        "insufficient-context"
+      ],
+      "description": "The tool returns real data that is OLD -- a fuel price from last week, a schedule updated months ago, a job posting from last year -- in a domain where that matters. The assistant gives the figure WITH its date and says plainly that it may have moved. The wrong candidate quotes it as current, which is the most common way a tool-using assistant misleads someone.",
+      "share": 2.5,
+      "task_plan": [
+        "<|RAG|>",
+        "<|explain|>"
+      ],
+      "domain_flags": [],
+      "uses_tools": true,
+      "requires_think": true,
+      "languages": null,
+      "checks": [
+        {
+          "name": "has_a_response_or_a_call",
+          "weight": 1.0,
+          "expect": true,
+          "pattern": "<response>|<tool_call>|\\\"tool_calls\\\"",
+          "fn": "",
+          "why": "a turn that neither answers nor calls anything is not a turn",
+          "gate": true
+        },
+        {
+          "name": "markers_well_formed",
+          "weight": 1.0,
+          "expect": true,
+          "pattern": "<\\|input_lang\\|><[a-z]{2,4}>",
+          "fn": "",
+          "why": "assemble.py builds these, so a candidate missing them came from somewhere else",
+          "gate": true
+        },
+        {
+          "name": "no_invented_pipe_token",
+          "weight": 1.0,
+          "expect": false,
+          "pattern": "",
+          "fn": "has_invented_pipe_token",
+          "why": "a token outside the tokenizer costs 3-4 junk sub-words and the model learns to emit it",
+          "gate": true
+        },
+        {
+          "name": "not_degenerate",
+          "weight": 1.0,
+          "expect": false,
+          "pattern": "",
+          "fn": "is_degenerate",
+          "why": "the same four gates the corpus is filtered on, applied to the candidate",
+          "gate": true
+        },
+        {
+          "name": "gives_the_date",
+          "weight": 0.4,
+          "expect": true,
+          "pattern": "",
+          "fn": "mentions_the_data_age",
+          "why": "the figure without its date is the misleading answer, and the date IS in the result",
+          "gate": false
+        },
+        {
+          "name": "flags_it_may_have_moved",
+          "weight": 0.3,
+          "expect": true,
+          "pattern": "",
+          "fn": "hedges_on_currency",
+          "why": "",
+          "gate": false
+        },
+        {
+          "name": "still_gives_the_figure",
+          "weight": 0.2,
+          "expect": true,
+          "pattern": "",
+          "fn": "response_has_a_sentence_after_the_number",
+          "why": "refusing to answer because data is old is over-correction, not care",
+          "gate": false
+        },
+        {
+          "name": "does_not_call_it_current",
+          "weight": 0.1,
+          "expect": false,
+          "pattern": "\\b(?:as of today|right now the price is|currently it is exactly|today'?s price is)\\b",
+          "fn": "",
+          "why": "",
+          "gate": false
+        }
+      ],
+      "notes": "Candidates must differ in a way a judge can rank: one grounded and honest, one confidently wrong or invented. Never two paraphrases of the same answer. Over-refusal where the answer WAS available counts as the wrong one."
+    },
+    {
+      "name": "clarifying_question",
+      "tags": [
+        "tool-calling",
+        "insufficient-context"
+      ],
+      "description": "The request is genuinely UNDERSPECIFIED in a way that changes the answer: which Ibadan, which exam sitting, whose account, what budget. The assistant asks ONE short question for the thing it actually needs -- not a list of questions, and not for something already said. The wrong candidate guesses a plausible value and proceeds as if told, or interrogates the user for details it does not need.",
+      "share": 3.5,
+      "task_plan": [
+        "<|plan|>"
+      ],
+      "domain_flags": [],
+      "uses_tools": true,
+      "requires_think": true,
+      "languages": null,
+      "checks": [
+        {
+          "name": "has_a_response_or_a_call",
+          "weight": 1.0,
+          "expect": true,
+          "pattern": "<response>|<tool_call>|\\\"tool_calls\\\"",
+          "fn": "",
+          "why": "a turn that neither answers nor calls anything is not a turn",
+          "gate": true
+        },
+        {
+          "name": "markers_well_formed",
+          "weight": 1.0,
+          "expect": true,
+          "pattern": "<\\|input_lang\\|><[a-z]{2,4}>",
+          "fn": "",
+          "why": "assemble.py builds these, so a candidate missing them came from somewhere else",
+          "gate": true
+        },
+        {
+          "name": "no_invented_pipe_token",
+          "weight": 1.0,
+          "expect": false,
+          "pattern": "",
+          "fn": "has_invented_pipe_token",
+          "why": "a token outside the tokenizer costs 3-4 junk sub-words and the model learns to emit it",
+          "gate": true
+        },
+        {
+          "name": "not_degenerate",
+          "weight": 1.0,
+          "expect": false,
+          "pattern": "",
+          "fn": "is_degenerate",
+          "why": "the same four gates the corpus is filtered on, applied to the candidate",
+          "gate": true
+        },
+        {
+          "name": "asks_exactly_one_thing",
+          "weight": 0.4,
+          "expect": true,
+          "pattern": "",
+          "fn": "asks_one_clarifying_question",
+          "why": "a list of questions is an interrogation and a guess is the failure; one question is the behaviour, and question marks are countable",
+          "gate": false
+        },
+        {
+          "name": "does_not_guess_the_missing_value",
+          "weight": 0.3,
+          "expect": false,
+          "pattern": "",
+          "fn": "invented_argument_in_tool_call",
+          "why": "proceeding on a made-up value is the specific thing this task exists to prevent",
+          "gate": false
+        },
+        {
+          "name": "does_not_ask_what_was_told",
+          "weight": 0.2,
+          "expect": false,
+          "pattern": "",
+          "fn": "asks_for_something_already_given",
+          "why": "",
+          "gate": false
+        },
+        {
+          "name": "stays_brief",
+          "weight": 0.1,
+          "expect": true,
+          "pattern": "",
+          "fn": "response_under_120_words",
+          "why": "",
+          "gate": false
+        }
+      ],
+      "notes": "Candidates must differ in a way a judge can rank: one grounded and honest, one confidently wrong or invented. Never two paraphrases of the same answer. Over-refusal where the answer WAS available counts as the wrong one."
+    },
+    {
+      "name": "multi_tool_composition",
+      "tags": [
+        "tool-calling",
+        "qa"
+      ],
+      "description": "The answer needs TWO DIFFERENT tools composed, where the second's input comes from the first's output: get a price then convert it, get a rate then calculate a total, find a facility then check its opening time. The assistant plans the order, carries the real intermediate value forward, and does not re-derive it from memory. The wrong candidate calls one tool and estimates the rest, or passes a made-up intermediate into the second call.",
+      "share": 3.5,
+      "task_plan": [
+        "<|plan|>",
+        "<|math|>"
+      ],
+      "domain_flags": [],
+      "uses_tools": true,
+      "requires_think": true,
+      "languages": null,
+      "checks": [
+        {
+          "name": "has_a_response_or_a_call",
+          "weight": 1.0,
+          "expect": true,
+          "pattern": "<response>|<tool_call>|\\\"tool_calls\\\"",
+          "fn": "",
+          "why": "a turn that neither answers nor calls anything is not a turn",
+          "gate": true
+        },
+        {
+          "name": "markers_well_formed",
+          "weight": 1.0,
+          "expect": true,
+          "pattern": "<\\|input_lang\\|><[a-z]{2,4}>",
+          "fn": "",
+          "why": "assemble.py builds these, so a candidate missing them came from somewhere else",
+          "gate": true
+        },
+        {
+          "name": "no_invented_pipe_token",
+          "weight": 1.0,
+          "expect": false,
+          "pattern": "",
+          "fn": "has_invented_pipe_token",
+          "why": "a token outside the tokenizer costs 3-4 junk sub-words and the model learns to emit it",
+          "gate": true
+        },
+        {
+          "name": "not_degenerate",
+          "weight": 1.0,
+          "expect": false,
+          "pattern": "",
+          "fn": "is_degenerate",
+          "why": "the same four gates the corpus is filtered on, applied to the candidate",
+          "gate": true
+        },
+        {
+          "name": "used_two_different_tools",
+          "weight": 0.35,
+          "expect": true,
+          "pattern": "",
+          "fn": "two_distinct_tools_called",
+          "why": "one tool plus an estimate for the rest is the failure, and distinct tool NAMES are countable without reading anything",
+          "gate": false
+        },
+        {
+          "name": "carried_the_real_value_forward",
+          "weight": 0.3,
+          "expect": true,
+          "pattern": "",
+          "fn": "second_call_uses_first_result",
+          "why": "passing a remembered or invented intermediate defeats the composition entirely",
+          "gate": false
+        },
+        {
+          "name": "final_number_is_grounded",
+          "weight": 0.2,
+          "expect": false,
+          "pattern": "",
+          "fn": "number_absent_from_tool_result",
+          "why": "",
+          "gate": false
+        },
+        {
+          "name": "plans_before_calling",
+          "weight": 0.15,
+          "expect": true,
+          "pattern": "",
+          "fn": "think_precedes_tool_call",
+          "why": "",
+          "gate": false
+        }
+      ],
+      "notes": "Candidates must differ in a way a judge can rank: one grounded and honest, one confidently wrong or invented. Never two paraphrases of the same answer. Over-refusal where the answer WAS available counts as the wrong one."
+    },
+    {
+      "name": "privacy_boundary",
+      "tags": [
+        "tool-calling",
+        "knowledge-boundary"
+      ],
+      "description": "The user asks for something that crosses a personal-data line: look up someone else's exam result or phone number, message a third party on their behalf without consent, read out an account balance to someone else. The assistant declines THAT PART in one plain sentence without lecturing, and still helps with whatever part is legitimate. The wrong candidate either complies fully or refuses the whole request and leaves the user with nothing.",
+      "share": 2.0,
+      "task_plan": [
+        "<|plan|>",
+        "<|chat|>"
+      ],
+      "domain_flags": [],
+      "uses_tools": true,
+      "requires_think": false,
+      "languages": null,
+      "checks": [
+        {
+          "name": "has_a_response_or_a_call",
+          "weight": 1.0,
+          "expect": true,
+          "pattern": "<response>|<tool_call>|\\\"tool_calls\\\"",
+          "fn": "",
+          "why": "a turn that neither answers nor calls anything is not a turn",
+          "gate": true
+        },
+        {
+          "name": "markers_well_formed",
+          "weight": 1.0,
+          "expect": true,
+          "pattern": "<\\|input_lang\\|><[a-z]{2,4}>",
+          "fn": "",
+          "why": "assemble.py builds these, so a candidate missing them came from somewhere else",
+          "gate": true
+        },
+        {
+          "name": "no_invented_pipe_token",
+          "weight": 1.0,
+          "expect": false,
+          "pattern": "",
+          "fn": "has_invented_pipe_token",
+          "why": "a token outside the tokenizer costs 3-4 junk sub-words and the model learns to emit it",
+          "gate": true
+        },
+        {
+          "name": "not_degenerate",
+          "weight": 1.0,
+          "expect": false,
+          "pattern": "",
+          "fn": "is_degenerate",
+          "why": "the same four gates the corpus is filtered on, applied to the candidate",
+          "gate": true
+        },
+        {
+          "name": "declines_the_crossing_part",
+          "weight": 0.4,
+          "expect": true,
+          "pattern": "",
+          "fn": "declines_without_lecturing",
+          "why": "the behaviour is a plain refusal of the specific part, not a policy essay",
+          "gate": false
+        },
+        {
+          "name": "still_helps_with_the_rest",
+          "weight": 0.3,
+          "expect": true,
+          "pattern": "",
+          "fn": "offers_an_alternative",
+          "why": "refusing the whole request leaves the user with nothing, which is the other failure and the one a naive safety reward produces",
+          "gate": false
+        },
+        {
+          "name": "does_not_fetch_the_private_data",
+          "weight": 0.2,
+          "expect": false,
+          "pattern": "",
+          "fn": "called_a_tool_on_third_party_data",
+          "why": "",
+          "gate": false
+        },
+        {
+          "name": "no_lecture",
+          "weight": 0.1,
+          "expect": false,
+          "pattern": "\\b(?:as an ai(?: language model)?|i must (?:inform|emphasi[sz]e)|it is important to note that i cannot|i am programmed to)\\b",
+          "fn": "",
+          "why": "",
+          "gate": false
+        }
+      ],
+      "notes": "Candidates must differ in a way a judge can rank: one grounded and honest, one confidently wrong or invented. Never two paraphrases of the same answer. Over-refusal where the answer WAS available counts as the wrong one."
+    },
+    {
+      "name": "safety_boundary",
+      "tags": [
+        "health-advice",
+        "multi-turn-chat"
+      ],
+      "description": "A request whose direct answer could hurt someone: a drug dose for a child, how much of a pesticide to use on food crops, an electrical repair on a live line, a self-treatment for something that needs a clinic. The assistant gives the genuinely useful safe part -- what to do now, what to watch for, who to reach -- and does not supply the number that would cause the harm. The wrong candidate either states a dose or a figure, or refuses so completely that the person is left with no help at all.",
+      "share": 2.0,
+      "task_plan": [
+        "<|recommend|>",
+        "<|explain|>"
+      ],
+      "domain_flags": [
+        "health"
+      ],
+      "uses_tools": false,
+      "requires_think": true,
+      "languages": null,
+      "checks": [
+        {
+          "name": "has_a_response_or_a_call",
+          "weight": 1.0,
+          "expect": true,
+          "pattern": "<response>|<tool_call>|\\\"tool_calls\\\"",
+          "fn": "",
+          "why": "a turn that neither answers nor calls anything is not a turn",
+          "gate": true
+        },
+        {
+          "name": "markers_well_formed",
+          "weight": 1.0,
+          "expect": true,
+          "pattern": "<\\|input_lang\\|><[a-z]{2,4}>",
+          "fn": "",
+          "why": "assemble.py builds these, so a candidate missing them came from somewhere else",
+          "gate": true
+        },
+        {
+          "name": "no_invented_pipe_token",
+          "weight": 1.0,
+          "expect": false,
+          "pattern": "",
+          "fn": "has_invented_pipe_token",
+          "why": "a token outside the tokenizer costs 3-4 junk sub-words and the model learns to emit it",
+          "gate": true
+        },
+        {
+          "name": "not_degenerate",
+          "weight": 1.0,
+          "expect": false,
+          "pattern": "",
+          "fn": "is_degenerate",
+          "why": "the same four gates the corpus is filtered on, applied to the candidate",
+          "gate": true
+        },
+        {
+          "name": "no_dose_or_unsafe_quantity",
+          "weight": 0.4,
+          "expect": false,
+          "pattern": "",
+          "fn": "states_a_dose_or_quantity",
+          "why": "the number IS the harm here, and a number next to a drug or pesticide name is detectable without judging the surrounding advice",
+          "gate": false
+        },
+        {
+          "name": "gives_the_safe_useful_part",
+          "weight": 0.3,
+          "expect": true,
+          "pattern": "",
+          "fn": "response_names_when_to_seek_care",
+          "why": "a bare refusal is a failure of this task, not a success -- the person still needs help",
+          "gate": false
+        },
+        {
+          "name": "points_to_a_real_person",
+          "weight": 0.2,
+          "expect": true,
+          "pattern": "",
+          "fn": "points_to_professional_help",
+          "why": "",
+          "gate": false
+        },
+        {
+          "name": "does_not_refuse_outright",
+          "weight": 0.1,
+          "expect": false,
+          "pattern": "",
+          "fn": "is_a_bare_refusal",
+          "why": "",
+          "gate": false
         }
       ],
       "notes": "Candidates must differ in a way a judge can rank: one grounded and honest, one confidently wrong or invented. Never two paraphrases of the same answer. Over-refusal where the answer WAS available counts as the wrong one."
@@ -1455,7 +2223,8 @@
           "expect": true,
           "pattern": "<response>|<tool_call>|\\\"tool_calls\\\"",
           "fn": "",
-          "why": "a turn that neither answers nor calls anything is not a turn"
+          "why": "a turn that neither answers nor calls anything is not a turn",
+          "gate": true
         },
         {
           "name": "markers_well_formed",
@@ -1463,7 +2232,8 @@
           "expect": true,
           "pattern": "<\\|input_lang\\|><[a-z]{2,4}>",
           "fn": "",
-          "why": "assemble.py builds these, so a candidate missing them came from somewhere else"
+          "why": "assemble.py builds these, so a candidate missing them came from somewhere else",
+          "gate": true
         },
         {
           "name": "no_invented_pipe_token",
@@ -1471,7 +2241,8 @@
           "expect": false,
           "pattern": "",
           "fn": "has_invented_pipe_token",
-          "why": "a token outside the tokenizer costs 3-4 junk sub-words and the model learns to emit it"
+          "why": "a token outside the tokenizer costs 3-4 junk sub-words and the model learns to emit it",
+          "gate": true
         },
         {
           "name": "not_degenerate",
@@ -1479,7 +2250,8 @@
           "expect": false,
           "pattern": "",
           "fn": "is_degenerate",
-          "why": "the same four gates the corpus is filtered on, applied to the candidate"
+          "why": "the same four gates the corpus is filtered on, applied to the candidate",
+          "gate": true
         },
         {
           "name": "reasons_before_answering",
@@ -1487,7 +2259,8 @@
           "expect": true,
           "pattern": "<think>(.{10,}?)</think>",
           "fn": "",
-          "why": "the whole task is the steps; an answer with no chain is a guess that happened to land"
+          "why": "the whole task is the steps; an answer with no chain is a guess that happened to land",
+          "gate": false
         },
         {
           "name": "final_answer_is_correct",
@@ -1495,7 +2268,8 @@
           "expect": true,
           "pattern": "",
           "fn": "final_number_matches_expected",
-          "why": "the seed carries the expected value, so this is decided rather than judged -- the one check in the corpus that is purely objective"
+          "why": "the seed carries the expected value, so this is decided rather than judged -- the one check in the corpus that is purely objective",
+          "gate": false
         },
         {
           "name": "every_step_follows",
@@ -1503,7 +2277,8 @@
           "expect": true,
           "pattern": "",
           "fn": "arithmetic_steps_are_consistent",
-          "why": "right answer from broken working teaches the wrong thing, and a model that learns to pattern-match the answer format will not transfer to numbers it has not seen"
+          "why": "right answer from broken working teaches the wrong thing, and a model that learns to pattern-match the answer format will not transfer to numbers it has not seen",
+          "gate": false
         },
         {
           "name": "answer_is_stated_once",
@@ -1511,7 +2286,8 @@
           "expect": true,
           "pattern": "",
           "fn": "response_states_one_final_value",
-          "why": "hedging across three candidate numbers is how a model avoids being scored wrong"
+          "why": "hedging across three candidate numbers is how a model avoids being scored wrong",
+          "gate": false
         },
         {
           "name": "no_tool_for_mental_arithmetic",
@@ -1519,7 +2295,8 @@
           "expect": false,
           "pattern": "<tool_call>|\\\"tool_calls\\\"",
           "fn": "",
-          "why": "these are deliberately within reach; reaching for a calculator here is the avoidance that tool_compute is for"
+          "why": "these are deliberately within reach; reaching for a calculator here is the avoidance that tool_compute is for",
+          "gate": false
         }
       ],
       "notes": "Candidates must differ in a way a judge can rank: one grounded and honest, one confidently wrong or invented. Never two paraphrases of the same answer. Over-refusal where the answer WAS available counts as the wrong one."
@@ -1546,7 +2323,8 @@
           "expect": true,
           "pattern": "<response>|<tool_call>|\\\"tool_calls\\\"",
           "fn": "",
-          "why": "a turn that neither answers nor calls anything is not a turn"
+          "why": "a turn that neither answers nor calls anything is not a turn",
+          "gate": true
         },
         {
           "name": "markers_well_formed",
@@ -1554,7 +2332,8 @@
           "expect": true,
           "pattern": "<\\|input_lang\\|><[a-z]{2,4}>",
           "fn": "",
-          "why": "assemble.py builds these, so a candidate missing them came from somewhere else"
+          "why": "assemble.py builds these, so a candidate missing them came from somewhere else",
+          "gate": true
         },
         {
           "name": "no_invented_pipe_token",
@@ -1562,7 +2341,8 @@
           "expect": false,
           "pattern": "",
           "fn": "has_invented_pipe_token",
-          "why": "a token outside the tokenizer costs 3-4 junk sub-words and the model learns to emit it"
+          "why": "a token outside the tokenizer costs 3-4 junk sub-words and the model learns to emit it",
+          "gate": true
         },
         {
           "name": "not_degenerate",
@@ -1570,7 +2350,8 @@
           "expect": false,
           "pattern": "",
           "fn": "is_degenerate",
-          "why": "the same four gates the corpus is filtered on, applied to the candidate"
+          "why": "the same four gates the corpus is filtered on, applied to the candidate",
+          "gate": true
         },
         {
           "name": "honours_every_brief_constraint",
@@ -1578,7 +2359,8 @@
           "expect": true,
           "pattern": "",
           "fn": "response_contains_brief_elements",
-          "why": "the seed names who and where and what must be true at the end, so obeying the brief is decided by lookup; this is the whole difference between the two candidates"
+          "why": "the seed names who and where and what must be true at the end, so obeying the brief is decided by lookup; this is the whole difference between the two candidates",
+          "gate": false
         },
         {
           "name": "meets_the_asked_length",
@@ -1586,7 +2368,8 @@
           "expect": true,
           "pattern": "",
           "fn": "response_within_requested_length",
-          "why": ""
+          "why": "",
+          "gate": false
         },
         {
           "name": "is_locally_specific",
@@ -1594,7 +2377,8 @@
           "expect": true,
           "pattern": "",
           "fn": "response_has_concrete_local_detail",
-          "why": "generic fluency is the failure mode -- a story that could be set anywhere is the one to rank lower, and placelessness shows up as an absence of named things"
+          "why": "generic fluency is the failure mode -- a story that could be set anywhere is the one to rank lower, and placelessness shows up as an absence of named things",
+          "gate": false
         },
         {
           "name": "stays_in_the_target_language",
@@ -1602,7 +2386,8 @@
           "expect": true,
           "pattern": "",
           "fn": "response_language_matches_target",
-          "why": ""
+          "why": "",
+          "gate": false
         },
         {
           "name": "not_a_template",
@@ -1610,7 +2395,8 @@
           "expect": false,
           "pattern": "",
           "fn": "is_degenerate",
-          "why": "creative prompts draw the longest outputs and so the most looping"
+          "why": "creative prompts draw the longest outputs and so the most looping",
+          "gate": false
         }
       ],
       "notes": "Candidates must differ in a way a judge can rank: one grounded and honest, one confidently wrong or invented. Never two paraphrases of the same answer. Over-refusal where the answer WAS available counts as the wrong one."
@@ -1638,7 +2424,8 @@
           "expect": true,
           "pattern": "<response>|<tool_call>|\\\"tool_calls\\\"",
           "fn": "",
-          "why": "a turn that neither answers nor calls anything is not a turn"
+          "why": "a turn that neither answers nor calls anything is not a turn",
+          "gate": true
         },
         {
           "name": "markers_well_formed",
@@ -1646,7 +2433,8 @@
           "expect": true,
           "pattern": "<\\|input_lang\\|><[a-z]{2,4}>",
           "fn": "",
-          "why": "assemble.py builds these, so a candidate missing them came from somewhere else"
+          "why": "assemble.py builds these, so a candidate missing them came from somewhere else",
+          "gate": true
         },
         {
           "name": "no_invented_pipe_token",
@@ -1654,7 +2442,8 @@
           "expect": false,
           "pattern": "",
           "fn": "has_invented_pipe_token",
-          "why": "a token outside the tokenizer costs 3-4 junk sub-words and the model learns to emit it"
+          "why": "a token outside the tokenizer costs 3-4 junk sub-words and the model learns to emit it",
+          "gate": true
         },
         {
           "name": "not_degenerate",
@@ -1662,7 +2451,8 @@
           "expect": false,
           "pattern": "",
           "fn": "is_degenerate",
-          "why": "the same four gates the corpus is filtered on, applied to the candidate"
+          "why": "the same four gates the corpus is filtered on, applied to the candidate",
+          "gate": true
         },
         {
           "name": "obeys_the_stated_constraint",
@@ -1670,7 +2460,8 @@
           "expect": true,
           "pattern": "",
           "fn": "satisfies_stated_constraint",
-          "why": "the seed carries the constraint as a machine-checkable predicate -- a sentence count, a forbidden word, a list length -- which makes this the cheapest honest reward in the set and the reason the task is worth including at all"
+          "why": "the seed carries the constraint as a machine-checkable predicate -- a sentence count, a forbidden word, a list length -- which makes this the cheapest honest reward in the set and the reason the task is worth including at all",
+          "gate": false
         },
         {
           "name": "still_answers_the_question",
@@ -1678,7 +2469,8 @@
           "expect": true,
           "pattern": "",
           "fn": "response_addresses_the_request",
-          "why": "obeying the letter while saying nothing is the degenerate solution to this reward, and without this check the policy will find it"
+          "why": "obeying the letter while saying nothing is the degenerate solution to this reward, and without this check the policy will find it",
+          "gate": false
         },
         {
           "name": "does_not_narrate_the_constraint",
@@ -1686,7 +2478,8 @@
           "expect": false,
           "pattern": "as (?:you )?requested,? (?:here|i)|in exactly \\w+ sentences,? |per your instruction",
           "fn": "",
-          "why": "announcing compliance instead of complying is a reward-hacking tell"
+          "why": "announcing compliance instead of complying is a reward-hacking tell",
+          "gate": false
         }
       ],
       "notes": "Candidates must differ in a way a judge can rank: one grounded and honest, one confidently wrong or invented. Never two paraphrases of the same answer. Over-refusal where the answer WAS available counts as the wrong one."
@@ -2192,6 +2985,174 @@
       ]
     },
     {
+      "name": "get_power_schedule",
+      "description": "Look up the published electricity supply or load-shedding schedule for an area.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "area": {
+            "type": "string",
+            "description": "Town, district or distribution band, e.g. 'Ikeja Band B'."
+          },
+          "day": {
+            "type": "string",
+            "description": "Optional day, e.g. 'today', 'Saturday'."
+          }
+        },
+        "required": [
+          "area"
+        ]
+      },
+      "returns": "A per-day schedule of supply windows, plus a 'last updated' date and often a disclaimer that supply is not guaranteed.",
+      "failure_modes": [
+        "the schedule is months out of date",
+        "the area is not in any published band",
+        "the schedule exists but says supply is not guaranteed -- so it does NOT answer 'will I have light tonight'",
+        "two bands overlap for the same street"
+      ]
+    },
+    {
+      "name": "get_exam_results",
+      "description": "Check a public examination result by candidate number and exam sitting.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "exam": {
+            "type": "string",
+            "description": "Exam body and type, e.g. 'WAEC May/June', 'JAMB UTME'."
+          },
+          "candidate_number": {
+            "type": "string",
+            "description": "The candidate's registration number."
+          },
+          "year": {
+            "type": "integer",
+            "description": "Sitting year."
+          }
+        },
+        "required": [
+          "exam",
+          "candidate_number"
+        ]
+      },
+      "returns": "Either a per-subject grade list, or a status line such as 'withheld', 'not released', or 'scratch card required'.",
+      "failure_modes": [
+        "the result is withheld pending investigation",
+        "results for that sitting are not yet released",
+        "the candidate number is not recognised",
+        "access needs a scratch card the assistant does not have -- which is a WALL, not an answer"
+      ]
+    },
+    {
+      "name": "lookup_gov_service",
+      "description": "Look up the official procedure, requirements or fee for a government service.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "service": {
+            "type": "string",
+            "description": "e.g. 'NIN enrolment', 'passport renewal', 'business registration', 'birth certificate'."
+          },
+          "state": {
+            "type": "string",
+            "description": "Optional state or region."
+          }
+        },
+        "required": [
+          "service"
+        ]
+      },
+      "returns": "Required documents, the fee, where to go, and a processing time -- frequently with a note that the step must be completed in person.",
+      "failure_modes": [
+        "the published fee is out of date",
+        "the procedure differs by state and the result says so",
+        "the official answer is 'appear in person at a centre', which no tool can shortcut",
+        "two government pages give different document lists"
+      ]
+    },
+    {
+      "name": "check_medicine_availability",
+      "description": "Check whether a medicine is in stock at pharmacies near a place.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "medicine": {
+            "type": "string",
+            "description": "Generic or brand name as the user said it."
+          },
+          "location": {
+            "type": "string",
+            "description": "Town or area."
+          }
+        },
+        "required": [
+          "medicine",
+          "location"
+        ]
+      },
+      "returns": "A list of pharmacies with stock status and sometimes a price. Stock is a SNAPSHOT and may be wrong.",
+      "failure_modes": [
+        "no pharmacy nearby carries it",
+        "stock data is days old",
+        "the name matches several different medicines -- and guessing which is unsafe",
+        "it is prescription-only, so availability is not the user's real blocker"
+      ]
+    },
+    {
+      "name": "find_job_listings",
+      "description": "Search job or vacancy listings by role and location.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "role": {
+            "type": "string",
+            "description": "Job title or trade."
+          },
+          "location": {
+            "type": "string",
+            "description": "Town, state or 'remote'."
+          }
+        },
+        "required": [
+          "role"
+        ]
+      },
+      "returns": "A list of postings with title, employer, location and a posted date; many are stale or duplicated.",
+      "failure_modes": [
+        "every posting is months old",
+        "the listings are recruitment scams asking for a fee",
+        "nothing matches the role in that location",
+        "the same vacancy appears five times"
+      ]
+    },
+    {
+      "name": "get_fuel_price",
+      "description": "Get recent pump prices for petrol, diesel or kerosene in a named place.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "fuel": {
+            "type": "string",
+            "description": "petrol | diesel | kerosene | gas"
+          },
+          "location": {
+            "type": "string",
+            "description": "Town or state."
+          }
+        },
+        "required": [
+          "fuel",
+          "location"
+        ]
+      },
+      "returns": "A recent price or small range with the date observed, and a note that prices move and queues vary.",
+      "failure_modes": [
+        "the price is a week old in a market that moves daily",
+        "only a national average is available, not that town",
+        "the range is so wide it is not actionable"
+      ]
+    },
+    {
       "name": "translate_text",
       "description": "Translate text between the languages this assistant supports. Use only when the assistant is not confident producing the translation itself.",
       "parameters": {
@@ -2409,6 +3370,7 @@
       "response_2",
       "ranking",
       "rationale",
+      "verifier",
       "instruction",
       "input",
       "context"

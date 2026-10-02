@@ -758,31 +758,38 @@ length floor to the brief before a full run.
 # AfriCOMET translation prompts (`africomet_translation/`)
 
 Prompts for RLHF where the reward is [AfriCOMET](https://huggingface.co/masakhane/africomet-qe-stl-1.1) (reference-free QE).
-**No LLM is called and nothing is paid for**: passages are real text from public datasets, instructions come from
+**No LLM is called and nothing is paid for**: passages are real text from public corpora, instructions come from
 hand-written template banks. Each row is `instruction`, `input` (1-5 consecutive sentences of one document),
 `source_language`, `target_language`, plus the joined `prompt`, instruction placement/language and provenance.
-Pushed continuously, one commit per language, to `BeardedMonster/africomet-translation` (private by default).
+Pushed to `BeardedMonster/africomet-translation` (private by default).
 
 ```bash
 cd data-gen
-python -m africomet_translation.build build --per-language 12 --out /tmp/pilot --cache /tmp/pilot_cache        # local pilot
-python -m africomet_translation.build build --per-language 5000 --out OUT --cache CACHE --push                 # full run
-python -m africomet_translation.build cleanup --out OUT --cache CACHE   # verifies every shard is on the Hub, then deletes CACHE
+# Stage A -- one resumable task per (language, source); web text is verified sentence-by-sentence with GlotLID
+python -m africomet_translation.cli extract --out OUT --cache CACHE --languages pcm,yor,hau,ibo,fon,ewe,twi,efi,ibb --lid-workers 2 --workers 2
+python -m africomet_translation.cli extract --out OUT --cache CACHE --languages eng --eng-c4 12 --eng-wiki 10 --eng-edu 10 --workers 4
+python -m africomet_translation.cli status  --out OUT -v
+# Stage B -- de-duplicate across sources, balance targets, render instructions, write parquet, push per language
+python -m africomet_translation.cli assemble --out OUT --total 10000000 --tag v2 --push
 ```
 
 * **Languages:** `eng pcm yor hau ibo fon ewe twi efi ibb`. Akan and Urhobo are excluded (AfriCOMET cannot evaluate them);
   Ibibio is included on request although AfriCOMET-1.1's encoder (`Davlan/afro-xlmr-large-76L`) does not list it, so
   rows touching it carry `africomet_supported=false`.
-* **Sources** (`sources.py`): masakhanews (eng/pcm/yor/hau/ibo), FLORES+ (yor/hau/ibo/fon/ewe/twi), google/smol docs
-  (pcm/yor/hau/ibo/fon/ewe/efi), `howard-nlp/ibom-mt` + `sib200-ibom` (efi/ibb), the two `offiongbassey` Efik sets
-  (transcripts only; the audio is never downloaded), and for English also streamed Wikipedia and FineWeb-Edu.
-  Sentences are de-duplicated across a language's sources in registry order.
-* **Length:** `input` is capped at 256 tokens of the AfriCOMET tokenizer (it truncates each segment at 512), leaving
-  room for the translation. Window size is balanced towards uniform 1-5; short-article sources cannot supply many 5s.
+* **Sources** (`registry.py`): masakhanews, FLORES+, google/smol, `howard-nlp/ibom-mt` + `sib200-ibom`, the two
+  `offiongbassey` Efik sets (transcripts only), Wikipedia, wikianc, the AfriSpeech Africa Corpus (Bible), GlotCC,
+  HPLT 2.0, mC4, OPUS-100; English also C4, Wikipedia and FineWeb-Edu. Skipped with evidence (see `registry.py`):
+  xP3x / xP3mt (FLORES-only), Inkuba-instruct, bluesky, `Aletheia-ng/GlotCC-V1`. Inkuba-Mono is CC-BY-NC and off
+  unless `--include-nc`.
+* **Why language ID matters:** only ~46% of the lines HPLT labels Yoruba were Yoruba per GlotLID (the rest: Budu, Gun,
+  Gokana Bible text...). `lid.py` keeps a sentence only if GlotLID's top label is the expected language.
+* **Balance:** non-English rows are all kept; English rows fill the rest of `--total` and are routed so that every
+  *target* language gets about the same number of rows (English as a target is double-weighted for non-English sources).
+* **Length:** `input` is capped at 256 tokens of the AfriCOMET tokenizer (it truncates each segment at 512).
 * **Instructions** (`instructions.py`): written in `eng pcm yor hau ibo twi ewe`, rotated evenly; prepended or appended;
-  structure/length vary from 3 to 40+ words. **Fon, Efik and Ibibio have no templates** -- they were not written because
-  nobody involved can write them reliably. Add a bank to `TEMPLATES` and they join the rotation automatically.
-  `template_confidence` marks `twi`/`ewe` as `low`; none of it is native-reviewed.
-* **Licenses differ per row** (`source_license`); `ibom-mt` is CC-BY-NC-4.0. FLORES/SIB-200 sentences are standard eval
-  sets, so do not evaluate on them after training on these prompts.
-* `tests/test_africomet_translation.py` (offline).
+  from 2 to 40+ words. **Fon, Efik and Ibibio have no templates** (not written: nobody involved can write them
+  reliably). Add a bank to `TEMPLATES` and they join automatically. Not native-reviewed (`template_confidence`).
+* **Licenses differ per row** (`source_license`, `source_kind`): ibom-mt is CC-BY-NC-4.0; Bible rows have unverified
+  Bible-society copyright; web rows are Common Crawl derivatives. FLORES/SIB-200 sentences are standard eval sets.
+* Memory: each language-ID worker holds a 1.6 GB model; keep `--lid-workers` small on a 16 GB machine.
+* `tests/test_africomet_translation.py`, `tests/test_africomet_assemble.py` (offline).

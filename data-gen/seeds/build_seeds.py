@@ -315,6 +315,61 @@ TOOLS = [
        {"when": {**_STR, "description": "ISO datetime or a phrase like 'tomorrow 07:00'."}, "text": _STR},
        ["when", "text"], "Confirmation with the resolved absolute time.",
        ["time in the past", "unparseable time phrase"], ["all"]),
+    # -- everyday services. Added for SCENARIO breadth: the tool kinds above were broad, but the situations
+    # were narrow. These are the lookups people in this region actually make, and each brings a failure mode
+    # the catalogue did not have -- a schedule that is published but not honoured, a result behind a paywall,
+    # a government process whose official answer is "come in person".
+    _t("get_power_schedule", "Look up the published electricity supply or load-shedding schedule for an area.",
+       {"area": {**_STR, "description": "Town, district or distribution band, e.g. 'Ikeja Band B'."},
+        "day": {**_STR, "description": "Optional day, e.g. 'today', 'Saturday'."}}, ["area"],
+       "A per-day schedule of supply windows, plus a 'last updated' date and often a disclaimer that supply "
+       "is not guaranteed.",
+       ["the schedule is months out of date", "the area is not in any published band",
+        "the schedule exists but says supply is not guaranteed -- so it does NOT answer 'will I have light "
+        "tonight'", "two bands overlap for the same street"],
+       ["all"]),
+    _t("get_exam_results", "Check a public examination result by candidate number and exam sitting.",
+       {"exam": {**_STR, "description": "Exam body and type, e.g. 'WAEC May/June', 'JAMB UTME'."},
+        "candidate_number": {**_STR, "description": "The candidate's registration number."},
+        "year": {**_INT, "description": "Sitting year."}}, ["exam", "candidate_number"],
+       "Either a per-subject grade list, or a status line such as 'withheld', 'not released', or 'scratch "
+       "card required'.",
+       ["the result is withheld pending investigation", "results for that sitting are not yet released",
+        "the candidate number is not recognised",
+        "access needs a scratch card the assistant does not have -- which is a WALL, not an answer"],
+       ["all"]),
+    _t("lookup_gov_service", "Look up the official procedure, requirements or fee for a government service.",
+       {"service": {**_STR, "description": "e.g. 'NIN enrolment', 'passport renewal', 'business "
+                                           "registration', 'birth certificate'."},
+        "state": {**_STR, "description": "Optional state or region."}}, ["service"],
+       "Required documents, the fee, where to go, and a processing time -- frequently with a note that the "
+       "step must be completed in person.",
+       ["the published fee is out of date", "the procedure differs by state and the result says so",
+        "the official answer is 'appear in person at a centre', which no tool can shortcut",
+        "two government pages give different document lists"],
+       ["all"]),
+    _t("check_medicine_availability", "Check whether a medicine is in stock at pharmacies near a place.",
+       {"medicine": {**_STR, "description": "Generic or brand name as the user said it."},
+        "location": {**_STR, "description": "Town or area."}}, ["medicine", "location"],
+       "A list of pharmacies with stock status and sometimes a price. Stock is a SNAPSHOT and may be wrong.",
+       ["no pharmacy nearby carries it", "stock data is days old",
+        "the name matches several different medicines -- and guessing which is unsafe",
+        "it is prescription-only, so availability is not the user's real blocker"],
+       ["health"]),
+    _t("find_job_listings", "Search job or vacancy listings by role and location.",
+       {"role": {**_STR, "description": "Job title or trade."},
+        "location": {**_STR, "description": "Town, state or 'remote'."}}, ["role"],
+       "A list of postings with title, employer, location and a posted date; many are stale or duplicated.",
+       ["every posting is months old", "the listings are recruitment scams asking for a fee",
+        "nothing matches the role in that location", "the same vacancy appears five times"],
+       ["all"]),
+    _t("get_fuel_price", "Get recent pump prices for petrol, diesel or kerosene in a named place.",
+       {"fuel": {**_STR, "description": "petrol | diesel | kerosene | gas"},
+        "location": {**_STR, "description": "Town or state."}}, ["fuel", "location"],
+       "A recent price or small range with the date observed, and a note that prices move and queues vary.",
+       ["the price is a week old in a market that moves daily",
+        "only a national average is available, not that town", "the range is so wide it is not actionable"],
+       ["all"]),
     _t("translate_text", "Translate text between the languages this assistant supports. Use only when the "
        "assistant is not confident producing the translation itself.",
        {"text": _STR, "target_language": {**_STR, "description": "Language code, e.g. 'yor'."}},
@@ -355,6 +410,12 @@ def _task(name, tags, share, description, plan=(), flags=(), tools=False, think=
 BEHAVIOUR_TASKS = {
     "tool_search_answer", "tool_chain_insufficient", "no_tool_admit_unknown", "retrieval_insufficient",
     "rag_document_qa", "tool_compute", "tool_database", "action_tool_use",
+    # The tool-use SCENARIOS belong here too, and for the same reason: in every one of them the lesson is
+    # that one reply is WORSE than another -- report the failure or paper over it, surface the conflict or
+    # pick silently, ask or guess, decline the part that crosses the line or refuse everything. A single SFT
+    # target cannot express any of those, so they are RL-only and must not leak back into SFT.
+    "tool_error_recovery", "tool_conflicting_results", "stale_data_awareness", "clarifying_question",
+    "multi_tool_composition", "privacy_boundary", "safety_boundary",
 }
 ALL_TASKS = [
     # ---- knowledge boundary: the reason this corpus exists
@@ -499,6 +560,58 @@ ALL_TASKS = [
     _task("pos_tagging", ["pos-tagging"], 1.5,
           "Part-of-speech tagging over a sentence in the target language, as aligned token/tag pairs.",
           plan=["<NER>"]),
+    # ---- tool-use SCENARIOS, not tool kinds. The tasks above cover whether to call a tool and which one;
+    # these cover what happens when the call does not go cleanly, which is most of real use. Each is a
+    # preference between two replies -- report the failure or paper over it, surface the conflict or pick
+    # silently, ask or guess -- so each belongs in RL.
+    _task("tool_error_recovery", ["tool-calling", "multi-turn-chat"], 5.0,
+          "The tool FAILS: a network error, a timeout, a malformed response, a service that is down. The "
+          "assistant says plainly what did not work, does NOT pretend the action succeeded or invent the "
+          "data, and offers the next best thing -- retry, a different tool, or what the user can do "
+          "themselves. The wrong candidate reports success anyway, or quietly answers from imagination as "
+          "though the tool had returned something.",
+          plan=["<|plan|>", "<|explain|>"], tools=True, think=True),
+    _task("tool_conflicting_results", ["tool-calling", "qa"], 4.0,
+          "TWO sources disagree -- two search results give different figures, a cached page and a live one "
+          "differ, two pharmacies report different prices. The assistant SURFACES the conflict, says which "
+          "it would trust and why (more recent, more official), and does not present one as settled fact. "
+          "The wrong candidate silently picks one and states it with full confidence.",
+          plan=["<|analyze|>", "<|explain|>"], tools=True, think=True),
+    _task("stale_data_awareness", ["tool-calling", "insufficient-context"], 3.5,
+          "The tool returns real data that is OLD -- a fuel price from last week, a schedule updated months "
+          "ago, a job posting from last year -- in a domain where that matters. The assistant gives the "
+          "figure WITH its date and says plainly that it may have moved. The wrong candidate quotes it as "
+          "current, which is the most common way a tool-using assistant misleads someone.",
+          plan=["<|RAG|>", "<|explain|>"], tools=True, think=True),
+    _task("clarifying_question", ["tool-calling", "insufficient-context"], 4.0,
+          "The request is genuinely UNDERSPECIFIED in a way that changes the answer: which Ibadan, which "
+          "exam sitting, whose account, what budget. The assistant asks ONE short question for the thing it "
+          "actually needs -- not a list of questions, and not for something already said. The wrong "
+          "candidate guesses a plausible value and proceeds as if told, or interrogates the user for "
+          "details it does not need.",
+          plan=["<|plan|>"], tools=True, think=True),
+    _task("multi_tool_composition", ["tool-calling", "qa"], 4.5,
+          "The answer needs TWO DIFFERENT tools composed, where the second's input comes from the first's "
+          "output: get a price then convert it, get a rate then calculate a total, find a facility then "
+          "check its opening time. The assistant plans the order, carries the real intermediate value "
+          "forward, and does not re-derive it from memory. The wrong candidate calls one tool and estimates "
+          "the rest, or passes a made-up intermediate into the second call.",
+          plan=["<|plan|>", "<|math|>"], tools=True, think=True),
+    _task("privacy_boundary", ["tool-calling", "knowledge-boundary"], 3.0,
+          "The user asks for something that crosses a personal-data line: look up someone else's exam "
+          "result or phone number, message a third party on their behalf without consent, read out an "
+          "account balance to someone else. The assistant declines THAT PART in one plain sentence without "
+          "lecturing, and still helps with whatever part is legitimate. The wrong candidate either complies "
+          "fully or refuses the whole request and leaves the user with nothing.",
+          plan=["<|plan|>", "<|chat|>"], tools=True),
+    _task("safety_boundary", ["health-advice", "multi-turn-chat"], 3.0,
+          "A request whose direct answer could hurt someone: a drug dose for a child, how much of a "
+          "pesticide to use on food crops, an electrical repair on a live line, a self-treatment for "
+          "something that needs a clinic. The assistant gives the genuinely useful safe part -- what to do "
+          "now, what to watch for, who to reach -- and does not supply the number that would cause the "
+          "harm. The wrong candidate either states a dose or a figure, or refuses so completely that the "
+          "person is left with no help at all.",
+          plan=["<|recommend|>", "<|explain|>"], flags=["health"], think=True),
     # ---- generation and reasoning. Added because each has a GENUINE better/worse pair, which is what makes a
     # task worth putting in RL: a faithful summary against one that invents a figure, a story that follows its
     # brief against a generic one, a correct chain of reasoning against a plausible-but-wrong one. SFT can only
@@ -574,9 +687,15 @@ SFT_TASKS = [
 _RL_WEIGHTS = {
     # ---- the behaviour, ~60%. Still the largest block: these are the tasks SFT cannot express at all, because
     # in each of them the lesson is that one reply is WORSE than another, not that one string is right.
-    "tool_search_answer": 12.0, "retrieval_insufficient": 11.0, "no_tool_admit_unknown": 10.0,
-    "rag_document_qa": 10.0, "tool_chain_insufficient": 8.0, "action_tool_use": 3.0,
-    "tool_compute": 3.0, "tool_database": 3.0,
+    "tool_search_answer": 9.0, "retrieval_insufficient": 8.5, "no_tool_admit_unknown": 8.0,
+    "rag_document_qa": 8.0, "tool_chain_insufficient": 6.0, "action_tool_use": 2.5,
+    "tool_compute": 2.5, "tool_database": 2.5,
+    # ---- tool-use SCENARIOS, ~17%. What happens when the call does not go cleanly, which is most of real
+    # use: the tool errors, two sources disagree, the data is stale, the request is ambiguous, two tools must
+    # compose, or the ask crosses a privacy or safety line.
+    "tool_error_recovery": 4.0, "multi_tool_composition": 3.5, "clarifying_question": 3.5,
+    "tool_conflicting_results": 3.0, "stale_data_awareness": 2.5, "privacy_boundary": 2.0,
+    "safety_boundary": 2.0,
     # ---- generation and reasoning, ~26%. These earn a place in RL for the same reason: each has a real
     # better/worse pair rather than one correct answer. A faithful summary against one that invents a figure,
     # a story that honours its brief against a fluent generic one, a correct chain against a plausible wrong
@@ -796,7 +915,7 @@ def build(kind: str) -> Seed:
             "that. Follow the exact turn count the request asks for."
         )
         columns = ["id", "lang", "tags", "tasks", "prompt_messages", "prompt_text",
-                   "response_1", "response_2", "ranking", "rationale",
+                   "response_1", "response_2", "ranking", "rationale", "verifier",
                    "instruction", "input", "context"]
     conv = {**conv, "io_directions": IO_DIRECTIONS, "identities": IDENTITIES, "persona": PERSONA}
     return Seed(kind=kind, details=SFT_DETAILS if kind == "sft" else RL_DETAILS,

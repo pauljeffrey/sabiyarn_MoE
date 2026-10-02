@@ -163,8 +163,12 @@ def test_knowledge_boundary_is_the_biggest_block_of_RL(seeds):
     reply is WORSE than another -- a confident invention against an admission -- and a single SFT target cannot
     express a comparison. SFT is now dominated by world knowledge instead: a model that cannot explain how a
     generator works has nothing to be honest about."""
-    behaviour = {"tool_search_answer", "retrieval_insufficient", "no_tool_admit_unknown", "rag_document_qa",
-                 "tool_chain_insufficient", "action_tool_use", "tool_compute", "tool_database"}
+    # Read the set from build_seeds rather than restating it: a hardcoded copy went stale the moment seven
+    # scenario tasks were added, and the test then reported the split wrongly instead of catching anything.
+    import sys
+    from pathlib import Path as _P
+    sys.path.insert(0, str(_P(__file__).resolve().parent.parent / "seeds"))
+    from build_seeds import BEHAVIOUR_TASKS as behaviour  # noqa: N813
     rl = seeds["rl"]
     rl_total = sum(t.share for t in rl.tasks)
     got = sum(t.share for t in rl.tasks if t.name in behaviour) / rl_total

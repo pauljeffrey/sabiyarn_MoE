@@ -105,11 +105,19 @@ class RLConfig:
     kl_coef: float = 0.05  # per-token k3 KL penalty against the reference
     advantage_std_norm: bool = True  # divide advantages by the group std
     rl_micro_batch: int = 16  # sequences per forward/backward chunk
-    reward: str = "chrf"  # chrf | africomet
+    reward: str = "chrf"  # chrf | africomet | verifier | verifier+africomet
     reward_id: str = "masakhane/africomet-stl"
     reward_python: Optional[str] = None  # python of an env with `unbabel-comet` (it needs transformers<5); null = in-process
     reward_batch_size: int = 16
     reward_gpu: bool = True
+    # Weight on the VERIFIER half of "verifier+africomet". The verifier covers the behaviour, reasoning and
+    # instruction-following tasks; AfriCOMET covers translation quality. 0.5 is a starting point, not a
+    # finding -- raise it if the policy games the learned metric.
+    reward_blend: float = 0.5
+    # Log one scored sample with its per-check verdicts every N samples. Worth keeping non-zero early: a
+    # programmatic reward fails SILENTLY when a check is always "unknown", and the per-check detail is the
+    # only way to see that happening.
+    reward_log_every: int = 0
 
     # ---- output / tracking ----------------------------------------------------------------------------
     out_dir: str = "outputs/dpo"

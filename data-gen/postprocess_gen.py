@@ -185,8 +185,23 @@ def _candidate_text(content: Any, md: dict) -> str:
     except (AssemblyError, Exception):  # noqa: BLE001
         return ""
     for m in built:
-        if m.get("role") == "assistant":
-            return _strip_invalid_closers(m.get("content") or "").strip()
+        if m.get("role") != "assistant":
+            continue
+        body = _strip_invalid_closers(m.get("content") or "").strip()
+        # A tool-call turn carries the call in `tool_calls`, NOT in the content -- the chat template is what
+        # turns it into text. So the assembled content alone ends at </task_plan> and the call is invisible.
+        # Measured: 0 of 108 candidates contained <tool_call>, which made the entire tool-use half of the
+        # corpus unscoreable by the verifiers, and made a tool-call candidate look like an empty answer.
+        # Append it exactly as the template renders it, which is also exactly what the policy emits.
+        for call in m.get("tool_calls") or []:
+            fn = (call or {}).get("function") or {}
+            name, args = fn.get("name") or "", fn.get("arguments")
+            if not name:
+                continue
+            if not isinstance(args, str):
+                args = json.dumps(args, ensure_ascii=False)
+            body += f"<tool_call>{name}\n{args}</tool_call>"
+        return body.strip()
     return ""
 
 
@@ -316,6 +331,62 @@ def _clean_messages(raw: Any) -> Optional[list[dict]]:
             msg["tool_calls"] = calls
             msg.pop("content", None) if not msg["content"] else None
         out.append(msg)
+    return out
+
+
+_CONSTRAINT_KINDS = {"max_words", "exactly_sentences", "list_items", "forbidden_word", "required_word"}
+
+
+def _clean_verifier(raw: Any, msgs: list[dict]) -> dict:
+    """Keep only verifier fields that are well formed AND consistent with the prompt.
+
+    A verifier is ground truth a program will trust without reading the answer, so a wrong one is actively
+    harmful: it marks the good reply wrong and trains the policy towards the bad one. Everything here is
+    therefore checked rather than taken on faith, and anything doubtful is dropped -- a missing field costs
+    one check's weight, a wrong field inverts it.
+    """
+    if not isinstance(raw, dict):
+        return {}
+    out: dict[str, Any] = {}
+    prompt = " ".join(m.get("content") or "" for m in msgs).lower()
+
+    ans = raw.get("expected_answer")
+    if isinstance(ans, (int, float)) or (isinstance(ans, str) and ans.strip()):
+        s = str(ans).strip()
+        if len(s) <= 40:
+            out["expected_answer"] = s
+
+    c = raw.get("constraint")
+    if isinstance(c, dict) and c.get("kind") in _CONSTRAINT_KINDS:
+        kind, val = c["kind"], c.get("value")
+        if kind in ("max_words", "exactly_sentences", "list_items"):
+            try:
+                n = int(val)
+                if 1 <= n <= 500:
+                    out["constraint"] = {"kind": kind, "value": n}
+            except (TypeError, ValueError):
+                pass
+        elif isinstance(val, str) and val.strip():
+            word = val.strip()
+            # A forbidden/required word the USER never mentioned is one the generator invented. The prompt is
+            # the only evidence the constraint was actually imposed, so require it to appear there.
+            if len(word) <= 40 and word.lower() in prompt:
+                out["constraint"] = {"kind": kind, "value": word}
+
+    els = raw.get("brief_elements")
+    if isinstance(els, list):
+        keep = [str(e).strip() for e in els if isinstance(e, (str, int, float)) and str(e).strip()]
+        keep = [e for e in keep if len(e) <= 60][:8]
+        if keep:
+            out["brief_elements"] = keep
+
+    mw = raw.get("max_words")
+    try:
+        n = int(mw)
+        if 10 <= n <= 2_000:
+            out["max_words"] = n
+    except (TypeError, ValueError):
+        pass
     return out
 
 
@@ -757,6 +828,10 @@ def _to_record(seed: Seed, resp: Response) -> Optional[dict]:
     order = sorted(range(len(responses)), key=lambda i: {"best": 0, "partial": 1, "worst": 2}.get(quals[i], 1))
     rec = {**base, "tags": _tags(data.get("tags"), md.get("tags", [])),
            "tasks": data.get("tasks") or md.get("tasks", []), "tools": md.get("tools", []),
+           # The ground truth the programmatic scorers need (rl/verifiers.py). Kept even when empty so the
+           # column exists for every row, and sanitised: a verifier the generator invented wrongly would
+           # score the GOOD answer as bad, which is worse than having none.
+           "verifier": _clean_verifier(data.get("verifier"), msgs),
            "prompt_messages": msgs, "prompt_text": render_messages(msgs, add_generation_prompt=True),
            "ranking": [quals[i] for i in order],
            "rationale": [responses[i].get("why", "") for i in order],

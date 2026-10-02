@@ -1049,6 +1049,174 @@
       ]
     },
     {
+      "name": "get_power_schedule",
+      "description": "Look up the published electricity supply or load-shedding schedule for an area.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "area": {
+            "type": "string",
+            "description": "Town, district or distribution band, e.g. 'Ikeja Band B'."
+          },
+          "day": {
+            "type": "string",
+            "description": "Optional day, e.g. 'today', 'Saturday'."
+          }
+        },
+        "required": [
+          "area"
+        ]
+      },
+      "returns": "A per-day schedule of supply windows, plus a 'last updated' date and often a disclaimer that supply is not guaranteed.",
+      "failure_modes": [
+        "the schedule is months out of date",
+        "the area is not in any published band",
+        "the schedule exists but says supply is not guaranteed -- so it does NOT answer 'will I have light tonight'",
+        "two bands overlap for the same street"
+      ]
+    },
+    {
+      "name": "get_exam_results",
+      "description": "Check a public examination result by candidate number and exam sitting.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "exam": {
+            "type": "string",
+            "description": "Exam body and type, e.g. 'WAEC May/June', 'JAMB UTME'."
+          },
+          "candidate_number": {
+            "type": "string",
+            "description": "The candidate's registration number."
+          },
+          "year": {
+            "type": "integer",
+            "description": "Sitting year."
+          }
+        },
+        "required": [
+          "exam",
+          "candidate_number"
+        ]
+      },
+      "returns": "Either a per-subject grade list, or a status line such as 'withheld', 'not released', or 'scratch card required'.",
+      "failure_modes": [
+        "the result is withheld pending investigation",
+        "results for that sitting are not yet released",
+        "the candidate number is not recognised",
+        "access needs a scratch card the assistant does not have -- which is a WALL, not an answer"
+      ]
+    },
+    {
+      "name": "lookup_gov_service",
+      "description": "Look up the official procedure, requirements or fee for a government service.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "service": {
+            "type": "string",
+            "description": "e.g. 'NIN enrolment', 'passport renewal', 'business registration', 'birth certificate'."
+          },
+          "state": {
+            "type": "string",
+            "description": "Optional state or region."
+          }
+        },
+        "required": [
+          "service"
+        ]
+      },
+      "returns": "Required documents, the fee, where to go, and a processing time -- frequently with a note that the step must be completed in person.",
+      "failure_modes": [
+        "the published fee is out of date",
+        "the procedure differs by state and the result says so",
+        "the official answer is 'appear in person at a centre', which no tool can shortcut",
+        "two government pages give different document lists"
+      ]
+    },
+    {
+      "name": "check_medicine_availability",
+      "description": "Check whether a medicine is in stock at pharmacies near a place.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "medicine": {
+            "type": "string",
+            "description": "Generic or brand name as the user said it."
+          },
+          "location": {
+            "type": "string",
+            "description": "Town or area."
+          }
+        },
+        "required": [
+          "medicine",
+          "location"
+        ]
+      },
+      "returns": "A list of pharmacies with stock status and sometimes a price. Stock is a SNAPSHOT and may be wrong.",
+      "failure_modes": [
+        "no pharmacy nearby carries it",
+        "stock data is days old",
+        "the name matches several different medicines -- and guessing which is unsafe",
+        "it is prescription-only, so availability is not the user's real blocker"
+      ]
+    },
+    {
+      "name": "find_job_listings",
+      "description": "Search job or vacancy listings by role and location.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "role": {
+            "type": "string",
+            "description": "Job title or trade."
+          },
+          "location": {
+            "type": "string",
+            "description": "Town, state or 'remote'."
+          }
+        },
+        "required": [
+          "role"
+        ]
+      },
+      "returns": "A list of postings with title, employer, location and a posted date; many are stale or duplicated.",
+      "failure_modes": [
+        "every posting is months old",
+        "the listings are recruitment scams asking for a fee",
+        "nothing matches the role in that location",
+        "the same vacancy appears five times"
+      ]
+    },
+    {
+      "name": "get_fuel_price",
+      "description": "Get recent pump prices for petrol, diesel or kerosene in a named place.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "fuel": {
+            "type": "string",
+            "description": "petrol | diesel | kerosene | gas"
+          },
+          "location": {
+            "type": "string",
+            "description": "Town or state."
+          }
+        },
+        "required": [
+          "fuel",
+          "location"
+        ]
+      },
+      "returns": "A recent price or small range with the date observed, and a note that prices move and queues vary.",
+      "failure_modes": [
+        "the price is a week old in a market that moves daily",
+        "only a national average is available, not that town",
+        "the range is so wide it is not actionable"
+      ]
+    },
+    {
       "name": "translate_text",
       "description": "Translate text between the languages this assistant supports. Use only when the assistant is not confident producing the translation itself.",
       "parameters": {

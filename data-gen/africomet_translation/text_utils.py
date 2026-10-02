@@ -18,6 +18,11 @@ _ABBREVIATIONS = {
 _CLOSERS = "\"'”’)]»"
 _URLISH = re.compile(r"https?://|www\.|@\w+\.\w+|\.com\b|\.org\b", re.IGNORECASE)
 _MARKUP = re.compile(r"[<>{}|\[\]\\]|={2,}|\bedit\b\]")
+_PII = re.compile(
+    r"[\w.+-]+@[\w-]+\.[\w.]+"                 # e-mail
+    r"|(?<!\d)(?:\+?\d[\s().-]?){9,}\d(?!\d)"   # phone-like digit runs
+    r"|\b\d{1,3}(?:\.\d{1,3}){3}\b",           # IPv4
+)
 _CONTROL = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f​-‏  ﻿�]")
 _SPACES = re.compile(r"[ \t\r\f\v ]+")
 
@@ -31,6 +36,12 @@ def normalize(text: str) -> str:
 
 def dedupe_key(text: str) -> str:
     return re.sub(r"[\W_]+", "", unicodedata.normalize("NFC", text).casefold())
+
+
+def sent_hash(text: str) -> int:
+    """Stable 63-bit hash of the normalised sentence, used for cross-source de-duplication."""
+    import hashlib
+    return int.from_bytes(hashlib.blake2b(dedupe_key(text).encode(), digest_size=8).digest(), "big") >> 1
 
 
 def _is_abbreviation(token: str) -> bool:
@@ -87,7 +98,9 @@ def good_sentence(
     words = s.split()
     if not (min_words <= len(words) <= max_words):
         return False
-    if _URLISH.search(s) or _MARKUP.search(s):
+    if _URLISH.search(s) or _MARKUP.search(s) or _PII.search(s):
+        return False
+    if len(words) >= 8 and len({w.lower() for w in words}) / len(words) < 0.45:     # "buy buy buy ..." spam
         return False
     letters = [c for c in s if c.isalpha()]
     if len(letters) < 8:
