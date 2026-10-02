@@ -752,3 +752,37 @@ honest figure is 67%.
 
 Remaining regression: responses are thinner under few-shot (123 vs 151 chars, more sub-40-char replies). Add a
 length floor to the brief before a full run.
+
+---
+
+# AfriCOMET translation prompts (`africomet_translation/`)
+
+Prompts for RLHF where the reward is [AfriCOMET](https://huggingface.co/masakhane/africomet-qe-stl-1.1) (reference-free QE).
+**No LLM is called and nothing is paid for**: passages are real text from public datasets, instructions come from
+hand-written template banks. Each row is `instruction`, `input` (1-5 consecutive sentences of one document),
+`source_language`, `target_language`, plus the joined `prompt`, instruction placement/language and provenance.
+Pushed continuously, one commit per language, to `BeardedMonster/africomet-translation` (private by default).
+
+```bash
+cd data-gen
+python -m africomet_translation.build build --per-language 12 --out /tmp/pilot --cache /tmp/pilot_cache        # local pilot
+python -m africomet_translation.build build --per-language 5000 --out OUT --cache CACHE --push                 # full run
+python -m africomet_translation.build cleanup --out OUT --cache CACHE   # verifies every shard is on the Hub, then deletes CACHE
+```
+
+* **Languages:** `eng pcm yor hau ibo fon ewe twi efi ibb`. Akan and Urhobo are excluded (AfriCOMET cannot evaluate them);
+  Ibibio is included on request although AfriCOMET-1.1's encoder (`Davlan/afro-xlmr-large-76L`) does not list it, so
+  rows touching it carry `africomet_supported=false`.
+* **Sources** (`sources.py`): masakhanews (eng/pcm/yor/hau/ibo), FLORES+ (yor/hau/ibo/fon/ewe/twi), google/smol docs
+  (pcm/yor/hau/ibo/fon/ewe/efi), `howard-nlp/ibom-mt` + `sib200-ibom` (efi/ibb), the two `offiongbassey` Efik sets
+  (transcripts only; the audio is never downloaded), and for English also streamed Wikipedia and FineWeb-Edu.
+  Sentences are de-duplicated across a language's sources in registry order.
+* **Length:** `input` is capped at 256 tokens of the AfriCOMET tokenizer (it truncates each segment at 512), leaving
+  room for the translation. Window size is balanced towards uniform 1-5; short-article sources cannot supply many 5s.
+* **Instructions** (`instructions.py`): written in `eng pcm yor hau ibo twi ewe`, rotated evenly; prepended or appended;
+  structure/length vary from 3 to 40+ words. **Fon, Efik and Ibibio have no templates** -- they were not written because
+  nobody involved can write them reliably. Add a bank to `TEMPLATES` and they join the rotation automatically.
+  `template_confidence` marks `twi`/`ewe` as `low`; none of it is native-reviewed.
+* **Licenses differ per row** (`source_license`); `ibom-mt` is CC-BY-NC-4.0. FLORES/SIB-200 sentences are standard eval
+  sets, so do not evaluate on them after training on these prompts.
+* `tests/test_africomet_translation.py` (offline).

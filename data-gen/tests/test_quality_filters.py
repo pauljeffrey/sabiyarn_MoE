@@ -340,3 +340,15 @@ def test_a_tool_call_candidate_is_accepted():
                                          "arguments": {"location": "Ibi", "days": 1}}}, md)
     assert out, "a tool-call candidate must assemble"
     assert "<|input_lang|>" in out, "and must carry the marker the candidate gate tests"
+
+
+def test_quality_label_synonyms_are_accepted():
+    """A generator that says chosen/rejected rather than best/worst has given the same information. Mapping
+    synonyms is safe; inventing a label that was never given is not, so an unknown label still fails."""
+    import postprocess_gen as P
+    src = P.__file__
+    import re
+    body = open(src, encoding="utf-8").read()
+    assert '"chosen": "best"' in body and '"rejected": "worst"' in body
+    # and the mapping must not invent a label for something unlabelled
+    assert '"": "best"' not in body

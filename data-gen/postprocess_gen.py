@@ -739,7 +739,14 @@ def _to_record(seed: Seed, resp: Response) -> Optional[dict]:
     if len(responses) < 2:
         _drop("too_few_responses", resp.text or "", resp.custom_id)
         return None
-    quals = [(r.get("quality") or "").lower() for r in responses]
+    # The labels the contract asks for are best/worst, but a generator reaches for its own vocabulary often
+    # enough to matter (7 of 44 drops on one run). These are synonyms, not judgements, so mapping them is
+    # information-preserving -- unlike guessing a label that was never given.
+    _QUAL = {"chosen": "best", "good": "best", "better": "best", "preferred": "best", "correct": "best",
+             "rejected": "worst", "bad": "worst", "worse": "worst", "incorrect": "worst", "wrong": "worst",
+             "partial": "partial", "best": "best", "worst": "worst"}
+    quals = [_QUAL.get((r.get("quality") or "").strip().lower(), (r.get("quality") or "").strip().lower())
+             for r in responses]
     if "best" not in quals or "worst" not in quals:
         _drop("no_best_or_worst")
         return None

@@ -261,7 +261,12 @@ class Provider:
                 if not calls and len(body.strip().strip("{}").strip()) < 2:
                     last = "empty completion (provider returned a 200 with no content)"
                     if attempt < self.max_retries - 1:
-                        time.sleep(delay + random.uniform(0, min(delay, 30.0)))
+                        wait = delay + random.uniform(0, min(delay, 30.0))
+                        # Say so. A silent retry loop is indistinguishable from a hang, and the first time
+                        # this fired it looked like the run had stalled.
+                        print(f"  [{self.name}] empty completion, retrying in {wait:.0f}s "
+                              f"(attempt {attempt + 1}/{self.max_retries})", flush=True)
+                        time.sleep(wait)
                         delay = min(delay * 2, self.retry_max_s)
                         continue
                     return Response(req.custom_id, "", False, last, pt, ct,

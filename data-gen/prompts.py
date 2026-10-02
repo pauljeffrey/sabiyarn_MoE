@@ -606,20 +606,33 @@ Return JSON:
   "tasks": ["<task names used>"], "tags": ["<tags from the closed list>"],
   "confidence": <float 0-1: your honest estimate that this conversation is correct AND fluent {lang_name}>}}"""
     else:
+        n_resp = int(seed.conversation['responses_per_prompt'])
         shape = f"""Produce ONE conversation PREFIX with EXACTLY {n_user} messages of role "user", the LAST
-of which ends the prefix (tool turns are extra and do not count), then
-{seed.conversation['responses_per_prompt']} alternative assistant replies to that final user message.
+of which ends the prefix (tool turns are extra and do not count), then EXACTLY {n_resp} alternative
+assistant replies to that final user message.
 
-The replies must be genuinely rankable, not paraphrases:
-  - exactly one is best: honest, correctly grounded, uses the right tool or correctly admits it cannot;
-  - exactly one is worst: confidently wrong -- invents a fact, answers from an irrelevant tool result, or
-    claims to recognise something it was never told;
-  - the rest are partial: right but uselessly hedged, right answer via the wrong tool, or refusing when the
-    answer WAS actually available.
+Do NOT write the final assistant reply inside "prompt_turns". The prefix STOPS at the last user message (or
+at a tool result, if the assistant called a tool and the reply must read off the result). The replies go in
+"responses" and nowhere else.
+
+"responses" must be a list of EXACTLY {n_resp} items -- one labelled "best" and one labelled "worst". Both
+are required; a single reply is not a sample, because there is nothing to rank. Do not use any other label.
+  - best:  honest, correctly grounded, uses the right tool or correctly admits it cannot;
+  - worst: confidently wrong -- invents a fact, answers from an irrelevant tool result, claims to recognise
+    something it was never told, or refuses when the answer WAS actually available.
+They must differ in SUBSTANCE, not wording: two paraphrases of the same answer are useless.
+
+Each reply's "content" is an OBJECT with THE SAME FIELDS as an assistant turn in the OUTPUT CONTRACT --
+think, task_plan, input_lang, target_lang, response (or tool_call). Write the FIELDS. Do NOT write the
+special tokens or the marker string yourself, and do NOT put a JSON string there: the markers are assembled
+for you, exactly as they are for the turns in "prompt_turns".
 
 Return JSON:
 {{"prompt_turns": [ ...turn objects exactly as the OUTPUT CONTRACT describes... ],
-  "responses": [{{"content": "<full assistant turn incl. special tokens>", "quality": "best"|"partial"|"worst", "why": "<one line, English>"}}],
+  "responses": [
+    {{"content": {{ ...assistant turn FIELDS... }}, "quality": "best",  "why": "<one line, English>"}},
+    {{"content": {{ ...assistant turn FIELDS... }}, "quality": "worst", "why": "<one line, English>"}}
+  ],
   "tasks": [...], "tags": [...],
   "confidence": <float 0-1: your honest estimate that the ranking is right and the text is fluent {lang_name}>}}"""
 
