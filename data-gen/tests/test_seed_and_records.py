@@ -85,7 +85,11 @@ def test_seeds_load_and_validate(seeds):
     for kind in ("sft", "rl"):
         s = seeds[kind]
         assert s.tools and s.tasks
-        assert s.conversation["ends_with"] == "assistant"
+        # SFT generates the assistant reply, so the conversation ends there. An RL sample is a prefix plus
+        # two candidate replies, so its prefix stops at the user turn the candidates answer -- which is what
+        # postprocess_gen validates. The seed used to be forced to say "assistant" for both, instructing the
+        # generator to produce the one shape the validator rejects.
+        assert s.conversation["ends_with"] == ("user" if kind == "rl" else "assistant")
         for t in s.tasks:
             assert set(t.tags) <= set(TAGS)
 
@@ -164,7 +168,14 @@ def test_knowledge_boundary_is_the_biggest_block_of_RL(seeds):
     rl = seeds["rl"]
     rl_total = sum(t.share for t in rl.tasks)
     got = sum(t.share for t in rl.tasks if t.name in behaviour) / rl_total
-    assert got > 0.70, f"behaviour is only {got:.0%} of rl"
+    # A majority rather than the old 70%: generation and reasoning were added to RL because they have genuine
+    # better/worse pairs too (a faithful summary against one that invents a figure). Behaviour stays the
+    # largest block by a wide margin, but it no longer crowds the rest out.
+    assert got > 0.50, f"behaviour is only {got:.0%} of rl"
+    generation = {"multi_step_reasoning", "summarization", "creative_writing", "instruction_following",
+                  "long_document_summarization"}
+    assert sum(t.share for t in rl.tasks if t.name in generation) / rl_total > 0.20, \
+        "generation and reasoning should be a real block of rl, not a token presence"
     # and competence is held in, so the policy does not learn that refusing is always safe
     assert sum(t.share for t in rl.tasks if t.name not in behaviour) / rl_total > 0.15
 
@@ -449,9 +460,9 @@ def test_rl_record_orders_responses_and_rejects_paraphrases(seeds):
     prefix = _sft_payload()["messages"][:6] + [{"role": "user", "content": "To, me ke nan?"}]
     good = {"prompt_messages": prefix, "tasks": ["tool_search_answer"], "tags": ["knowledge-boundary"],
             "responses": [
-                {"content": "<|input_lang|><hau><response>Ban sani ba.", "quality": "worst", "why": "invented"},
-                {"content": "<|input_lang|><hau><response>AWS na Amazon ne.", "quality": "best", "why": "grounded"},
-                {"content": "<|input_lang|><hau><response>Wataƙila.", "quality": "partial", "why": "hedged"}]}
+                {"content": "<|input_lang|><hau><|target_lang|><hau><response>Ban sani ba.", "quality": "worst", "why": "invented"},
+                {"content": "<|input_lang|><hau><|target_lang|><hau><response>AWS na Amazon ne.", "quality": "best", "why": "grounded"},
+                {"content": "<|input_lang|><hau><|target_lang|><hau><response>Wataƙila.", "quality": "partial", "why": "hedged"}]}
     r = to_record(seeds["rl"], _resp("rl__hau__tool_search_answer__000001", good, md))
     # Two candidates now, not three: the judge needs only a better/worse pair, and a third response is ~40%
     # more output tokens for a ranking it does not use.

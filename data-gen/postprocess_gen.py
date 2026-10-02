@@ -16,8 +16,11 @@ sequence that reaches training teaches the model to emit malformed special-token
 from __future__ import annotations
 
 import json
+import os
 import random
 import re
+import traceback
+from pathlib import Path
 from typing import Any, Optional
 
 from providers.base import Response
@@ -51,8 +54,37 @@ _RESP = re.compile(r"<response>(.*)", re.S)
 STATS: dict[str, int] = {}
 
 
-def _drop(reason: str) -> None:
+# Set DATA_GEN_DEBUG_DIR to capture the raw response behind every drop. The counters tell you how often a
+# thing goes wrong; only the raw text tells you why, and without it a reason like `prompt_messages_malformed`
+# is unactionable -- it says the contract was broken without saying what the model sent instead.
+_DEBUG_DIR = os.environ.get("DATA_GEN_DEBUG_DIR") or ""
+_debug_seen: dict[str, int] = {}
+_DEBUG_PER_REASON = 5  # enough to see the pattern, few enough to stay readable
+
+
+def _drop(reason: str, raw: str = "", custom_id: str = "") -> None:
     STATS[reason] = STATS.get(reason, 0) + 1
+    if not (_DEBUG_DIR and raw):
+        return
+    n = _debug_seen.get(reason, 0)
+    if n >= _DEBUG_PER_REASON:
+        return
+    _debug_seen[reason] = n + 1
+    try:
+        d = Path(_DEBUG_DIR)
+        d.mkdir(parents=True, exist_ok=True)
+        safe = "".join(c if c.isalnum() or c in "-_." else "_" for c in reason)[:60]
+        (d / f"{safe}.{n}.txt").write_text(f"# custom_id: {custom_id}\n# reason: {reason}\n\n{raw}",
+                                          encoding="utf-8")
+    except OSError:
+        pass  # diagnostics must never break a run
+
+
+def _capture(resp, tag: str) -> None:
+    """Capture a raw response for a drop that was recorded deeper down, where resp is not in scope."""
+    if _DEBUG_DIR:
+        _drop(f"_raw:{tag}", resp.text or "", resp.custom_id)
+        STATS.pop(f"_raw:{tag}", None)  # diagnostics only; must not appear in the yield accounting
 
 
 def _json(text: str) -> Optional[dict]:
@@ -95,6 +127,67 @@ _LEADING_LABEL = re.compile(r"^\s*(" + "|".join(re.escape(t) for t in
                                                 sorted(_LABEL_BY_TOKEN, key=len, reverse=True)) + r")\s*")
 # Tasks whose answer legitimately IS a stream of `word <tag> LABEL` pairs, so <tag> there is content.
 _SEQUENCE_TASKS = {"ner", "pos_tagging"}
+
+
+def _objectify_turns(turns: Any) -> Any:
+    """Recover turns the generator emitted as FLAT key/value arrays.
+
+    Measured on the first live RL run: 3 of 24 responses came back as
+        ["role", "user", "content", "I'm reading about..."]
+    instead of {"role": "user", "content": "..."}. The content is intact and the conversion is exact for an
+    even-length list whose alternating keys are strings, so dropping these threw away sound data over a
+    JSON shape. An odd-length list, or one with a non-string key, is left alone for the assembler to reject.
+    """
+    if not isinstance(turns, list):
+        return turns
+    out = []
+    for t in turns:
+        if (isinstance(t, list) and len(t) % 2 == 0 and len(t) >= 2
+                and all(isinstance(t[i], str) for i in range(0, len(t), 2))):
+            out.append({t[i]: t[i + 1] for i in range(0, len(t), 2)})
+        else:
+            out.append(t)
+    return out
+
+
+def _candidate_text(content: Any, md: dict) -> str:
+    """One RL candidate -> the assistant string a reward model will score.
+
+    The generator sends `content` as a DICT OF FIELDS -- think, task_plan, input_lang, response -- because
+    that is the contract every other part of the pipeline teaches it. This handler used to assume a
+    pre-assembled string and crashed with AttributeError on the dict, which discarded whole samples that
+    were otherwise excellent. Both shapes are now accepted; the dict goes through the same assembler as the
+    prompt turns, so the markers in a candidate are built exactly like the markers everywhere else.
+    """
+    if isinstance(content, str):
+        s = content.strip()
+        # A STRINGIFIED field dict: the generator JSON-encodes the turn instead of nesting it. Measured on a
+        # live run, 26 of 33 kept samples held raw JSON as the candidate text -- they passed every gate,
+        # because nothing was checking that a candidate looks like an assistant turn, and would have taught
+        # the model to emit JSON. Parse it back and assemble it like any other field dict.
+        if s.startswith("{") and s.endswith("}"):
+            try:
+                parsed = json.loads(s)
+            except ValueError:
+                parsed = None
+            if isinstance(parsed, dict) and (parsed.get("response") is not None
+                                             or parsed.get("tool_call") is not None):
+                content = parsed
+            else:
+                return _strip_invalid_closers(s).strip()
+        else:
+            return _strip_invalid_closers(s).strip()
+    if not isinstance(content, dict):
+        return ""
+    turn = {**content, "role": "assistant"}
+    try:
+        built = build_messages(_fill_turn_defaults([turn], md))
+    except (AssemblyError, Exception):  # noqa: BLE001
+        return ""
+    for m in built:
+        if m.get("role") == "assistant":
+            return _strip_invalid_closers(m.get("content") or "").strip()
+    return ""
 
 
 def _fill_turn_defaults(turns: Any, md: dict) -> Any:
@@ -161,6 +254,16 @@ def _fill_turn_defaults(turns: Any, md: dict) -> Any:
             if m:
                 t["label_token"] = _LABEL_BY_TOKEN[m.group(1)]
                 t["response"] = resp[m.end():]
+        # A `label_token` that is not a label token at all. Measured: the generator put the TASK NAME there
+        # ("creative_writing"), which the assembler rightly refuses because it is not in the tokenizer. A
+        # label token only means anything for the classification tasks, so for anything else the field is
+        # noise and discarding it recovers an otherwise sound sample -- whereas keeping it loses the sample
+        # and would, if it ever got through, teach the model to emit a junk token.
+        # Accepted either as a key ("summary") or as the token itself ("<summary>"), matching the assembler.
+        lt = t.get("label_token")
+        if lt is not None and LABEL_TOKENS.get(lt, lt) not in LABEL_TOKENS.values():
+            t.pop("label_token")
+            STATS["repair:dropped_invalid_label_token"] = STATS.get("repair:dropped_invalid_label_token", 0) + 1
         if sequence:
             t["sequence_labels"] = True
     return turns
@@ -216,7 +319,7 @@ def _clean_messages(raw: Any) -> Optional[list[dict]]:
     return out
 
 
-def _validate_conversation(msgs: list[dict], seed: Seed, *, ends_with: str,
+def _validate_conversation(msgs: list[dict], seed: Seed, *, ends_with: "str | tuple[str, ...]",
                            md: Optional[dict] = None) -> bool:
     md = md or {}
     conv = seed.conversation
@@ -239,7 +342,8 @@ def _validate_conversation(msgs: list[dict], seed: Seed, *, ends_with: str,
     if len(msgs) > max_total:
         _drop(f"total_messages:{len(msgs)}{'+tools' if uses_tools else ''}")
         return False
-    if msgs[-1]["role"] != ends_with:
+    want = (ends_with,) if isinstance(ends_with, str) else ends_with
+    if msgs[-1]["role"] not in want:
         _drop(f"ends_with:{msgs[-1]['role']}")
         return False
     if any(m["role"] == "system" for m in msgs[1:]):
@@ -488,7 +592,10 @@ def to_record(seed: Seed, resp: Response) -> Optional[dict]:
     try:
         return _to_record(seed, resp)
     except Exception as exc:  # noqa: BLE001
-        _drop(f"postprocess_error:{type(exc).__name__}")
+        # The class alone is unactionable -- AttributeError could be anywhere in 600 lines. Capture the
+        # traceback with the raw response so the bug is locatable from one run.
+        _drop(f"postprocess_error:{type(exc).__name__}", traceback.format_exc() + "\n\n--- raw ---\n"
+              + (resp.text or "")[:8000], resp.custom_id)
         return None
 
 
@@ -496,7 +603,7 @@ def _to_record(seed: Seed, resp: Response) -> Optional[dict]:
     md = resp.metadata or {}
     data = _json(resp.text)
     if data is None:
-        _drop("json_invalid")
+        _drop("json_invalid", resp.text or "", resp.custom_id)
         return None
     conf = data.get("confidence")
     try:
@@ -544,9 +651,9 @@ def _to_record(seed: Seed, resp: Response) -> Optional[dict]:
                 return None
         if isinstance(turns, list) and any(isinstance(t, dict) and ("task_plan" in t or "response" in t
                                                                    or "tool_call" in t) for t in turns):
-            msgs = _messages_from_turns(_fill_turn_defaults(turns, md))
+            msgs = _messages_from_turns(_fill_turn_defaults(_objectify_turns(turns), md))
         elif data.get("turns") is not None:
-            msgs = _messages_from_turns(_fill_turn_defaults(data["turns"], md))
+            msgs = _messages_from_turns(_fill_turn_defaults(_objectify_turns(data["turns"]), md))
         else:
             msgs = _clean_messages(data.get("messages"))
         if msgs is None:
@@ -575,25 +682,68 @@ def _to_record(seed: Seed, resp: Response) -> Optional[dict]:
 
     # rl
     if data.get("prompt_turns") is not None:
-        msgs = _messages_from_turns(_fill_turn_defaults(data["prompt_turns"], md))
+        msgs = _messages_from_turns(_fill_turn_defaults(_objectify_turns(data["prompt_turns"]), md))
     else:
         msgs = _clean_messages(data.get("prompt_messages"))
+    msgs_pre = msgs
+    if msgs:
+        # The generator often writes the final assistant reply INTO the prefix as well as into `responses`.
+        # The prefix must stop where the candidates begin, and the candidates are the better source: they
+        # come as a ranked pair. So a trailing assistant turn is redundant and dropping it recovers the
+        # sample -- 20 of 39 drops on a live run were exactly this.
+        while msgs and msgs[-1]["role"] == "assistant":
+            msgs = msgs[:-1]
+            STATS["repair:trimmed_trailing_assistant"] = STATS.get("repair:trimmed_trailing_assistant", 0) + 1
+        if not msgs:
+            msgs = msgs_pre  # nothing but assistant turns: let the validator reject it with a real reason
     if msgs is None:
-        _drop("prompt_messages_malformed") if data.get("prompt_turns") is None else None
+        # Both branches must record. Previously the prompt_turns branch returned None with no counter
+        # incremented, so those drops vanished from the accounting entirely and the yield looked better
+        # than it was by however many of them there were.
+        _drop("prompt_messages_malformed" if data.get("prompt_turns") is None else "prompt_turns_unusable",
+              resp.text or "", resp.custom_id)
         return None
-    if not _validate_conversation(msgs, seed, ends_with="user", md=md):
+    # A RAG or tool prefix legitimately ends with the TOOL RESULT: the candidates are the answer read off
+    # that result, which is the whole lesson of those tasks. Requiring "user" rejected every one of them.
+    if not _validate_conversation(msgs, seed, ends_with=("user", "tool"), md=md):
+        _capture(resp, "validate_conversation")
         return None
     responses = data.get("responses") or []
     want = int(seed.conversation["responses_per_prompt"])
-    responses = [r for r in responses if isinstance(r, dict) and (r.get("content") or "").strip()]
+    # Assemble first, then filter on what came out: a candidate whose fields will not assemble is as
+    # useless as an empty one, and deciding that here keeps the two checks from disagreeing.
+    # The candidate is expected as {"content": <fields>, "quality": "best"|"worst", "why": ...}. The
+    # generator sometimes emits the assistant TURN directly as the list item instead, with the fields at the
+    # top level and no wrapper. The fields are all there, so reading the item as its own content recovers it.
+    def _content_of(r: dict) -> Any:
+        if r.get("content") is not None:
+            return r["content"]
+        if r.get("response") is not None or r.get("tool_call") is not None:
+            return {k: v for k, v in r.items() if k not in ("quality", "why", "role")}
+        return None
+
+    responses = [{**r, "_text": _candidate_text(_content_of(r), md)}
+                 for r in responses if isinstance(r, dict)]
+    responses = [r for r in responses if r["_text"]]
+    # A candidate must LOOK like an assembled assistant turn. Without this, a stringified JSON blob counted
+    # as a valid candidate and reached the corpus -- 26 of 33 on one run -- because every other check only
+    # asked whether the text was non-empty and different from its sibling.
+    #
+    # The marker to test is <|input_lang|>, which opens EVERY assembled assistant turn. Testing
+    # <|target_lang|> instead rejected legitimate tool-call candidates, which end at <task_plan> and carry no
+    # target language or <response> at all -- they are a call, not a reply.
+    bad = [r for r in responses if "<|input_lang|>" not in r["_text"]]
+    if bad:
+        _drop("candidate_not_an_assembled_turn", bad[0]["_text"][:2000], resp.custom_id)
+        return None
     if len(responses) < 2:
-        _drop("too_few_responses")
+        _drop("too_few_responses", resp.text or "", resp.custom_id)
         return None
     quals = [(r.get("quality") or "").lower() for r in responses]
     if "best" not in quals or "worst" not in quals:
         _drop("no_best_or_worst")
         return None
-    texts = [_strip_invalid_closers(r["content"]).strip() for r in responses]
+    texts = [r["_text"] for r in responses]
     if len(set(texts)) < len(texts):
         _drop("duplicate_responses")
         return None
@@ -645,6 +795,15 @@ def to_records(seed: Seed, resp: Response) -> list[dict]:
 
 
 def summary() -> str:
+    """Drops and repairs reported separately. A repair KEPT a sample, so listing it among the drops overstates
+    the failure rate and hides which reasons are actually costing data."""
     if not STATS:
         return "no drops"
-    return "drops: " + ", ".join(f"{k}={v}" for k, v in sorted(STATS.items(), key=lambda kv: -kv[1]))
+    drops = {k: v for k, v in STATS.items() if not k.startswith("repair:")}
+    fixed = {k[len("repair:"):]: v for k, v in STATS.items() if k.startswith("repair:")}
+    parts = []
+    if drops:
+        parts.append("drops: " + ", ".join(f"{k}={v}" for k, v in sorted(drops.items(), key=lambda kv: -kv[1])))
+    if fixed:
+        parts.append("repaired: " + ", ".join(f"{k}={v}" for k, v in sorted(fixed.items(), key=lambda kv: -kv[1])))
+    return "  ".join(parts) or "no drops"

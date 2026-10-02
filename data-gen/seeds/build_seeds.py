@@ -499,6 +499,35 @@ ALL_TASKS = [
     _task("pos_tagging", ["pos-tagging"], 1.5,
           "Part-of-speech tagging over a sentence in the target language, as aligned token/tag pairs.",
           plan=["<NER>"]),
+    # ---- generation and reasoning. Added because each has a GENUINE better/worse pair, which is what makes a
+    # task worth putting in RL: a faithful summary against one that invents a figure, a story that follows its
+    # brief against a generic one, a correct chain of reasoning against a plausible-but-wrong one. SFT can only
+    # show one target and call it right; DPO can show the contrast. They are also unusually checkable -- a
+    # summary's numbers must appear in the source, a constrained answer either obeys the constraint or does
+    # not -- so they score without a judge.
+    _task("multi_step_reasoning", ["qa", "multi-turn-chat"], 4.0,
+          "A question needing TWO TO FOUR steps before the answer, of the kind people actually ask: how much "
+          "change from three bags at a given price, which of two transport routes is cheaper once the fare "
+          "AND the time are counted, how many days of medicine remain, whether a trader broke even. The "
+          "assistant lays out the steps in <think> IN ENGLISH, then gives the answer and the one number that "
+          "matters. No tool: this is arithmetic and inference a person does in their head, done correctly. "
+          "The wrong candidate is plausible and off by one step -- a forgotten unit, a rate applied twice.",
+          plan=["<|math|>", "<|analyze|>"], think=True),
+    _task("creative_writing", ["content-writing", "text-rephrasing"], 3.5,
+          "Write something to a BRIEF with named constraints: a folktale with a given animal and a moral, a "
+          "radio drama scene between two named characters, a market trader's testimony, a condolence letter, "
+          "a song for a naming ceremony. The brief fixes two or three things -- who is in it, where it happens, "
+          "what must be true at the end -- and the piece must honour them while being locally specific. The "
+          "wrong candidate is fluent and generic: it ignores a constraint, moves the setting somewhere "
+          "anonymous, or could have been written about anywhere.",
+          plan=["<|generate|>"]),
+    _task("instruction_following", ["structured-output", "text-rephrasing"], 3.5,
+          "The user adds an EXPLICIT, CHECKABLE constraint to an ordinary request: answer in exactly three "
+          "sentences, do not use the word 'money', give it as a numbered list of five, reply in under forty "
+          "words, do not mention the brand name. The assistant obeys the constraint AND answers well. The "
+          "wrong candidate answers well and quietly breaks the constraint, which is the most common real "
+          "failure and the easiest to score.",
+          plan=["<|edit|>", "<|chat|>"]),
     # ---- generation
     _task("rephrasing_and_writing", ["text-rephrasing", "content-writing"], 4.0,
           "Rewrite for register, length or clarity; or compose something short and real -- a market notice, a "
@@ -509,6 +538,15 @@ ALL_TASKS = [
           "Keeps the model from sounding like a task-executor only.",
           plan=["<|chat|>"]),
 ]
+
+def _checks_for(task: str) -> list:
+    """The programmatic scorers for one RL task. Imported lazily so build_seeds has no hard dependency on the
+    reward spec when only pretrain or sft is being built."""
+    import sys
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+    from rewards_spec import for_task
+    return for_task(task)
+
 
 # SFT: everything that has ONE good answer. The behaviour tasks are excluded and re-weighted proportionally,
 # so world knowledge -- the base the whole design rests on -- becomes the largest block rather than a third of
@@ -534,17 +572,30 @@ SFT_TASKS = [
 # why they moved here. A handful of non-behaviour tasks stay at low weight so the policy is not optimised
 # purely on refusal and forgets how to answer.
 _RL_WEIGHTS = {
-    # the behaviour, ~78%
-    "tool_search_answer": 16.0, "retrieval_insufficient": 15.0, "no_tool_admit_unknown": 14.0,
-    "rag_document_qa": 13.0, "tool_chain_insufficient": 10.0, "action_tool_use": 4.0,
+    # ---- the behaviour, ~60%. Still the largest block: these are the tasks SFT cannot express at all, because
+    # in each of them the lesson is that one reply is WORSE than another, not that one string is right.
+    "tool_search_answer": 12.0, "retrieval_insufficient": 11.0, "no_tool_admit_unknown": 10.0,
+    "rag_document_qa": 10.0, "tool_chain_insufficient": 8.0, "action_tool_use": 3.0,
     "tool_compute": 3.0, "tool_database": 3.0,
-    # competence held in, ~22%, so the policy does not learn that refusing is always safe
-    "world_knowledge_qa": 12.0, "health_advice": 4.0, "health_triage": 3.0, "financial_analysis": 3.0,
+    # ---- generation and reasoning, ~26%. These earn a place in RL for the same reason: each has a real
+    # better/worse pair rather than one correct answer. A faithful summary against one that invents a figure,
+    # a story that honours its brief against a fluent generic one, a correct chain against a plausible wrong
+    # one, an obeyed constraint against a quietly broken one. All four also score WITHOUT a judge.
+    "multi_step_reasoning": 8.0, "summarization": 6.0, "creative_writing": 6.0,
+    "instruction_following": 6.0,
+    # ---- competence held in, ~14%, so the policy does not learn that refusing is always safe
+    "world_knowledge_qa": 7.0, "health_advice": 2.0, "health_triage": 1.5, "financial_analysis": 1.5,
+    "translation_english": 1.5, "long_document_summarization": 1.5,
 }
+# Each RL task carries the checks that SCORE its candidates -- regexes and named functions that judge procedure
+# and form with no model in the loop (rewards_spec.py). Most of what this phase teaches is checkable that way:
+# did it call a tool before answering, does the number match what the calculator returned, did it admit the
+# retrieval missed. A judge is still needed for taste, but these take the easy majority off its workload and
+# make the reward reproducible.
 RL_TASKS = [
     TaskSpec(t.name, t.tags, t.description, share=_RL_WEIGHTS[t.name], task_plan=t.task_plan,
              domain_flags=t.domain_flags, uses_tools=t.uses_tools, requires_think=t.requires_think,
-             languages=t.languages,
+             languages=t.languages, checks=_checks_for(t.name),
              notes="Candidates must differ in a way a judge can rank: one grounded and honest, one "
                    "confidently wrong or invented. Never two paraphrases of the same answer. Over-refusal "
                    "where the answer WAS available counts as the wrong one.")
@@ -712,6 +763,38 @@ def build(kind: str) -> Seed:
         # Two candidates, not three: the judge only needs a better/worse pair, and a third
         # response is ~40% more output tokens for a ranking it does not use.
         conv["responses_per_prompt"] = 2
+        # An RL sample is a PREFIX plus one judgeable pair, so it wants a shorter conversation than SFT.
+        # Measured on the first live RL run: asking for 3-6 user turns and 2-4 tasks to set up a single
+        # preference pair cost a 14.5k-token prompt, and `user_turns:1` was the second-largest drop class
+        # because the generator kept producing the short prefix the task actually implies -- a user pastes a
+        # passage and asks for a summary, which is ONE turn. The long prefix was also mostly wasted: only
+        # the final exchange is ever scored.
+        #
+        # So: 1-3 turns, 2-4 when tools are involved because a tool chain needs a turn to establish context.
+        # Cheaper, higher-yield, and the preference pair is about the thing the task is about.
+        conv["min_user_turns"], conv["max_user_turns"] = 1, 3
+        # A tool conversation keeps a floor of TWO user turns: the retrieval happens mid-conversation, so
+        # collapsing it to a single turn would lose the thing these tasks teach -- that the assistant reaches
+        # for a tool in the middle of a dialogue it is already holding.
+        conv["min_user_turns_with_tools"], conv["max_user_turns_with_tools"] = 2, 4
+        conv["min_messages"], conv["max_messages"] = 2, 8
+        conv["target_messages"], conv["target_messages_with_tools"] = [2, 8], [4, 12]
+        conv["max_total_messages"], conv["max_total_messages_with_tools"] = 10, 16
+        conv["task_mix_per_conversation"] = [1, 2]
+        # The PREFIX ends with the user. This was "assistant" -- inherited from SFT, where the assistant turn
+        # is the sample -- while postprocess validates the RL prefix with ends_with="user", because the
+        # assistant turn is exactly what the two candidates supply. So the seed was instructing the generator
+        # to do the one thing the validator rejects, and every response that obeyed the seed was discarded.
+        conv["ends_with"] = "user"
+        conv["counting"] = (
+            "Counts USER + ASSISTANT messages only. An RL prefix is SHORT on purpose: it exists to set up "
+            "ONE final user turn whose two candidate answers are ranked. Do not pad it with exchanges that "
+            "will never be scored. For a plain request -- summarise this, write me a story, answer this "
+            "question -- a SINGLE user turn is correct and common. BUT when the conversation uses a TOOL, "
+            "write AT LEAST TWO user turns: the point of those samples is that the assistant reaches for a "
+            "tool in the middle of a dialogue it is already holding, and a one-turn version does not show "
+            "that. Follow the exact turn count the request asks for."
+        )
         columns = ["id", "lang", "tags", "tasks", "prompt_messages", "prompt_text",
                    "response_1", "response_2", "ranking", "rationale",
                    "instruction", "input", "context"]

@@ -529,7 +529,12 @@ def test_rag_samples_keep_a_normal_conversation_shape(seed):
     from schemas.seed import Seed
     doc = {**_doc(3000), "rag": True}
     req = build_request(Seed.load("rl"), _row("yor", 5, "rag_document_qa"), doc)
-    assert req.metadata["min_user_turns"] >= 3
-    assert len(req.metadata["tasks"]) > 1
+    # What this test protects is that we still ASK for a mid-dialogue retrieval rather than a one-shot
+    # lookup. The accepted floor is separately 1 for RL (see prompts.build_request: gemma-4 returns a single
+    # user turn for about half of all tool rows whatever the instruction says, and rejecting those cost 4x
+    # for samples that are realistic anyway). So the request is what carries the intent.
+    assert req.metadata["n_user_turns"] >= 2, "a RAG row must still ask for a mid-conversation retrieval"
+    assert req.metadata["min_user_turns"] == 1, "but a shorter prefix is accepted rather than discarded"
+    assert req.metadata["tasks"]
     # the user still writes their own language: a tool result does not change what came IN
     assert req.metadata["expect_markers"][1] == "yor"

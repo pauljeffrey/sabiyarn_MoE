@@ -168,6 +168,7 @@
       "uses_tools": false,
       "requires_think": false,
       "languages": null,
+      "checks": [],
       "notes": ""
     },
     {
@@ -186,6 +187,7 @@
       "uses_tools": false,
       "requires_think": false,
       "languages": null,
+      "checks": [],
       "notes": ""
     },
     {
@@ -205,6 +207,7 @@
       "uses_tools": true,
       "requires_think": true,
       "languages": null,
+      "checks": [],
       "notes": ""
     },
     {
@@ -223,6 +226,7 @@
       "uses_tools": false,
       "requires_think": true,
       "languages": null,
+      "checks": [],
       "notes": ""
     },
     {
@@ -243,6 +247,7 @@
       "uses_tools": true,
       "requires_think": true,
       "languages": null,
+      "checks": [],
       "notes": ""
     },
     {
@@ -260,6 +265,7 @@
       "uses_tools": false,
       "requires_think": false,
       "languages": null,
+      "checks": [],
       "notes": ""
     },
     {
@@ -276,6 +282,7 @@
       "uses_tools": false,
       "requires_think": false,
       "languages": null,
+      "checks": [],
       "notes": ""
     },
     {
@@ -292,6 +299,7 @@
       "uses_tools": false,
       "requires_think": true,
       "languages": null,
+      "checks": [],
       "notes": ""
     },
     {
@@ -308,6 +316,7 @@
       "uses_tools": false,
       "requires_think": false,
       "languages": null,
+      "checks": [],
       "notes": ""
     },
     {
@@ -324,6 +333,7 @@
       "uses_tools": false,
       "requires_think": true,
       "languages": null,
+      "checks": [],
       "notes": ""
     },
     {
@@ -340,6 +350,7 @@
       "uses_tools": false,
       "requires_think": false,
       "languages": null,
+      "checks": [],
       "notes": ""
     },
     {
@@ -356,6 +367,7 @@
       "uses_tools": false,
       "requires_think": false,
       "languages": null,
+      "checks": [],
       "notes": ""
     },
     {
@@ -373,6 +385,7 @@
       "uses_tools": false,
       "requires_think": false,
       "languages": null,
+      "checks": [],
       "notes": ""
     },
     {
@@ -389,6 +402,7 @@
       "uses_tools": false,
       "requires_think": false,
       "languages": null,
+      "checks": [],
       "notes": ""
     },
     {
@@ -405,6 +419,7 @@
       "uses_tools": false,
       "requires_think": true,
       "languages": null,
+      "checks": [],
       "notes": ""
     },
     {
@@ -421,6 +436,7 @@
       "uses_tools": false,
       "requires_think": false,
       "languages": null,
+      "checks": [],
       "notes": ""
     },
     {
@@ -437,6 +453,63 @@
       "uses_tools": false,
       "requires_think": false,
       "languages": null,
+      "checks": [],
+      "notes": ""
+    },
+    {
+      "name": "multi_step_reasoning",
+      "tags": [
+        "qa",
+        "multi-turn-chat"
+      ],
+      "description": "A question needing TWO TO FOUR steps before the answer, of the kind people actually ask: how much change from three bags at a given price, which of two transport routes is cheaper once the fare AND the time are counted, how many days of medicine remain, whether a trader broke even. The assistant lays out the steps in <think> IN ENGLISH, then gives the answer and the one number that matters. No tool: this is arithmetic and inference a person does in their head, done correctly. The wrong candidate is plausible and off by one step -- a forgotten unit, a rate applied twice.",
+      "share": 4.0,
+      "task_plan": [
+        "<|math|>",
+        "<|analyze|>"
+      ],
+      "domain_flags": [],
+      "uses_tools": false,
+      "requires_think": true,
+      "languages": null,
+      "checks": [],
+      "notes": ""
+    },
+    {
+      "name": "creative_writing",
+      "tags": [
+        "content-writing",
+        "text-rephrasing"
+      ],
+      "description": "Write something to a BRIEF with named constraints: a folktale with a given animal and a moral, a radio drama scene between two named characters, a market trader's testimony, a condolence letter, a song for a naming ceremony. The brief fixes two or three things -- who is in it, where it happens, what must be true at the end -- and the piece must honour them while being locally specific. The wrong candidate is fluent and generic: it ignores a constraint, moves the setting somewhere anonymous, or could have been written about anywhere.",
+      "share": 3.5,
+      "task_plan": [
+        "<|generate|>"
+      ],
+      "domain_flags": [],
+      "uses_tools": false,
+      "requires_think": false,
+      "languages": null,
+      "checks": [],
+      "notes": ""
+    },
+    {
+      "name": "instruction_following",
+      "tags": [
+        "structured-output",
+        "text-rephrasing"
+      ],
+      "description": "The user adds an EXPLICIT, CHECKABLE constraint to an ordinary request: answer in exactly three sentences, do not use the word 'money', give it as a numbered list of five, reply in under forty words, do not mention the brand name. The assistant obeys the constraint AND answers well. The wrong candidate answers well and quietly breaks the constraint, which is the most common real failure and the easiest to score.",
+      "share": 3.5,
+      "task_plan": [
+        "<|edit|>",
+        "<|chat|>"
+      ],
+      "domain_flags": [],
+      "uses_tools": false,
+      "requires_think": false,
+      "languages": null,
+      "checks": [],
       "notes": ""
     },
     {
@@ -455,6 +528,7 @@
       "uses_tools": false,
       "requires_think": false,
       "languages": null,
+      "checks": [],
       "notes": ""
     },
     {
@@ -471,6 +545,7 @@
       "uses_tools": false,
       "requires_think": false,
       "languages": null,
+      "checks": [],
       "notes": ""
     }
   ],

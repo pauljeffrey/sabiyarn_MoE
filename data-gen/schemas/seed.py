@@ -95,6 +95,10 @@ class TaskSpec:
     uses_tools: bool = False
     requires_think: bool = False       # must open with <think>...</think>
     languages: Optional[list[str]] = None   # None = all; else restrict (e.g. translation pairs)
+    # Programmatic scorers for this task's RL candidates: regexes and named functions that score PROCEDURE
+    # and FORM without a judge model (see rewards_spec.py). Empty for sft, where there is one target rather
+    # than two candidates to rank.
+    checks: list = field(default_factory=list)
     notes: str = ""
 
 
@@ -166,8 +170,14 @@ class Seed:
             lo, hi = c.get("min_messages"), c.get("max_messages")
             if not isinstance(lo, int) or not isinstance(hi, int) or not 0 < lo <= hi:
                 raise ValueError("conversation.min_messages/max_messages must be ints with 0 < min <= max")
-            if c.get("ends_with") != "assistant":
-                raise ValueError("conversation.ends_with must be 'assistant' (the model is graded on its reply)")
+            # SFT generates the assistant reply, so its conversation ends there. An RL sample is a PREFIX
+            # plus two candidate replies, so the prefix ends with the USER turn the candidates answer --
+            # postprocess_gen validates exactly that. Requiring "assistant" for both meant the RL seed could
+            # not describe its own shape, and instructed the generator to produce what the validator rejects.
+            want = "user" if self.kind == "rl" else "assistant"
+            if c.get("ends_with") != want:
+                raise ValueError(f"{self.kind}: conversation.ends_with must be {want!r} "
+                                 f"({'the prefix stops where the candidates begin' if want == 'user' else 'the model is graded on its reply'})")
             if self.kind == "rl" and int(c.get("responses_per_prompt", 0)) < 2:
                 raise ValueError("rl: conversation.responses_per_prompt must be >= 2 to form preference pairs")
         return self

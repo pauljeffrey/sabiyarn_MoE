@@ -249,3 +249,94 @@ def test_dedup_handles_thousands_quickly():
     recs += [{"t": recs[i]["t"]} for i in range(0, 3000, 300)]  # 10 exact duplicates
     drop, _ = find_near_duplicates(recs, cell_key_fn=lambda r: "x", text_fn=lambda r: r["t"])
     assert len(drop) == 10
+
+
+# --------------------------------------------------------------------------- RL shape recovery
+# Three bugs found by the first live RL run, which kept 1 of 24. All three discarded sound data over a
+# JSON shape rather than over quality, so each gets a regression test.
+
+def test_flat_keyvalue_turns_are_recovered():
+    """The generator sometimes emits a turn as ["role","user","content","..."] instead of an object. The
+    content is intact and the conversion is exact, so it is recovered rather than dropped."""
+    from postprocess_gen import _objectify_turns
+    got = _objectify_turns([["role", "user", "content", "how far?"],
+                            {"role": "assistant", "response": "I dey"}])
+    assert got[0] == {"role": "user", "content": "how far?"}
+    assert got[1] == {"role": "assistant", "response": "I dey"}
+
+
+def test_odd_or_nonstring_flat_turns_are_left_for_the_assembler():
+    """Only an even-length list with string keys converts unambiguously; anything else must not be guessed."""
+    from postprocess_gen import _objectify_turns
+    odd = [["role", "user", "content"]]
+    assert _objectify_turns(odd) == odd
+    bad = [[1, "user", "content", "x"]]
+    assert _objectify_turns(bad) == bad
+    assert _objectify_turns("not a list") == "not a list"
+
+
+def test_rl_candidate_accepts_a_dict_of_fields():
+    """`responses[].content` arrives as the SAME field dict the prompt turns use, because that is the
+    contract the generator is taught. It used to crash with AttributeError on .strip() and lose the sample."""
+    from postprocess_gen import _candidate_text
+    md = {"lang": "pcm", "expect_markers": ["pcm", "pcm"], "tasks": ["world_knowledge_qa"]}
+    out = _candidate_text({"think": "simple question", "task_plan": ["<|explain|>"],
+                           "input_lang": "pcm", "target_lang": "pcm",
+                           "response": "Generator dey turn fuel into electricity."}, md)
+    assert out, "a well-formed field dict must assemble"
+    assert "Generator dey turn fuel" in out
+
+
+def test_rl_candidate_still_accepts_a_plain_string():
+    from postprocess_gen import _candidate_text
+    assert _candidate_text("  already assembled  ", {"lang": "pcm"}) == "already assembled"
+
+
+def test_rl_candidate_rejects_what_cannot_assemble():
+    """An unusable candidate must come back empty so the `< 2 responses` check drops the sample, rather
+    than reaching the corpus as a half-built string."""
+    from postprocess_gen import _candidate_text
+    assert _candidate_text(None, {"lang": "pcm"}) == ""
+    assert _candidate_text(12, {"lang": "pcm"}) == ""
+    assert _candidate_text({}, {"lang": "pcm"}) == ""
+
+
+def test_rl_output_ceiling_clears_a_self_written_source():
+    """A summarization prefix contains a source the generator wrote itself, and at a 6,144 ceiling that
+    truncated into invalid JSON. The ceiling must leave room for the prefix AND both candidates."""
+    from budgets import budget_for
+    b = budget_for("rl")
+    assert b.max_output_tokens >= b.max_response_tokens * 2 + 4_096
+
+
+def test_rl_candidate_recovers_a_stringified_field_dict():
+    """The generator sometimes JSON-ENCODES the turn instead of nesting it. These passed every gate and put
+    raw JSON into the corpus (26 of 33 kept samples on one live run), which would teach the model to emit
+    JSON. Parsed back and assembled like any other field dict."""
+    import json as _json
+    from postprocess_gen import _candidate_text
+    md = {"lang": "pcm", "expect_markers": ["pcm", "pcm"], "tasks": ["world_knowledge_qa"]}
+    blob = _json.dumps({"role": "assistant", "think": "simple", "task_plan": ["<|explain|>"],
+                        "input_lang": "pcm", "target_lang": "pcm", "response": "Na so e be."})
+    out = _candidate_text(blob, md)
+    assert "<|target_lang|>" in out, "a stringified dict must be assembled, not passed through as JSON"
+    assert '"role"' not in out, "raw JSON must not survive into the candidate"
+    assert "Na so e be." in out
+
+
+def test_rl_candidate_leaves_ordinary_text_alone():
+    """A plain-prose candidate is not JSON and must not be mangled by the recovery path."""
+    from postprocess_gen import _candidate_text
+    assert _candidate_text("{not json at all", {"lang": "pcm"}) == "{not json at all"
+
+
+def test_a_tool_call_candidate_is_accepted():
+    """A tool-call candidate ends at <task_plan> with no <|target_lang|> and no <response>: it is a call, not
+    a reply. Gating on <|target_lang|> rejected these, which are a large share of the behaviour tasks."""
+    from postprocess_gen import _candidate_text
+    md = {"lang": "pcm", "expect_markers": ["pcm", "pcm"], "tasks": ["tool_search_answer"]}
+    out = _candidate_text({"think": "need the weather", "task_plan": ["<|plan|>"], "input_lang": "eng",
+                           "tool_call": {"name": "get_weather_forecast",
+                                         "arguments": {"location": "Ibi", "days": 1}}}, md)
+    assert out, "a tool-call candidate must assemble"
+    assert "<|input_lang|>" in out, "and must carry the marker the candidate gate tests"

@@ -251,7 +251,22 @@ class Provider:
                 with self._lock:
                     self.prompt_tokens += pt
                     self.completion_tokens += ct
-                return Response(req.custom_id, choice.message.content or "", True, None, pt, ct,
+                body = choice.message.content or ""
+                # An EMPTY 200. Measured on Doubleword under concurrency: the call succeeds, usage is
+                # reported, and the content is "" or "{}" -- 21 of 45 requests at concurrency 12 against 2 of
+                # 20 at concurrency 10. It is an overload symptom, not a refusal and not a malformed sample,
+                # but because it is not an exception it never reached the retry path: it was counted as a
+                # generation failure and the request was thrown away. Retrying it is the difference between
+                # a 20% and a usable yield, so treat it as transient.
+                if not calls and len(body.strip().strip("{}").strip()) < 2:
+                    last = "empty completion (provider returned a 200 with no content)"
+                    if attempt < self.max_retries - 1:
+                        time.sleep(delay + random.uniform(0, min(delay, 30.0)))
+                        delay = min(delay * 2, self.retry_max_s)
+                        continue
+                    return Response(req.custom_id, "", False, last, pt, ct,
+                                    getattr(r, "model", self.model), None, req.metadata)
+                return Response(req.custom_id, body, True, None, pt, ct,
                                 getattr(r, "model", self.model), calls, req.metadata)
             except Exception as exc:  # noqa: BLE001 -- provider SDKs raise a wide zoo of errors
                 last = f"{type(exc).__name__}: {exc}"

@@ -547,7 +547,8 @@ def _sft_like_request(seed: Seed, row: dict, *, rl: bool, document: Optional[dic
     # tool conversations get an extra exchange of headroom (see the seed's conversation policy)
     _hi = int(seed.conversation.get("max_user_turns_with_tools", 6) if needs_tools
               else seed.conversation.get("max_user_turns", 5))
-    _lo = int(seed.conversation.get("min_user_turns", 3))
+    _lo = int(seed.conversation.get("min_user_turns_with_tools", 2) if needs_tools
+              else seed.conversation.get("min_user_turns", 3))
     # A low-resource language is capped lower: six turns of shaky Fon is six turns of unusable data, and the
     # generator spends its fluency budget on quantity instead of correctness.
     _hi = min(_hi, _TIER_TURNS.get(lang.tier, 6))
@@ -683,7 +684,14 @@ Hard requirements:
                   # The turn bounds this row was actually asked for, so the validator checks the request that
                   # was made rather than the seed-wide floor -- a long-document sample legitimately has one
                   # user turn, which the global min_user_turns=3 would reject.
-                  "min_user_turns": _lo, "max_user_turns": _hi,
+                  # Ask high, accept lower -- but only for RL. The request still asks for _lo.._hi turns, so
+                  # the generator produces the multi-turn tool conversations we want where it can; the
+                  # validator then accepts a shorter prefix rather than discarding it. Measured: gemma-4
+                  # returns a single user turn for roughly half of all tool rows whatever the instruction
+                  # says, and dropping those was ~50% of every RL drop -- a 4x cost multiple to reject
+                  # samples that are themselves realistic, since plenty of real tool use is a one-shot
+                  # question. For SFT the floor stays as asked: there the conversation IS the sample.
+                  "min_user_turns": 1 if seed.kind == "rl" else _lo, "max_user_turns": _hi,
                   "document": document, "expect_markers": io["expect_markers"]},
     )
 

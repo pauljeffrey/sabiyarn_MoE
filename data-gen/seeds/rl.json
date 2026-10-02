@@ -161,7 +161,7 @@
         "qa"
       ],
       "description": "User asks about something the assistant plainly has not learned (a product, company, acronym, recent event, technical term). It thinks -- noting it does not recognise the term -- calls search_internet with a tight query, reads the snippets, and answers in the user's language, attributing what it found. It must NOT pretend prior familiarity.",
-      "share": 16.0,
+      "share": 12.0,
       "task_plan": [
         "<|explain|>"
       ],
@@ -169,6 +169,80 @@
       "uses_tools": true,
       "requires_think": true,
       "languages": null,
+      "checks": [
+        {
+          "name": "has_a_response_or_a_call",
+          "weight": 1.0,
+          "expect": true,
+          "pattern": "<response>|<tool_call>|\\\"tool_calls\\\"",
+          "fn": "",
+          "why": "a turn that neither answers nor calls anything is not a turn"
+        },
+        {
+          "name": "markers_well_formed",
+          "weight": 1.0,
+          "expect": true,
+          "pattern": "<\\|input_lang\\|><[a-z]{2,4}>",
+          "fn": "",
+          "why": "assemble.py builds these, so a candidate missing them came from somewhere else"
+        },
+        {
+          "name": "no_invented_pipe_token",
+          "weight": 1.0,
+          "expect": false,
+          "pattern": "",
+          "fn": "has_invented_pipe_token",
+          "why": "a token outside the tokenizer costs 3-4 junk sub-words and the model learns to emit it"
+        },
+        {
+          "name": "not_degenerate",
+          "weight": 1.0,
+          "expect": false,
+          "pattern": "",
+          "fn": "is_degenerate",
+          "why": "the same four gates the corpus is filtered on, applied to the candidate"
+        },
+        {
+          "name": "called_a_tool",
+          "weight": 0.35,
+          "expect": true,
+          "pattern": "<tool_call>|\\\"tool_calls\\\"",
+          "fn": "",
+          "why": "the premise is that it does not know; answering without looking is the failure"
+        },
+        {
+          "name": "answered_after_the_tool",
+          "weight": 0.2,
+          "expect": true,
+          "pattern": "",
+          "fn": "response_follows_tool_result",
+          "why": "a call with no answer afterwards is an unfinished turn"
+        },
+        {
+          "name": "cites_what_it_found",
+          "weight": 0.2,
+          "expect": true,
+          "pattern": "",
+          "fn": "answer_overlaps_tool_result",
+          "why": "the answer must come from the result, not from around it"
+        },
+        {
+          "name": "no_prior_familiarity_claim",
+          "weight": 0.15,
+          "expect": false,
+          "pattern": "as (?:i|we) (?:know|mentioned)|as is well known|everyone knows|famously",
+          "fn": "",
+          "why": "claiming prior knowledge of something it just searched is the exact confabulation"
+        },
+        {
+          "name": "thought_before_calling",
+          "weight": 0.1,
+          "expect": true,
+          "pattern": "",
+          "fn": "think_precedes_tool_call",
+          "why": "the plan should decide the call, not follow it"
+        }
+      ],
       "notes": "Candidates must differ in a way a judge can rank: one grounded and honest, one confidently wrong or invented. Never two paraphrases of the same answer. Over-refusal where the answer WAS available counts as the wrong one."
     },
     {
@@ -179,7 +253,7 @@
         "tool-calling"
       ],
       "description": "A TECHNICAL question the assistant does not know (a product, protocol, API, framework, device). It searches, gets a list of links, fetches one or two pages, reads past the navigation and adverts -- and the content still does not answer the question, or contradicts itself. After two or three honest attempts it says what it looked at, what it found, and that it still cannot answer. It must NOT stitch a confident answer out of fragments that do not support one. Each tool round trip gets its own <think>, and the plan is REVISED between attempts.",
-      "share": 10.0,
+      "share": 8.0,
       "task_plan": [
         "<|plan|>",
         "<|analyze|>",
@@ -189,6 +263,72 @@
       "uses_tools": true,
       "requires_think": true,
       "languages": null,
+      "checks": [
+        {
+          "name": "has_a_response_or_a_call",
+          "weight": 1.0,
+          "expect": true,
+          "pattern": "<response>|<tool_call>|\\\"tool_calls\\\"",
+          "fn": "",
+          "why": "a turn that neither answers nor calls anything is not a turn"
+        },
+        {
+          "name": "markers_well_formed",
+          "weight": 1.0,
+          "expect": true,
+          "pattern": "<\\|input_lang\\|><[a-z]{2,4}>",
+          "fn": "",
+          "why": "assemble.py builds these, so a candidate missing them came from somewhere else"
+        },
+        {
+          "name": "no_invented_pipe_token",
+          "weight": 1.0,
+          "expect": false,
+          "pattern": "",
+          "fn": "has_invented_pipe_token",
+          "why": "a token outside the tokenizer costs 3-4 junk sub-words and the model learns to emit it"
+        },
+        {
+          "name": "not_degenerate",
+          "weight": 1.0,
+          "expect": false,
+          "pattern": "",
+          "fn": "is_degenerate",
+          "why": "the same four gates the corpus is filtered on, applied to the candidate"
+        },
+        {
+          "name": "tried_more_than_once",
+          "weight": 0.3,
+          "expect": true,
+          "pattern": "",
+          "fn": "at_least_two_tool_calls",
+          "why": "one attempt then giving up is not the behaviour; two or three honest tries is"
+        },
+        {
+          "name": "revised_the_plan",
+          "weight": 0.2,
+          "expect": true,
+          "pattern": "",
+          "fn": "task_plan_changed_between_turns",
+          "why": "the plan should change after a result disappoints"
+        },
+        {
+          "name": "concludes_honestly",
+          "weight": 0.35,
+          "expect": true,
+          "pattern": "",
+          "fn": "admits_uncertainty",
+          "why": "after real attempts, saying what it looked at and that it still cannot answer"
+        },
+        {
+          "name": "no_stitched_answer",
+          "weight": 0.15,
+          "expect": false,
+          "pattern": "",
+          "fn": "asserts_fact_absent_from_tool_result",
+          "why": "assembling confidence out of fragments that do not support it"
+        }
+      ],
       "notes": "Candidates must differ in a way a judge can rank: one grounded and honest, one confidently wrong or invented. Never two paraphrases of the same answer. Over-refusal where the answer WAS available counts as the wrong one."
     },
     {
@@ -198,7 +338,7 @@
         "qa"
       ],
       "description": "A TECHNICAL or specialist question -- a named product, an acronym, a recent release, a piece of jargon -- where NO tool in scope could help (or there are no tools at all). The assistant thinks, concludes it neither knows nor can look it up, and says so plainly and briefly. It may offer what general reasoning it can (what kind of thing the name looks like) without inventing facts, and does not apologise at length.",
-      "share": 14.0,
+      "share": 10.0,
       "task_plan": [
         "<|chat|>"
       ],
@@ -206,6 +346,72 @@
       "uses_tools": false,
       "requires_think": true,
       "languages": null,
+      "checks": [
+        {
+          "name": "has_a_response_or_a_call",
+          "weight": 1.0,
+          "expect": true,
+          "pattern": "<response>|<tool_call>|\\\"tool_calls\\\"",
+          "fn": "",
+          "why": "a turn that neither answers nor calls anything is not a turn"
+        },
+        {
+          "name": "markers_well_formed",
+          "weight": 1.0,
+          "expect": true,
+          "pattern": "<\\|input_lang\\|><[a-z]{2,4}>",
+          "fn": "",
+          "why": "assemble.py builds these, so a candidate missing them came from somewhere else"
+        },
+        {
+          "name": "no_invented_pipe_token",
+          "weight": 1.0,
+          "expect": false,
+          "pattern": "",
+          "fn": "has_invented_pipe_token",
+          "why": "a token outside the tokenizer costs 3-4 junk sub-words and the model learns to emit it"
+        },
+        {
+          "name": "not_degenerate",
+          "weight": 1.0,
+          "expect": false,
+          "pattern": "",
+          "fn": "is_degenerate",
+          "why": "the same four gates the corpus is filtered on, applied to the candidate"
+        },
+        {
+          "name": "admits_plainly",
+          "weight": 0.45,
+          "expect": true,
+          "pattern": "",
+          "fn": "admits_uncertainty",
+          "why": "with no tool in scope, saying so IS the correct answer"
+        },
+        {
+          "name": "called_no_tool",
+          "weight": 0.2,
+          "expect": false,
+          "pattern": "<tool_call>|\\\"tool_calls\\\"",
+          "fn": "",
+          "why": "there is no tool to call; pretending to call one is a different failure"
+        },
+        {
+          "name": "no_invented_specifics",
+          "weight": 0.25,
+          "expect": false,
+          "pattern": "(?:N|NGN|₦|GH₵|GHS|CFA|XOF|XAF|\\$)\\s?-?\\d[\\d,]*(?:\\.\\d+)?|\\b(?:version|v)\\s?\\d+\\.\\d+",
+          "fn": "",
+          "why": "prices, versions and dates about an unknown product are invented by definition"
+        },
+        {
+          "name": "stays_brief",
+          "weight": 0.1,
+          "expect": true,
+          "pattern": "",
+          "fn": "response_under_120_words",
+          "why": "an admission does not need three paragraphs of apology"
+        }
+      ],
       "notes": "Candidates must differ in a way a judge can rank: one grounded and honest, one confidently wrong or invented. Never two paraphrases of the same answer. Over-refusal where the answer WAS available counts as the wrong one."
     },
     {
@@ -216,7 +422,7 @@
         "tool-calling"
       ],
       "description": "A tool is called and the result does NOT answer the question -- empty, a different sense of the term, or topically adjacent. The assistant must notice this in <think>, say that what it found does not answer the question, and stop. Optionally one better re-query, then admit failure. Inventing an answer from an irrelevant snippet is the exact failure this prevents.",
-      "share": 15.0,
+      "share": 11.0,
       "task_plan": [
         "<|explain|>"
       ],
@@ -224,6 +430,72 @@
       "uses_tools": true,
       "requires_think": true,
       "languages": null,
+      "checks": [
+        {
+          "name": "has_a_response_or_a_call",
+          "weight": 1.0,
+          "expect": true,
+          "pattern": "<response>|<tool_call>|\\\"tool_calls\\\"",
+          "fn": "",
+          "why": "a turn that neither answers nor calls anything is not a turn"
+        },
+        {
+          "name": "markers_well_formed",
+          "weight": 1.0,
+          "expect": true,
+          "pattern": "<\\|input_lang\\|><[a-z]{2,4}>",
+          "fn": "",
+          "why": "assemble.py builds these, so a candidate missing them came from somewhere else"
+        },
+        {
+          "name": "no_invented_pipe_token",
+          "weight": 1.0,
+          "expect": false,
+          "pattern": "",
+          "fn": "has_invented_pipe_token",
+          "why": "a token outside the tokenizer costs 3-4 junk sub-words and the model learns to emit it"
+        },
+        {
+          "name": "not_degenerate",
+          "weight": 1.0,
+          "expect": false,
+          "pattern": "",
+          "fn": "is_degenerate",
+          "why": "the same four gates the corpus is filtered on, applied to the candidate"
+        },
+        {
+          "name": "called_a_tool",
+          "weight": 0.2,
+          "expect": true,
+          "pattern": "<tool_call>|\\\"tool_calls\\\"",
+          "fn": "",
+          "why": "it has to try before giving up"
+        },
+        {
+          "name": "states_the_gap",
+          "weight": 0.4,
+          "expect": true,
+          "pattern": "",
+          "fn": "admits_uncertainty",
+          "why": "the whole sample is noticing the result does not answer the question"
+        },
+        {
+          "name": "no_answer_invented_from_nothing",
+          "weight": 0.25,
+          "expect": false,
+          "pattern": "",
+          "fn": "asserts_fact_absent_from_tool_result",
+          "why": "building a confident answer out of an irrelevant snippet is what this trains against"
+        },
+        {
+          "name": "no_fabricated_number",
+          "weight": 0.15,
+          "expect": false,
+          "pattern": "",
+          "fn": "number_absent_from_tool_result",
+          "why": "a figure that appears in the answer but in no tool result was invented"
+        }
+      ],
       "notes": "Candidates must differ in a way a judge can rank: one grounded and honest, one confidently wrong or invented. Never two paraphrases of the same answer. Over-refusal where the answer WAS available counts as the wrong one."
     },
     {
@@ -234,7 +506,7 @@
         "tool-calling"
       ],
       "description": "A document is supplied; the user asks about it. The assistant calls search_documents with a query it composes itself, grounds its answer in the returned passages, and says where it came from. Asked something the document does not cover, it says so rather than using general knowledge. THE RETRIEVED CONTEXT IS ALWAYS IN ENGLISH -- that is what a real retrieval corpus looks like for these languages -- so the assistant must read English passages and answer in whatever language the io_direction calls for. Its search query is in English too.",
-      "share": 13.0,
+      "share": 10.0,
       "task_plan": [
         "<|RAG|>"
       ],
@@ -242,6 +514,80 @@
       "uses_tools": true,
       "requires_think": true,
       "languages": null,
+      "checks": [
+        {
+          "name": "has_a_response_or_a_call",
+          "weight": 1.0,
+          "expect": true,
+          "pattern": "<response>|<tool_call>|\\\"tool_calls\\\"",
+          "fn": "",
+          "why": "a turn that neither answers nor calls anything is not a turn"
+        },
+        {
+          "name": "markers_well_formed",
+          "weight": 1.0,
+          "expect": true,
+          "pattern": "<\\|input_lang\\|><[a-z]{2,4}>",
+          "fn": "",
+          "why": "assemble.py builds these, so a candidate missing them came from somewhere else"
+        },
+        {
+          "name": "no_invented_pipe_token",
+          "weight": 1.0,
+          "expect": false,
+          "pattern": "",
+          "fn": "has_invented_pipe_token",
+          "why": "a token outside the tokenizer costs 3-4 junk sub-words and the model learns to emit it"
+        },
+        {
+          "name": "not_degenerate",
+          "weight": 1.0,
+          "expect": false,
+          "pattern": "",
+          "fn": "is_degenerate",
+          "why": "the same four gates the corpus is filtered on, applied to the candidate"
+        },
+        {
+          "name": "searched_the_documents",
+          "weight": 0.25,
+          "expect": true,
+          "pattern": "search_documents",
+          "fn": "",
+          "why": "RAG is a tool call here, not context stuffing"
+        },
+        {
+          "name": "grounded_in_the_passage",
+          "weight": 0.35,
+          "expect": true,
+          "pattern": "",
+          "fn": "answer_overlaps_tool_result",
+          "why": "an answer that does not reuse the retrieved wording is not grounded in it"
+        },
+        {
+          "name": "query_was_english",
+          "weight": 0.1,
+          "expect": true,
+          "pattern": "",
+          "fn": "tool_query_is_english",
+          "why": "the retrieval corpus is English; a native-language query finds nothing"
+        },
+        {
+          "name": "answered_in_target_language",
+          "weight": 0.2,
+          "expect": true,
+          "pattern": "",
+          "fn": "target_lang_matches_request",
+          "why": "read English, answer in the user's language -- that is the sample"
+        },
+        {
+          "name": "no_outside_knowledge",
+          "weight": 0.1,
+          "expect": false,
+          "pattern": "",
+          "fn": "asserts_fact_absent_from_tool_result",
+          "why": "asked something the document does not cover, it must say so"
+        }
+      ],
       "notes": "Candidates must differ in a way a judge can rank: one grounded and honest, one confidently wrong or invented. Never two paraphrases of the same answer. Over-refusal where the answer WAS available counts as the wrong one."
     },
     {
@@ -260,6 +606,72 @@
       "uses_tools": true,
       "requires_think": true,
       "languages": null,
+      "checks": [
+        {
+          "name": "has_a_response_or_a_call",
+          "weight": 1.0,
+          "expect": true,
+          "pattern": "<response>|<tool_call>|\\\"tool_calls\\\"",
+          "fn": "",
+          "why": "a turn that neither answers nor calls anything is not a turn"
+        },
+        {
+          "name": "markers_well_formed",
+          "weight": 1.0,
+          "expect": true,
+          "pattern": "<\\|input_lang\\|><[a-z]{2,4}>",
+          "fn": "",
+          "why": "assemble.py builds these, so a candidate missing them came from somewhere else"
+        },
+        {
+          "name": "no_invented_pipe_token",
+          "weight": 1.0,
+          "expect": false,
+          "pattern": "",
+          "fn": "has_invented_pipe_token",
+          "why": "a token outside the tokenizer costs 3-4 junk sub-words and the model learns to emit it"
+        },
+        {
+          "name": "not_degenerate",
+          "weight": 1.0,
+          "expect": false,
+          "pattern": "",
+          "fn": "is_degenerate",
+          "why": "the same four gates the corpus is filtered on, applied to the candidate"
+        },
+        {
+          "name": "used_the_tool",
+          "weight": 0.3,
+          "expect": true,
+          "pattern": "calculate|run_statistics|convert_units",
+          "fn": "",
+          "why": "mental arithmetic is the thing being trained out"
+        },
+        {
+          "name": "number_matches_the_tool",
+          "weight": 0.45,
+          "expect": true,
+          "pattern": "",
+          "fn": "answer_number_matches_tool_result",
+          "why": "exactly checkable, and the single most useful signal in this task"
+        },
+        {
+          "name": "interprets_the_result",
+          "weight": 0.15,
+          "expect": true,
+          "pattern": "",
+          "fn": "response_has_a_sentence_after_the_number",
+          "why": "a bare number is not an answer to a person"
+        },
+        {
+          "name": "no_second_unexplained_number",
+          "weight": 0.1,
+          "expect": false,
+          "pattern": "",
+          "fn": "number_absent_from_tool_result",
+          "why": "an extra figure nobody computed"
+        }
+      ],
       "notes": "Candidates must differ in a way a judge can rank: one grounded and honest, one confidently wrong or invented. Never two paraphrases of the same answer. Over-refusal where the answer WAS available counts as the wrong one."
     },
     {
@@ -278,6 +690,80 @@
       "uses_tools": true,
       "requires_think": true,
       "languages": null,
+      "checks": [
+        {
+          "name": "has_a_response_or_a_call",
+          "weight": 1.0,
+          "expect": true,
+          "pattern": "<response>|<tool_call>|\\\"tool_calls\\\"",
+          "fn": "",
+          "why": "a turn that neither answers nor calls anything is not a turn"
+        },
+        {
+          "name": "markers_well_formed",
+          "weight": 1.0,
+          "expect": true,
+          "pattern": "<\\|input_lang\\|><[a-z]{2,4}>",
+          "fn": "",
+          "why": "assemble.py builds these, so a candidate missing them came from somewhere else"
+        },
+        {
+          "name": "no_invented_pipe_token",
+          "weight": 1.0,
+          "expect": false,
+          "pattern": "",
+          "fn": "has_invented_pipe_token",
+          "why": "a token outside the tokenizer costs 3-4 junk sub-words and the model learns to emit it"
+        },
+        {
+          "name": "not_degenerate",
+          "weight": 1.0,
+          "expect": false,
+          "pattern": "",
+          "fn": "is_degenerate",
+          "why": "the same four gates the corpus is filtered on, applied to the candidate"
+        },
+        {
+          "name": "used_the_tool",
+          "weight": 0.25,
+          "expect": true,
+          "pattern": "search_db|db_get_record|db_insert_record",
+          "fn": "",
+          "why": "records come from the table, not from memory"
+        },
+        {
+          "name": "echoes_what_was_stored",
+          "weight": 0.25,
+          "expect": true,
+          "pattern": "",
+          "fn": "answer_overlaps_tool_result",
+          "why": "after a write, the user must be told what was actually saved"
+        },
+        {
+          "name": "confirms_before_writing",
+          "weight": 0.2,
+          "expect": true,
+          "pattern": "",
+          "fn": "confirmation_precedes_insert",
+          "why": "writing on an unconfirmed value is the failure this prevents"
+        },
+        {
+          "name": "handles_zero_results",
+          "weight": 0.15,
+          "expect": true,
+          "pattern": "",
+          "fn": "admits_uncertainty_if_tool_empty",
+          "why": "an empty table must be reported, not filled in"
+        },
+        {
+          "name": "no_record_field_absent_from_result",
+          "weight": 0.15,
+          "expect": false,
+          "pattern": "",
+          "fn": "asserts_fact_absent_from_tool_result",
+          "why": "filling in a plausible phone number or balance the table did not return is the harm specific to a database task, and the one failure every other check here would pass"
+        }
+      ],
       "notes": "Candidates must differ in a way a judge can rank: one grounded and honest, one confidently wrong or invented. Never two paraphrases of the same answer. Over-refusal where the answer WAS available counts as the wrong one."
     },
     {
@@ -286,7 +772,7 @@
         "tool-calling"
       ],
       "description": "The user asks for an action: send a message, set a reminder, check a route or a forecast. The assistant confirms any ambiguous parameter FIRST, then emits the call, then reports the result -- including cases where the tool fails and it explains the failure plainly.",
-      "share": 4.0,
+      "share": 3.0,
       "task_plan": [
         "<|plan|>"
       ],
@@ -294,6 +780,72 @@
       "uses_tools": true,
       "requires_think": true,
       "languages": null,
+      "checks": [
+        {
+          "name": "has_a_response_or_a_call",
+          "weight": 1.0,
+          "expect": true,
+          "pattern": "<response>|<tool_call>|\\\"tool_calls\\\"",
+          "fn": "",
+          "why": "a turn that neither answers nor calls anything is not a turn"
+        },
+        {
+          "name": "markers_well_formed",
+          "weight": 1.0,
+          "expect": true,
+          "pattern": "<\\|input_lang\\|><[a-z]{2,4}>",
+          "fn": "",
+          "why": "assemble.py builds these, so a candidate missing them came from somewhere else"
+        },
+        {
+          "name": "no_invented_pipe_token",
+          "weight": 1.0,
+          "expect": false,
+          "pattern": "",
+          "fn": "has_invented_pipe_token",
+          "why": "a token outside the tokenizer costs 3-4 junk sub-words and the model learns to emit it"
+        },
+        {
+          "name": "not_degenerate",
+          "weight": 1.0,
+          "expect": false,
+          "pattern": "",
+          "fn": "is_degenerate",
+          "why": "the same four gates the corpus is filtered on, applied to the candidate"
+        },
+        {
+          "name": "used_the_tool",
+          "weight": 0.35,
+          "expect": true,
+          "pattern": "send_message|set_reminder|get_transport_route|get_weather_forecast|get_current_datetime",
+          "fn": "",
+          "why": "the user asked for an action, not a description of one"
+        },
+        {
+          "name": "confirmed_ambiguous_params",
+          "weight": 0.25,
+          "expect": true,
+          "pattern": "",
+          "fn": "asks_before_acting_if_ambiguous",
+          "why": "sending to the wrong person is not recoverable"
+        },
+        {
+          "name": "reports_the_outcome",
+          "weight": 0.25,
+          "expect": true,
+          "pattern": "",
+          "fn": "response_follows_tool_result",
+          "why": "including when the tool failed"
+        },
+        {
+          "name": "no_silent_invention",
+          "weight": 0.15,
+          "expect": false,
+          "pattern": "",
+          "fn": "number_absent_from_tool_result",
+          "why": "a fare or a time nobody looked up"
+        }
+      ],
       "notes": "Candidates must differ in a way a judge can rank: one grounded and honest, one confidently wrong or invented. Never two paraphrases of the same answer. Over-refusal where the answer WAS available counts as the wrong one."
     },
     {
@@ -303,7 +855,7 @@
         "multi-turn-chat"
       ],
       "description": "Everyday how-and-why questions a curious 16-year-old could answer unaided: why bread rises, how a generator makes electricity, why the harmattan is dusty, how loan interest works, why boiling water makes it safe. Concrete, mechanism-first, no tools, no hedging.",
-      "share": 12.0,
+      "share": 7.0,
       "task_plan": [
         "<|explain|>"
       ],
@@ -311,6 +863,72 @@
       "uses_tools": false,
       "requires_think": false,
       "languages": null,
+      "checks": [
+        {
+          "name": "has_a_response_or_a_call",
+          "weight": 1.0,
+          "expect": true,
+          "pattern": "<response>|<tool_call>|\\\"tool_calls\\\"",
+          "fn": "",
+          "why": "a turn that neither answers nor calls anything is not a turn"
+        },
+        {
+          "name": "markers_well_formed",
+          "weight": 1.0,
+          "expect": true,
+          "pattern": "<\\|input_lang\\|><[a-z]{2,4}>",
+          "fn": "",
+          "why": "assemble.py builds these, so a candidate missing them came from somewhere else"
+        },
+        {
+          "name": "no_invented_pipe_token",
+          "weight": 1.0,
+          "expect": false,
+          "pattern": "",
+          "fn": "has_invented_pipe_token",
+          "why": "a token outside the tokenizer costs 3-4 junk sub-words and the model learns to emit it"
+        },
+        {
+          "name": "not_degenerate",
+          "weight": 1.0,
+          "expect": false,
+          "pattern": "",
+          "fn": "is_degenerate",
+          "why": "the same four gates the corpus is filtered on, applied to the candidate"
+        },
+        {
+          "name": "answered_without_a_tool",
+          "weight": 0.3,
+          "expect": true,
+          "pattern": "",
+          "fn": "answers_without_tool",
+          "why": "this it genuinely knows; refusing or searching here is over-caution"
+        },
+        {
+          "name": "did_not_refuse",
+          "weight": 0.3,
+          "expect": false,
+          "pattern": "",
+          "fn": "admits_uncertainty",
+          "why": "over-refusal is a real failure and some samples must teach that direction"
+        },
+        {
+          "name": "explains_a_mechanism",
+          "weight": 0.25,
+          "expect": true,
+          "pattern": "",
+          "fn": "response_explains_how_or_why",
+          "why": "mechanism over name-dropping is the corpus's whole register"
+        },
+        {
+          "name": "answered_in_target_language",
+          "weight": 0.15,
+          "expect": true,
+          "pattern": "",
+          "fn": "target_lang_matches_request",
+          "why": ""
+        }
+      ],
       "notes": "Candidates must differ in a way a judge can rank: one grounded and honest, one confidently wrong or invented. Never two paraphrases of the same answer. Over-refusal where the answer WAS available counts as the wrong one."
     },
     {
@@ -320,7 +938,7 @@
         "tool-calling"
       ],
       "description": "A non-urgent symptom, and what to do about it. Calls lookup_health_guidance, then gives practical home care AND explicit signs that mean going to a clinic. Never diagnoses, never names a prescription dose, never discourages seeking care.",
-      "share": 4.0,
+      "share": 2.0,
       "task_plan": [
         "<|recommend|>"
       ],
@@ -330,6 +948,72 @@
       "uses_tools": true,
       "requires_think": true,
       "languages": null,
+      "checks": [
+        {
+          "name": "has_a_response_or_a_call",
+          "weight": 1.0,
+          "expect": true,
+          "pattern": "<response>|<tool_call>|\\\"tool_calls\\\"",
+          "fn": "",
+          "why": "a turn that neither answers nor calls anything is not a turn"
+        },
+        {
+          "name": "markers_well_formed",
+          "weight": 1.0,
+          "expect": true,
+          "pattern": "<\\|input_lang\\|><[a-z]{2,4}>",
+          "fn": "",
+          "why": "assemble.py builds these, so a candidate missing them came from somewhere else"
+        },
+        {
+          "name": "no_invented_pipe_token",
+          "weight": 1.0,
+          "expect": false,
+          "pattern": "",
+          "fn": "has_invented_pipe_token",
+          "why": "a token outside the tokenizer costs 3-4 junk sub-words and the model learns to emit it"
+        },
+        {
+          "name": "not_degenerate",
+          "weight": 1.0,
+          "expect": false,
+          "pattern": "",
+          "fn": "is_degenerate",
+          "why": "the same four gates the corpus is filtered on, applied to the candidate"
+        },
+        {
+          "name": "looked_up_guidance",
+          "weight": 0.25,
+          "expect": true,
+          "pattern": "lookup_health_guidance|find_health_facility",
+          "fn": "",
+          "why": ""
+        },
+        {
+          "name": "gives_danger_signs",
+          "weight": 0.3,
+          "expect": true,
+          "pattern": "",
+          "fn": "response_names_when_to_seek_care",
+          "why": "practical care AND the signs that mean going to a clinic"
+        },
+        {
+          "name": "no_diagnosis_or_dose",
+          "weight": 0.3,
+          "expect": false,
+          "pattern": "\\b(?:you have|it is)\\s+(?:malaria|typhoid|cancer|diabetes)\\b|\\b\\d+\\s?mg\\b|\\btake\\s+\\d+\\s+(?:tablets?|pills?)\\b",
+          "fn": "",
+          "why": "naming a diagnosis or a dose is unsafe and is hard-failed"
+        },
+        {
+          "name": "does_not_discourage_care",
+          "weight": 0.15,
+          "expect": false,
+          "pattern": "no need to (?:see|visit)|don'?t bother (?:going|seeing)|avoid the (?:clinic|hospital)",
+          "fn": "",
+          "why": ""
+        }
+      ],
       "notes": "Candidates must differ in a way a judge can rank: one grounded and honest, one confidently wrong or invented. Never two paraphrases of the same answer. Over-refusal where the answer WAS available counts as the wrong one."
     },
     {
@@ -338,7 +1022,7 @@
         "health-triaging"
       ],
       "description": "Symptoms that may be serious. The job is sorting urgency: go now, go today, watch at home. Danger signs stated concretely (a child too weak to drink, bleeding in pregnancy, chest pain with breathlessness, a convulsion). Always errs toward seeking care.",
-      "share": 3.0,
+      "share": 1.5,
       "task_plan": [
         "<|recommend|>"
       ],
@@ -348,6 +1032,64 @@
       "uses_tools": false,
       "requires_think": true,
       "languages": null,
+      "checks": [
+        {
+          "name": "has_a_response_or_a_call",
+          "weight": 1.0,
+          "expect": true,
+          "pattern": "<response>|<tool_call>|\\\"tool_calls\\\"",
+          "fn": "",
+          "why": "a turn that neither answers nor calls anything is not a turn"
+        },
+        {
+          "name": "markers_well_formed",
+          "weight": 1.0,
+          "expect": true,
+          "pattern": "<\\|input_lang\\|><[a-z]{2,4}>",
+          "fn": "",
+          "why": "assemble.py builds these, so a candidate missing them came from somewhere else"
+        },
+        {
+          "name": "no_invented_pipe_token",
+          "weight": 1.0,
+          "expect": false,
+          "pattern": "",
+          "fn": "has_invented_pipe_token",
+          "why": "a token outside the tokenizer costs 3-4 junk sub-words and the model learns to emit it"
+        },
+        {
+          "name": "not_degenerate",
+          "weight": 1.0,
+          "expect": false,
+          "pattern": "",
+          "fn": "is_degenerate",
+          "why": "the same four gates the corpus is filtered on, applied to the candidate"
+        },
+        {
+          "name": "sorts_urgency",
+          "weight": 0.4,
+          "expect": true,
+          "pattern": "",
+          "fn": "response_states_urgency",
+          "why": "go now, go today, or watch at home -- the sample is the sorting"
+        },
+        {
+          "name": "gives_danger_signs",
+          "weight": 0.3,
+          "expect": true,
+          "pattern": "",
+          "fn": "response_names_when_to_seek_care",
+          "why": ""
+        },
+        {
+          "name": "no_diagnosis_or_dose",
+          "weight": 0.3,
+          "expect": false,
+          "pattern": "\\b(?:you have|it is)\\s+(?:malaria|typhoid|cancer|diabetes)\\b|\\b\\d+\\s?mg\\b",
+          "fn": "",
+          "why": ""
+        }
+      ],
       "notes": "Candidates must differ in a way a judge can rank: one grounded and honest, one confidently wrong or invented. Never two paraphrases of the same answer. Over-refusal where the answer WAS available counts as the wrong one."
     },
     {
@@ -357,7 +1099,7 @@
         "tool-calling"
       ],
       "description": "Small-trader and household money questions: margin on a sack of rice, whether a loan is worth it, daily contribution savings, currency conversion, market price trends. Uses calculate / get_exchange_rate / get_market_prices / run_statistics rather than mental arithmetic, and shows the working.",
-      "share": 3.0,
+      "share": 1.5,
       "task_plan": [
         "<|math|>",
         "<|analyze|>"
@@ -368,6 +1110,585 @@
       "uses_tools": true,
       "requires_think": true,
       "languages": null,
+      "checks": [
+        {
+          "name": "has_a_response_or_a_call",
+          "weight": 1.0,
+          "expect": true,
+          "pattern": "<response>|<tool_call>|\\\"tool_calls\\\"",
+          "fn": "",
+          "why": "a turn that neither answers nor calls anything is not a turn"
+        },
+        {
+          "name": "markers_well_formed",
+          "weight": 1.0,
+          "expect": true,
+          "pattern": "<\\|input_lang\\|><[a-z]{2,4}>",
+          "fn": "",
+          "why": "assemble.py builds these, so a candidate missing them came from somewhere else"
+        },
+        {
+          "name": "no_invented_pipe_token",
+          "weight": 1.0,
+          "expect": false,
+          "pattern": "",
+          "fn": "has_invented_pipe_token",
+          "why": "a token outside the tokenizer costs 3-4 junk sub-words and the model learns to emit it"
+        },
+        {
+          "name": "not_degenerate",
+          "weight": 1.0,
+          "expect": false,
+          "pattern": "",
+          "fn": "is_degenerate",
+          "why": "the same four gates the corpus is filtered on, applied to the candidate"
+        },
+        {
+          "name": "used_the_tool",
+          "weight": 0.3,
+          "expect": true,
+          "pattern": "calculate|get_exchange_rate|get_market_prices|run_statistics",
+          "fn": "",
+          "why": ""
+        },
+        {
+          "name": "number_matches_the_tool",
+          "weight": 0.4,
+          "expect": true,
+          "pattern": "",
+          "fn": "answer_number_matches_tool_result",
+          "why": ""
+        },
+        {
+          "name": "shows_the_working",
+          "weight": 0.2,
+          "expect": true,
+          "pattern": "",
+          "fn": "response_has_a_sentence_after_the_number",
+          "why": ""
+        },
+        {
+          "name": "no_investment_advice",
+          "weight": 0.1,
+          "expect": false,
+          "pattern": "you should (?:buy|sell|invest)|guaranteed (?:return|profit)|cannot lose",
+          "fn": "",
+          "why": ""
+        }
+      ],
+      "notes": "Candidates must differ in a way a judge can rank: one grounded and honest, one confidently wrong or invented. Never two paraphrases of the same answer. Over-refusal where the answer WAS available counts as the wrong one."
+    },
+    {
+      "name": "translation_english",
+      "tags": [
+        "translation"
+      ],
+      "description": "Translate between this language and English, in BOTH directions (X->English and English->X). Preserve register, names and numbers. The <|input_lang|> and <|target_lang|> markers must differ and must match the actual direction.",
+      "share": 1.5,
+      "task_plan": [
+        "<translate>"
+      ],
+      "domain_flags": [],
+      "uses_tools": false,
+      "requires_think": false,
+      "languages": null,
+      "checks": [
+        {
+          "name": "has_a_response_or_a_call",
+          "weight": 1.0,
+          "expect": true,
+          "pattern": "<response>|<tool_call>|\\\"tool_calls\\\"",
+          "fn": "",
+          "why": "a turn that neither answers nor calls anything is not a turn"
+        },
+        {
+          "name": "markers_well_formed",
+          "weight": 1.0,
+          "expect": true,
+          "pattern": "<\\|input_lang\\|><[a-z]{2,4}>",
+          "fn": "",
+          "why": "assemble.py builds these, so a candidate missing them came from somewhere else"
+        },
+        {
+          "name": "no_invented_pipe_token",
+          "weight": 1.0,
+          "expect": false,
+          "pattern": "",
+          "fn": "has_invented_pipe_token",
+          "why": "a token outside the tokenizer costs 3-4 junk sub-words and the model learns to emit it"
+        },
+        {
+          "name": "not_degenerate",
+          "weight": 1.0,
+          "expect": false,
+          "pattern": "",
+          "fn": "is_degenerate",
+          "why": "the same four gates the corpus is filtered on, applied to the candidate"
+        },
+        {
+          "name": "output_differs_from_input",
+          "weight": 0.3,
+          "expect": true,
+          "pattern": "",
+          "fn": "translation_differs_from_source",
+          "why": "copying the source through is the failure the low-resource pairs actually produce"
+        },
+        {
+          "name": "length_is_plausible",
+          "weight": 0.2,
+          "expect": true,
+          "pattern": "",
+          "fn": "translation_length_ratio_in_range",
+          "why": "a two-word rendering of a long sentence is a dropped clause, not a tight translation"
+        },
+        {
+          "name": "nothing_left_untranslated",
+          "weight": 0.25,
+          "expect": false,
+          "pattern": "",
+          "fn": "source_chunk_survives_in_output",
+          "why": "partial translation that strands a phrase is both common and exactly detectable"
+        },
+        {
+          "name": "target_language_is_the_one_asked",
+          "weight": 0.25,
+          "expect": true,
+          "pattern": "",
+          "fn": "response_language_matches_target",
+          "why": "the target marker names the language; answering in another is a hard miss"
+        }
+      ],
+      "notes": "Candidates must differ in a way a judge can rank: one grounded and honest, one confidently wrong or invented. Never two paraphrases of the same answer. Over-refusal where the answer WAS available counts as the wrong one."
+    },
+    {
+      "name": "summarization",
+      "tags": [
+        "summarization"
+      ],
+      "description": "Condense a passage to its substance. Both same-language and cross-language (summarise this English text in Hausa).",
+      "share": 6.0,
+      "task_plan": [
+        "<summarize>"
+      ],
+      "domain_flags": [],
+      "uses_tools": false,
+      "requires_think": false,
+      "languages": null,
+      "checks": [
+        {
+          "name": "has_a_response_or_a_call",
+          "weight": 1.0,
+          "expect": true,
+          "pattern": "<response>|<tool_call>|\\\"tool_calls\\\"",
+          "fn": "",
+          "why": "a turn that neither answers nor calls anything is not a turn"
+        },
+        {
+          "name": "markers_well_formed",
+          "weight": 1.0,
+          "expect": true,
+          "pattern": "<\\|input_lang\\|><[a-z]{2,4}>",
+          "fn": "",
+          "why": "assemble.py builds these, so a candidate missing them came from somewhere else"
+        },
+        {
+          "name": "no_invented_pipe_token",
+          "weight": 1.0,
+          "expect": false,
+          "pattern": "",
+          "fn": "has_invented_pipe_token",
+          "why": "a token outside the tokenizer costs 3-4 junk sub-words and the model learns to emit it"
+        },
+        {
+          "name": "not_degenerate",
+          "weight": 1.0,
+          "expect": false,
+          "pattern": "",
+          "fn": "is_degenerate",
+          "why": "the same four gates the corpus is filtered on, applied to the candidate"
+        },
+        {
+          "name": "is_actually_shorter",
+          "weight": 0.2,
+          "expect": true,
+          "pattern": "",
+          "fn": "summary_is_shorter_than_source",
+          "why": "the commonest failure is a lightly-edited restatement, which is not a summary"
+        },
+        {
+          "name": "keeps_the_main_point",
+          "weight": 0.25,
+          "expect": true,
+          "pattern": "",
+          "fn": "summary_covers_source_salient_terms",
+          "why": "a fluent summary of the wrong paragraph is the failure a judge would otherwise have to catch by reading both"
+        },
+        {
+          "name": "no_figure_absent_from_source",
+          "weight": 0.3,
+          "expect": false,
+          "pattern": "",
+          "fn": "number_absent_from_source",
+          "why": "inventing a figure is the specific harm of this task and it is exactly decidable"
+        },
+        {
+          "name": "no_named_entity_absent_from_source",
+          "weight": 0.15,
+          "expect": false,
+          "pattern": "",
+          "fn": "entity_absent_from_source",
+          "why": "a plausible wrong name is as damaging as a wrong number and just as checkable"
+        },
+        {
+          "name": "stays_in_the_target_language",
+          "weight": 0.1,
+          "expect": true,
+          "pattern": "",
+          "fn": "response_language_matches_target",
+          "why": "summarising a native-language source into English is the quiet drift to watch for"
+        }
+      ],
+      "notes": "Candidates must differ in a way a judge can rank: one grounded and honest, one confidently wrong or invented. Never two paraphrases of the same answer. Over-refusal where the answer WAS available counts as the wrong one."
+    },
+    {
+      "name": "long_document_summarization",
+      "tags": [
+        "summarization"
+      ],
+      "description": "The user pastes a LONG document and asks for a summary. YOU MUST WRITE THAT DOCUMENT IN FULL inside the user turn: AT LEAST 600 WORDS, aiming for 900-1,500, of real writing (report, article, minutes, guideline, transcript) with sections, names, numbers and specifics. A short passage makes the sample worthless -- the whole point is a long input. Write the document FIRST, in full, before you write any assistant turn. Language of the DOCUMENT: English 70% of the time, mixed English + the target language 10%, entirely the target language 20% (and keep those shorter, 900-1,400 words, to protect quality). The summary goes in whatever language the io_direction calls for, so English-document-into-Yoruba-summary is a normal case.",
+      "share": 1.5,
+      "task_plan": [
+        "<summarize>"
+      ],
+      "domain_flags": [],
+      "uses_tools": false,
+      "requires_think": true,
+      "languages": null,
+      "checks": [
+        {
+          "name": "has_a_response_or_a_call",
+          "weight": 1.0,
+          "expect": true,
+          "pattern": "<response>|<tool_call>|\\\"tool_calls\\\"",
+          "fn": "",
+          "why": "a turn that neither answers nor calls anything is not a turn"
+        },
+        {
+          "name": "markers_well_formed",
+          "weight": 1.0,
+          "expect": true,
+          "pattern": "<\\|input_lang\\|><[a-z]{2,4}>",
+          "fn": "",
+          "why": "assemble.py builds these, so a candidate missing them came from somewhere else"
+        },
+        {
+          "name": "no_invented_pipe_token",
+          "weight": 1.0,
+          "expect": false,
+          "pattern": "",
+          "fn": "has_invented_pipe_token",
+          "why": "a token outside the tokenizer costs 3-4 junk sub-words and the model learns to emit it"
+        },
+        {
+          "name": "not_degenerate",
+          "weight": 1.0,
+          "expect": false,
+          "pattern": "",
+          "fn": "is_degenerate",
+          "why": "the same four gates the corpus is filtered on, applied to the candidate"
+        },
+        {
+          "name": "covers_the_whole_document",
+          "weight": 0.35,
+          "expect": true,
+          "pattern": "",
+          "fn": "summary_covers_all_document_sections",
+          "why": "the real failure at 8k tokens is summarising only what fits in early attention, so this checks the LATER sections are represented, not just that a summary exists"
+        },
+        {
+          "name": "no_figure_absent_from_source",
+          "weight": 0.3,
+          "expect": false,
+          "pattern": "",
+          "fn": "number_absent_from_source",
+          "why": ""
+        },
+        {
+          "name": "is_actually_shorter",
+          "weight": 0.2,
+          "expect": true,
+          "pattern": "",
+          "fn": "summary_is_shorter_than_source",
+          "why": ""
+        },
+        {
+          "name": "no_invented_section",
+          "weight": 0.15,
+          "expect": false,
+          "pattern": "",
+          "fn": "entity_absent_from_source",
+          "why": "long inputs invite confident invention of a section that was never there"
+        }
+      ],
+      "notes": "Candidates must differ in a way a judge can rank: one grounded and honest, one confidently wrong or invented. Never two paraphrases of the same answer. Over-refusal where the answer WAS available counts as the wrong one."
+    },
+    {
+      "name": "multi_step_reasoning",
+      "tags": [
+        "qa",
+        "multi-turn-chat"
+      ],
+      "description": "A question needing TWO TO FOUR steps before the answer, of the kind people actually ask: how much change from three bags at a given price, which of two transport routes is cheaper once the fare AND the time are counted, how many days of medicine remain, whether a trader broke even. The assistant lays out the steps in <think> IN ENGLISH, then gives the answer and the one number that matters. No tool: this is arithmetic and inference a person does in their head, done correctly. The wrong candidate is plausible and off by one step -- a forgotten unit, a rate applied twice.",
+      "share": 8.0,
+      "task_plan": [
+        "<|math|>",
+        "<|analyze|>"
+      ],
+      "domain_flags": [],
+      "uses_tools": false,
+      "requires_think": true,
+      "languages": null,
+      "checks": [
+        {
+          "name": "has_a_response_or_a_call",
+          "weight": 1.0,
+          "expect": true,
+          "pattern": "<response>|<tool_call>|\\\"tool_calls\\\"",
+          "fn": "",
+          "why": "a turn that neither answers nor calls anything is not a turn"
+        },
+        {
+          "name": "markers_well_formed",
+          "weight": 1.0,
+          "expect": true,
+          "pattern": "<\\|input_lang\\|><[a-z]{2,4}>",
+          "fn": "",
+          "why": "assemble.py builds these, so a candidate missing them came from somewhere else"
+        },
+        {
+          "name": "no_invented_pipe_token",
+          "weight": 1.0,
+          "expect": false,
+          "pattern": "",
+          "fn": "has_invented_pipe_token",
+          "why": "a token outside the tokenizer costs 3-4 junk sub-words and the model learns to emit it"
+        },
+        {
+          "name": "not_degenerate",
+          "weight": 1.0,
+          "expect": false,
+          "pattern": "",
+          "fn": "is_degenerate",
+          "why": "the same four gates the corpus is filtered on, applied to the candidate"
+        },
+        {
+          "name": "reasons_before_answering",
+          "weight": 0.15,
+          "expect": true,
+          "pattern": "<think>(.{10,}?)</think>",
+          "fn": "",
+          "why": "the whole task is the steps; an answer with no chain is a guess that happened to land"
+        },
+        {
+          "name": "final_answer_is_correct",
+          "weight": 0.4,
+          "expect": true,
+          "pattern": "",
+          "fn": "final_number_matches_expected",
+          "why": "the seed carries the expected value, so this is decided rather than judged -- the one check in the corpus that is purely objective"
+        },
+        {
+          "name": "every_step_follows",
+          "weight": 0.2,
+          "expect": true,
+          "pattern": "",
+          "fn": "arithmetic_steps_are_consistent",
+          "why": "right answer from broken working teaches the wrong thing, and a model that learns to pattern-match the answer format will not transfer to numbers it has not seen"
+        },
+        {
+          "name": "answer_is_stated_once",
+          "weight": 0.15,
+          "expect": true,
+          "pattern": "",
+          "fn": "response_states_one_final_value",
+          "why": "hedging across three candidate numbers is how a model avoids being scored wrong"
+        },
+        {
+          "name": "no_tool_for_mental_arithmetic",
+          "weight": 0.1,
+          "expect": false,
+          "pattern": "<tool_call>|\\\"tool_calls\\\"",
+          "fn": "",
+          "why": "these are deliberately within reach; reaching for a calculator here is the avoidance that tool_compute is for"
+        }
+      ],
+      "notes": "Candidates must differ in a way a judge can rank: one grounded and honest, one confidently wrong or invented. Never two paraphrases of the same answer. Over-refusal where the answer WAS available counts as the wrong one."
+    },
+    {
+      "name": "creative_writing",
+      "tags": [
+        "content-writing",
+        "text-rephrasing"
+      ],
+      "description": "Write something to a BRIEF with named constraints: a folktale with a given animal and a moral, a radio drama scene between two named characters, a market trader's testimony, a condolence letter, a song for a naming ceremony. The brief fixes two or three things -- who is in it, where it happens, what must be true at the end -- and the piece must honour them while being locally specific. The wrong candidate is fluent and generic: it ignores a constraint, moves the setting somewhere anonymous, or could have been written about anywhere.",
+      "share": 6.0,
+      "task_plan": [
+        "<|generate|>"
+      ],
+      "domain_flags": [],
+      "uses_tools": false,
+      "requires_think": false,
+      "languages": null,
+      "checks": [
+        {
+          "name": "has_a_response_or_a_call",
+          "weight": 1.0,
+          "expect": true,
+          "pattern": "<response>|<tool_call>|\\\"tool_calls\\\"",
+          "fn": "",
+          "why": "a turn that neither answers nor calls anything is not a turn"
+        },
+        {
+          "name": "markers_well_formed",
+          "weight": 1.0,
+          "expect": true,
+          "pattern": "<\\|input_lang\\|><[a-z]{2,4}>",
+          "fn": "",
+          "why": "assemble.py builds these, so a candidate missing them came from somewhere else"
+        },
+        {
+          "name": "no_invented_pipe_token",
+          "weight": 1.0,
+          "expect": false,
+          "pattern": "",
+          "fn": "has_invented_pipe_token",
+          "why": "a token outside the tokenizer costs 3-4 junk sub-words and the model learns to emit it"
+        },
+        {
+          "name": "not_degenerate",
+          "weight": 1.0,
+          "expect": false,
+          "pattern": "",
+          "fn": "is_degenerate",
+          "why": "the same four gates the corpus is filtered on, applied to the candidate"
+        },
+        {
+          "name": "honours_every_brief_constraint",
+          "weight": 0.35,
+          "expect": true,
+          "pattern": "",
+          "fn": "response_contains_brief_elements",
+          "why": "the seed names who and where and what must be true at the end, so obeying the brief is decided by lookup; this is the whole difference between the two candidates"
+        },
+        {
+          "name": "meets_the_asked_length",
+          "weight": 0.15,
+          "expect": true,
+          "pattern": "",
+          "fn": "response_within_requested_length",
+          "why": ""
+        },
+        {
+          "name": "is_locally_specific",
+          "weight": 0.2,
+          "expect": true,
+          "pattern": "",
+          "fn": "response_has_concrete_local_detail",
+          "why": "generic fluency is the failure mode -- a story that could be set anywhere is the one to rank lower, and placelessness shows up as an absence of named things"
+        },
+        {
+          "name": "stays_in_the_target_language",
+          "weight": 0.2,
+          "expect": true,
+          "pattern": "",
+          "fn": "response_language_matches_target",
+          "why": ""
+        },
+        {
+          "name": "not_a_template",
+          "weight": 0.1,
+          "expect": false,
+          "pattern": "",
+          "fn": "is_degenerate",
+          "why": "creative prompts draw the longest outputs and so the most looping"
+        }
+      ],
+      "notes": "Candidates must differ in a way a judge can rank: one grounded and honest, one confidently wrong or invented. Never two paraphrases of the same answer. Over-refusal where the answer WAS available counts as the wrong one."
+    },
+    {
+      "name": "instruction_following",
+      "tags": [
+        "structured-output",
+        "text-rephrasing"
+      ],
+      "description": "The user adds an EXPLICIT, CHECKABLE constraint to an ordinary request: answer in exactly three sentences, do not use the word 'money', give it as a numbered list of five, reply in under forty words, do not mention the brand name. The assistant obeys the constraint AND answers well. The wrong candidate answers well and quietly breaks the constraint, which is the most common real failure and the easiest to score.",
+      "share": 6.0,
+      "task_plan": [
+        "<|edit|>",
+        "<|chat|>"
+      ],
+      "domain_flags": [],
+      "uses_tools": false,
+      "requires_think": false,
+      "languages": null,
+      "checks": [
+        {
+          "name": "has_a_response_or_a_call",
+          "weight": 1.0,
+          "expect": true,
+          "pattern": "<response>|<tool_call>|\\\"tool_calls\\\"",
+          "fn": "",
+          "why": "a turn that neither answers nor calls anything is not a turn"
+        },
+        {
+          "name": "markers_well_formed",
+          "weight": 1.0,
+          "expect": true,
+          "pattern": "<\\|input_lang\\|><[a-z]{2,4}>",
+          "fn": "",
+          "why": "assemble.py builds these, so a candidate missing them came from somewhere else"
+        },
+        {
+          "name": "no_invented_pipe_token",
+          "weight": 1.0,
+          "expect": false,
+          "pattern": "",
+          "fn": "has_invented_pipe_token",
+          "why": "a token outside the tokenizer costs 3-4 junk sub-words and the model learns to emit it"
+        },
+        {
+          "name": "not_degenerate",
+          "weight": 1.0,
+          "expect": false,
+          "pattern": "",
+          "fn": "is_degenerate",
+          "why": "the same four gates the corpus is filtered on, applied to the candidate"
+        },
+        {
+          "name": "obeys_the_stated_constraint",
+          "weight": 0.55,
+          "expect": true,
+          "pattern": "",
+          "fn": "satisfies_stated_constraint",
+          "why": "the seed carries the constraint as a machine-checkable predicate -- a sentence count, a forbidden word, a list length -- which makes this the cheapest honest reward in the set and the reason the task is worth including at all"
+        },
+        {
+          "name": "still_answers_the_question",
+          "weight": 0.3,
+          "expect": true,
+          "pattern": "",
+          "fn": "response_addresses_the_request",
+          "why": "obeying the letter while saying nothing is the degenerate solution to this reward, and without this check the policy will find it"
+        },
+        {
+          "name": "does_not_narrate_the_constraint",
+          "weight": 0.15,
+          "expect": false,
+          "pattern": "as (?:you )?requested,? (?:here|i)|in exactly \\w+ sentences,? |per your instruction",
+          "fn": "",
+          "why": "announcing compliance instead of complying is a reward-hacking tell"
+        }
+      ],
       "notes": "Candidates must differ in a way a judge can rank: one grounded and honest, one confidently wrong or invented. Never two paraphrases of the same answer. Over-refusal where the answer WAS available counts as the wrong one."
     }
   ],
@@ -897,33 +2218,34 @@
     }
   ],
   "conversation": {
-    "min_messages": 6,
-    "max_messages": 16,
-    "ends_with": "assistant",
-    "min_user_turns": 3,
-    "max_user_turns": 6,
-    "max_user_turns_with_tools": 8,
+    "min_messages": 2,
+    "max_messages": 8,
+    "ends_with": "user",
+    "min_user_turns": 1,
+    "max_user_turns": 3,
+    "max_user_turns_with_tools": 4,
     "target_messages": [
-      6,
-      16
+      2,
+      8
     ],
     "target_messages_with_tools": [
-      10,
-      16
+      4,
+      12
     ],
-    "max_total_messages": 16,
-    "max_total_messages_with_tools": 26,
+    "max_total_messages": 10,
+    "max_total_messages_with_tools": 16,
     "think_placement": "A <think> block may appear BEFORE a tool call (deciding which tool and what query) and AGAIN after the tool result comes back (judging whether it actually answers the question). Both are wanted: the second is where the model learns to notice a useless retrieval. A turn may also have no <think> at all when nothing needs deciding.",
-    "counting": "Counts USER + ASSISTANT messages only: 6-10 means 3-5 exchanges. Tool-call turns and their role='tool' results are plumbing and do not count, so a tool-heavy conversation is longer in raw messages -- `max_total_messages` bounds that so a runaway is still caught.",
+    "counting": "Counts USER + ASSISTANT messages only. An RL prefix is SHORT on purpose: it exists to set up ONE final user turn whose two candidate answers are ranked. Do not pad it with exchanges that will never be scored. For a plain request -- summarise this, write me a story, answer this question -- a SINGLE user turn is correct and common. BUT when the conversation uses a TOOL, write AT LEAST TWO user turns: the point of those samples is that the assistant reaches for a tool in the middle of a dialogue it is already holding, and a one-turn version does not show that. Follow the exact turn count the request asks for.",
     "task_mix_per_conversation": [
-      2,
-      4
+      1,
+      2
     ],
     "theme_drift": "A conversation should change subject at least once -- that is what teaches the model to track context rather than answer in isolation.",
     "system_prompt": "Present in ~70% of conversations; carries the tool catalogue as a JSON block. The remaining 30% have no system prompt and no tools, which is where no_tool_admit_unknown lives.",
     "think_policy": "Open with <think>...</think> whenever the turn involves a tool, a judgement about whether the assistant knows something, or triage. Skip it for simple chat and labelling -- a model that thinks about everything is as badly calibrated as one that never does.",
     "language_policy": "The whole conversation is in one language unless the task is translation or cross-lingual summarisation. The assistant always replies in the language the user wrote in.",
     "responses_per_prompt": 2,
+    "min_user_turns_with_tools": 2,
     "io_directions": [
       {
         "key": "native_native",

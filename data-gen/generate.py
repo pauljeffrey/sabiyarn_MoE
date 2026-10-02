@@ -391,7 +391,8 @@ def resolve_langs(seed_kind: str, langs: Optional[str]) -> Optional[list[str]]:
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--kind", required=True, choices=["pretrain", "sft", "rl"])
-    ap.add_argument("--provider", default="openrouter", choices=["together", "openrouter"])
+    ap.add_argument("--provider", default="openrouter",
+                    choices=["together", "doubleword", "openrouter"])
     ap.add_argument("--model", default=None)
     ap.add_argument("--langs", default=None, help="comma list, e.g. yor,hau")
     ap.add_argument("--limit", type=int, default=0, help="cap this run (0 = everything outstanding)")

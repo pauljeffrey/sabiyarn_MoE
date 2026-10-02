@@ -3,14 +3,20 @@
 from __future__ import annotations
 
 from providers.base import Provider, Request, Response, load_env  # noqa: F401
+from providers.doubleword import DoublewordProvider
 from providers.openrouter import OpenRouterProvider
 from providers.together import TogetherProvider
 
-PROVIDERS = {"together": TogetherProvider, "openrouter": OpenRouterProvider}
+PROVIDERS = {"together": TogetherProvider, "doubleword": DoublewordProvider,
+             "openrouter": OpenRouterProvider}
 
-# Sensible model per provider for this project. gpt-oss-120b is strong enough for the reasoning/tool-call
-# structure; for the low-resource languages a gemma-3-27b pass is worth A/B-ing (see README).
-DEFAULT_MODELS = {"together": "openai/gpt-oss-120b", "openrouter": "openai/gpt-oss-120b"}
+# Sensible model per provider. These are MEASURED choices, not guesses -- see providers.base.RECOMMENDED_MODEL
+# for the per-phase figures. gemma-3-27b is the pretraining model (89% clean on low-resource prose against
+# gemma-4-31b's 6%) and gemma-4-31b is the sft/rl model; Doubleword carries only gemma-4, which is why it is
+# the place to buy sft and rl rather than pretraining.
+DEFAULT_MODELS = {"together": "openai/gpt-oss-120b",
+                  "doubleword": "google/gemma-4-31B-it",
+                  "openrouter": "google/gemma-4-31b-it"}
 
 
 def get_provider(name: str, model: str | None = None, **kw) -> Provider:

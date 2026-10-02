@@ -121,12 +121,17 @@ def _rl(context: int) -> Budget:
     # RL is a conversation PREFIX plus two candidate final responses. Both candidates must fit alongside the
     # prefix, so the per-response ceiling is half what SFT allows at the same context.
     resp = 2_048 if context >= 32_768 else 1_024
-    # RL has no long_document_summarization task (see build_seeds._RL_WEIGHTS), so its documents exist only to
-    # back a RAG context; the band is the RAG band.
+    # RL now carries long_document_summarization as well as the RAG tasks (build_seeds._RL_WEIGHTS), so its
+    # documents serve both. One band covers both cases: a summary source and a RAG context want the same
+    # 2k-8k, and a longer source would leave no room for two candidates beside it.
     return Budget(
         kind="rl", context=context, max_response_tokens=resp,
         doc_token_bands=((2_048, 8_192),), rag_context_tokens=(2_048, 8_192),
-        max_output_tokens=min(context, resp * 2 + 2_048),
+        # Headroom over the two candidates is 4k, not 2k. The generator emits the whole conversation PREFIX
+        # as well as the candidates, and for a task like summarization the prefix contains a source document
+        # it wrote itself -- measured truncations at a 6,144 ceiling, returning invalid JSON and losing the
+        # sample. Output is billed per token actually produced, so the extra ceiling costs nothing unused.
+        max_output_tokens=min(context, resp * 2 + 4_096),
         # A prefix can carry an 8,192-token RAG context on top of a conversation that measured p99 6,762, plus
         # two candidates: it genuinely can approach the full context.
         engine_len=context,
