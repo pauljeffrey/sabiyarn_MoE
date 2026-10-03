@@ -443,7 +443,14 @@ def _sft_like_request(seed: Seed, row: dict, *, rl: bool, document: Optional[dic
     max_extra = 0 if (document and not document.get("rag")) else _TIER_EXTRA_TASKS.get(lang.tier, 3)
     extra = (rng.sample(others, k=min(len(others), rng.randint(1, max_extra))) if max_extra else [])
     tasks = [task] + extra
-    domain, subtopic, _ = _coverage_pick(lang.code, row["index"])
+    # A document-bearing row takes its domain from the DOCUMENT's group, because several rows share one
+    # document and the conversation has to be about the document that was actually written. Using the row's
+    # own index let the two drift apart silently.
+    if document is not None:
+        from longdocs import doc_group_index
+        domain, subtopic, _ = _coverage_pick(lang.code, doc_group_index(row))
+    else:
+        domain, subtopic, _ = _coverage_pick(lang.code, row["index"])
     io = _io_direction(seed, lang.code, row["index"], rng)
     # A RAG document reaches the assistant through a TOOL, so it does not change what came IN: the user still
     # writes in their own language and io_direction is already correct. Only a pasted summarisation document
@@ -655,7 +662,18 @@ Return JSON:
     # A long-document sample covers ONE task, so "change subject at least once" would be self-contradictory.
     mix_line = ("Task for this conversation:" if len(tasks) == 1 else
                 "Tasks this conversation must cover (mix them, change subject at least once):")
-    doc_section = ("\n" + document_brief(document) + "\n") if document else ""
+    # The ANGLE is what keeps rows sharing a document from being near-duplicates. Each sharing row is told
+    # to interrogate a different facet, and one of the four is deliberately unanswerable from the document
+    # -- which is the retrieval_insufficient case the corpus most needs and used to pay a whole document for.
+    doc_section = ""
+    if document:
+        from longdocs import doc_angle, document_reuse
+        doc_section = "\n" + document_brief(document) + "\n"
+        if document_reuse() > 1:
+            doc_section += (
+                f"\nWHAT THIS CONVERSATION ASKS OF THE DOCUMENT -- make the user's question turn on\n"
+                f"{doc_angle(row)}.\nSeveral separate conversations are built from this same document, so "
+                f"ask about THIS facet and not the document in general.\n")
 
     user = f"""LANGUAGE DIRECTION for this conversation -- {io['key']}:
 {io['brief']}

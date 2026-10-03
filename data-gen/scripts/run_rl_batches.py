@@ -63,9 +63,27 @@ class State:
         return self.data["langs"].setdefault(code, {"batches": [], "fetched": [], "requested": 0})
 
 
-def _run(cmd: list[str], env: dict) -> tuple[int, str]:
-    p = subprocess.run(cmd, cwd=ROOT, env=env, capture_output=True, text=True)
-    return p.returncode, (p.stdout or "") + (p.stderr or "")
+def _run(cmd: list[str], env: dict, log: Path | None = None) -> tuple[int, str]:
+    """Run generate.py, STREAMING its output to `log` while capturing it for parsing.
+
+    Streaming matters: the document pre-stage can run for hours, and capturing its output to print at the
+    end made a long run indistinguishable from a hung one. The log is the only window into it.
+    """
+    lines: list[str] = []
+    sink = open(log, "a", encoding="utf-8", buffering=1) if log else None
+    try:
+        proc = subprocess.Popen(cmd, cwd=ROOT, env=env, stdout=subprocess.PIPE,
+                                stderr=subprocess.STDOUT, text=True, bufsize=1)
+        assert proc.stdout is not None
+        for line in proc.stdout:
+            lines.append(line)
+            if sink:
+                sink.write(line)
+        proc.wait()
+        return proc.returncode, "".join(lines)
+    finally:
+        if sink:
+            sink.close()
 
 
 def submit(lang: str, n_req: int, args, env: dict, st: State) -> None:
@@ -77,7 +95,7 @@ def submit(lang: str, n_req: int, args, env: dict, st: State) -> None:
         cmd += ["--model", args.model]
     print(f"[{lang}] submitting up to {n_req:,} requests "
           f"(documents are generated synchronously first -- this is the slow part)", flush=True)
-    code, out = _run(cmd, env)
+    code, out = _run(cmd, env, log=Path(f"/tmp/claude-501/rl_gen_{lang}.log"))
     ids = re.findall(r"batch ([0-9a-f-]{16,})", out)
     for b in ids:
         if b not in rec["batches"]:
@@ -102,7 +120,7 @@ def fetch(lang: str, args, env: dict, st: State) -> bool:
         cmd = [sys.executable, "generate.py", "--kind", "rl", "--provider", args.provider, "--fetch", b]
         if args.push:
             cmd.append("--push")
-        code, out = _run(cmd, env)
+        code, out = _run(cmd, env, log=Path(f"/tmp/claude-501/rl_fetch_{lang}.log"))
         last = "\n".join(out.strip().splitlines()[-3:])
         if re.search(r"\bkept \d+ of \d+", out) or "completed" in out:
             if "in_progress" not in out:

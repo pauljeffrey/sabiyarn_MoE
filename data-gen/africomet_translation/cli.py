@@ -18,6 +18,7 @@ import os
 import re
 import sys
 import time
+from collections import Counter
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 
@@ -88,6 +89,56 @@ def cmd_status(a) -> int:
     for l, n in sorted(by_lang.items()):
         print(f"{l:4s} {n:>12,} candidate windows")
     print(f"{'all':4s} {sum(by_lang.values()):>12,}")
+    return 0
+
+
+def _clean_worker(args):
+    from .clean import clean_file
+    return clean_file(*args)
+
+
+def cmd_clean(a) -> int:
+    import pickle
+    out = Path(a.out).resolve()
+    cache = Path(a.cache).resolve()
+    cache.mkdir(parents=True, exist_ok=True)
+    _env(str(cache))
+    from .clean import THRESHOLD, train_model
+    langs = a.languages.split(",") if a.languages else ["pcm", "yor", "hau", "ibo", "fon", "ewe", "twi", "efi", "ibb", "eng"]
+    (out / "clean_models").mkdir(exist_ok=True)
+    for lang in langs:
+        p = out / "clean_models" / f"{lang}.pkl"
+        if p.exists() and not a.retrain:
+            continue
+        t0 = time.time()
+        m = train_model(out, lang)
+        if m is None:
+            print(f"[{lang}] too little curated or web data for a classifier; rules only", flush=True)
+            continue
+        p.write_bytes(pickle.dumps(m))
+        print(f"[{lang}] classifier: {m['n_pos']:,} clean + {m['n_neg']:,} web; "
+              f"{m['heldout_pass']:.0%} of held-out clean windows score >= {THRESHOLD} ({time.time() - t0:.0f}s)", flush=True)
+    if a.train_only:
+        return 0
+    files = [(str(f), lang, str(out), a.threshold) for lang in langs for f in sorted((out / "windows" / lang).glob("*.parquet"))
+             if not (out / "clean" / lang / f.name).exists() or a.force]
+    print(f"cleaning {len(files)} window file(s) with {a.workers} worker(s)", flush=True)
+    ctx = mp.get_context("spawn")
+    agg: dict[str, Counter] = {}
+    t0 = time.time()
+    with ProcessPoolExecutor(a.workers, mp_context=ctx) as pool:
+        futs = [pool.submit(_clean_worker, f) for f in files]
+        for i, fu in enumerate(as_completed(futs), 1):
+            r = fu.result()
+            agg.setdefault(r["lang"], Counter()).update({k: v for k, v in r.items() if isinstance(v, int)})
+            print(f"[{i}/{len(files)}] {r['lang']} {r['file'][:50]}: {r['in']:,} -> {r['out']:,}", flush=True)
+    for lang, c in agg.items():
+        rej = {k[4:]: v for k, v in c.items() if k.startswith("rej:")}
+        print(f"{lang}: kept {c['out']:,} of {c['in']:,} ({c['out'] / max(1, c['in']):.0%}); rejected by: "
+              + ", ".join(f"{k} {v:,}" for k, v in sorted(rej.items(), key=lambda kv: -kv[1])[:5]), flush=True)
+    (out / "clean").mkdir(exist_ok=True)
+    (out / "clean" / "_stats.json").write_text(json.dumps({l: dict(c) for l, c in agg.items()}, indent=1))
+    print(f"clean finished in {time.time() - t0:.0f}s", flush=True)
     return 0
 
 
@@ -211,6 +262,15 @@ def main(argv=None) -> int:
     m.add_argument("--max-non-eng-per-lang", type=int, default=0)
     m.add_argument("--push", action="store_true")
     m.add_argument("--public", action="store_true")
+    c = sub.add_parser("clean")
+    c.add_argument("--out", required=True)
+    c.add_argument("--cache", required=True)
+    c.add_argument("--languages", default="")
+    c.add_argument("--workers", type=int, default=4)
+    c.add_argument("--threshold", type=float, default=0.5)
+    c.add_argument("--retrain", action="store_true")
+    c.add_argument("--train-only", action="store_true")
+    c.add_argument("--force", action="store_true")
     s = sub.add_parser("status")
     s.add_argument("--out", required=True)
     s.add_argument("-v", "--verbose", action="store_true")
@@ -219,6 +279,8 @@ def main(argv=None) -> int:
         return cmd_extract(a)
     if a.cmd == "status":
         return cmd_status(a)
+    if a.cmd == "clean":
+        return cmd_clean(a)
     if a.cmd == "assemble":
         a.limit_per_lang = a.limit_per_lang or None
         a.max_non_eng_per_lang = a.max_non_eng_per_lang or None

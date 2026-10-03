@@ -95,6 +95,31 @@ def tokens_for(kind: str, tasks) -> dict[str, float]:
             "completion": COMPLETION_TOKENS_ENG[kind], "doc_share": doc_share}
 
 
+# GENERATING the documents is a separate cost from carrying them in the prompt, and the first version of
+# this model counted only the second. Measured on the English run: 0.82 outline calls and 1.77 section calls
+# per document, a 6,000-word median, and 17% of RL samples document-backed. Unique-per-sample that came to
+# ~$54 -- MORE than the whole sample budget -- which is why longdocs reuses each document across several
+# samples. The pre-stage is synchronous, so it pays full price, not the batch rate.
+DOC_SHARE = {"rl": 0.17, "sft": 0.05, "pretrain": 0.0}
+OUTLINES_PER_DOC = 0.82
+SECTIONS_PER_DOC = 1.77
+DOC_WORDS = 6_000
+OUTLINE_OUT_TOKENS = 450
+SYNC_MULTIPLIER = 2.0  # the pre-stage is not batched
+
+
+def document_cost(lang: str, kind: str, n_samples: int, reuse: int) -> float:
+    """Dollars to GENERATE the documents backing `n_samples`, at `reuse` samples per document."""
+    share = DOC_SHARE.get(kind, 0.0)
+    if not share:
+        return 0.0
+    docs = n_samples * share / max(1, reuse)
+    pen = _GEMMA_PENALTY.get(lang, 2.2)
+    out = docs * (OUTLINES_PER_DOC * OUTLINE_OUT_TOKENS + DOC_WORDS * pen)
+    inp = docs * (OUTLINES_PER_DOC + SECTIONS_PER_DOC) * 2_000
+    return (inp * PRICE_IN + out * PRICE_OUT) / 1e6 * SYNC_MULTIPLIER
+
+
 def cost_per_sample(lang: str, kind: str, tk: dict[str, float]) -> float:
     """Dollars for one KEPT sample, including the retries it took to get it.
 
@@ -161,6 +186,9 @@ def main() -> int:
                          "competence and generation slices at zero API cost, but covers NONE of the "
                          "behaviour slice -- searches for tool-use or retrieval preference data return "
                          "nothing -- so English is generated for behaviour and topped up from the Hub.")
+    ap.add_argument("--reuse", type=int, default=4,
+                    help="samples per generated document (longdocs._DOC_REUSE). 1 = unique per sample, "
+                         "which measured at more than the sample budget itself.")
     ap.add_argument("--floor", type=int, default=0,
                     help="min samples for any one language, paid before the proportional share. Below a few "
                          "hundred preference pairs a language is not trainable, so the spend buys nothing.")
@@ -187,7 +215,17 @@ def main() -> int:
             print(f"--pin names {lang!r}, which is not in the {a.kind} seed", file=sys.stderr)
             return 1
         pinned[lang] = int(n)
+    # The document pre-stage is paid first: it is a real cost and leaving it out of the budget is exactly
+    # the mistake that turned a $50 plan into a $104 one.
     budget = a.budget
+    doc_reserve = 0.0
+    if DOC_SHARE.get(a.kind):
+        # Estimated from the TARGET sizes, then confirmed against the allocation below.
+        guess = {**volumes, **pinned}
+        scale = a.budget / max(1e-9, sum(n * cost_per_sample(l, a.kind, tk) for l, n in guess.items()))
+        for l, n in guess.items():
+            doc_reserve += document_cost(l, a.kind, n * min(1.0, scale), a.reuse)
+        budget -= doc_reserve
     for lang, n in pinned.items():
         budget -= n * cost_per_sample(lang, a.kind, tk)
         del volumes[lang]
@@ -205,6 +243,9 @@ def main() -> int:
 
     print(f"{a.kind}  budget ${a.budget:.2f}  cap {a.cap:,}"
           f"{f'  floor {a.floor:,}' if a.floor else ''}  languages {len(alloc)}")
+    if doc_reserve:
+        print(f"documents: {a.reuse} samples per document, ${doc_reserve:.2f} reserved for the "
+              f"synchronous pre-stage (${doc_reserve * a.reuse:.2f} if each were unique)")
     print(f"average request: {tk['prompt']:,.0f} prompt tokens + {tk['completion']:,.0f} completion tokens "
           f"(English baseline); {tk['doc_share']:.0%} of the mix carries a source document")
     print(f"{'lang':<6}{'tier':<8}{'samples':>9}{'$/1k':>8}{'cost':>9}{'share':>8}")
@@ -214,7 +255,10 @@ def main() -> int:
                 "  (capped)" if n >= a.cap else ("  (floor)" if a.floor and n <= a.floor else ""))
         print(f"{l:<6}{_TIER.get(l, 'low'):<8}{n:>9,}{cost_per_sample(l, a.kind, tk)*1000:>8.2f}"
               f"{c:>9.2f}{c/spent:>7.0%}{flag}")
-    print(f"{'total':<14}{sum(alloc.values()):>9,}{'':>8}{spent:>9.2f}")
+    docs = sum(document_cost(l, a.kind, n, a.reuse) for l, n in alloc.items())
+    print(f"{'samples':<14}{sum(alloc.values()):>9,}{'':>8}{spent:>9.2f}")
+    print(f"{'documents':<14}{'':>9}{'':>8}{docs:>9.2f}")
+    print(f"{'TOTAL':<14}{'':>9}{'':>8}{spent + docs:>9.2f}")
 
     if a.json:
         Path(a.json).write_text(json.dumps({"kind": a.kind, "budget": a.budget, "cap": a.cap,

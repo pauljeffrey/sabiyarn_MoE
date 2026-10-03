@@ -147,7 +147,8 @@ def stage_one_documents(seed: Any, todo: list[dict], provider: Any, *, dry_run: 
     with the conversation for the same completion budget. Generated alone it has the whole budget, and stage 2
     then pays for it in INPUT tokens (3-5x cheaper) instead of output tokens.
     """
-    from longdocs import DOCUMENT_TASKS, DocumentStore, generate_documents, plan_document
+    from longdocs import (DOCUMENT_TASKS, DocumentStore, doc_group_index, document_reuse,
+                          generate_documents, plan_document)
     from prompts import coverage_pick
 
     rows = [r for r in todo if r.get("task") in DOCUMENT_TASKS]
@@ -155,18 +156,27 @@ def stage_one_documents(seed: Any, todo: list[dict], provider: Any, *, dry_run: 
         return {}
     specs = []
     for r in rows:
-        domain, subtopic, _ = coverage_pick(r["lang"], r["index"])
+        # The domain must come from the DOCUMENT's group, not the row. Rows sharing a document are asked
+        # about that document, so taking their domain from their own index would describe one subject in the
+        # conversation while the document was written about another -- the two would silently disagree.
+        domain, subtopic, _ = coverage_pick(r["lang"], doc_group_index(r))
         specs.append((r["custom_id"], plan_document(seed, r, domain=domain, subtopic=subtopic)))
     store = DocumentStore(documents_dir(seed.kind))
-    have = sum(1 for _, s in specs if s.custom_id in store)
-    print(f"  long documents: {len(specs):,} needed, {have:,} already on disk")
+    unique = {s.custom_id for _, s in specs}
+    have = sum(1 for cid in unique if cid in store)
+    reuse = document_reuse()
+    print(f"  long documents: {len(unique):,} needed for {len(specs):,} samples "
+          f"(reused {reuse}x), {have:,} already on disk")
     if dry_run:
         return {cid: (store.get(s.custom_id) or {"title": "(dry run)", "text": "(dry run)", "words": 0,
                                                  "doc_lang": s.doc_lang, "doc_lang_mode": s.doc_lang_mode,
                                                  "form": s.form})
                 for cid, s in specs}
     try:
-        by_doc = generate_documents(seed, [s for _, s in specs], provider, store)
+        seen_specs: dict[str, Any] = {}
+        for _, s in specs:
+            seen_specs.setdefault(s.custom_id, s)
+        by_doc = generate_documents(seed, list(seen_specs.values()), provider, store)
     finally:
         store.close()
     out = {cid: by_doc[s.custom_id] for cid, s in specs if s.custom_id in by_doc}

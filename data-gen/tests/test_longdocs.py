@@ -127,7 +127,10 @@ def test_section_count_follows_the_word_target(seed):
 
 
 def test_all_forms_are_reachable(seed):
-    forms = {_spec(seed, "hau", i)[1].form for i in range(len(L._FORMS) * 3)}
+    # The form cycle advances per DOCUMENT GROUP, not per sample, so covering every form takes
+    # len(_FORMS) x reuse indices. Scaled rather than hardcoded so this keeps working if reuse changes.
+    span = len(L._FORMS) * L.document_reuse() * 3
+    forms = {_spec(seed, "hau", i)[1].form for i in range(span)}
     assert forms == {f[0] for f in L._FORMS}
 
 
@@ -538,3 +541,83 @@ def test_rag_samples_keep_a_normal_conversation_shape(seed):
     assert req.metadata["tasks"]
     # the user still writes their own language: a tool result does not change what came IN
     assert req.metadata["expect_markers"][1] == "yor"
+
+
+# --------------------------------------------------------------------------- document reuse
+# Generating a unique 6,000-word document per document-bearing sample cost ~$54 for the RL run -- more than
+# the entire $50 sample budget -- and ~10 hours of synchronous calls before any batch could be submitted.
+
+def test_sharing_rows_plan_the_same_document(seed):
+    """The whole mechanism: rows in one group must plan an IDENTICAL custom_id, because that is what makes
+    DocumentStore hand them one document instead of building four."""
+    from longdocs import document_reuse, plan_document
+    n = document_reuse()
+    assert n > 1, "reuse is the point of this test"
+    ids = set()
+    for i in range(n):
+        row = {"custom_id": f"rl__pcm__rag_document_qa__{i:06d}", "lang": "pcm",
+               "task": "rag_document_qa", "index": i}
+        ids.add(plan_document(seed, row, domain="health", subtopic="clinics").custom_id)
+    assert len(ids) == 1, f"{n} sharing rows planned {len(ids)} documents"
+
+
+def test_the_next_group_plans_a_different_document(seed):
+    from longdocs import document_reuse, plan_document
+    n = document_reuse()
+    def cid(i):
+        row = {"custom_id": f"rl__pcm__rag_document_qa__{i:06d}", "lang": "pcm",
+               "task": "rag_document_qa", "index": i}
+        return plan_document(seed, row, domain="health", subtopic="clinics").custom_id
+    assert cid(0) != cid(n), "groups must not collide, or the whole corpus shares one document"
+
+
+def test_documents_are_not_shared_across_languages_or_tasks(seed):
+    """A Fon sample must not read a document planned for Hausa, and a summarisation document is not a RAG
+    context -- the spec differs. Only the index is grouped."""
+    from longdocs import plan_document
+    base = {"custom_id": "rl__pcm__rag_document_qa__000000", "index": 0}
+    a = plan_document(seed, {**base, "lang": "pcm", "task": "rag_document_qa"},
+                      domain="health", subtopic="clinics").custom_id
+    b = plan_document(seed, {**base, "lang": "hau", "task": "rag_document_qa"},
+                      domain="health", subtopic="clinics").custom_id
+    c = plan_document(seed, {**base, "lang": "pcm", "task": "retrieval_insufficient"},
+                      domain="health", subtopic="clinics").custom_id
+    assert len({a, b, c}) == 3
+
+
+def test_every_sharing_row_gets_a_different_angle():
+    """Four conversations over one document must differ by construction, not by luck. One of the angles is
+    deliberately unanswerable, which is the retrieval_insufficient case."""
+    from longdocs import DOC_ANGLES, doc_angle, document_reuse
+    n = document_reuse()
+    angles = {doc_angle({"index": i}) for i in range(n)}
+    assert len(angles) == n, f"{n} sharing rows got {len(angles)} distinct angles"
+    assert any("DOES NOT" in a for a in DOC_ANGLES), "no angle probes what the document omits"
+
+
+def test_reuse_can_be_turned_off(seed):
+    """set_document_reuse(1) must restore a unique document per sample, so the old behaviour is recoverable
+    and the saving is measurable against it."""
+    from longdocs import document_reuse, plan_document, set_document_reuse
+    was = document_reuse()
+    try:
+        set_document_reuse(1)
+        ids = set()
+        for i in range(3):
+            row = {"custom_id": f"rl__pcm__rag_document_qa__{i:06d}", "lang": "pcm",
+                   "task": "rag_document_qa", "index": i}
+            ids.add(plan_document(seed, row, domain="health", subtopic="clinics").custom_id)
+        assert len(ids) == 3
+    finally:
+        set_document_reuse(was)
+
+
+def test_a_shared_document_and_its_conversation_agree_on_the_subject(seed):
+    """The conversation's domain is taken from the document's GROUP. Taking it from the row's own index let
+    the document be written about one subject while the conversation asked about another."""
+    from longdocs import doc_group_index
+    from prompts import coverage_pick
+    rows = [{"custom_id": f"rl__pcm__rag_document_qa__{i:06d}", "lang": "pcm",
+             "task": "rag_document_qa", "index": i} for i in range(4)]
+    picks = {coverage_pick("pcm", doc_group_index(r))[:2] for r in rows}
+    assert len(picks) == 1, "rows sharing a document must resolve to one (domain, subtopic)"

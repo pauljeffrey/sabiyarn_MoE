@@ -188,13 +188,63 @@ class DocSpec:
         return {k: getattr(self, k) for k in self.__slots__}
 
 
+# How many SAMPLES share one document. Generating a unique 6,000-word document per document-bearing sample
+# was the single largest cost in the RL run -- measured at ~$54 for 11,000 documents, more than the whole
+# $50 sample budget, and ~10 hours of synchronous calls before any batch could even be submitted.
+#
+# Reuse is also better data, not merely cheaper. One long multi-section document interrogated four different
+# ways -- for a figure, for a cause, for a comparison, and for something it genuinely does NOT say -- teaches
+# more than four unrelated documents asked one question each. The last of those is exactly what
+# retrieval_insufficient needs, and paying for a whole document to extract one question from it was waste.
+#
+# The sharing rows get a different ANGLE (see doc_angle) so they are different samples by construction
+# rather than by luck.
+_DOC_REUSE = 4
+
+# What each sharing row is asked to probe. Index 0 is the straightforward read; the last is deliberately
+# unanswerable from the document, which is the case the corpus most needs and previously paid full price for.
+DOC_ANGLES = (
+    "a specific figure, date or name stated in the document",
+    "a cause, reason or consequence the document explains",
+    "a comparison or change over time that the document supports",
+    "something a reader would reasonably expect to be here but which the document DOES NOT state -- the "
+    "honest answer is that it is not in the document",
+)
+
+
+def set_document_reuse(n: int) -> None:
+    """Testing and tuning hook. 1 restores a unique document per sample."""
+    global _DOC_REUSE
+    _DOC_REUSE = max(1, int(n))
+
+
+def document_reuse() -> int:
+    return _DOC_REUSE
+
+
+def doc_group_index(row: dict) -> int:
+    """Which DOCUMENT this row's sample reads. Rows sharing a group share one document."""
+    return int(row["index"]) // _DOC_REUSE
+
+
+def doc_angle(row: dict) -> str:
+    """What this row asks OF the shared document, so sharing rows are not near-duplicates."""
+    return DOC_ANGLES[int(row["index"]) % _DOC_REUSE % len(DOC_ANGLES)]
+
+
 def plan_document(seed: Any, row: dict, *, domain: str, subtopic: str) -> DocSpec:
-    """Decide form, language, length and section count for this row's document. Pure function of the row."""
+    """Decide form, language, length and section count for this row's document.
+
+    A pure function of the row's DOCUMENT GROUP, not of the row: every field that defines the document is
+    derived from doc_group_index so that sharing rows plan byte-identical specs and therefore the same
+    custom_id -- which is what makes DocumentStore hand them one document instead of building four.
+    """
     rag = row.get("task") in RAG_DOCUMENT_TASKS
     lang = row["lang"]
-    i = row["index"] + _offset(lang)
+    gi = doc_group_index(row)
+    i = gi + _offset(lang)
     form, form_desc, stages = _FORMS[i % len(_FORMS)]
-    mode = _DOC_LANG_CYCLE[(row["index"] * _DOC_LANG_STRIDE + _offset(lang)) % len(_DOC_LANG_CYCLE)]
+    mode = _DOC_LANG_CYCLE[(gi * _DOC_LANG_STRIDE + _offset(lang)) % len(_DOC_LANG_CYCLE)]
     if lang == "eng":
         mode = "eng"
     if rag:
@@ -206,7 +256,7 @@ def plan_document(seed: Any, row: dict, *, domain: str, subtopic: str) -> DocSpe
 
     tier = next((l.tier for l in seed.languages if l.code == lang), "medium")
     lo, hi = _tokens_for(row["index"], lang, rag=rag)
-    tokens = lo + (_offset(row["custom_id"]) % max(1, hi - lo))
+    tokens = lo + (_offset(f"{lang}:{row.get('task')}:{gi}") % max(1, hi - lo))
     # A document written ENTIRELY in a low-resource language is capped short. The full band asked Fon for
     # 4,775 words, and a generator that half-knows Fon does not produce 4,775 good ones -- it drifts into
     # French or starts looping. English and mixed documents keep the whole 4k-16k band, which also matches
@@ -221,7 +271,9 @@ def plan_document(seed: Any, row: dict, *, domain: str, subtopic: str) -> DocSpe
     key = mode if mode != "native" else ("native_low" if tier == "low" else "native")
     n_sections = min(MAX_SECTIONS, max(len(stages), -(-words // _SECTION_WORDS[key])))
     section_words = min(_MAX_SECTION_WORDS, max(_SECTION_WORDS[key], -(-words // n_sections)))
-    return DocSpec(custom_id=f"doc__{row['custom_id']}", lang=lang, doc_lang=doc_lang, doc_lang_mode=mode,
+    # Keyed by the GROUP, not the row: this is the whole reuse mechanism.
+    return DocSpec(custom_id=f"doc__{lang}__{row.get('task')}__{gi:06d}",
+                   lang=lang, doc_lang=doc_lang, doc_lang_mode=mode,
                    form=form, form_desc=form_desc, stages=stages, tokens=tokens, words=words,
                    n_sections=n_sections, section_words=section_words, min_words=_MIN_WORDS[key],
                    register=_REGISTERS[i % len(_REGISTERS)], domain=domain, subtopic=subtopic,
