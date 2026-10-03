@@ -197,6 +197,50 @@ def test_topic_seeds_cover_the_corpus_domains():
     assert all(v for v in TOPIC_SEEDS.values())
 
 
+# --------------------------------------------------------------------------- relevance
+# Technicality alone let "Toyota Prius (XW20)" (0.95), "BMW 7 Series (G70)" (0.93) and "Value-added tax in
+# the United Kingdom" into the first harvest. All technical; all useless. Relevance is the second gate.
+
+def test_a_foreign_jurisdiction_in_the_title_is_rejected_outright():
+    """Not penalised -- rejected. "Canadian passport" is a perfect match for a query about identity
+    enrolment and still the wrong answer: a document question answered from another country's procedure is
+    worse than one answered with "I could not find it". A penalty left it above the gate at 0.50."""
+    from doc_sources import MIN_RELEVANCE, relevance
+    body = "passport enrolment identification national requirement procedure " * 30
+    assert relevance(body, "Canadian passport", "national identification enrolment") == 0.0
+    assert relevance(body, "Value-added tax in the United Kingdom", "tax rate threshold") == 0.0
+    assert relevance(body, "Malaysian identity card", "national identification enrolment") == 0.0
+    # and the same subject without a jurisdiction is kept
+    civil = "civil birth registration procedure vital records certificate registrar " * 30
+    assert relevance(civil, "Civil registration", "birth registration procedure") >= MIN_RELEVANCE
+
+
+def test_a_product_or_model_in_the_title_is_rejected_outright():
+    from doc_sources import relevance
+    body = "hybrid battery charging profile kwh nickel metal hydride " * 30
+    assert relevance(body, "Toyota Prius (XW20)", "battery charging profile") == 0.0
+    assert relevance(body, "BMW 7 Series (G70)", "battery charging profile") == 0.0
+
+
+def test_on_topic_local_documents_score_well():
+    from doc_sources import MIN_RELEVANCE, relevance
+    body = ("drip irrigation emitter discharge rate smallholder plots in Nigeria and Ghana, "
+            "rated 2 l/h at 100 kPa. " * 25)
+    assert relevance(body, "Drip irrigation", "drip irrigation emitter discharge rate") >= MIN_RELEVANCE
+
+
+def test_a_passing_mention_is_not_relevance():
+    """The lead section defines the subject; a query term appearing once near the end does not."""
+    from doc_sources import MIN_RELEVANCE, relevance
+    body = ("A long article about something else entirely. " * 200) + " tilapia stocking density pond"
+    assert relevance(body, "Something Else", "tilapia stocking density pond") < MIN_RELEVANCE
+
+
+def test_relevance_needs_a_query():
+    from doc_sources import relevance
+    assert relevance("anything at all", "Title", "") == 0.0
+
+
 # --------------------------------------------------------------------------- network
 
 @pytest.mark.skipif(not NET, reason="set SABIYARN_NET=1 to test against Wikipedia")

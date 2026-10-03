@@ -124,8 +124,94 @@ TOPIC_SEEDS: dict[str, tuple[str, ...]] = {
     ),
     "education": (
         "examination grading scale", "curriculum contact hours credit",
+        "school building classroom size standard", "teacher qualification requirement",
+    ),
+    "energy_power": (
+        "solar photovoltaic module efficiency rating", "inverter sizing surge capacity",
+        "deep cycle battery depth of discharge", "generator fuel consumption rating",
+        "transmission line voltage drop", "earthing resistance specification",
+        "power factor correction capacitor", "diesel generator derating altitude",
+    ),
+    "engineering_construction": (
+        "concrete curing time strength gain", "soil bearing capacity foundation design",
+        "steel reinforcement lap length", "block wall mortar mix proportion",
+        "borehole casing screen design", "culvert sizing design discharge",
+        "scaffolding load capacity standard",
+    ),
+    "water_sanitation": (
+        "slow sand filter loading rate", "borehole yield pumping test",
+        "chlorine dose contact time disinfection", "pit latrine setback distance groundwater",
+        "rainwater harvesting tank sizing", "water quality guideline value turbidity",
+        "greywater reuse irrigation standard",
+    ),
+    "transport_mobility": (
+        "tyre load index speed rating", "axle load limit road",
+        "brake pad wear specification", "vehicle emission standard limit",
+        "motorcycle helmet safety standard", "road camber gradient design",
+    ),
+    "telecom_phones": (
+        "LTE band frequency duplex", "antenna gain radiation pattern",
+        "fibre optic attenuation splice loss", "VSAT link budget",
+        "SIM card authentication protocol", "mobile battery charging current",
+    ),
+    "environment_climate": (
+        "rainfall intensity duration frequency", "evapotranspiration reference crop coefficient",
+        "air quality index particulate matter", "carbon sequestration rate",
+        "desertification land degradation indicator", "mangrove restoration planting density",
+    ),
+    "natural_science": (
+        "soil texture classification triangle", "groundwater aquifer transmissivity",
+        "mosquito larval habitat control", "plant nutrient deficiency symptom",
+        "geological formation stratigraphy", "lightning protection zone",
+    ),
+    "weather_seasons": (
+        "harmattan dust haze visibility", "rainy season onset cessation criteria",
+        "tropical cyclone intensity scale", "weather station instrument siting",
+    ),
+    "security_safety": (
+        "personal protective equipment standard", "fire resistance rating wall",
+        "first aid burn treatment protocol", "occupational exposure limit noise",
+        "pesticide re-entry interval",
+    ),
+    "animals_wildlife": (
+        "rabies post-exposure prophylaxis", "tsetse fly trypanosomiasis control",
+        "veterinary drug withdrawal period", "wildlife stocking carrying capacity",
+    ),
+    "ai_data": (
+        "sampling error confidence interval", "database normalisation form",
+        "data retention regulation requirement", "cryptographic key length recommendation",
+    ),
+    "careers_work": (
+        "professional certification requirement hours", "minimum wage statutory rate",
+        "pension contribution rate statutory", "apprenticeship duration requirement",
+    ),
+    "childhood_parenting": (
+        "childhood immunisation schedule dose", "infant growth monitoring indicator",
+        "deworming dose schedule children", "iron supplementation children dose",
+    ),
+    "consumer_life": (
+        "electrical appliance energy label", "warranty period statutory consumer",
+        "food labelling requirement nutrition", "weighing instrument accuracy class",
+    ),
+    "disability_inclusion": (
+        "wheelchair ramp gradient standard", "hearing aid fitting specification",
+        "accessible toilet dimension standard",
+    ),
+    "entrepreneurship": (
+        "business name registration fee", "small business tax threshold",
+        "cooperative society registration requirement",
     ),
 }
+
+# DELIBERATELY NOT SEEDED: music, film_nollywood, sports, history, festivals_customs,
+# proverbs_oral_tradition, arts_literature, geography_places, rural_life, urban_life, religion_ethics,
+# family_relationships, language_linguistics and the rest of the general-interest domains.
+#
+# That is the point rather than an omission. The corpus is teaching the model to answer general knowledge
+# FROM ITS WEIGHTS and to reach for a tool only when the question turns on a looked-up specific. Putting a
+# retrieved document about Nollywood or a proverb behind the tool would teach exactly the opposite -- that
+# the right response to something it already knows is to go and search. Those domains still appear
+# throughout the corpus; they appear in the tasks that answer WITHOUT a tool.
 
 # --- technicality scoring -------------------------------------------------------------------------------
 # A number WITH a unit. The heart of the score: a figure carrying a unit is a fact that has to be looked
@@ -181,6 +267,95 @@ def technicality(text: str, title: str = "") -> float:
     if any(w in tl for w in ("list of", "discography", "filmography", "timeline of")):
         score -= 0.30
     return max(0.0, min(1.0, score))
+
+
+# --- relevance and locality ------------------------------------------------------------------------------
+# Technicality alone is not enough, and the first harvest proved it: "Toyota Prius (XW20)" scored 0.95,
+# "BMW 7 Series (G70)" 0.93, alongside "Parliament Hill", "Coal companies of Australia" and "Value-added tax
+# in the United Kingdom". All genuinely technical; all useless here. A retrieved document about a BMW trim
+# level or UK VAT teaches retrieval on content no SabiYarn user will ever ask about, and mis-teaches the
+# jurisdiction for anything legal or fiscal.
+#
+# So a candidate must also be ON TOPIC for the query that found it, and must not be anchored to a place or
+# product the corpus does not serve.
+
+# A specific product or model: a parenthesised model code, a trim designation, a model year.
+R_MODEL = re.compile(r"\((?:[A-Z]{1,3}\d{2,3}|\d{4})\)|\b(?:Mk\s?\d|Series\s*\(|generation\))", re.I)
+# Anchored to a jurisdiction or place the corpus does not serve. Legal, fiscal and standards pages are the
+# ones that matter: the wrong jurisdiction is worse than no document.
+# Both forms matter. "of Canada" and "Canadian" anchor a page just as firmly, and the first version caught
+# only the prepositional one -- which let "Canadian passport", "Argentine identity card" and "Malaysian
+# identity card" into the pool, each teaching the wrong country's procedure for a document question.
+_FOREIGN_PLACES = (
+    "United Kingdom", "United States", "Australia", "Canada", "Britain", "England", "Scotland", "Wales",
+    "Ireland", "Germany", "France", "Japan", "China", "India", "Brazil", "Russia", "Sweden", "Norway",
+    "Denmark", "Finland", "Italy", "Spain", "Poland", "Mexico", "Netherlands", "Philippines", "Argentina",
+    "Malaysia", "Indonesia", "Pakistan", "Bangladesh", "Turkey", "Korea", "Vietnam", "Thailand",
+)
+_FOREIGN_ADJECTIVES = (
+    "British", "American", "Australian", "Canadian", "English", "Scottish", "Welsh", "Irish", "German",
+    "French", "Japanese", "Chinese", "Indian", "Brazilian", "Russian", "Swedish", "Norwegian", "Danish",
+    "Finnish", "Italian", "Spanish", "Polish", "Mexican", "Dutch", "Filipino", "Argentine", "Argentinian",
+    "Malaysian", "Indonesian", "Pakistani", "Bangladeshi", "Turkish", "Korean", "Vietnamese", "Thai",
+)
+R_FOREIGN = re.compile(
+    r"\b(?:in|of)\s+(?:the\s+)?(?:" + "|".join(re.escape(p) for p in _FOREIGN_PLACES) + r")\b"
+    r"|\b(?:" + "|".join(_FOREIGN_ADJECTIVES) + r")\b", re.I)
+# Places and lineages, which arrive via search noise and carry no transferable fact.
+R_PROPER_SUBJECT = re.compile(r"\b(?:family|dynasty|dam|bridge|stadium|cathedral|castle|palace|"
+                              r"constituency|county|province|prefecture)\b", re.I)
+# Worth keeping even if it mentions elsewhere: the corpus's own region.
+R_LOCAL = re.compile(
+    r"\b(?:africa|african|nigeria|nigerian|ghana|ghanaian|benin|togo|niger|cameroon|senegal|mali|"
+    r"burkina|ivory\s+coast|c[oô]te\s+d'ivoire|liberia|sierra\s+leone|gambia|guinea|chad|"
+    r"sub-saharan|west\s+africa|tropical|sahel|savanna)\b", re.I)
+
+
+def _content_terms(q: str) -> set[str]:
+    stop = {"the", "a", "an", "of", "and", "for", "in", "to", "on", "rate", "per"}
+    return {w for w in re.findall(r"[a-z]+", q.lower()) if len(w) > 3 and w not in stop}
+
+
+def relevance(text: str, title: str, query: str) -> float:
+    """0..1. Is this document about what the query asked for, and is it usable for this corpus?
+
+    Deliberately a gate rather than a ranking: the pool is drawn from a free corpus, so it costs nothing to
+    be strict and a lot to be wrong.
+    """
+    terms = _content_terms(query)
+    if not terms:
+        return 0.0
+    low = text.lower()
+    lead = low[:2000]  # the lead section defines the subject; a passing mention later does not
+    hit_any = sum(1 for w in terms if w in low) / len(terms)
+    hit_lead = sum(1 for w in terms if w in lead) / len(terms)
+    # The LEAD is what decides the subject. A document whose lead mentions none of the query's terms is
+    # about something else, however many times they appear further down -- measured: a page with the terms
+    # only in its last sentence scored 0.55 and passed the gate, because the any-mention term dominated.
+    if hit_lead == 0.0:
+        return 0.0
+    score = 0.45 * hit_any + 0.55 * hit_lead
+
+    # A jurisdiction in the TITLE is a hard reject, not a penalty. "Canadian passport" is a perfect match
+    # for a query about identity enrolment and still the wrong answer: a document question answered from
+    # another country's procedure is worse than one answered with "I could not find it". A penalty left it
+    # at 0.50, above the gate.
+    if R_FOREIGN.search(title):
+        return 0.0
+    # Likewise a specific product or model year. "Toyota Prius (XW20)" matches a query about battery
+    # charging perfectly and is still never a document a SabiYarn user retrieves. A penalty left it at 0.55.
+    if R_MODEL.search(title):
+        return 0.0
+    if R_PROPER_SUBJECT.search(title):
+        score -= 0.35           # a named place or lineage
+    if R_FOREIGN.search(lead) and not R_LOCAL.search(low):
+        score -= 0.20
+    if R_LOCAL.search(low):
+        score += 0.15           # actually about somewhere the corpus serves
+    return max(0.0, min(1.0, score))
+
+
+MIN_RELEVANCE = 0.40
 
 
 # --- the API ---------------------------------------------------------------------------------------------
@@ -314,11 +489,15 @@ def harvest(*, min_words: int, max_words: int, min_technicality: float = MIN_TEC
                 score = technicality(body, title)
                 if score < min_technicality:
                     continue
+                rel = relevance(body, title, q)
+                if rel < MIN_RELEVANCE:
+                    continue
                 produced += 1
                 if verbose:
-                    print(f"  [{domain}] {title[:52]:<52} {n:>6,}w  tech {score:.2f}")
+                    print(f"  [{domain}] {title[:46]:<46} {n:>6,}w  tech {score:.2f} rel {rel:.2f}")
                 yield {"title": pg["title"], "pageid": pg["pageid"], "url": pg["url"],
                        "text": body, "words": n, "technicality": round(score, 3),
+                       "relevance": round(rel, 3), "query": q,
                        "domain": domain, "source": "wikipedia", "licence": LICENCE}
                 if want and produced >= want:
                     return

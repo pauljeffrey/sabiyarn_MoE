@@ -190,6 +190,14 @@ def build_card_v2(stats: dict, tag: str, max_src_tokens: int) -> str:
         "* **Web text is only used after sentence-level language ID** (GlotLID v3). Measured on HPLT 'Yoruba', only ~46% of "
         "lines the corpus labels Yoruba were Yoruba. Sentences with e-mail/phone/URL, spam-like repetition, markup or "
         "non-prose shapes are dropped; sentences are de-duplicated across all sources.",
+        "* **Cleaned, then filtered.** Each sentence is cleaned (verse / section numbers, scripture references, footnote "
+        "marks, bullets and spacing removed), then windows are dropped for mojibake, symbols/emoji, too few letters, digits "
+        "or punctuation, repetition, Title-Case spam, mixed letter-digit corruption, and English function- or content-word "
+        "leakage (threshold calibrated per language on its own clean news). Web Yoruba, Igbo and English are additionally "
+        "scored by a per-language classifier trained to separate hand-translated/edited prose from random web text; "
+        "windows below 0.5 are dropped. This removed most machine-translated web text: **only 13% of raw Yoruba, 24% of "
+        "Igbo and 67% of English windows survived**. The classifier is deliberately NOT used for Hausa, Twi and the smaller "
+        "languages, where it rejected genuine news and religious prose, so those rely on the rules alone and are noisier.",
         "* **English is the augmenter.** Non-English source text is limited by what exists, so English passages fill the "
         "rest and are routed to the other nine languages so each *target* language gets about the same number of rows.",
         "* **Targets** for non-English sources cycle evenly over the nine other languages, with English as target weighted double.",
