@@ -762,9 +762,12 @@ def _to_record(seed: Seed, resp: Response) -> Optional[dict]:
         # The prefix must stop where the candidates begin, and the candidates are the better source: they
         # come as a ranked pair. So a trailing assistant turn is redundant and dropping it recovers the
         # sample -- 20 of 39 drops on a live run were exactly this.
-        while msgs and msgs[-1]["role"] == "assistant":
+        # Only a trailing ANSWER is redundant. A trailing TOOL CALL is not: it is the retrieval step, and
+        # trimming it leaves a RAG prefix as a bare user turn with the tool result gone -- which silently
+        # turned document-grounded samples into something else and made every grounding check unscoreable.
+        while (len(msgs) > 1 and msgs[-1]["role"] == "assistant" and not msgs[-1].get("tool_calls")):
             msgs = msgs[:-1]
-            STATS["repair:trimmed_trailing_assistant"] = STATS.get("repair:trimmed_trailing_assistant", 0) + 1
+            STATS["repair:trimmed_trailing_answer"] = STATS.get("repair:trimmed_trailing_answer", 0) + 1
         if not msgs:
             msgs = msgs_pre  # nothing but assistant turns: let the validator reject it with a real reason
     if msgs is None:

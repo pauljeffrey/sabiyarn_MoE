@@ -385,6 +385,23 @@ UNIVERSAL: list[Check] = [
 ]
 
 
+# Tasks where the two candidates differ in FACTUAL TRUTH rather than in procedure, so these checks cannot
+# separate them -- and measurably do not. On 52 real preference pairs the programmatic reward picked the
+# better candidate 90% of the time on the behaviour tasks and only 40% of the time on these: below chance,
+# which means using it alone here would train the policy BACKWARDS.
+#
+# The reason is structural, not a missing check. For a world-knowledge question the wrong answer is
+# confidently wrong and procedurally identical to the right one: both answer without a tool, both explain,
+# neither refuses. Nothing a regex can see distinguishes them. That needs a judge.
+JUDGE_ONLY_TASKS = frozenset({
+    "world_knowledge_qa", "health_advice", "health_triage", "financial_analysis",
+})
+
+
+def judge_required(task: str) -> bool:
+    return task in JUDGE_ONLY_TASKS
+
+
 def for_task(task: str) -> list[dict[str, Any]]:
     """Serialisable checks for one task: the universal gates plus that task's own."""
     return [asdict(c) for c in UNIVERSAL] + [asdict(c) for c in CHECKS.get(task, [])]

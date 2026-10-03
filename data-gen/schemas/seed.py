@@ -99,6 +99,9 @@ class TaskSpec:
     # and FORM without a judge model (see rewards_spec.py). Empty for sft, where there is one target rather
     # than two candidates to rank.
     checks: list = field(default_factory=list)
+    # True when the programmatic checks cannot rank this task's candidates and a judge must
+    # (rewards_spec.JUDGE_ONLY_TASKS). Measured, not assumed: see that constant.
+    judge_required: bool = False
     notes: str = ""
 
 

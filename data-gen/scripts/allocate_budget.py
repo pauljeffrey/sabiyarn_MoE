@@ -155,6 +155,12 @@ def main() -> int:
     ap.add_argument("--kind", default="rl", choices=["rl", "sft", "pretrain"])
     ap.add_argument("--budget", type=float, default=50.0, help="dollars")
     ap.add_argument("--cap", type=int, default=12_000, help="max samples for any one language")
+    ap.add_argument("--pin", default="", metavar="LANG=N[,LANG=N]",
+                    help="fix a language at exactly N samples, paid off the top before the proportional "
+                         "share. For English: public DPO data (UltraFeedback, HH-RLHF) covers the "
+                         "competence and generation slices at zero API cost, but covers NONE of the "
+                         "behaviour slice -- searches for tool-use or retrieval preference data return "
+                         "nothing -- so English is generated for behaviour and topped up from the Hub.")
     ap.add_argument("--floor", type=int, default=0,
                     help="min samples for any one language, paid before the proportional share. Below a few "
                          "hundred preference pairs a language is not trainable, so the spend buys nothing.")
@@ -173,7 +179,23 @@ def main() -> int:
         volumes = {l: volumes[l] for l in want}
 
     tk = tokens_for(a.kind, seed.tasks)
-    alloc = allocate(volumes, a.budget, a.cap, a.kind, tk, a.floor)
+    pinned: dict[str, int] = {}
+    for part in (s for s in a.pin.split(",") if s.strip()):
+        lang, _, n = part.partition("=")
+        lang = lang.strip()
+        if lang not in volumes:
+            print(f"--pin names {lang!r}, which is not in the {a.kind} seed", file=sys.stderr)
+            return 1
+        pinned[lang] = int(n)
+    budget = a.budget
+    for lang, n in pinned.items():
+        budget -= n * cost_per_sample(lang, a.kind, tk)
+        del volumes[lang]
+    if budget <= 0:
+        print(f"the pinned languages alone cost ${a.budget - budget:.2f}", file=sys.stderr)
+        return 1
+    alloc = allocate(volumes, budget, a.cap, a.kind, tk, a.floor)
+    alloc = {**alloc, **pinned} if alloc else alloc
     if not alloc:
         need = sum(a.floor * cost_per_sample(l, a.kind, tk) for l in volumes)
         print(f"a floor of {a.floor:,} for {len(volumes)} languages needs ${need:.2f}, "
@@ -188,7 +210,8 @@ def main() -> int:
     print(f"{'lang':<6}{'tier':<8}{'samples':>9}{'$/1k':>8}{'cost':>9}{'share':>8}")
     for l, n in sorted(alloc.items(), key=lambda kv: -kv[1]):
         c = n * cost_per_sample(l, a.kind, tk)
-        flag = "  (capped)" if n >= a.cap else ("  (floor)" if a.floor and n <= a.floor else "")
+        flag = ("  (pinned)" if l in pinned else
+                "  (capped)" if n >= a.cap else ("  (floor)" if a.floor and n <= a.floor else ""))
         print(f"{l:<6}{_TIER.get(l, 'low'):<8}{n:>9,}{cost_per_sample(l, a.kind, tk)*1000:>8.2f}"
               f"{c:>9.2f}{c/spent:>7.0%}{flag}")
     print(f"{'total':<14}{sum(alloc.values()):>9,}{'':>8}{spent:>9.2f}")

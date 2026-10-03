@@ -652,12 +652,19 @@ ALL_TASKS = [
           plan=["<|chat|>"]),
 ]
 
+def _judge_required(name: str) -> bool:
+    """Whether a judge must rank this task's candidates, because the programmatic checks measurably cannot
+    (rewards_spec.JUDGE_ONLY_TASKS)."""
+    from rewards_spec import judge_required
+    return judge_required(name)
+
+
 def _checks_for(task: str) -> list:
     """The programmatic scorers for one RL task. Imported lazily so build_seeds has no hard dependency on the
     reward spec when only pretrain or sft is being built."""
     import sys
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-    from rewards_spec import for_task
+    from rewards_spec import for_task, judge_required
     return for_task(task)
 
 
@@ -715,6 +722,7 @@ RL_TASKS = [
     TaskSpec(t.name, t.tags, t.description, share=_RL_WEIGHTS[t.name], task_plan=t.task_plan,
              domain_flags=t.domain_flags, uses_tools=t.uses_tools, requires_think=t.requires_think,
              languages=t.languages, checks=_checks_for(t.name),
+             judge_required=_judge_required(t.name),
              notes="Candidates must differ in a way a judge can rank: one grounded and honest, one "
                    "confidently wrong or invented. Never two paraphrases of the same answer. Over-refusal "
                    "where the answer WAS available counts as the wrong one.")

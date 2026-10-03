@@ -27,7 +27,7 @@ import os
 import subprocess
 import sys
 from pathlib import Path
-from typing import Callable, Optional, Protocol
+from typing import Any, Callable, Optional, Protocol
 
 import structlog
 
@@ -134,27 +134,45 @@ class VerifierReward:
     """
 
     def __init__(self, neutral: float = 0.5, log_every: int = 0):
-        from rl.verifiers import score  # local import: keeps torch-free callers torch-free
+        # `neutral` is returned for a sample this reward must not score -- a judge-only task, or a row with
+        # no checks. Not 0: a zero would teach the policy to avoid whatever those rows contain.
+        from rl.verifiers import score, score_group  # local import: keeps torch-free callers torch-free
 
         self._score = score
+        self._score_group = score_group
         self.neutral = neutral
         self.log_every = log_every
         self._n = 0
 
     def __call__(self, items, completions):
-        out: list[float] = []
-        for item, completion in zip(items, completions):
+        # Score each PROMPT'S GROUP together: consecutive entries sharing an id are the k completions
+        # sampled for one prompt. Scoring them jointly is what stops an unscoreable candidate from winning
+        # (see rl.verifiers.score_group), and the advantage is a within-group difference anyway.
+        out: list[Optional[float]] = [None] * len(items)
+        groups: dict[Any, list[int]] = {}
+        for i, item in enumerate(items):
+            key = item.get("id") or id(item)
+            groups.setdefault(key, []).append(i)
+
+        for idxs in groups.values():
+            item = items[idxs[0]]
             checks = item.get("checks") or []
-            if not checks:
-                out.append(self.neutral)
+            # Some tasks the programmatic checks measurably CANNOT rank: where the two candidates differ in
+            # factual truth rather than in procedure, this reward scored the worse one higher 60% of the
+            # time. Returning `neutral` defers to the judge half of a blended reward instead of contributing
+            # a confidently wrong signal. See data-gen/rewards_spec.JUDGE_ONLY_TASKS.
+            if item.get("judge_required") or not checks:
+                for i in idxs:
+                    out[i] = self.neutral
                 continue
-            r, detail = self._score(completion, item, checks)
-            out.append(r)
-            self._n += 1
-            if self.log_every and self._n % self.log_every == 0:
-                LOG.info("verifier", reward=round(r, 3), task=(item.get("tasks") or [None])[0],
-                         lang=item.get("lang"), detail=detail)
-        return out
+            rs, details = self._score_group([completions[i] for i in idxs], item, checks)
+            for i, r, detail in zip(idxs, rs, details):
+                out[i] = r
+                self._n += 1
+                if self.log_every and self._n % self.log_every == 0:
+                    LOG.info("verifier", reward=round(r, 3), task=(item.get("tasks") or [None])[0],
+                             lang=item.get("lang"), detail=detail)
+        return [self.neutral if r is None else r for r in out]
 
 
 class BlendedReward:

@@ -23,7 +23,7 @@ sys.path.insert(0, str(ROOT / "data-gen"))
 sys.path.insert(0, str(ROOT / "data-gen" / "seeds"))
 
 from rl.verifiers import (  # noqa: E402
-    Ctx, KNOWN_PIPE_TOKENS, REGISTRY, missing_scorers, score,
+    Ctx, KNOWN_PIPE_TOKENS, REGISTRY, missing_scorers, score, score_group,
 )
 
 
@@ -248,19 +248,26 @@ def test_reward_prefers_the_best_candidate():
     A reward that cannot separate them is not a reward -- it is noise at best and, if inverted, it actively
     trains the policy towards confident fabrication. That is not hypothetical: the first version of these
     scorers preferred the WORST candidate on 32 of 54 real samples.
+
+    Scoped to the tasks this reward CLAIMS to score. The judge-only tasks are excluded because they are
+    excluded at training time too (VerifierReward returns `neutral` for them) -- measured at 40% there,
+    below chance, which is exactly why that exclusion exists rather than a higher-effort check.
     """
+    import rewards_spec as R
     rows, cbt = _real_pairs()
     rows = [r for r in rows if (r.get("ranking") or [None])[0] == "best"
             and r.get("response_1") and r.get("response_2")
-            and cbt.get((r.get("tasks") or [None])[0])]
+            and cbt.get((r.get("tasks") or [None])[0])
+            and not R.judge_required((r.get("tasks") or [None])[0])]
     if len(rows) < 20:
         pytest.skip(f"only {len(rows)} scored records on disk; run a probe first")
 
     better = worse = tied = 0
     for r in rows:
         checks = cbt[(r["tasks"] or [None])[0]]
-        rb, _ = score(r["response_1"], r, checks)
-        rw, _ = score(r["response_2"], r, checks)
+        # score_group, not score: a check evaluable for one candidate and not the other is the CANDIDATE's
+        # doing, and must not shrink its denominator into a higher score.
+        (rb, rw), _ = score_group([r["response_1"], r["response_2"]], r, checks)
         if rb > rw:
             better += 1
         elif rb < rw:
@@ -274,3 +281,69 @@ def test_reward_prefers_the_best_candidate():
     assert accuracy >= 0.80, (
         f"the reward prefers the WORSE candidate too often: {better} right, {worse} wrong, {tied} tied "
         f"of {n} ({accuracy:.0%} of decided pairs). A reward below chance trains the policy backwards.")
+
+
+def test_judge_only_tasks_are_not_scored_by_the_verifier():
+    """The exclusion must be real at training time, not just documented. Measured at 40% accuracy on these
+    -- below chance -- so a confident wrong signal is worse than no signal."""
+    import rewards_spec as R
+    from rl.rewards import VerifierReward
+    rw = VerifierReward()
+    item = {"id": "x", "lang": "eng", "judge_required": True, "tasks": ["world_knowledge_qa"],
+            "checks": R.for_task("world_knowledge_qa")}
+    out = rw([item, item], ["<|input_lang|><eng><response>a", "<|input_lang|><eng><response>b"])
+    assert out == [rw.neutral, rw.neutral], "a judge-only task must defer, not score"
+    assert "world_knowledge_qa" in R.JUDGE_ONLY_TASKS
+
+
+def test_behaviour_tasks_are_not_quietly_excluded():
+    """The flip side: the exclusion must stay narrow. If a behaviour task ever lands in JUDGE_ONLY_TASKS the
+    programmatic reward has silently stopped covering the thing this phase exists to teach."""
+    import sys as _s
+    from pathlib import Path as _P
+    _s.path.insert(0, str(_P(__file__).resolve().parent.parent / "data-gen" / "seeds"))
+    import rewards_spec as R
+    from build_seeds import BEHAVIOUR_TASKS
+    overlap = sorted(BEHAVIOUR_TASKS & R.JUDGE_ONLY_TASKS)
+    assert not overlap, f"behaviour tasks must be programmatically scored, but these are judge-only: {overlap}"
+
+
+def test_group_scoring_does_not_reward_being_unscoreable():
+    """The flaw score_group exists to fix: dropping unknown checks per candidate let a candidate that did
+    nothing checkable win. Measured on a real multi-tool sample -- worst 1.0, best 0.7 -- purely because the
+    worst called no tool, so every tool check was unknown for it and its denominator shrank."""
+    item = {"lang": "eng", "prompt_messages": [{"role": "user", "content": "price in naira then in cedis"}]}
+    checks = [
+        {"name": "two_tools", "weight": 0.6, "expect": True, "fn": "two_distinct_tools_called"},
+        {"name": "brief", "weight": 0.4, "expect": True, "fn": "response_under_120_words"},
+    ]
+    acted = ('<|input_lang|><eng><task_plan><|plan|></task_plan>'
+             '<tool_call>get_market_prices\n{"commodity":"maize"}</tool_call>'
+             '<tool_call>get_exchange_rate\n{"base":"NGN"}</tool_call>')
+    did_nothing = "<|input_lang|><eng><|target_lang|><eng><response>It is about 2000.</response>"
+
+    (r_acted, r_idle), _ = score_group([acted, did_nothing], item, checks)
+    assert r_acted > r_idle, (
+        f"the candidate that did nothing scored {r_idle} against {r_acted} -- being unscoreable must not pay")
+
+
+def test_a_check_unknown_for_every_candidate_is_dropped_for_everyone():
+    """The other direction: a missing `verifier.expected_answer` is a gap in the DATA, so it must not
+    penalise any candidate."""
+    item = {"lang": "eng", "verifier": {}}
+    checks = [{"name": "correct", "weight": 0.8, "expect": True, "fn": "final_number_matches_expected"},
+              {"name": "brief", "weight": 0.2, "expect": True, "fn": "response_under_120_words"}]
+    rs, details = score_group(["<|input_lang|><eng><response>Short.", "<|input_lang|><eng><response>Also."],
+                              item, checks)
+    assert all(r == pytest.approx(1.0) for r in rs)
+    assert all(d["correct"] == "unknown (no candidate)" for d in details)
+
+
+def test_a_failed_gate_zeroes_only_that_candidate():
+    item = {"lang": "eng"}
+    checks = [{"name": "not_degenerate", "weight": 1.0, "expect": False, "fn": "is_degenerate", "gate": True},
+              {"name": "brief", "weight": 1.0, "expect": True, "fn": "response_under_120_words"}]
+    loop = "<|input_lang|><eng><response>" + "the market is open " * 12
+    fine = "<|input_lang|><eng><response>The market opens at six and shuts when the yams are gone."
+    (r_loop, r_fine), _ = score_group([loop, fine], item, checks)
+    assert r_loop == 0.0 and r_fine > 0.0

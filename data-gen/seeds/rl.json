@@ -252,6 +252,7 @@
           "gate": false
         }
       ],
+      "judge_required": false,
       "notes": "Candidates must differ in a way a judge can rank: one grounded and honest, one confidently wrong or invented. Never two paraphrases of the same answer. Over-refusal where the answer WAS available counts as the wrong one."
     },
     {
@@ -346,6 +347,7 @@
           "gate": false
         }
       ],
+      "judge_required": false,
       "notes": "Candidates must differ in a way a judge can rank: one grounded and honest, one confidently wrong or invented. Never two paraphrases of the same answer. Over-refusal where the answer WAS available counts as the wrong one."
     },
     {
@@ -437,6 +439,7 @@
           "gate": false
         }
       ],
+      "judge_required": false,
       "notes": "Candidates must differ in a way a judge can rank: one grounded and honest, one confidently wrong or invented. Never two paraphrases of the same answer. Over-refusal where the answer WAS available counts as the wrong one."
     },
     {
@@ -529,6 +532,7 @@
           "gate": false
         }
       ],
+      "judge_required": false,
       "notes": "Candidates must differ in a way a judge can rank: one grounded and honest, one confidently wrong or invented. Never two paraphrases of the same answer. Over-refusal where the answer WAS available counts as the wrong one."
     },
     {
@@ -630,6 +634,7 @@
           "gate": false
         }
       ],
+      "judge_required": false,
       "notes": "Candidates must differ in a way a judge can rank: one grounded and honest, one confidently wrong or invented. Never two paraphrases of the same answer. Over-refusal where the answer WAS available counts as the wrong one."
     },
     {
@@ -722,6 +727,7 @@
           "gate": false
         }
       ],
+      "judge_required": false,
       "notes": "Candidates must differ in a way a judge can rank: one grounded and honest, one confidently wrong or invented. Never two paraphrases of the same answer. Over-refusal where the answer WAS available counts as the wrong one."
     },
     {
@@ -823,6 +829,7 @@
           "gate": false
         }
       ],
+      "judge_required": false,
       "notes": "Candidates must differ in a way a judge can rank: one grounded and honest, one confidently wrong or invented. Never two paraphrases of the same answer. Over-refusal where the answer WAS available counts as the wrong one."
     },
     {
@@ -913,6 +920,7 @@
           "gate": false
         }
       ],
+      "judge_required": false,
       "notes": "Candidates must differ in a way a judge can rank: one grounded and honest, one confidently wrong or invented. Never two paraphrases of the same answer. Over-refusal where the answer WAS available counts as the wrong one."
     },
     {
@@ -1004,6 +1012,7 @@
           "gate": false
         }
       ],
+      "judge_required": true,
       "notes": "Candidates must differ in a way a judge can rank: one grounded and honest, one confidently wrong or invented. Never two paraphrases of the same answer. Over-refusal where the answer WAS available counts as the wrong one."
     },
     {
@@ -1097,6 +1106,7 @@
           "gate": false
         }
       ],
+      "judge_required": true,
       "notes": "Candidates must differ in a way a judge can rank: one grounded and honest, one confidently wrong or invented. Never two paraphrases of the same answer. Over-refusal where the answer WAS available counts as the wrong one."
     },
     {
@@ -1180,6 +1190,7 @@
           "gate": false
         }
       ],
+      "judge_required": true,
       "notes": "Candidates must differ in a way a judge can rank: one grounded and honest, one confidently wrong or invented. Never two paraphrases of the same answer. Over-refusal where the answer WAS available counts as the wrong one."
     },
     {
@@ -1274,6 +1285,7 @@
           "gate": false
         }
       ],
+      "judge_required": true,
       "notes": "Candidates must differ in a way a judge can rank: one grounded and honest, one confidently wrong or invented. Never two paraphrases of the same answer. Over-refusal where the answer WAS available counts as the wrong one."
     },
     {
@@ -1364,6 +1376,7 @@
           "gate": false
         }
       ],
+      "judge_required": false,
       "notes": "Candidates must differ in a way a judge can rank: one grounded and honest, one confidently wrong or invented. Never two paraphrases of the same answer. Over-refusal where the answer WAS available counts as the wrong one."
     },
     {
@@ -1463,6 +1476,7 @@
           "gate": false
         }
       ],
+      "judge_required": false,
       "notes": "Candidates must differ in a way a judge can rank: one grounded and honest, one confidently wrong or invented. Never two paraphrases of the same answer. Over-refusal where the answer WAS available counts as the wrong one."
     },
     {
@@ -1553,6 +1567,7 @@
           "gate": false
         }
       ],
+      "judge_required": false,
       "notes": "Candidates must differ in a way a judge can rank: one grounded and honest, one confidently wrong or invented. Never two paraphrases of the same answer. Over-refusal where the answer WAS available counts as the wrong one."
     },
     {
@@ -1645,6 +1660,7 @@
           "gate": false
         }
       ],
+      "judge_required": false,
       "notes": "Candidates must differ in a way a judge can rank: one grounded and honest, one confidently wrong or invented. Never two paraphrases of the same answer. Over-refusal where the answer WAS available counts as the wrong one."
     },
     {
@@ -1737,6 +1753,7 @@
           "gate": false
         }
       ],
+      "judge_required": false,
       "notes": "Candidates must differ in a way a judge can rank: one grounded and honest, one confidently wrong or invented. Never two paraphrases of the same answer. Over-refusal where the answer WAS available counts as the wrong one."
     },
     {
@@ -1829,6 +1846,7 @@
           "gate": false
         }
       ],
+      "judge_required": false,
       "notes": "Candidates must differ in a way a judge can rank: one grounded and honest, one confidently wrong or invented. Never two paraphrases of the same answer. Over-refusal where the answer WAS available counts as the wrong one."
     },
     {
@@ -1920,6 +1938,7 @@
           "gate": false
         }
       ],
+      "judge_required": false,
       "notes": "Candidates must differ in a way a judge can rank: one grounded and honest, one confidently wrong or invented. Never two paraphrases of the same answer. Over-refusal where the answer WAS available counts as the wrong one."
     },
     {
@@ -2012,6 +2031,7 @@
           "gate": false
         }
       ],
+      "judge_required": false,
       "notes": "Candidates must differ in a way a judge can rank: one grounded and honest, one confidently wrong or invented. Never two paraphrases of the same answer. Over-refusal where the answer WAS available counts as the wrong one."
     },
     {
@@ -2104,6 +2124,7 @@
           "gate": false
         }
       ],
+      "judge_required": false,
       "notes": "Candidates must differ in a way a judge can rank: one grounded and honest, one confidently wrong or invented. Never two paraphrases of the same answer. Over-refusal where the answer WAS available counts as the wrong one."
     },
     {
@@ -2198,6 +2219,7 @@
           "gate": false
         }
       ],
+      "judge_required": false,
       "notes": "Candidates must differ in a way a judge can rank: one grounded and honest, one confidently wrong or invented. Never two paraphrases of the same answer. Over-refusal where the answer WAS available counts as the wrong one."
     },
     {
@@ -2299,6 +2321,7 @@
           "gate": false
         }
       ],
+      "judge_required": false,
       "notes": "Candidates must differ in a way a judge can rank: one grounded and honest, one confidently wrong or invented. Never two paraphrases of the same answer. Over-refusal where the answer WAS available counts as the wrong one."
     },
     {
@@ -2399,6 +2422,7 @@
           "gate": false
         }
       ],
+      "judge_required": false,
       "notes": "Candidates must differ in a way a judge can rank: one grounded and honest, one confidently wrong or invented. Never two paraphrases of the same answer. Over-refusal where the answer WAS available counts as the wrong one."
     },
     {
@@ -2482,6 +2506,7 @@
           "gate": false
         }
       ],
+      "judge_required": false,
       "notes": "Candidates must differ in a way a judge can rank: one grounded and honest, one confidently wrong or invented. Never two paraphrases of the same answer. Over-refusal where the answer WAS available counts as the wrong one."
     }
   ],

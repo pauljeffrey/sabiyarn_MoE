@@ -1110,6 +1110,80 @@ def score(completion: str, item: Optional[dict] = None,
     return (got / total if total else 0.0), detail
 
 
+def score_group(completions: list[str], item: Optional[dict] = None,
+                checks: Optional[list[dict]] = None) -> tuple[list[float], list[dict]]:
+    """Score several candidates for the SAME prompt together. Use this, not `score`, wherever a group exists
+    -- a DPO pair, or the k samples of a policy-gradient group.
+
+    It exists because dropping unknown checks per candidate REWARDS BEING UNSCOREABLE. Measured: on a
+    multi-tool sample the worst candidate scored 1.0 against the best candidate's 0.7, purely because it
+    called no tool, so every tool check was unknown for it, dropped, and its denominator shrank to the
+    handful it did satisfy. The policy would learn that the safest move is to do nothing checkable.
+
+    Scoring the group together separates the two reasons a check can be unknown:
+
+      - unknown for EVERY candidate -> the RECORD lacks the ground truth (no expected_answer, no tool result
+        in the prefix). That is a gap in the data, so the check is dropped for everyone. Failing open here
+        is right: the policy should not be punished for what the generator did not write down.
+      - unknown for SOME candidates only -> the CANDIDATE did not do the thing. The check was evaluable on
+        this prompt, so not being evaluable here is the candidate's doing, and it counts as a FAILURE.
+
+    Every candidate in the group therefore gets the same denominator, which is what makes the scores
+    comparable -- and comparability is the whole point, since the advantage is a difference within the group.
+    """
+    item = item or {}
+    checks = checks if checks is not None else (item.get("checks") or [])
+    ctxs = [Ctx(c, item) for c in completions]
+    details: list[dict] = [{} for _ in completions]
+
+    gates = [c for c in checks if c.get("gate")]
+    scored = [c for c in checks if not c.get("gate")]
+
+    failed_gate = [False] * len(completions)
+    for c in gates:
+        name = c.get("name", "?")
+        for i, ctx in enumerate(ctxs):
+            raw = _evaluate(c, ctx)
+            if raw is None:
+                details[i][name] = "unknown"
+                continue
+            ok = (bool(raw) == bool(c.get("expect", True)))
+            details[i][name] = "pass" if ok else "GATE FAILED"
+            if not ok:
+                failed_gate[i] = True
+
+    # Evaluate every scored check for every candidate first, so "unknown everywhere" can be told apart
+    # from "unknown here".
+    verdicts: list[list[Optional[bool]]] = []
+    for c in scored:
+        row: list[Optional[bool]] = []
+        for ctx in ctxs:
+            try:
+                row.append(_evaluate(c, ctx))
+            except _NoScorer:
+                row.append(None)
+        verdicts.append(row)
+
+    rewards: list[float] = []
+    for i in range(len(completions)):
+        total = got = 0.0
+        for c, row in zip(scored, verdicts):
+            name = c.get("name", "?")
+            weight, expect = float(c.get("weight") or 0.0), bool(c.get("expect", True))
+            if all(v is None for v in row):
+                details[i][name] = "unknown (no candidate)"
+                continue
+            total += weight
+            if row[i] is None:
+                details[i][name] = "fail (not applicable to this candidate)"
+                continue
+            passed = (bool(row[i]) == expect)
+            details[i][name] = "pass" if passed else "fail"
+            got += weight if passed else 0.0
+        rewards.append(0.0 if failed_gate[i] else (got / total if total else 0.0))
+    return rewards, details
+
+
 def missing_scorers(checks_by_task: dict[str, list[dict]]) -> set[str]:
     """Every `fn` a seed references that this module does not define. Used by a test, so the seed and the
     scorers cannot drift apart silently."""
