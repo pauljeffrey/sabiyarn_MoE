@@ -118,6 +118,17 @@ def cmd_clean(a) -> int:
         p.write_bytes(pickle.dumps(m))
         print(f"[{lang}] classifier: {m['n_pos']:,} clean + {m['n_neg']:,} web; "
               f"{m['heldout_pass']:.0%} of held-out clean windows score >= {THRESHOLD} ({time.time() - t0:.0f}s)", flush=True)
+    from .clean import build_lexicon
+    for lang in langs:
+        lp = out / "clean_models" / f"{lang}.lex"
+        if lp.exists() and not a.retrain:
+            continue
+        lx = build_lexicon(out, lang)
+        if lx is None:
+            continue
+        lp.write_bytes(pickle.dumps(lx))
+        print(f"[{lang}] english-word lexicon: {len(lx['lexicon']):,} words, reject above {lx['threshold']:.1%} "
+              f"(99.5th percentile of {lx['n_clean_ref']:,} clean windows)", flush=True)
     if a.train_only:
         return 0
     files = [(str(f), lang, str(out), a.threshold) for lang in langs for f in sorted((out / "windows" / lang).glob("*.parquet"))
@@ -222,7 +233,7 @@ def cmd_assemble(a) -> int:
             n = push_files(api, REPO_ID, batch, f"Add {lang} prompts {a.tag} ({len(batch)} shard(s))", private=not a.public)
             print(f"[hub] {lang}: pushed {n} shard(s)", flush=True)
 
-    stats = assemble(out, a.total, a.seed, a.tag, langs, a.limit_per_lang, on_done, a.max_non_eng_per_lang)
+    stats = assemble(out, a.total, a.seed, a.tag, langs, a.limit_per_lang, on_done, a.max_non_eng_per_lang, a.windows_dir)
     card = build_card_v2(stats, a.tag, a.max_src_tokens)
     (out / "final" / "README.md").write_text(card)
     if api:
@@ -260,6 +271,7 @@ def main(argv=None) -> int:
     m.add_argument("--languages", default="")
     m.add_argument("--limit-per-lang", type=int, default=0)
     m.add_argument("--max-non-eng-per-lang", type=int, default=0)
+    m.add_argument("--windows-dir", default="windows", help="'clean' to assemble from the cleaned windows")
     m.add_argument("--push", action="store_true")
     m.add_argument("--public", action="store_true")
     c = sub.add_parser("clean")

@@ -43,6 +43,10 @@ _SCRIPTURE = re.compile(
     r"\s*[\(\[][^()\[\]]{0,40}?\b\d{1,3}\s?[:.]\s?\d{1,3}(?:\s?[-–,]\s?\d{1,3})*[^()\[\]]{0,25}[\)\]]"   # (Ìṣí 14: 9-11 NKJ)
     r"|\s*[—–-]\s?(?:[1-3]\s)?[A-Z][a-zà-ÿ]{1,7}\.?\s\d{1,3}\s?:\s?\d{1,3}(?:[-–]\d{1,3})?\.?$"       # —Heb. 13:15
 )
+_LEAD_FRAG = re.compile(r"^\s*\d{1,3}\s*:\s*\d{1,3}(?:\s*,\s*\d{1,3})*\)\s*")        # "6:2, 3) Nanso ..."  (tail of a citation)
+_TRAIL_CITE = re.compile(
+    r"\s*[—–-]\s?(?:[1-3]\s)?[^\W\d_][^\W\d_.]{1,25}(?:\s[^\W\d_][^\W\d_.]{1,25}){0,2}\.?\s\d{1,3}\s?:\s?\d{1,3}(?:\s?[-–,]\s?\d{1,3})*\.?$")
+_MIXED = re.compile(r"\b(?=\w*\d)(?=\w*[^\W\d_])\w+\b")                                    # letters+digits inside one word
 _BULLET = re.compile(r"^\s*[•·▪►▶■□●○◦‣⁃\-–—*#>]+\s*")
 _SPACE_PUNCT = re.compile(r"\s+([,.;:!?%)\]»”])")
 _OPEN_SPACE = re.compile(r"([(\[«“])\s+")
@@ -62,6 +66,9 @@ def clean_sentence(s: str, lang: str) -> str:
     if lang != "eng":
         s = _LEAD_NUM.sub("", s)
     s = _SCRIPTURE.sub("", s)
+    s = _LEAD_FRAG.sub("", s)
+    if s.rstrip(".").endswith(tuple("0123456789")):
+        s = re.sub(r"\.{2,}$", ".", _TRAIL_CITE.sub(".", s))
     s = re.sub(r"(?<=[^\W\d_,.;:!?])\+(?=[\s,.;:!?]|$)|(?<=[,.;:!?])\+", "", s)       # footnote markers "akpakọrịta,+ bụ́"
     s = _ELLIPSIS_SP.sub("...", s)
     s = _PUNCT_RUN.sub(lambda m: m.group(1) * (3 if m.group(1) == "." else 1), s)
@@ -92,6 +99,9 @@ def reject_reason(text: str, lang: str, kind: str = "web") -> str | None:
     mean_len = sum(map(len, words)) / nw
     if not 2.4 <= mean_len <= 13:
         return "word_length"
+    mixed = len(_MIXED.findall(text))
+    if mixed >= 3 and mixed / nw > 0.08:
+        return "mixed_digits"
     low = [w.lower() for w in words]
     if nw >= 12 and len(set(low)) / nw < 0.45:
         return "repetition"
@@ -160,6 +170,40 @@ def load_models(out: Path) -> dict[str, dict]:
     return {p.stem: pickle.loads(p.read_bytes()) for p in d.glob("*.pkl")}
 
 
+# ------------------------------------------------------------------------------------------------ English leakage
+
+_ASCII_WORD = re.compile(r"[a-z]{4,}")
+
+
+def build_lexicon(out: Path, lang: str, top_n: int = 40_000, min_clean: int = 3) -> dict | None:
+    """English content words that this language's own clean text (news / curated / Bible) does not use, and the
+    English-word share that 99.5% of that clean text stays under (so foreign names in real news are tolerated)."""
+    import pyarrow.parquet as pq
+    if lang in ("eng", "pcm"):
+        return None
+    eng = Counter()
+    for f in sorted((out / "windows" / "eng").glob("*.parquet"))[:3]:
+        for t in pq.read_table(f, columns=["text"]).column("text").to_pylist()[:150_000]:
+            eng.update(_ASCII_WORD.findall(t.lower()))
+    top = {w for w, _ in eng.most_common(top_n)}
+    clean_vocab, clean_texts = Counter(), []
+    for f in sorted((out / "windows" / lang).glob("*.parquet")):
+        for r in pq.read_table(f, columns=["text", "kind"]).to_pylist():
+            if r["kind"] in ("news", "curated", "bible"):
+                clean_vocab.update(_ASCII_WORD.findall(r["text"].lower()))
+                if r["kind"] != "bible" and len(clean_texts) < 30_000:
+                    clean_texts.append(r["text"])
+    lex = frozenset(w for w in top if clean_vocab[w] < min_clean)
+    shares = [english_share(t, lex) for t in clean_texts]
+    thr = max(0.05, float(np.quantile(shares, 0.995))) if shares else 0.15
+    return {"lexicon": lex, "threshold": thr, "n_clean_ref": len(clean_texts)}
+
+
+def english_share(text: str, lex) -> float:
+    words = _WORD.findall(text.lower())
+    return sum(w in lex for w in words) / max(1, len(words))
+
+
 # ------------------------------------------------------------------------------------------------ apply
 
 def clean_file(path: str, lang: str, out_dir: str, threshold: float = THRESHOLD) -> dict:
@@ -172,6 +216,10 @@ def clean_file(path: str, lang: str, out_dir: str, threshold: float = THRESHOLD)
     if mp.exists():
         model = pickle.loads(mp.read_bytes())["clf"]
     hv = _vectorizer()
+    lex = None
+    lp = out / "clean_models" / f"{lang}.lex"
+    if lp.exists():
+        lex = pickle.loads(lp.read_bytes())
     t = pq.read_table(path)
     rows = t.to_pylist()
     stats = Counter()
@@ -187,6 +235,9 @@ def clean_file(path: str, lang: str, out_dir: str, threshold: float = THRESHOLD)
         why = reject_reason(text, lang, r["kind"])
         if why:
             stats["rej:" + why] += 1
+            continue
+        if lex is not None and r["kind"] != "bible" and english_share(text, lex["lexicon"]) > lex["threshold"]:
+            stats["rej:english_words"] += 1
             continue
         r["_changed"] = text != r["text"]
         r["text"], r["n_sentences"], r["hashes"] = text, len(sents), [sent_hash(s) for s in sents]

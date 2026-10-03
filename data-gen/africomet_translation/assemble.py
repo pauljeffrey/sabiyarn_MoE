@@ -39,17 +39,17 @@ def _stem_slug(path: Path) -> str:
 
 # ------------------------------------------------------------------------------------------------ 1. dedupe
 
-def dedupe_language(out: Path, lang: str, force: bool = False) -> dict:
+def dedupe_language(out: Path, lang: str, force: bool = False, src_dir: str = "windows") -> dict:
     import pyarrow as pa
     import pyarrow.parquet as pq
-    kept_dir = out / "kept" / lang
+    kept_dir = out / ("kept" if src_dir == "windows" else f"kept_{src_dir}") / lang
     marker = kept_dir / "_done.json"
     if marker.exists() and not force:
         return json.loads(marker.read_text())
     shutil.rmtree(kept_dir, ignore_errors=True)
     kept_dir.mkdir(parents=True)
     prio = _priority_by_slug()
-    files = sorted((out / "windows" / lang).glob("*.parquet"), key=lambda p: (prio.get(_stem_slug(p), 99), p.name))
+    files = sorted((out / src_dir / lang).glob("*.parquet"), key=lambda p: (prio.get(_stem_slug(p), 99), p.name))
     seen = np.empty(0, dtype=np.int64)
     parts, total_in, total_kept = [], 0, 0
     for i, f in enumerate(files):
@@ -115,11 +115,11 @@ def split_counts(n: int, weights: dict[str, float]) -> dict[str, int]:
 
 # ------------------------------------------------------------------------------------------------ 3. scatter + render
 
-def scatter(out: Path, lang: str, keep_per_part: dict[str, int], n_out: int, seed: int) -> None:
+def scatter(out: Path, lang: str, keep_per_part: dict[str, int], n_out: int, seed: int, kept_name: str = "kept") -> None:
     import pyarrow.parquet as pq
     tmp = out / "tmp" / lang
     shutil.rmtree(tmp, ignore_errors=True)
-    for p in sorted((out / "kept" / lang).glob("[0-9]*.parquet")):
+    for p in sorted((out / kept_name / lang).glob("[0-9]*.parquet")):
         t = pq.read_table(p)
         want = keep_per_part.get(p.name, t.num_rows)
         rng = np.random.default_rng([seed, zlib.crc32(f"{lang}/{p.name}".encode())])
@@ -187,13 +187,13 @@ def stats_to_json(stats: dict) -> dict:
 # ------------------------------------------------------------------------------------------------ orchestration
 
 def assemble(out: Path, total: int, seed: int, tag: str, langs: list[str] | None = None, limit_per_lang: int | None = None,
-             on_language_done=None, max_non_eng_per_lang: int | None = None) -> dict:
+             on_language_done=None, max_non_eng_per_lang: int | None = None, src_dir: str = "windows") -> dict:
     langs = langs or LANGS
     print("== 1/3 de-duplicating", flush=True)
     dd = {}
     for lang in langs:
-        if (out / "windows" / lang).exists():
-            dd[lang] = dedupe_language(out, lang)
+        if (out / src_dir / lang).exists():
+            dd[lang] = dedupe_language(out, lang, src_dir=src_dir)
             print(f"   {lang}: {dd[lang]['in']:,} -> {dd[lang]['kept']:,} windows after de-duplication", flush=True)
     non_eng = {l: min(d["kept"], max_non_eng_per_lang or 10**12, limit_per_lang or 10**12) for l, d in dd.items() if l != "eng"}
     eng_avail = dd.get("eng", {}).get("kept", 0)
@@ -216,7 +216,7 @@ def assemble(out: Path, total: int, seed: int, tag: str, langs: list[str] | None
         keep = {p["file"]: int(round(p["rows"] * n_keep / total_rows)) for p in parts} if n_keep < total_rows else {}
         n_out = max(1, -(-n_keep // ROWS_PER_OUT_SHARD))
         print(f"== 3/3 {lang}: {n_keep:,} rows -> {n_out} shard(s)", flush=True)
-        scatter(out, lang, keep, n_out, seed)
+        scatter(out, lang, keep, n_out, seed, "kept" if src_dir == "windows" else f"kept_{src_dir}")
         w = weights_eng if lang == "eng" else target_weights_non_eng(lang)
         files = [render_shard(out, lang, i, w, seed, tag, stats) for i in range(n_out)]
         shutil.rmtree(out / "tmp" / lang, ignore_errors=True)

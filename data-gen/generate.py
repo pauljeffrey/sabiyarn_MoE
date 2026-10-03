@@ -162,6 +162,21 @@ def stage_one_documents(seed: Any, todo: list[dict], provider: Any, *, dry_run: 
         domain, subtopic, _ = coverage_pick(r["lang"], doc_group_index(r))
         specs.append((r["custom_id"], plan_document(seed, r, domain=domain, subtopic=subtopic)))
     store = DocumentStore(documents_dir(seed.kind))
+    # Real documents first. Wikipedia text is free and, for a RETRIEVED passage, better: a generated
+    # document is written by the same model family that will be questioned about it, so it contains exactly
+    # the facts the question expects and makes retrieval artificially easy. Real reference prose brings the
+    # irrelevant sections and citation clutter the model has to learn to read past. Only ENGLISH documents
+    # can be sourced -- the low-resource Wikipedias are stubs -- so native-language specs fall through to
+    # the generator untouched.
+    pool_path = Path(os.environ.get("DATA_GEN_DOC_POOL") or (OUT_ROOT.parent / "document_pool.jsonl"))
+    if pool_path.exists():
+        from doc_sources import DocumentPool, fill_store
+        pool = DocumentPool(pool_path)
+        if len(pool):
+            sourced = fill_store([s for _, s in specs], store, pool)
+            if sourced:
+                print(f"  sourced {sourced:,} documents from {pool_path.name} "
+                      f"({len(pool):,} in the pool)")
     unique = {s.custom_id for _, s in specs}
     have = sum(1 for cid in unique if cid in store)
     reuse = document_reuse()
