@@ -311,6 +311,17 @@ R_LOCAL = re.compile(
     r"sub-saharan|west\s+africa|tropical|sahel|savanna)\b", re.I)
 
 
+# A BIOGRAPHY. Wikipedia opens these with a birth date in parentheses, which makes them exactly detectable
+# rather than guessed at. A person's page carries no transferable fact for a retrieval corpus, and these
+# arrive through search noise -- "Eddie Obeid" came back for a query about mineral licences.
+R_BIOGRAPHY = re.compile(
+    r"\((?:born\s|b\.\s|\d{1,2}\s+\w+\s+\d{4}\s*[-–]\s*)"
+    r"|\bwas\s+an?\s+(?:[a-z]+\s+){0,3}(?:politician|businessman|footballer|singer|actor|writer|poet|"
+    r"journalist|lawyer|engineer|physician|economist|academic|activist)\b"
+    r"|\bis\s+an?\s+(?:[a-z]+\s+){0,3}(?:politician|businessman|footballer|singer|actor|writer|poet|"
+    r"journalist|lawyer|economist|activist)\b", re.I)
+
+
 def _content_terms(q: str) -> set[str]:
     stop = {"the", "a", "an", "of", "and", "for", "in", "to", "on", "rate", "per"}
     return {w for w in re.findall(r"[a-z]+", q.lower()) if len(w) > 3 and w not in stop}
@@ -345,6 +356,9 @@ def relevance(text: str, title: str, query: str) -> float:
     # Likewise a specific product or model year. "Toyota Prius (XW20)" matches a query about battery
     # charging perfectly and is still never a document a SabiYarn user retrieves. A penalty left it at 0.55.
     if R_MODEL.search(title):
+        return 0.0
+    # Checked against the LEAD, which is where Wikipedia states a birth date.
+    if R_BIOGRAPHY.search(text[:400]):
         return 0.0
     if R_PROPER_SUBJECT.search(title):
         score -= 0.35           # a named place or lineage

@@ -108,12 +108,28 @@ OUTLINE_OUT_TOKENS = 450
 SYNC_MULTIPLIER = 2.0  # the pre-stage is not batched
 
 
-def document_cost(lang: str, kind: str, n_samples: int, reuse: int) -> float:
-    """Dollars to GENERATE the documents backing `n_samples`, at `reuse` samples per document."""
+# A document-backed sample whose document is ENGLISH can be served from the sourced pool for free
+# (doc_sources.py). Measured from the RL task mix: the RAG tasks are English by design and account for most
+# of the document share, so this is the fraction of document-backed samples the pool can cover at all.
+ENGLISH_DOC_SHARE = 0.91
+
+
+def document_cost(lang: str, kind: str, n_samples: int, reuse: int, pool: int = 0,
+                  pool_claim: float = 1.0) -> float:
+    """Dollars to GENERATE the documents backing `n_samples`.
+
+    `pool` is the number of sourced documents available and `pool_claim` this language's share of them --
+    sourced documents cost nothing, so only the shortfall is generated. Native-language documents are never
+    sourced: the low-resource Wikipedias are stubs, so those are always generated.
+    """
     share = DOC_SHARE.get(kind, 0.0)
     if not share:
         return 0.0
-    docs = n_samples * share / max(1, reuse)
+    doc_samples = n_samples * share
+    native = doc_samples * (1.0 - ENGLISH_DOC_SHARE)
+    english = doc_samples * ENGLISH_DOC_SHARE
+    covered = min(english, pool * max(1, reuse) * pool_claim)
+    docs = (native + (english - covered)) / max(1, reuse)
     pen = _GEMMA_PENALTY.get(lang, 2.2)
     out = docs * (OUTLINES_PER_DOC * OUTLINE_OUT_TOKENS + DOC_WORDS * pen)
     inp = docs * (OUTLINES_PER_DOC + SECTIONS_PER_DOC) * 2_000
@@ -186,6 +202,9 @@ def main() -> int:
                          "competence and generation slices at zero API cost, but covers NONE of the "
                          "behaviour slice -- searches for tool-use or retrieval preference data return "
                          "nothing -- so English is generated for behaviour and topped up from the Hub.")
+    ap.add_argument("--pool", type=int, default=-1,
+                    help="sourced documents available (default: count data/document_pool.jsonl). These are "
+                         "free, so only the shortfall is generated.")
     ap.add_argument("--reuse", type=int, default=4,
                     help="samples per generated document (longdocs._DOC_REUSE). 1 = unique per sample, "
                          "which measured at more than the sample budget itself.")
@@ -217,14 +236,20 @@ def main() -> int:
         pinned[lang] = int(n)
     # The document pre-stage is paid first: it is a real cost and leaving it out of the budget is exactly
     # the mistake that turned a $50 plan into a $104 one.
+    pool_n = a.pool
+    if pool_n < 0:
+        pf = ROOT / "data" / "document_pool.jsonl"
+        pool_n = sum(1 for line in pf.open(encoding="utf-8") if line.strip()) if pf.exists() else 0
     budget = a.budget
     doc_reserve = 0.0
     if DOC_SHARE.get(a.kind):
         # Estimated from the TARGET sizes, then confirmed against the allocation below.
         guess = {**volumes, **pinned}
         scale = a.budget / max(1e-9, sum(n * cost_per_sample(l, a.kind, tk) for l, n in guess.items()))
+        total_target = sum(guess.values()) or 1
         for l, n in guess.items():
-            doc_reserve += document_cost(l, a.kind, n * min(1.0, scale), a.reuse)
+            doc_reserve += document_cost(l, a.kind, n * min(1.0, scale), a.reuse,
+                                         pool=pool_n, pool_claim=n / total_target)
         budget -= doc_reserve
     for lang, n in pinned.items():
         budget -= n * cost_per_sample(lang, a.kind, tk)
@@ -243,9 +268,9 @@ def main() -> int:
 
     print(f"{a.kind}  budget ${a.budget:.2f}  cap {a.cap:,}"
           f"{f'  floor {a.floor:,}' if a.floor else ''}  languages {len(alloc)}")
-    if doc_reserve:
-        print(f"documents: {a.reuse} samples per document, ${doc_reserve:.2f} reserved for the "
-              f"synchronous pre-stage (${doc_reserve * a.reuse:.2f} if each were unique)")
+    if DOC_SHARE.get(a.kind):
+        print(f"documents: {pool_n:,} sourced from Wikipedia (free), {a.reuse} samples each; "
+              f"${doc_reserve:.2f} reserved to generate the shortfall and the native-language ones")
     print(f"average request: {tk['prompt']:,.0f} prompt tokens + {tk['completion']:,.0f} completion tokens "
           f"(English baseline); {tk['doc_share']:.0%} of the mix carries a source document")
     print(f"{'lang':<6}{'tier':<8}{'samples':>9}{'$/1k':>8}{'cost':>9}{'share':>8}")
@@ -255,7 +280,9 @@ def main() -> int:
                 "  (capped)" if n >= a.cap else ("  (floor)" if a.floor and n <= a.floor else ""))
         print(f"{l:<6}{_TIER.get(l, 'low'):<8}{n:>9,}{cost_per_sample(l, a.kind, tk)*1000:>8.2f}"
               f"{c:>9.2f}{c/spent:>7.0%}{flag}")
-    docs = sum(document_cost(l, a.kind, n, a.reuse) for l, n in alloc.items())
+    tot_alloc = sum(alloc.values()) or 1
+    docs = sum(document_cost(l, a.kind, n, a.reuse, pool=pool_n, pool_claim=n / tot_alloc)
+               for l, n in alloc.items())
     print(f"{'samples':<14}{sum(alloc.values()):>9,}{'':>8}{spent:>9.2f}")
     print(f"{'documents':<14}{'':>9}{'':>8}{docs:>9.2f}")
     print(f"{'TOTAL':<14}{'':>9}{'':>8}{spent + docs:>9.2f}")
