@@ -2650,7 +2650,11 @@ class Trainer:
                     # this GPU's limit. Raise the batch if it is far below, lower it before an OOM.
                     log_kwargs["peak_mem_gib"] = round(torch.cuda.max_memory_allocated() / 2**30, 2)
                     torch.cuda.reset_peak_memory_stats()
-                if self.cfg.use_scheduled_sampling and len(self.train_bins) > 1:
+                if len(self.train_bins) > 1:
+                    # Logged whether or not the mixture is scheduled: with a FIXED mixture these
+                    # two numbers are the only confirmation in the logs that the configured ratio
+                    # is the one actually being drawn (previously they were omitted exactly when
+                    # the ratio was constant, which is when you most want to verify it).
                     eng_w, afr_w = self._sampling_weights()
                     log_kwargs.update(eng_sampling_weight=eng_w, afr_sampling_weight=afr_w)
                 LOG.info("step", **log_kwargs)

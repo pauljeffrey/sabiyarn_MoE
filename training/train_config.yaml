@@ -292,14 +292,13 @@ data:
     - afr_train_data_path : "datasets/nigerian_sft_training.bin"
     - eval_data_path: "datasets/sft_validation.bin"
   sampling:
-    - use_scheduled_sampling: true
-    - afr_sampling_weight: 0.45   # start mixture (and the fixed mixture when use_scheduled_sampling is false)
-    - eng_sampling_weight: 0.55
-    # Optional: piecewise-linear African-share schedule, [[progress, afr_weight], ...], progress =
-    # step / max_iters; English gets 1 - afr_weight. Interpolated linearly, flat outside the knots.
-    # Omit it to get the default cosine swap of the two weights above. Rank-identical and resumable
-    # (a pure function of the step). Example: 45% African for the first 30% of the run, ramp to 65% by
-    # 70%, hold: schedule: [[0.0, 0.45], [0.3, 0.45], [0.7, 0.65], [1.0, 0.65]]
+    # false = FIXED mixture for the whole run: the two weights below, normalized to sum to 1.
+    # sampling_weights() (training/load_config.py) returns the preset immediately in this mode and
+    # never looks at `schedule` below, so that curve is inert until this is set back to true.
+    - use_scheduled_sampling: false
+    - afr_sampling_weight: 0.85   # fixed mixture while use_scheduled_sampling is false
+    - eng_sampling_weight: 0.15
+    # INERT while use_scheduled_sampling is false (kept so the curve is not lost):
     - schedule: [[0.0, 0.45], [0.2, 0.55], [0.4, 0.65], [0.6, 0.75], [0.8, 0.85], [1.0, 0.95]]
  
 
