@@ -90,155 +90,27 @@ NATIVE_MIN_VIABLE = 25
 NATIVE_RAG_MIN_WORDS = 350
 NATIVE_RAG_MAX_WORDS = 6_400
 
-# MasakhaNEWS: BBC-sourced news in the languages this corpus serves, which is a better fit than Wikipedia for
-# them -- edited prose, current, and locally relevant, where the native wikis are thin and skewed.
-# Licence is AFL-3.0 on the dataset. The underlying text is BBC-sourced, so redistributing a corpus built from
-# it is a decision for whoever publishes; the per-document metadata records both so that decision is possible.
-NEWS_DATASET = "masakhane/masakhanews"
-NEWS_LICENCE = "AFL-3.0 (MasakhaNEWS; text sourced from BBC)"
-NEWS_CONFIGS = {
-    "hau": "hau", "yor": "yor", "ibo": "ibo", "pcm": "pcm",
-    "som": "som", "swh": "swa", "fra": "fra",
-}
-
-
-def harvest_news(lang: str, *, min_words: int = NATIVE_RAG_MIN_WORDS,
-                 max_words: int = NATIVE_RAG_MAX_WORDS, want: int = 0,
-                 page: int = 100, max_pages: int = 60, verbose: bool = True) -> Iterator[dict]:
-    """News articles in `lang` from MasakhaNEWS, via the datasets-server rows API.
-
-    Paged rather than streamed so it can be interrupted and resumed, and so a language with few long articles
-    costs a few requests rather than a download.
-    """
-    cfg = NEWS_CONFIGS.get(lang)
-    if not cfg:
-        return
-    produced = 0
-    seen_urls: set[str] = set()
-    for pg in range(max_pages):
-        params = urllib.parse.urlencode({"dataset": NEWS_DATASET, "config": cfg, "split": "train",
-                                         "offset": pg * page, "length": page})
-        url = "https://datasets-server.huggingface.co/rows?" + params
-        try:
-            req = urllib.request.Request(url, headers={"User-Agent": UA})
-            with urllib.request.urlopen(req, timeout=60) as fh:
-                rows = json.load(fh).get("rows", [])
-        except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
-            if verbose:
-                print(f"  [{lang}] news page {pg} failed: {type(exc).__name__}")
-            break
-        if not rows:
-            break
-        for r in rows:
-            row = r.get("row") or {}
-            body = (row.get("text") or "").strip()
-            headline = (row.get("headline") or "").strip()
-            u = row.get("url") or ""
-            if not body or u in seen_urls:
-                continue
-            seen_urls.add(u)
-            n = len(body.split())
-            if not (min_words <= n <= max_words):
-                continue
-            if not _is_prose(body):
-                continue
-            produced += 1
-            if verbose and produced % 25 == 0:
-                print(f"  [{lang}] news: {produced} kept")
-            yield {"title": headline or f"{lang} news", "pageid": abs(hash(u)) % (10 ** 9),
-                   "url": u, "text": body, "words": n, "doc_lang": lang,
-                   "technicality": round(technicality(body, headline, lang=lang), 3),
-                   "relevance": 1.0, "query": f"news:{row.get('category') or 'general'}",
-                   "domain": f"news_{row.get('category') or 'general'}",
-                   "source": "masakhanews", "licence": NEWS_LICENCE}
-            if want and produced >= want:
-                return
-
-# HOW the native wikis are harvested, and why it differs from English.
+# MASAKHANEWS WAS TRIED AND DROPPED. Recording why, so it is not re-litigated.
 #
-# The English pool is harvested by TOPIC: 155 English queries, each filtered for whether the article actually
-# answers to the query that found it. That machinery does not transfer. Searching the Hausa Wikipedia with an
-# English query finds little, and the relevance gate -- which asks whether the query's terms appear in the
-# text -- can never pass against Hausa prose.
+# BBC-sourced news in exactly these languages looked like the obvious fix for the thin native wikis, and 2,820
+# documents were harvested across hau, yor, ibo, pcm, som, swh and fra. Measured side by side against the
+# wikis, it lost on BOTH axes everywhere the two overlap -- median words and median technicality:
 #
-# Two further things I measured before settling on this:
-#   - interlanguage links are a dead end. Only 3 of 12 vetted English pages have a Hausa equivalent at all,
-#     and "Rogo" (cassava) is 69 words. The native equivalents of technical English pages are stubs.
-#   - the long articles DO exist (Hausa 68 of 200 sampled are 1,200+ words) but they are not about reference
-#     topics; they are about places, people, religion and history.
+#   hau  wiki 856w / 0.25   news 602w / 0.16
+#   ibo  wiki 690w / 0.20   news 546w / 0.14
+#   yor  wiki 622w / 0.21   news 540w / 0.11
+#   som  wiki 650w / 0.20   news 556w / 0.15
+#   fra  wiki 4,672w / 0.33 news 976w / 0.17
 #
-# Which is fine, and this is the point that resolves it: the QUESTION IS GENERATED FROM THE DOCUMENT. A long
-# Hausa article about anything at all produces a Hausa question about that thing, and answering it from the
-# passage is exactly the skill being taught. So native harvesting selects on LENGTH AND COHERENCE ONLY, and
-# the topic follows the document rather than the reverse.
+# Filtering by category did not rescue it either: across all seven MasakhaNEWS categories the technicality
+# medians sit between 0.10 and 0.20, and the highest is sport -- numbers of the wrong kind. News prose simply
+# carries few figures with units, which is what the score is mostly measuring.
 #
-# Common short words, used as search probes because a vague query returns the site's largest articles first.
-_NATIVE_PROBES = {
-    "fra": ("de", "la", "le", "et", "pour", "dans", "avec", "sur", "est", "une", "par", "plus",
-            "entre", "sous", "selon", "pendant", "chaque", "ainsi"),
-    "hau": ("da", "na", "a", "ta", "ya", "wannan", "kuma", "ba", "cikin", "wanda", "sun", "za",
-            "shi", "ne", "ko", "amma", "yana", "bayan"),
-    "ibo": ("na", "ya", "nke", "maka", "ihe", "ndi", "otu", "ka", "bu", "ego", "obodo", "oge",
-            "ike", "ala", "ulo", "mmiri", "afo", "ozo"),
-    "som": ("ka", "oo", "la", "iyo", "waa", "ah", "uu", "si", "in", "ay", "dhan", "badan",
-            "waxa", "dalka", "sanadka", "qof", "biyo", "caafimaad"),
-    "twi": ("ne", "no", "wo", "na", "se", "nti", "yi", "mu", "ho", "bi", "nso", "ara",
-            "nnipa", "asase", "nsuo", "sika", "afe", "aduane"),
-    "yor": ("ni", "ti", "ati", "awon", "fun", "lati", "pelu", "ko", "won", "ile", "omi", "owo",
-            "odun", "ounje", "ise", "oro", "eniyan", "ilu"),
-}
-
-
-def harvest_native(lang: str, *, min_words: int, max_words: int, want: int = 0,
-                   per_probe: int = 120, verbose: bool = True) -> Iterator[dict]:
-    """Long articles from `lang`'s own Wikipedia, selected on length and coherence.
-
-    No topic filter and no query-relevance gate -- see the note above. What IS checked:
-      - length, inside the band the samples ask for;
-      - that the text is prose rather than a list or a table dump, which is the one thing that would make a
-        document unusable as a passage to answer from;
-      - that it is not a disambiguation page or a bare stub with an infobox.
-    """
-    wiki_code = NATIVE_WIKIS.get(lang)
-    if not wiki_code:
-        return
-    wiki = Wikipedia(lang=wiki_code)
-    seen: set[str] = set()
-    produced = 0
-    for probe in _NATIVE_PROBES.get(lang, ("a",)):
-        try:
-            hits = wiki.search(probe, limit=per_probe)
-        except RuntimeError:
-            continue
-        # Length filter on the search result, before anything is downloaded.
-        cands = [h for h in hits
-                 if h.get("title") not in seen and int(h.get("wordcount") or 0) >= min_words * 0.9]
-        for h in cands:
-            title = h["title"]
-            seen.add(title)
-            try:
-                pg = wiki.plaintext(title)
-            except RuntimeError:
-                continue
-            if not pg:
-                continue
-            body = clean(pg["text"])
-            n = len(body.split())
-            if not (min_words <= n <= max_words):
-                continue
-            if not _is_prose(body):
-                continue
-            produced += 1
-            if verbose:
-                print(f"  [{lang}] {title[:48]:<50} {n:>6,}w")
-            yield {"title": pg["title"], "pageid": pg["pageid"], "url": pg["url"],
-                   "text": body, "words": n, "doc_lang": lang,
-                   # Scored for the record but not gated on: topic is not the selection criterion here.
-                   "technicality": round(technicality(body, title), 3),
-                   "relevance": 1.0, "query": f"native:{probe}",
-                   "domain": "native_general", "source": "wikipedia", "licence": LICENCE}
-            if want and produced >= want:
-                return
+# Only pcm and swh had no wiki alternative, and for those an ENGLISH document is the designed default anyway:
+# a retrieved passage is English by construction (see longdocs.plan_document), and english_to_native is one of
+# the standard directions. Dropping news also removes a second licence from the corpus -- AFL-3.0 over
+# BBC-sourced text -- which is one fewer question to answer before publishing, and removes a news-domain skew
+# towards politics, sport and entertainment that does not match the corpus's own domains.
 
 
 def _is_prose(text: str) -> bool:
