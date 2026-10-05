@@ -46,7 +46,10 @@ def report(pool: DocumentPool) -> None:
     print(f"  words      : median {statistics.median(words):,.0f}  "
           f"min {min(words):,}  max {max(words):,}")
     print(f"  technicality: median {statistics.median(tech):.2f}  min {min(tech):.2f}  max {max(tech):.2f}")
-    print(f"  licence    : {pool.docs[0].get('licence')} -- attribution required if the corpus is published")
+    lic = collections.Counter(d.get("licence") or "unknown" for d in pool.docs)
+    print("  licences   : (all apply if the corpus is published)")
+    for name, cnt in lic.most_common():
+        print(f"     {cnt:>5}  {name}")
     print(f"  languages  : {dict(by_lang.most_common())}")
     print("  domains    :")
     for dom, n in by_dom.most_common():

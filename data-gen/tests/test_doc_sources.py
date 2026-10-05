@@ -434,3 +434,32 @@ def test_a_short_news_article_counts_as_prose():
                "Kwamishinan ilimi ya bayyana cewa aikin zai kai ga kananan hukumomi arba'in da hudu. "
                "Ya kara da cewa kudaden za su fito daga kasafin kudin shekarar. " * 7)
     assert _is_prose(article), "a 350-word news article is a legitimate retrieval source"
+
+
+def test_technicality_is_language_aware():
+    """_SPEC_WORDS and _GENERAL_WORDS are English, so on a Hausa document a quarter of the score is
+    structurally unavailable and the penalty never fires. Native documents were scoring low partly because
+    the scorer is blind to them -- I nearly concluded from those numbers that native news is inherently
+    unspecific. The neutral evidence (figures with units, ranges, numeric density) is renormalised instead."""
+    from doc_sources import technicality
+    # Identical numeric evidence, one in English prose and one with no English spec vocabulary at all.
+    numeric = ("Ana amfani da 120 kg/ha na nitrogen a kowace shekara, kuma ruwan sama ya kai 850 mm. "
+               "Zafin ya tsaya tsakanin 22 °C da 34 °C, kuma pH ya kai 6.5. " * 10)
+    as_native = technicality(numeric, "Noma", lang="hau")
+    as_english = technicality(numeric, "Farming", lang="eng")
+    assert as_native > as_english, (
+        f"the native score ({as_native:.2f}) must not be penalised for lacking English spec words "
+        f"({as_english:.2f})")
+    assert as_native >= 0.45, "dense figures-with-units should score well in any language"
+
+
+def test_english_scoring_is_unchanged_by_the_language_split():
+    """The English path must still behave as calibrated: general-interest prose below the old threshold,
+    reference prose above it."""
+    from doc_sources import technicality
+    general = ("He was born in Abeokuta and began his career as a singer, recording his first album with "
+               "the band. His discography spans four decades and his filmography includes two films. " * 8)
+    technical = ("Emitters are rated at 2 l/h to 8 l/h at 100 kPa. The recommended application rate is "
+                 "120 kg/ha of nitrogen in two doses. Moisture must fall below 13% at 25 °C. " * 8)
+    assert technicality(general, "A Musician") < 0.36
+    assert technicality(technical, "Drip irrigation") >= 0.36

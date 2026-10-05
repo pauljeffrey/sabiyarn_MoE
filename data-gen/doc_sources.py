@@ -147,7 +147,7 @@ def harvest_news(lang: str, *, min_words: int = NATIVE_RAG_MIN_WORDS,
                 print(f"  [{lang}] news: {produced} kept")
             yield {"title": headline or f"{lang} news", "pageid": abs(hash(u)) % (10 ** 9),
                    "url": u, "text": body, "words": n, "doc_lang": lang,
-                   "technicality": round(technicality(body, headline), 3),
+                   "technicality": round(technicality(body, headline, lang=lang), 3),
                    "relevance": 1.0, "query": f"news:{row.get('category') or 'general'}",
                    "domain": f"news_{row.get('category') or 'general'}",
                    "source": "masakhanews", "licence": NEWS_LICENCE}
@@ -174,12 +174,18 @@ def harvest_news(lang: str, *, min_words: int = NATIVE_RAG_MIN_WORDS,
 #
 # Common short words, used as search probes because a vague query returns the site's largest articles first.
 _NATIVE_PROBES = {
-    "fra": ("de", "la", "le", "et", "pour", "dans", "avec", "sur"),
-    "hau": ("da", "na", "a", "ta", "ya", "wannan", "kuma", "ba"),
-    "ibo": ("na", "ya", "nke", "maka", "ihe", "ndi", "otu", "ka"),
-    "som": ("ka", "oo", "la", "iyo", "waa", "ah", "uu", "si"),
-    "twi": ("ne", "no", "wo", "na", "se", "nti", "yi", "mu"),
-    "yor": ("ni", "ti", "ati", "awon", "fun", "lati", "pelu", "ko"),
+    "fra": ("de", "la", "le", "et", "pour", "dans", "avec", "sur", "est", "une", "par", "plus",
+            "entre", "sous", "selon", "pendant", "chaque", "ainsi"),
+    "hau": ("da", "na", "a", "ta", "ya", "wannan", "kuma", "ba", "cikin", "wanda", "sun", "za",
+            "shi", "ne", "ko", "amma", "yana", "bayan"),
+    "ibo": ("na", "ya", "nke", "maka", "ihe", "ndi", "otu", "ka", "bu", "ego", "obodo", "oge",
+            "ike", "ala", "ulo", "mmiri", "afo", "ozo"),
+    "som": ("ka", "oo", "la", "iyo", "waa", "ah", "uu", "si", "in", "ay", "dhan", "badan",
+            "waxa", "dalka", "sanadka", "qof", "biyo", "caafimaad"),
+    "twi": ("ne", "no", "wo", "na", "se", "nti", "yi", "mu", "ho", "bi", "nso", "ara",
+            "nnipa", "asase", "nsuo", "sika", "afe", "aduane"),
+    "yor": ("ni", "ti", "ati", "awon", "fun", "lati", "pelu", "ko", "won", "ile", "omi", "owo",
+            "odun", "ounje", "ise", "oro", "eniyan", "ilu"),
 }
 
 
@@ -449,28 +455,43 @@ _GENERAL_WORDS = (
 )
 
 
-def technicality(text: str, title: str = "") -> float:
+def technicality(text: str, title: str = "", lang: str = "eng") -> float:
     """0..1. How much of this document is specific, checkable, looked-up fact.
 
     A proxy, and a deliberately crude one -- it is a filter on a free corpus, not a measurement. It only
     has to be good enough to prefer a page about emitter discharge rates over one about a footballer.
+
+    LANGUAGE MATTERS HERE, and getting it wrong misled me. _SPEC_WORDS and _GENERAL_WORDS are English
+    ("dosage", "tolerance", "per hectare", "discography"), so on a Hausa or Yoruba document they can never
+    match: a quarter of the score is structurally unavailable and the penalty never fires. Native documents
+    were therefore scoring low partly because the scorer is blind to them, not because the text is
+    unspecific -- and I nearly concluded from those numbers that native news is inherently untechnical.
+
+    For a non-English document the score is built from the LANGUAGE-NEUTRAL evidence only -- figures with
+    units, ranges, numeric density, all of which survive translation -- and renormalised, so the number means
+    the same thing in both cases.
     """
     words = text.split()
     n = len(words)
-    if n < 200:
+    if n < 150:
         return 0.0
     low = text.lower()
     per_1k = 1000.0 / n
     units = len(R_NUM_UNIT.findall(text)) * per_1k      # figures with units, per 1k words
     ranges = len(R_RANGE.findall(text)) * per_1k
     nums = len(R_NUMBER.findall(text)) * per_1k
+
+    u, r, d = min(units / 12.0, 1.0), min(ranges / 4.0, 1.0), min(nums / 35.0, 1.0)
+    if lang != "eng":
+        # Weights renormalised over the neutral components (0.40 + 0.15 + 0.10 = 0.65), plus the same floor.
+        return max(0.0, min(1.0, (u * 0.40 + r * 0.15 + d * 0.10) / 0.65 * 0.90 + 0.10))
+
     spec = sum(low.count(w) for w in _SPEC_WORDS) * per_1k
     general = sum(low.count(w) for w in _GENERAL_WORDS) * per_1k
-
-    score = (min(units / 12.0, 1.0) * 0.40
+    score = (u * 0.40
              + min(spec / 14.0, 1.0) * 0.25
-             + min(ranges / 4.0, 1.0) * 0.15
-             + min(nums / 35.0, 1.0) * 0.10
+             + r * 0.15
+             + d * 0.10
              + 0.10)  # a floor, so a sound reference page with few numbers is not excluded outright
     score -= min(general / 6.0, 1.0) * 0.45
     tl = title.lower()
