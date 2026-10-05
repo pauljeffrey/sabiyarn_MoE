@@ -118,6 +118,10 @@ class RLConfig:
     # programmatic reward fails SILENTLY when a check is always "unknown", and the per-check detail is the
     # only way to see that happening.
     reward_log_every: int = 0
+    # Drop DPO pairs whose two sides scored within this of each other (data-gen's own 0-10 scores). A pair
+    # that close teaches almost nothing and its gradient is noise. 0 disables the filter; generation already
+    # drops anything under 2.0, so this is for corpora built before that existed.
+    min_score_margin: float = 0.0
 
     # ---- output / tracking ----------------------------------------------------------------------------
     out_dir: str = "outputs/dpo"
