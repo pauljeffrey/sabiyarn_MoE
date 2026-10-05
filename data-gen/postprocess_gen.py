@@ -661,6 +661,79 @@ IDENTITIES = [
 ]
 
 
+
+def _pair_record(base: dict, md: dict, seed: Seed, msgs: list[dict], entry: Any,
+                 verifier: dict, want: int) -> Optional[dict]:
+    """One extra ranked pair, at an EARLIER turn, as its own training record.
+
+    The prefix is truncated to the user turn this pair answers, so the record is a complete
+    (prefix, chosen, rejected) triple on its own -- which is how multi-turn DPO is normally done. The
+    generator was told to write each pair against the prefix as it stands at that point with the BEST earlier
+    reply assumed, so the truncation matches what it was asked for.
+
+    Returns None rather than raising: an unusable extra pair must not cost the main record.
+    """
+    if not isinstance(entry, dict):
+        return None
+    try:
+        after = int(entry.get("after_user_turn"))
+    except (TypeError, ValueError):
+        return None
+    responses = entry.get("responses") or []
+    if not isinstance(responses, list) or len(responses) < 2:
+        return None
+
+    # Truncate the prefix to just after the `after`-th user turn.
+    seen, cut = 0, None
+    for i, m in enumerate(msgs):
+        if m.get("role") == "user":
+            seen += 1
+            if seen == after:
+                cut = i + 1
+                break
+    if cut is None or cut < 1:
+        return None
+    prefix = msgs[:cut]
+    # The same shape rules as the final pair: fields assembled, both sides present and different.
+    cands = []
+    for r in responses:
+        if not isinstance(r, dict):
+            continue
+        content = r.get("content")
+        if content is None and (r.get("response") is not None or r.get("tool_call") is not None):
+            content = {k: v for k, v in r.items() if k not in ("quality", "why", "role", "score")}
+        txt = _candidate_text(content, md)
+        if txt and "<|input_lang|>" in txt:
+            cands.append({**r, "_text": txt})
+    if len(cands) < 2:
+        return None
+    quals = [(c.get("quality") or "").strip().lower() for c in cands]
+    if "best" not in quals or "worst" not in quals:
+        return None
+    texts = [c["_text"] for c in cands]
+    if len(set(texts)) < len(texts):
+        return None
+    order = sorted(range(len(cands)), key=lambda i: {"best": 0, "partial": 1, "worst": 2}.get(quals[i], 1))
+    sc = [_score_of(cands[i]) for i in order]
+    if sc[0] is not None and sc[-1] is not None and (sc[0] - sc[-1]) < 2.0:
+        return None
+
+    rec = {**base,
+           "id": f"{base.get('id', '')}__t{after}",
+           "tags": base.get("tags") or [], "tasks": base.get("tasks") or [],
+           "tools": md.get("tools", []), "verifier": verifier,
+           "prompt_messages": prefix,
+           "prompt_text": render_messages(prefix, add_generation_prompt=True),
+           "ranking": [quals[i] for i in order],
+           "scores": sc,
+           "rationale": [cands[i].get("why", "") for i in order],
+           "paired_turn": after,
+           **_flatten(prefix)}
+    for n in range(want):
+        rec[f"response_{n + 1}"] = texts[order[n]] if n < len(order) else None
+    return rec
+
+
 def _rebuild_system_message(md: dict, rng_seed: str) -> Optional[str]:
     """Canonical system message: the preamble plus the applicable tools AND the injected distractors.
 
@@ -680,9 +753,15 @@ def _rebuild_system_message(md: dict, rng_seed: str) -> Optional[str]:
     # Deterministic shuffle so distractors are not always last -- position must not be a tell.
     rng.shuffle(catalogue)
     identity = md.get("identity") or rng.choice(IDENTITIES)
+    # TODAY'S DATE. Without it the model cannot tell that a tool result from "12 March" is stale, which makes
+    # stale_data_awareness unlearnable -- it would have to guess the gap instead of working it out. It also
+    # grounds every "today", "this week" and "last month" in the corpus, and it is what a real deployment
+    # puts in the system prompt anyway. Costs about 12 tokens.
+    today = md.get("today")
+    date_line = f" Today is {today}." if today else ""
     # Compact JSON: indent=2 cost ~40% more tokens for no benefit to the model.
-    return f"{identity} You have these tools:\n" + json.dumps(catalogue, ensure_ascii=False,
-                                                              separators=(",", ":"))
+    return (f"{identity}{date_line} You have these tools:\n"
+            + json.dumps(catalogue, ensure_ascii=False, separators=(",", ":")))
 
 
 def _tags(raw: Any, fallback: list[str]) -> list[str]:
@@ -907,6 +986,23 @@ def _to_record(seed: Seed, resp: Response) -> Optional[dict]:
            **_flatten(msgs)}
     for n in range(want):
         rec[f"response_{n + 1}"] = texts[order[n]] if n < len(order) else None
+
+    # EXTRA PAIRS at earlier turns. Each becomes its own (prefix, chosen, rejected) record, which is where
+    # the extra data comes from: the prefix was written once, so a second ranked turn is close to free.
+    extra = []
+    for entry in (data.get("turn_responses") or []):
+        er = _pair_record(base, md, seed, msgs, entry, verifier, want)
+        if er is not None:
+            extra.append(er)
+        else:
+            STATS["extra_pair_unusable"] = STATS.get("extra_pair_unusable", 0) + 1
+    if extra:
+        # Deduplicate against the final pair: a generator that repeats the last turn here adds nothing.
+        final_key = rec.get("response_1")
+        extra = [e for e in extra if e.get("response_1") != final_key]
+        if extra:
+            rec["_extra_pairs"] = extra
+            STATS["repair:extra_pairs_kept"] = STATS.get("repair:extra_pairs_kept", 0) + len(extra)
     return rec
 
 
@@ -915,7 +1011,9 @@ def to_records(seed: Seed, resp: Response) -> list[dict]:
     md = resp.metadata or {}
     if not md.get("packed"):
         r = to_record(seed, resp)
-        return [r] if r else []
+        if not r:
+            return []
+        return [r] + r.pop("_extra_pairs", [])
     data = _json(resp.text)
     if data is None:
         _drop("json_invalid")

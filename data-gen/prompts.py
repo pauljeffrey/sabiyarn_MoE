@@ -110,6 +110,57 @@ def _fewshot_block() -> str:
 _PAIRS = all_pairs()
 _GENRES = sorted(GENRES)
 # Implied current date/time, cycled so time-dependent behaviour is not learned against one anchor.
+from datetime import date as _date  # noqa: E402  (local to the date helper below)
+
+_MONTHS = ("January", "February", "March", "April", "May", "June",
+           "July", "August", "September", "October", "November", "December")
+_WEEKDAYS = ("Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday")
+# Spread across several years so the corpus is not anchored to one, and nothing in it implies a cutoff.
+_YEARS = (2024, 2025, 2026, 2027)
+
+
+def _concrete_date(when: str, index: int, lang_code: str) -> str:
+    """A real date, deterministic per row, and agreeing with `when` when `when` names a month or weekday.
+
+    Deterministic so a re-run produces the same corpus; varied so no single date is over-represented.
+    """
+    i = index * 7 + _lang_offset(lang_code)
+    low = (when or "").lower()
+    month = next((m for m in _MONTHS if m.lower() in low), "")
+    if not month:
+        # The seasonal phrases name a time of year without naming a month, and getting these wrong is
+        # noticeable to a reader: harmattan is not September and Christmas is not March.
+        for cue, months in (("harmattan", ("December", "January", "February")),
+                            ("christmas", ("December",)),
+                            ("ramadan", ("March", "April")),
+                            ("rainy season", ("June", "July", "August", "September")),
+                            ("dry season", ("November", "December", "January", "February")),
+                            ("new year", ("January",)),
+                            ("planting", ("April", "May")),
+                            ("harvest", ("September", "October", "November"))):
+            if cue in low:
+                month = months[i % len(months)]
+                break
+    month = month or _MONTHS[i % 12]
+    year = _YEARS[i % len(_YEARS)]
+    want_weekday = next((d for d in _WEEKDAYS if d.lower() in low), "")
+    if "week before christmas" in low:
+        day = 15 + (i % 5)          # actually before Christmas, not on it
+    else:
+        day = 1 + (i * 3) % 28      # 1-28 is valid in every month, so no February bookkeeping
+    base = _date(year, _MONTHS.index(month) + 1, day)
+    # The weekday must be the REAL one for that date. Deriving it (rather than taking it from `when`) stops
+    # the corpus asserting that 4 January 2025 was a Monday, which it was not -- a small wrong fact, but one
+    # repeated across thousands of samples and trivially avoidable.
+    if want_weekday:
+        target = _WEEKDAYS.index(want_weekday)
+        shift = (target - base.weekday()) % 7
+        if day + shift > 28:
+            shift -= 7
+        base = _date(year, base.month, max(1, day + shift))
+    return f"{_WEEKDAYS[base.weekday()]} {base.day} {_MONTHS[base.month - 1]} {base.year}"
+
+
 _WHENS = [
     "a Monday morning in January", "a Wednesday afternoon in March", "a Friday evening in May",
     "a Saturday morning in July", "a Sunday afternoon in August", "a Tuesday night in October",
@@ -485,6 +536,11 @@ def _sft_like_request(seed: Seed, row: dict, *, rl: bool, document: Optional[dic
     # Stride must be COPRIME with len(_WHENS) or most values are unreachable: *3 mod 12 reached only 4 of 12,
     # the same arithmetic trap that once locked every sub-topic to one genre. 5 is coprime with 12.
     when = _WHENS[(row["index"] * 5 + _lang_offset(lang.code)) % len(_WHENS)]
+    # A CONCRETE date for the system prompt, consistent with `when` where `when` names a month.
+    # `when` sets the scene for the generator -- register, season, festival -- but "a Wednesday afternoon in
+    # March" is not something a model can compare a tool result's date against. stale_data_awareness needs a
+    # real date to subtract from, and every "today"/"this week" in the corpus is better grounded with one.
+    today = _concrete_date(when, row["index"], lang.code)
 
     needs_tools = any(t.uses_tools for t in tasks)
     if needs_tools:
@@ -620,6 +676,34 @@ Return JSON:
   "confidence": <float 0-1: your honest estimate that this conversation is correct AND fluent {lang_name}>}}"""
     else:
         n_resp = int(seed.conversation['responses_per_prompt'])
+        # How many assistant turns get a ranked pair (see build_seeds, kind == "rl"). A long-reply task gets
+        # one, a wholly short-reply conversation three, everything else two. Pairing more turns multiplies
+        # the training pairs for one generation -- the prefix is written once either way -- but it also
+        # multiplies the OUTPUT in a single response, and long single responses are what produced the
+        # empty-completion and truncation failures measured earlier.
+        _names = {x.name for x in tasks}
+        if _names & set(seed.conversation.get("long_reply_tasks") or ()):
+            n_pairs = int(seed.conversation.get("paired_turns_long_tasks", 1))
+        elif _names <= set(seed.conversation.get("short_reply_tasks") or ()):
+            n_pairs = int(seed.conversation.get("paired_turns_short_tasks", 3))
+        else:
+            n_pairs = int(seed.conversation.get("paired_turns", 2))
+        n_pairs = max(1, min(n_pairs, n_user))
+        if n_pairs > 1:
+            multi_turn_block = (
+                f"RANK {n_pairs} TURNS, NOT ONE. The LAST {n_pairs} assistant turns each get a pair of "
+                f"candidate replies, returned in \"turn_responses\" as {n_pairs} entries of the form\n"
+                f'  {{"after_user_turn": <the 1-based number of the user turn it answers>, '
+                f'"responses": [ ...two items, same shape as below... ]}}\n'
+                "Earlier assistant turns in \"prompt_turns\" stay single. Each pair must answer the "
+                "conversation AS IT STANDS AT THAT POINT -- the prefix up to that user turn, with the BEST "
+                "reply assumed for every earlier paired turn. Keep every reply the length it would naturally "
+                "be; do not pad to fill the extra slots.\n\n")
+            turn_responses_line = (
+                '\n  "turn_responses": [{"after_user_turn": <n>, "responses": [...]}, ...],')
+        else:
+            multi_turn_block = ""
+            turn_responses_line = ""
         shape = f"""Produce ONE conversation PREFIX with EXACTLY {n_user} messages of role "user", the LAST
 of which ends the prefix (tool turns are extra and do not count), then EXACTLY {n_resp} alternative
 assistant replies to that final user message.
@@ -628,7 +712,7 @@ Do NOT write the final assistant reply inside "prompt_turns". The prefix STOPS a
 at a tool result, if the assistant called a tool and the reply must read off the result). The replies go in
 "responses" and nowhere else.
 
-"responses" must be a list of EXACTLY {n_resp} items -- one labelled "best" and one labelled "worst". Both
+{multi_turn_block}"responses" must be a list of EXACTLY {n_resp} items -- one labelled "best" and one labelled "worst". Both
 are required; a single reply is not a sample, because there is nothing to rank. Do not use any other label.
   - best:  honest, correctly grounded, uses the right tool or correctly admits it cannot;
   - worst: confidently wrong -- invents a fact, answers from an irrelevant tool result, claims to recognise
@@ -679,7 +763,7 @@ Return JSON:
     {{"content": {{ ...assistant turn FIELDS... }}, "quality": "worst", "score": <0-10>, "why": "<one line, English>"}}
   ],
   "verifier": {{ ...only the fields that apply, omit the rest... }},
-  "tasks": [...], "tags": [...],
+  "tasks": [...], "tags": [...],{turn_responses_line}
   "confidence": <float 0-1: your honest estimate that the ranking is right and the text is fluent {lang_name}>}}"""
 
     # A long-document sample covers ONE task, so "change subject at least once" would be self-contradictory.
@@ -750,7 +834,7 @@ Hard requirements:
                   "distractor_definitions": _tool_defs(seed, distractors),
                   "domain": domain, "subtopic": subtopic, "n_user_turns": n_user,
                   "io_direction": io["key"], "io_other_lang": io["other"],
-                  "identity": identity, "when": when,
+                  "identity": identity, "when": when, "today": today,
                   # The turn bounds this row was actually asked for, so the validator checks the request that
                   # was made rather than the seed-wide floor -- a long-document sample legitimately has one
                   # user turn, which the global min_user_turns=3 would reject.
@@ -762,6 +846,7 @@ Hard requirements:
                   # samples that are themselves realistic, since plenty of real tool use is a one-shot
                   # question. For SFT the floor stays as asked: there the conversation IS the sample.
                   "min_user_turns": 1 if seed.kind == "rl" else _lo, "max_user_turns": _hi,
+                  "n_pairs": n_pairs if seed.kind == "rl" else 1,
                   "document": document, "expect_markers": io["expect_markers"]},
     )
 

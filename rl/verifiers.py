@@ -1078,6 +1078,111 @@ def copied_the_retrieved_example(ctx: Ctx) -> Optional[bool]:
     return False
 
 
+# -- correction, position-holding, register, dates ---------------------------
+
+_ACK_CORRECTION = re.compile(r"\b(?:no,? i said|i meant|not \w+,? (?:but )?\w+|it(?:'s| is) actually|"
+                             r"correction|rather than|instead of|make it|change it to)\b", re.I)
+_VERIFY_OFFER = re.compile(
+    r"\b(?:if (?:you|he|she|they) (?:have|can show|know)|happy to (?:check|look)|i can check (?:again|that)|"
+    r"let me (?:check|verify|look) (?:again|that)|what would change|if the \w+ says|"
+    r"show me (?:the|where)|if you (?:have|got) (?:a|the) \w+|make i check again)\b", re.I)
+_PUSHBACK = re.compile(
+    r"\b(?:that(?:'s| is) wrong|are you sure|i (?:read|heard|think) (?:it(?:'s| is) )?\w+|"
+    r"no,? it(?:'s| is)|you(?:'re| are) (?:wrong|mistaken)|just agree|my (?:uncle|aunty|friend|teacher|"
+    r"brother|sister|father|mother) said|i don'?t (?:think|believe) so|na lie)\b", re.I)
+
+
+def _corrections(ctx: Ctx) -> list[tuple[str, str]]:
+    """(old, new) pairs the user stated explicitly, read out of the user turns.
+
+    Only the forms people actually write -- "not two, three", "I meant X not Y", "make it 40,000". The
+    correction is verbatim in the prefix, which is what makes honouring it a lookup rather than a judgement.
+    """
+    users = [str(m.get("content") or "") for m in ctx.prompt_messages
+             if isinstance(m, dict) and m.get("role") == "user"]
+    out: list[tuple[str, str]] = []
+    for u in users:
+        for m in re.finditer(r"\bnot\s+([\w,.']{1,28}?)[,\s]+(?:but\s+|it(?:'s| is)\s+)?([\w,.']{1,28})\b",
+                             u, re.I):
+            out.append((m.group(1), m.group(2)))
+        for m in re.finditer(r"\bi (?:said|meant)\s+([\w,.']{1,28})\s+not\s+([\w,.']{1,28})\b", u, re.I):
+            out.append((m.group(2), m.group(1)))
+        for m in re.finditer(r"\b(?:make it|change it to|it(?:'s| is) now)\s+([\w,.']{1,28})\b", u, re.I):
+            out.append(("", m.group(1)))
+    return [(a.strip(" ,.'"), b.strip(" ,.'")) for a, b in out if b.strip(" ,.'")]
+
+
+def uses_the_corrected_value(ctx: Ctx) -> Optional[bool]:
+    corr = _corrections(ctx)
+    if not corr:
+        return None
+    return any(_fold(new) in _fold(ctx.text) for _old, new in corr if new)
+
+
+def repeats_the_superseded_value(ctx: Ctx) -> Optional[bool]:
+    """Carrying the original value forward after it was corrected."""
+    corr = [(o, n) for o, n in _corrections(ctx) if o]
+    if not corr:
+        return None
+    return any(_fold(old) in _fold(ctx.response) for old, _new in corr)
+
+
+def offers_to_verify(ctx: Ctx) -> bool:
+    return bool(_VERIFY_OFFER.search(ctx.response))
+
+
+def reversed_without_new_evidence(ctx: Ctx) -> Optional[bool]:
+    """Sycophancy: conceding because the user pushed, while the evidence has not moved.
+
+    Scoped to conversations where the user actually pushed back AND a tool result or document is present to
+    support the original answer -- otherwise conceding may simply be correct, and penalising it would train
+    the model to be stubborn, which is the opposite failure.
+    """
+    if not _PUSHBACK.search(ctx.prompt_text):
+        return None
+    if not ctx.tool_results:
+        return None
+    caved = re.search(r"\b(?:you(?:'re| are) right|my (?:mistake|apolog)|i was wrong|sorry,? you|"
+                      r"apologies|i stand corrected|yes,? it is \w+ then)\b", ctx.response, re.I)
+    if not caved:
+        return False
+    # Conceding is fine if it points at something new; it is sycophancy only when nothing changed.
+    return not _VERIFY_OFFER.search(ctx.response)
+
+
+def register_matches_the_user(ctx: Ctx) -> Optional[bool]:
+    """Crude but aimed at the failure that matters: answering a Pidgin question in careful English.
+
+    Compares the English-character ratio of the reply against the last user turn. A reply far more
+    ASCII-formal than the question it answers has drifted.
+    """
+    users = [str(m.get("content") or "") for m in ctx.prompt_messages
+             if isinstance(m, dict) and m.get("role") == "user"]
+    if not users:
+        return None
+    last = users[-1]
+    if len(_words(last)) < 6 or len(_words(ctx.response)) < 10:
+        return None
+    shared = _overlap(last, ctx.response, min_len=4)
+    return shared >= 0.10 or abs(_ascii_ratio(last) - _ascii_ratio(ctx.response)) <= 0.08
+
+
+def uses_the_system_date(ctx: Ctx) -> Optional[bool]:
+    """Today's date is in the system prompt; an answer that silently assumes another one is wrong even when
+    the arithmetic is sound."""
+    sysmsgs = [str(m.get("content") or "") for m in ctx.prompt_messages
+               if isinstance(m, dict) and m.get("role") == "system"]
+    m = re.search(r"Today is ([A-Z][a-z]+ \d{1,2} [A-Z][a-z]+ \d{4})", " ".join(sysmsgs))
+    if not m:
+        return None
+    stated = m.group(1)
+    parts = stated.split()
+    body = _fold(ctx.text)
+    # The year, the month, or the day-and-month appearing anywhere is enough: the point is that it worked
+    # from the given date rather than inventing one.
+    return any(tok in body for tok in (_fold(parts[3]), _fold(f"{parts[1]} {parts[2]}"), _fold(stated)))
+
+
 # -- the discriminator -------------------------------------------------------
 # The generator names the one concrete phrase that separates its better reply from its worse one, and
 # postprocess verifies the claim before the sample is kept. That turns the hardest tasks into lookups: for a
