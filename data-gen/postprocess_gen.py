@@ -20,6 +20,7 @@ import os
 import random
 import re
 import traceback
+import unicodedata
 from pathlib import Path
 from typing import Any, Optional
 
@@ -78,6 +79,18 @@ def _drop(reason: str, raw: str = "", custom_id: str = "") -> None:
                                           encoding="utf-8")
     except OSError:
         pass  # diagnostics must never break a run
+
+
+def _fold(s: str) -> str:
+    """Casefold and strip diacritics for a SUBSTRING test only.
+
+    These languages are written with inconsistent accenting, so a discriminator phrase quoted by the
+    generator will often differ from the reply by a diacritic or two. Matching loosely here makes the check
+    about the words rather than the keystrokes; it is never used to produce output.
+    """
+    s = unicodedata.normalize("NFD", (s or "").casefold())
+    s = "".join(c for c in s if unicodedata.category(c) != "Mn")
+    return re.sub(r"\s+", " ", s).strip()
 
 
 def _capture(resp, tag: str) -> None:
@@ -379,6 +392,16 @@ def _clean_verifier(raw: Any, msgs: list[dict]) -> dict:
         keep = [e for e in keep if len(e) <= 60][:8]
         if keep:
             out["brief_elements"] = keep
+
+    disc = raw.get("discriminator")
+    if isinstance(disc, dict):
+        keep = {}
+        for side in ("good", "bad"):
+            v = disc.get(side)
+            if isinstance(v, str) and 2 <= len(v.strip()) <= 120:
+                keep[side] = v.strip()
+        if keep:
+            out["discriminator"] = keep
 
     mw = raw.get("max_words")
     try:
@@ -829,12 +852,35 @@ def _to_record(seed: Seed, resp: Response) -> Optional[dict]:
         _drop("duplicate_responses")
         return None
     order = sorted(range(len(responses)), key=lambda i: {"best": 0, "partial": 1, "worst": 2}.get(quals[i], 1))
+
+    # VERIFY THE DISCRIMINATOR. The generator was asked to name the one concrete phrase that makes the worse
+    # reply worse; this checks the claim against the replies it actually wrote. It is the cheapest quality
+    # gate available -- a substring test, no tokens -- and it catches the failure that matters most: two
+    # replies that differ in wording but not in substance, which teach the policy nothing and which no
+    # programmatic reward can separate afterwards.
+    #
+    # Without a judge in the loop this is also what makes the factual tasks scoreable at all: the phrase is
+    # the ground truth, so "is the right value present" and "is the invented one absent" become lookups.
+    verifier = rec_verifier = _clean_verifier(data.get("verifier"), msgs)
+    disc = (rec_verifier or {}).get("discriminator") or {}
+    if disc:
+        best_t = texts[order[0]]
+        worst_t = texts[order[-1]]
+        bad_sides = []
+        g, b = disc.get("good"), disc.get("bad")
+        if g and not (_fold(g) in _fold(best_t) and _fold(g) not in _fold(worst_t)):
+            bad_sides.append("good")
+        if b and not (_fold(b) in _fold(worst_t) and _fold(b) not in _fold(best_t)):
+            bad_sides.append("bad")
+        if bad_sides:
+            _drop(f"discriminator_does_not_hold:{'+'.join(bad_sides)}", resp.text or "", resp.custom_id)
+            return None
     rec = {**base, "tags": _tags(data.get("tags"), md.get("tags", [])),
            "tasks": data.get("tasks") or md.get("tasks", []), "tools": md.get("tools", []),
            # The ground truth the programmatic scorers need (rl/verifiers.py). Kept even when empty so the
            # column exists for every row, and sanitised: a verifier the generator invented wrongly would
            # score the GOOD answer as bad, which is worse than having none.
-           "verifier": _clean_verifier(data.get("verifier"), msgs),
+           "verifier": verifier,
            "prompt_messages": msgs, "prompt_text": render_messages(msgs, add_generation_prompt=True),
            "ranking": [quals[i] for i in order],
            "rationale": [responses[i].get("why", "") for i in order],

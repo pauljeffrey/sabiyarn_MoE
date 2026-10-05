@@ -187,7 +187,11 @@ CHECKS: dict[str, list[Check]] = {
     ],
     # -------- competence held in, so the policy does not learn that refusing is always safe
     "world_knowledge_qa": [
-        Check("answered_without_a_tool", 0.30, True, fn="answers_without_tool",
+        # REMOVED: a 0.30 reward for answering WITHOUT a tool. An unnecessary search costs a second; a
+        # confident wrong answer costs trust. Rewarding the model for not looking things up was pushing it
+        # the wrong way -- and people work the other way round: you do not know the Rule of 72 until the day
+        # you look it up. What matters is that the answer is RIGHT, which the discriminator now scores.
+        Check("explains_rather_than_asserts", 0.30, True, fn="response_explains_how_or_why",
               why="this it genuinely knows; refusing or searching here is over-caution"),
         Check("did_not_refuse", 0.30, False, fn="admits_uncertainty",
               why="over-refusal is a real failure and some samples must teach that direction"),
@@ -309,9 +313,12 @@ CHECKS: dict[str, list[Check]] = {
                   "pattern-match the answer format will not transfer to numbers it has not seen"),
         Check("answer_is_stated_once", 0.15, True, fn="response_states_one_final_value",
               why="hedging across three candidate numbers is how a model avoids being scored wrong"),
-        Check("no_tool_for_mental_arithmetic", 0.10, False, pattern=R_TOOL_CALL,
-              why="these are deliberately within reach; reaching for a calculator here is the avoidance "
-                  "that tool_compute is for"),
+        # Reaching for a calculator is NOT penalised. Checking your own working against a tool is what a
+        # careful person does, and the answer being correct is what this task is scored on.
+        Check("answer_is_not_contradicted_by_its_own_working", 0.10, False,
+              fn="final_answer_contradicts_the_steps",
+              why="a stated answer that disagrees with the arithmetic above it is the one reasoning failure "
+                  "a reader cannot catch at a glance"),
     ],
     "summarization": [
         Check("is_actually_shorter", 0.20, True, fn="summary_is_shorter_than_source",
@@ -359,6 +366,24 @@ CHECKS: dict[str, list[Check]] = {
               pattern=r"as (?:you )?requested,? (?:here|i)|in exactly \w+ sentences,? |per your instruction",
               why="announcing compliance instead of complying is a reward-hacking tell"),
     ],
+    "structured_output": [
+        # The best-scoring task in the set. "Is this valid JSON" and "does it have the asked-for fields" are
+        # not proxies for anything -- they are the thing itself, decided by a parser. The judge is needed
+        # only for whether the extracted VALUES are the right ones.
+        Check("is_valid_json", 0.30, True, fn="response_is_valid_json",
+              why="a schema answer that does not parse is worthless regardless of content, and this is "
+                  "decided by json.loads rather than judged"),
+        Check("has_the_asked_for_fields", 0.30, True, fn="json_has_required_fields",
+              why="the prompt names the fields; whether they are present is a lookup"),
+        Check("no_invented_field", 0.15, False, fn="json_has_extra_fields",
+              why="adding fields nobody asked for is the common failure and breaks any consumer parsing it"),
+        Check("values_come_from_the_source", 0.15, False, fn="json_value_absent_from_source",
+              why="extraction means taking what is there, so a value absent from the passage was invented -- "
+                  "the same decidable check as a figure absent from a document"),
+        Check("no_prose_around_the_json", 0.10, False,
+              pattern=r"(?:here (?:is|'s) the|i have extracted|as requested|```(?!json))",
+              why="wrapping the object in commentary is what makes it unparseable in practice"),
+    ],
     "translation_english": [
         Check("output_differs_from_input", 0.30, True, fn="translation_differs_from_source",
               why="copying the source through is the failure the low-resource pairs actually produce"),
@@ -373,6 +398,18 @@ CHECKS: dict[str, list[Check]] = {
 
 # Checks applied to EVERY RL candidate regardless of task, because they are structural and cheap. A candidate
 # failing these is malformed rather than merely worse, so they gate before the task's own score is considered.
+# Applied to EVERY candidate, like the gates, but scored rather than gating: the discriminator is the answer
+# key the generator wrote for this specific pair, so it is the single most informative signal available and
+# it is available for every task. Adding it here is what let JUDGE_ONLY_TASKS be retired -- the factual tasks
+# are now scored on whether they state the right thing and avoid the wrong one, which is a lookup.
+DISCRIMINATOR: list[Check] = [
+    Check("states_the_key_fact", 0.60, True, fn="states_the_key_fact",
+          why="the phrase the better reply is supposed to contain, quoted by the generator and verified "
+              "against both replies before the sample was kept"),
+    Check("avoids_the_false_claim", 0.40, False, fn="repeats_the_false_claim",
+          why="the invented figure or fabricated familiarity that marks the worse reply"),
+]
+
 UNIVERSAL: list[Check] = [
     Check("has_a_response_or_a_call", 1.0, True, pattern=R_RESPONSE + "|" + R_TOOL_CALL, gate=True,
           why="a turn that neither answers nor calls anything is not a turn"),
@@ -393,18 +430,39 @@ UNIVERSAL: list[Check] = [
 # The reason is structural, not a missing check. For a world-knowledge question the wrong answer is
 # confidently wrong and procedurally identical to the right one: both answer without a tool, both explain,
 # neither refuses. Nothing a regex can see distinguishes them. That needs a judge.
-JUDGE_ONLY_TASKS = frozenset({
-    "world_knowledge_qa", "health_advice", "health_triage", "financial_analysis",
-})
+# EMPTY, deliberately. There is no judge model in this pipeline -- no capital for rubric scoring -- so a task
+# that cannot be scored programmatically cannot be trained on at all.
+#
+# These four used to be here because the procedural checks scored them below chance: a confident falsehood is
+# procedurally identical to a truth. The discriminator fixed that at the DATA level rather than the scorer
+# level. The generator now writes down the phrase that separates its two replies, postprocess verifies the
+# claim holds, and scoring becomes a substring lookup.
+JUDGE_ONLY_TASKS: frozenset[str] = frozenset()
 
 
 def judge_required(task: str) -> bool:
     return task in JUDGE_ONLY_TASKS
 
 
+# How much of a task's score comes from the discriminator rather than its own procedural checks. The
+# discriminator is the sharpest signal but it is one phrase, so it informs rather than decides: procedure
+# still carries the majority, which is what keeps "called a tool before answering" worth doing.
+DISCRIMINATOR_WEIGHT = 0.35
+
+
 def for_task(task: str) -> list[dict[str, Any]]:
-    """Serialisable checks for one task: the universal gates plus that task's own."""
-    return [asdict(c) for c in UNIVERSAL] + [asdict(c) for c in CHECKS.get(task, [])]
+    """Serialisable checks for one task: the universal gates, the discriminator, and the task's own.
+
+    The task's own checks are scaled to (1 - DISCRIMINATOR_WEIGHT) and the discriminator to
+    DISCRIMINATOR_WEIGHT, so every task's score still sums to 1.0 and remains comparable across tasks.
+    """
+    own = [asdict(c) for c in CHECKS.get(task, [])]
+    for c in own:
+        c["weight"] = round(c["weight"] * (1.0 - DISCRIMINATOR_WEIGHT), 4)
+    disc = [asdict(c) for c in DISCRIMINATOR]
+    for c in disc:
+        c["weight"] = round(c["weight"] * DISCRIMINATOR_WEIGHT, 4)
+    return [asdict(c) for c in UNIVERSAL] + disc + own
 
 
 def all_function_names() -> set[str]:

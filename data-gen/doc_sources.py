@@ -619,3 +619,131 @@ def fill_store(specs: Iterable[Any], store: Any, pool: "DocumentPool") -> int:
         })
         filled += 1
     return filled
+
+
+# --- chunking --------------------------------------------------------------------------------------------
+# A real retriever returns PASSAGES, not whole documents. Handing the model a 3,000-word article in one tool
+# result teaches it to read an article; handing it four labelled passages, two of which are from the wrong
+# section, teaches it to retrieve -- which is the behaviour this corpus exists for.
+#
+# Four things become possible that whole-document retrieval cannot express at all:
+#
+#   1. DISTRACTOR passages from the SAME document -- plausible, adjacent, and wrong. Much harder than an
+#      unrelated document, and much closer to what a real index returns.
+#   2. Honest insufficiency: return passages that genuinely do not contain the answer, instead of hiding the
+#      answer inside a document that does contain it. retrieval_insufficient stops being a fiction.
+#   3. Multi-hop: the answer needs passage 4 AND passage 9.
+#   4. A follow-up call for the NEIGHBOURING passage when one is cut off mid-point.
+#
+# It is also cheaper: ~800 words of passages in the prompt instead of ~3,000.
+
+CHUNK_WORDS = 190          # ~250 tokens: large enough to carry a fact with its qualifier
+CHUNK_MIN_WORDS = 60       # below this a passage is a heading with nothing under it
+
+
+def chunk_document(text: str, *, target_words: int = CHUNK_WORDS) -> list[dict]:
+    """Split a document into labelled passages, respecting its own section headings.
+
+    Returns [{"id", "section", "text", "words"}]. The id is stable and sequential so a sample can record
+    WHICH passages it was shown and which actually held the answer -- that is what makes looking in the wrong
+    place scoreable rather than invisible.
+    """
+    sections: list[tuple[str, list[str]]] = [("", [])]
+    for line in (text or "").splitlines():
+        s = line.strip()
+        m = re.fullmatch(r"=+\s*(.+?)\s*=+", s)
+        if m:
+            sections.append((m.group(1).strip(), []))
+        elif s:
+            sections[-1][1].append(s)
+
+    def _split_long(para: str, limit: int) -> list[str]:
+        """Break a paragraph that is itself longer than a passage, on sentence boundaries.
+
+        Needed because paragraph breaks are not guaranteed: a 2,000-word unbroken paragraph would otherwise
+        become one 2,000-word "passage", which defeats retrieving a passage at all.
+        """
+        if len(para.split()) <= limit * 1.4:
+            return [para]
+        out, buf, n = [], [], 0
+        for sent in re.split(r"(?<=[.!?])\s+", para):
+            w = len(sent.split())
+            if n and n + w > limit:
+                out.append(" ".join(buf))
+                buf, n = [], 0
+            buf.append(sent)
+            n += w
+        if buf:
+            out.append(" ".join(buf))
+        # A "sentence" can still be longer than a passage -- table dumps and run-on text have no terminal
+        # punctuation at all. Fall back to a hard word split so passage size is bounded whatever the input.
+        bounded: list[str] = []
+        for piece in out:
+            words = piece.split()
+            if len(words) <= limit * 1.4:
+                bounded.append(piece)
+                continue
+            for i in range(0, len(words), limit):
+                bounded.append(" ".join(words[i:i + limit]))
+        return bounded
+
+    chunks: list[dict] = []
+    for heading, paras in sections:
+        paras = [piece for para in paras for piece in _split_long(para, target_words)]
+        buf: list[str] = []
+        n = 0
+        for para in paras:
+            w = len(para.split())
+            # Keep paragraphs whole where possible: a fact split across a boundary is unanswerable from
+            # either half, which would make the sample unfair rather than hard.
+            if n and n + w > target_words * 1.4:
+                chunks.append({"section": heading, "text": "\n".join(buf), "words": n})
+                buf, n = [], 0
+            buf.append(para)
+            n += w
+            if n >= target_words:
+                chunks.append({"section": heading, "text": "\n".join(buf), "words": n})
+                buf, n = [], 0
+        if buf and n >= CHUNK_MIN_WORDS:
+            chunks.append({"section": heading, "text": "\n".join(buf), "words": n})
+        elif buf and chunks:
+            chunks[-1]["text"] += "\n" + "\n".join(buf)
+            chunks[-1]["words"] += n
+    for i, c in enumerate(chunks, start=1):
+        c["id"] = f"c{i}"
+    return [c for c in chunks if c["words"] >= CHUNK_MIN_WORDS]
+
+
+def chunks_containing(chunks: list[dict], phrases: Iterable[str]) -> list[str]:
+    """Which passage ids contain any of `phrases`. Used to record the ANSWER-BEARING passages, so a reply
+    that cites the wrong one can be scored down."""
+    want = [_norm(p) for p in phrases if p and str(p).strip()]
+    if not want:
+        return []
+    out = []
+    for c in chunks:
+        hay = _norm(c["text"])
+        if any(w in hay for w in want):
+            out.append(c["id"])
+    return out
+
+
+def _norm(s: str) -> str:
+    import unicodedata
+    s = unicodedata.normalize("NFD", (s or "").casefold())
+    s = "".join(ch for ch in s if unicodedata.category(ch) != "Mn")
+    return re.sub(r"\s+", " ", s).strip()
+
+
+def render_retrieval(chunks: list[dict], *, scores: Optional[list[float]] = None) -> str:
+    """Format passages as a retriever would return them: id, section, a score, then the text.
+
+    The score is cosmetic but load-bearing for the lesson -- a real result is ranked, and the top hit is
+    often not the one that answers the question.
+    """
+    out = []
+    for i, c in enumerate(chunks):
+        sc = scores[i] if scores and i < len(scores) else max(0.30, 0.92 - 0.11 * i)
+        head = f"[{c['id']} | {c['section'] or 'untitled'} | score {sc:.2f}]"
+        out.append(f"{head}\n{c['text']}")
+    return "\n\n".join(out)

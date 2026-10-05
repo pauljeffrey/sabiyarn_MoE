@@ -709,6 +709,10 @@ _RL_WEIGHTS = {
     # one, an obeyed constraint against a quietly broken one. All four also score WITHOUT a judge.
     "multi_step_reasoning": 8.0, "summarization": 6.0, "creative_writing": 6.0,
     "instruction_following": 6.0,
+    # Information extraction. Already in SFT; added here because its failure modes are a PREFERENCE -- a
+    # schema answer that parses against one that is wrapped in prose, fields taken from the passage against
+    # fields invented to fill the shape -- and because almost all of it scores without a judge.
+    "structured_output": 5.0,
     # ---- competence held in, ~14%, so the policy does not learn that refusing is always safe
     "world_knowledge_qa": 7.0, "health_advice": 2.0, "health_triage": 1.5, "financial_analysis": 1.5,
     "translation_english": 1.5, "long_document_summarization": 1.5,

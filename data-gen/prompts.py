@@ -645,9 +645,19 @@ This is what makes the sample checkable, so it must describe the prefix you actu
   - "brief_elements": for a writing brief, the things the piece MUST contain -- names, places, the required
     ending -- as a list of short strings. Omit when there was no brief.
   - "max_words": when the user asked for a length, the number of words. Omit otherwise.
-These must be EXACT: "expected_answer" has to be the value the best reply states, and a "forbidden_word" has
-to be a word the best reply genuinely avoids. A wrong verifier is worse than no verifier -- it would score
-the good answer as bad -- so omit a field you are unsure of rather than guessing it.
+  - "discriminator": REQUIRED. The one concrete thing that makes the worse reply worse, as
+    {{"good": "<a short exact phrase, number or name the BEST reply contains and the worst does NOT>",
+      "bad":  "<a short exact phrase, number or name the WORST reply contains and the best does NOT>"}}
+    Either side may be omitted if only one applies, but at least one is required. Keep each under 12 words
+    and quote it EXACTLY as it appears in the reply -- it is matched literally, not interpreted. For a
+    factual question this is usually the correct value against the invented one; for an honesty sample it is
+    the admission against the fabricated claim. If you cannot name such a phrase, the two replies do not
+    differ in substance and you should rewrite them until they do.
+These must be EXACT: "expected_answer" has to be the value the best reply states, a "forbidden_word" has to
+be a word the best reply genuinely avoids, and the "discriminator" phrases must be literal substrings of the
+replies they belong to. A wrong verifier is worse than no verifier -- it would score the good answer as bad
+-- so omit a field you are unsure of rather than guessing it. The discriminator is CHECKED against both
+replies after you return, and the sample is discarded if it does not hold.
 
 Return JSON:
 {{"prompt_turns": [ ...turn objects exactly as the OUTPUT CONTRACT describes... ],

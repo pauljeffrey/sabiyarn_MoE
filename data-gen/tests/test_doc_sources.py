@@ -252,3 +252,78 @@ def test_live_search_and_fetch():
     pg = w.plaintext("Drip irrigation")
     assert pg and len(pg["text"].split()) > 1000
     assert technicality(clean(pg["text"]), pg["title"]) >= MIN_TECHNICALITY
+
+
+# --------------------------------------------------------------------------- chunking
+# A real retriever returns PASSAGES. Whole-document retrieval cannot express a distractor from the same
+# document, honest insufficiency, multi-hop, or a follow-up call for the neighbouring passage.
+
+def test_chunking_respects_section_headings():
+    from doc_sources import chunk_document
+    text = ("== Design ==\n" + "design word " * 150 + "\n== Dosage ==\n" + "dosage word " * 150)
+    cs = chunk_document(text)
+    assert cs, "nothing chunked"
+    assert {c["section"] for c in cs} == {"Design", "Dosage"}
+    assert all(c["id"].startswith("c") for c in cs)
+    assert [c["id"] for c in cs] == [f"c{i}" for i in range(1, len(cs) + 1)], "ids must be sequential"
+
+
+def test_chunks_are_a_usable_size():
+    from doc_sources import CHUNK_MIN_WORDS, chunk_document
+    cs = chunk_document("== S ==\n" + " ".join(f"w{i}" for i in range(2000)))
+    assert cs
+    assert all(c["words"] >= CHUNK_MIN_WORDS for c in cs), "a heading with nothing under it is not a passage"
+    assert max(c["words"] for c in cs) < 400, "a passage this long defeats the point of retrieving one"
+
+
+def test_a_tiny_trailing_passage_is_merged_not_emitted():
+    """A fact split across a boundary is unanswerable from either half, which makes a sample unfair rather
+    than hard."""
+    from doc_sources import CHUNK_MIN_WORDS, chunk_document
+    cs = chunk_document("== S ==\n" + "word " * 200 + "\nshort tail here")
+    assert all(c["words"] >= CHUNK_MIN_WORDS for c in cs)
+    assert "short tail here" in " ".join(c["text"] for c in cs), "the tail must not be lost"
+
+
+def test_chunks_containing_finds_the_answer_bearing_passage():
+    """This is what makes looking in the WRONG passage scoreable rather than invisible."""
+    from doc_sources import chunk_document, chunks_containing
+    text = ("== A ==\n" + "filler " * 200 + "\n== B ==\n" + "filler " * 100
+            + " the discharge rate is 4 l/h " + "filler " * 100)
+    cs = chunk_document(text)
+    hits = chunks_containing(cs, ["discharge rate is 4 l/h"])
+    assert len(hits) == 1
+    assert chunks_containing(cs, ["a phrase that is not present anywhere"]) == []
+    assert chunks_containing(cs, []) == [], "no phrases means no claim, not every chunk"
+
+
+def test_chunks_containing_ignores_accents_and_case():
+    from doc_sources import chunks_containing
+    cs = [{"id": "c1", "text": "Ọ̀pọ̀lọpọ̀ NAIRA were spent", "section": "", "words": 4}]
+    assert chunks_containing(cs, ["opolopo naira"]) == ["c1"]
+
+
+def test_render_retrieval_looks_like_a_ranked_result():
+    from doc_sources import render_retrieval
+    out = render_retrieval([{"id": "c1", "section": "Dosage", "text": "body one", "words": 2},
+                            {"id": "c2", "section": "", "text": "body two", "words": 2}])
+    assert "[c1 | Dosage | score" in out
+    assert "untitled" in out, "a passage with no heading still needs a label"
+    assert "body one" in out and "body two" in out
+    first = float(out.split("score ")[1].split("]")[0])
+    second = float(out.split("score ")[2].split("]")[0])
+    assert first > second, "a real result is ranked, and the top hit is often not the answer"
+
+
+def test_chunking_a_real_pooled_document():
+    import json
+    from pathlib import Path
+    from doc_sources import chunk_document
+    pool = Path(__file__).resolve().parent.parent / "data" / "document_pool.jsonl"
+    if not pool.exists():
+        pytest.skip("no document pool on disk")
+    doc = json.loads(pool.read_text(encoding="utf-8").splitlines()[0])
+    cs = chunk_document(doc["text"])
+    assert len(cs) >= 5, f"a {doc['words']}-word document should yield several passages, got {len(cs)}"
+    # Chunking must not lose content.
+    assert sum(c["words"] for c in cs) >= doc["words"] * 0.7

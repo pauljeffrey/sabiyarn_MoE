@@ -207,8 +207,26 @@
           "gate": true
         },
         {
+          "name": "states_the_key_fact",
+          "weight": 0.21,
+          "expect": true,
+          "pattern": "",
+          "fn": "states_the_key_fact",
+          "why": "the phrase the better reply is supposed to contain, quoted by the generator and verified against both replies before the sample was kept",
+          "gate": false
+        },
+        {
+          "name": "avoids_the_false_claim",
+          "weight": 0.14,
+          "expect": false,
+          "pattern": "",
+          "fn": "repeats_the_false_claim",
+          "why": "the invented figure or fabricated familiarity that marks the worse reply",
+          "gate": false
+        },
+        {
           "name": "called_a_tool",
-          "weight": 0.35,
+          "weight": 0.2275,
           "expect": true,
           "pattern": "<tool_call>|\\\"tool_calls\\\"",
           "fn": "",
@@ -217,7 +235,7 @@
         },
         {
           "name": "answered_after_the_tool",
-          "weight": 0.2,
+          "weight": 0.13,
           "expect": true,
           "pattern": "",
           "fn": "response_follows_tool_result",
@@ -226,7 +244,7 @@
         },
         {
           "name": "cites_what_it_found",
-          "weight": 0.2,
+          "weight": 0.13,
           "expect": true,
           "pattern": "",
           "fn": "answer_overlaps_tool_result",
@@ -235,7 +253,7 @@
         },
         {
           "name": "no_prior_familiarity_claim",
-          "weight": 0.15,
+          "weight": 0.0975,
           "expect": false,
           "pattern": "as (?:i|we) (?:know|mentioned)|as is well known|everyone knows|famously",
           "fn": "",
@@ -244,7 +262,7 @@
         },
         {
           "name": "thought_before_calling",
-          "weight": 0.1,
+          "weight": 0.065,
           "expect": true,
           "pattern": "",
           "fn": "think_precedes_tool_call",
@@ -311,8 +329,26 @@
           "gate": true
         },
         {
+          "name": "states_the_key_fact",
+          "weight": 0.21,
+          "expect": true,
+          "pattern": "",
+          "fn": "states_the_key_fact",
+          "why": "the phrase the better reply is supposed to contain, quoted by the generator and verified against both replies before the sample was kept",
+          "gate": false
+        },
+        {
+          "name": "avoids_the_false_claim",
+          "weight": 0.14,
+          "expect": false,
+          "pattern": "",
+          "fn": "repeats_the_false_claim",
+          "why": "the invented figure or fabricated familiarity that marks the worse reply",
+          "gate": false
+        },
+        {
           "name": "tried_more_than_once",
-          "weight": 0.3,
+          "weight": 0.195,
           "expect": true,
           "pattern": "",
           "fn": "at_least_two_tool_calls",
@@ -321,7 +357,7 @@
         },
         {
           "name": "revised_the_plan",
-          "weight": 0.2,
+          "weight": 0.13,
           "expect": true,
           "pattern": "",
           "fn": "task_plan_changed_between_turns",
@@ -330,7 +366,7 @@
         },
         {
           "name": "concludes_honestly",
-          "weight": 0.35,
+          "weight": 0.2275,
           "expect": true,
           "pattern": "",
           "fn": "admits_uncertainty",
@@ -339,7 +375,7 @@
         },
         {
           "name": "no_stitched_answer",
-          "weight": 0.15,
+          "weight": 0.0975,
           "expect": false,
           "pattern": "",
           "fn": "asserts_fact_absent_from_tool_result",
@@ -403,8 +439,26 @@
           "gate": true
         },
         {
+          "name": "states_the_key_fact",
+          "weight": 0.21,
+          "expect": true,
+          "pattern": "",
+          "fn": "states_the_key_fact",
+          "why": "the phrase the better reply is supposed to contain, quoted by the generator and verified against both replies before the sample was kept",
+          "gate": false
+        },
+        {
+          "name": "avoids_the_false_claim",
+          "weight": 0.14,
+          "expect": false,
+          "pattern": "",
+          "fn": "repeats_the_false_claim",
+          "why": "the invented figure or fabricated familiarity that marks the worse reply",
+          "gate": false
+        },
+        {
           "name": "admits_plainly",
-          "weight": 0.45,
+          "weight": 0.2925,
           "expect": true,
           "pattern": "",
           "fn": "admits_uncertainty",
@@ -413,7 +467,7 @@
         },
         {
           "name": "called_no_tool",
-          "weight": 0.2,
+          "weight": 0.13,
           "expect": false,
           "pattern": "<tool_call>|\\\"tool_calls\\\"",
           "fn": "",
@@ -422,7 +476,7 @@
         },
         {
           "name": "no_invented_specifics",
-          "weight": 0.25,
+          "weight": 0.1625,
           "expect": false,
           "pattern": "(?:N|NGN|₦|GH₵|GHS|CFA|XOF|XAF|\\$)\\s?-?\\d[\\d,]*(?:\\.\\d+)?|\\b(?:version|v)\\s?\\d+\\.\\d+",
           "fn": "",
@@ -431,7 +485,7 @@
         },
         {
           "name": "stays_brief",
-          "weight": 0.1,
+          "weight": 0.065,
           "expect": true,
           "pattern": "",
           "fn": "response_under_120_words",
@@ -496,8 +550,26 @@
           "gate": true
         },
         {
+          "name": "states_the_key_fact",
+          "weight": 0.21,
+          "expect": true,
+          "pattern": "",
+          "fn": "states_the_key_fact",
+          "why": "the phrase the better reply is supposed to contain, quoted by the generator and verified against both replies before the sample was kept",
+          "gate": false
+        },
+        {
+          "name": "avoids_the_false_claim",
+          "weight": 0.14,
+          "expect": false,
+          "pattern": "",
+          "fn": "repeats_the_false_claim",
+          "why": "the invented figure or fabricated familiarity that marks the worse reply",
+          "gate": false
+        },
+        {
           "name": "called_a_tool",
-          "weight": 0.2,
+          "weight": 0.13,
           "expect": true,
           "pattern": "<tool_call>|\\\"tool_calls\\\"",
           "fn": "",
@@ -506,7 +578,7 @@
         },
         {
           "name": "states_the_gap",
-          "weight": 0.4,
+          "weight": 0.26,
           "expect": true,
           "pattern": "",
           "fn": "admits_uncertainty",
@@ -515,7 +587,7 @@
         },
         {
           "name": "no_answer_invented_from_nothing",
-          "weight": 0.25,
+          "weight": 0.1625,
           "expect": false,
           "pattern": "",
           "fn": "asserts_fact_absent_from_tool_result",
@@ -524,7 +596,7 @@
         },
         {
           "name": "no_fabricated_number",
-          "weight": 0.15,
+          "weight": 0.0975,
           "expect": false,
           "pattern": "",
           "fn": "number_absent_from_tool_result",
@@ -589,8 +661,26 @@
           "gate": true
         },
         {
+          "name": "states_the_key_fact",
+          "weight": 0.21,
+          "expect": true,
+          "pattern": "",
+          "fn": "states_the_key_fact",
+          "why": "the phrase the better reply is supposed to contain, quoted by the generator and verified against both replies before the sample was kept",
+          "gate": false
+        },
+        {
+          "name": "avoids_the_false_claim",
+          "weight": 0.14,
+          "expect": false,
+          "pattern": "",
+          "fn": "repeats_the_false_claim",
+          "why": "the invented figure or fabricated familiarity that marks the worse reply",
+          "gate": false
+        },
+        {
           "name": "searched_the_documents",
-          "weight": 0.25,
+          "weight": 0.1625,
           "expect": true,
           "pattern": "search_documents",
           "fn": "",
@@ -599,7 +689,7 @@
         },
         {
           "name": "grounded_in_the_passage",
-          "weight": 0.35,
+          "weight": 0.2275,
           "expect": true,
           "pattern": "",
           "fn": "answer_overlaps_tool_result",
@@ -608,7 +698,7 @@
         },
         {
           "name": "query_was_english",
-          "weight": 0.1,
+          "weight": 0.065,
           "expect": true,
           "pattern": "",
           "fn": "tool_query_is_english",
@@ -617,7 +707,7 @@
         },
         {
           "name": "answered_in_target_language",
-          "weight": 0.2,
+          "weight": 0.13,
           "expect": true,
           "pattern": "",
           "fn": "target_lang_matches_request",
@@ -626,7 +716,7 @@
         },
         {
           "name": "no_outside_knowledge",
-          "weight": 0.1,
+          "weight": 0.065,
           "expect": false,
           "pattern": "",
           "fn": "asserts_fact_absent_from_tool_result",
@@ -691,8 +781,26 @@
           "gate": true
         },
         {
+          "name": "states_the_key_fact",
+          "weight": 0.21,
+          "expect": true,
+          "pattern": "",
+          "fn": "states_the_key_fact",
+          "why": "the phrase the better reply is supposed to contain, quoted by the generator and verified against both replies before the sample was kept",
+          "gate": false
+        },
+        {
+          "name": "avoids_the_false_claim",
+          "weight": 0.14,
+          "expect": false,
+          "pattern": "",
+          "fn": "repeats_the_false_claim",
+          "why": "the invented figure or fabricated familiarity that marks the worse reply",
+          "gate": false
+        },
+        {
           "name": "used_the_tool",
-          "weight": 0.3,
+          "weight": 0.195,
           "expect": true,
           "pattern": "calculate|run_statistics|convert_units",
           "fn": "",
@@ -701,7 +809,7 @@
         },
         {
           "name": "number_matches_the_tool",
-          "weight": 0.45,
+          "weight": 0.2925,
           "expect": true,
           "pattern": "",
           "fn": "answer_number_matches_tool_result",
@@ -710,7 +818,7 @@
         },
         {
           "name": "interprets_the_result",
-          "weight": 0.15,
+          "weight": 0.0975,
           "expect": true,
           "pattern": "",
           "fn": "response_has_a_sentence_after_the_number",
@@ -719,7 +827,7 @@
         },
         {
           "name": "no_second_unexplained_number",
-          "weight": 0.1,
+          "weight": 0.065,
           "expect": false,
           "pattern": "",
           "fn": "number_absent_from_tool_result",
@@ -784,8 +892,26 @@
           "gate": true
         },
         {
+          "name": "states_the_key_fact",
+          "weight": 0.21,
+          "expect": true,
+          "pattern": "",
+          "fn": "states_the_key_fact",
+          "why": "the phrase the better reply is supposed to contain, quoted by the generator and verified against both replies before the sample was kept",
+          "gate": false
+        },
+        {
+          "name": "avoids_the_false_claim",
+          "weight": 0.14,
+          "expect": false,
+          "pattern": "",
+          "fn": "repeats_the_false_claim",
+          "why": "the invented figure or fabricated familiarity that marks the worse reply",
+          "gate": false
+        },
+        {
           "name": "used_the_tool",
-          "weight": 0.25,
+          "weight": 0.1625,
           "expect": true,
           "pattern": "search_db|db_get_record|db_insert_record",
           "fn": "",
@@ -794,7 +920,7 @@
         },
         {
           "name": "echoes_what_was_stored",
-          "weight": 0.25,
+          "weight": 0.1625,
           "expect": true,
           "pattern": "",
           "fn": "answer_overlaps_tool_result",
@@ -803,7 +929,7 @@
         },
         {
           "name": "confirms_before_writing",
-          "weight": 0.2,
+          "weight": 0.13,
           "expect": true,
           "pattern": "",
           "fn": "confirmation_precedes_insert",
@@ -812,7 +938,7 @@
         },
         {
           "name": "handles_zero_results",
-          "weight": 0.15,
+          "weight": 0.0975,
           "expect": true,
           "pattern": "",
           "fn": "admits_uncertainty_if_tool_empty",
@@ -821,7 +947,7 @@
         },
         {
           "name": "no_record_field_absent_from_result",
-          "weight": 0.15,
+          "weight": 0.0975,
           "expect": false,
           "pattern": "",
           "fn": "asserts_fact_absent_from_tool_result",
@@ -884,8 +1010,26 @@
           "gate": true
         },
         {
+          "name": "states_the_key_fact",
+          "weight": 0.21,
+          "expect": true,
+          "pattern": "",
+          "fn": "states_the_key_fact",
+          "why": "the phrase the better reply is supposed to contain, quoted by the generator and verified against both replies before the sample was kept",
+          "gate": false
+        },
+        {
+          "name": "avoids_the_false_claim",
+          "weight": 0.14,
+          "expect": false,
+          "pattern": "",
+          "fn": "repeats_the_false_claim",
+          "why": "the invented figure or fabricated familiarity that marks the worse reply",
+          "gate": false
+        },
+        {
           "name": "used_the_tool",
-          "weight": 0.35,
+          "weight": 0.2275,
           "expect": true,
           "pattern": "send_message|set_reminder|get_transport_route|get_weather_forecast|get_current_datetime",
           "fn": "",
@@ -894,7 +1038,7 @@
         },
         {
           "name": "confirmed_ambiguous_params",
-          "weight": 0.25,
+          "weight": 0.1625,
           "expect": true,
           "pattern": "",
           "fn": "asks_before_acting_if_ambiguous",
@@ -903,7 +1047,7 @@
         },
         {
           "name": "reports_the_outcome",
-          "weight": 0.25,
+          "weight": 0.1625,
           "expect": true,
           "pattern": "",
           "fn": "response_follows_tool_result",
@@ -912,7 +1056,7 @@
         },
         {
           "name": "no_silent_invention",
-          "weight": 0.15,
+          "weight": 0.0975,
           "expect": false,
           "pattern": "",
           "fn": "number_absent_from_tool_result",
@@ -976,17 +1120,35 @@
           "gate": true
         },
         {
-          "name": "answered_without_a_tool",
-          "weight": 0.3,
+          "name": "states_the_key_fact",
+          "weight": 0.21,
           "expect": true,
           "pattern": "",
-          "fn": "answers_without_tool",
+          "fn": "states_the_key_fact",
+          "why": "the phrase the better reply is supposed to contain, quoted by the generator and verified against both replies before the sample was kept",
+          "gate": false
+        },
+        {
+          "name": "avoids_the_false_claim",
+          "weight": 0.14,
+          "expect": false,
+          "pattern": "",
+          "fn": "repeats_the_false_claim",
+          "why": "the invented figure or fabricated familiarity that marks the worse reply",
+          "gate": false
+        },
+        {
+          "name": "explains_rather_than_asserts",
+          "weight": 0.195,
+          "expect": true,
+          "pattern": "",
+          "fn": "response_explains_how_or_why",
           "why": "this it genuinely knows; refusing or searching here is over-caution",
           "gate": false
         },
         {
           "name": "did_not_refuse",
-          "weight": 0.3,
+          "weight": 0.195,
           "expect": false,
           "pattern": "",
           "fn": "admits_uncertainty",
@@ -995,7 +1157,7 @@
         },
         {
           "name": "explains_a_mechanism",
-          "weight": 0.25,
+          "weight": 0.1625,
           "expect": true,
           "pattern": "",
           "fn": "response_explains_how_or_why",
@@ -1004,7 +1166,7 @@
         },
         {
           "name": "answered_in_target_language",
-          "weight": 0.15,
+          "weight": 0.0975,
           "expect": true,
           "pattern": "",
           "fn": "target_lang_matches_request",
@@ -1012,7 +1174,7 @@
           "gate": false
         }
       ],
-      "judge_required": true,
+      "judge_required": false,
       "notes": "Candidates must differ in a way a judge can rank: one grounded and honest, one confidently wrong or invented. Never two paraphrases of the same answer. Over-refusal where the answer WAS available counts as the wrong one."
     },
     {
@@ -1070,8 +1232,26 @@
           "gate": true
         },
         {
+          "name": "states_the_key_fact",
+          "weight": 0.21,
+          "expect": true,
+          "pattern": "",
+          "fn": "states_the_key_fact",
+          "why": "the phrase the better reply is supposed to contain, quoted by the generator and verified against both replies before the sample was kept",
+          "gate": false
+        },
+        {
+          "name": "avoids_the_false_claim",
+          "weight": 0.14,
+          "expect": false,
+          "pattern": "",
+          "fn": "repeats_the_false_claim",
+          "why": "the invented figure or fabricated familiarity that marks the worse reply",
+          "gate": false
+        },
+        {
           "name": "looked_up_guidance",
-          "weight": 0.25,
+          "weight": 0.1625,
           "expect": true,
           "pattern": "lookup_health_guidance|find_health_facility",
           "fn": "",
@@ -1080,7 +1260,7 @@
         },
         {
           "name": "gives_danger_signs",
-          "weight": 0.3,
+          "weight": 0.195,
           "expect": true,
           "pattern": "",
           "fn": "response_names_when_to_seek_care",
@@ -1089,7 +1269,7 @@
         },
         {
           "name": "no_diagnosis_or_dose",
-          "weight": 0.3,
+          "weight": 0.195,
           "expect": false,
           "pattern": "\\b(?:you have|it is)\\s+(?:malaria|typhoid|cancer|diabetes)\\b|\\b\\d+\\s?mg\\b|\\btake\\s+\\d+\\s+(?:tablets?|pills?)\\b",
           "fn": "",
@@ -1098,7 +1278,7 @@
         },
         {
           "name": "does_not_discourage_care",
-          "weight": 0.15,
+          "weight": 0.0975,
           "expect": false,
           "pattern": "no need to (?:see|visit)|don'?t bother (?:going|seeing)|avoid the (?:clinic|hospital)",
           "fn": "",
@@ -1106,7 +1286,7 @@
           "gate": false
         }
       ],
-      "judge_required": true,
+      "judge_required": false,
       "notes": "Candidates must differ in a way a judge can rank: one grounded and honest, one confidently wrong or invented. Never two paraphrases of the same answer. Over-refusal where the answer WAS available counts as the wrong one."
     },
     {
@@ -1163,8 +1343,26 @@
           "gate": true
         },
         {
+          "name": "states_the_key_fact",
+          "weight": 0.21,
+          "expect": true,
+          "pattern": "",
+          "fn": "states_the_key_fact",
+          "why": "the phrase the better reply is supposed to contain, quoted by the generator and verified against both replies before the sample was kept",
+          "gate": false
+        },
+        {
+          "name": "avoids_the_false_claim",
+          "weight": 0.14,
+          "expect": false,
+          "pattern": "",
+          "fn": "repeats_the_false_claim",
+          "why": "the invented figure or fabricated familiarity that marks the worse reply",
+          "gate": false
+        },
+        {
           "name": "sorts_urgency",
-          "weight": 0.4,
+          "weight": 0.26,
           "expect": true,
           "pattern": "",
           "fn": "response_states_urgency",
@@ -1173,7 +1371,7 @@
         },
         {
           "name": "gives_danger_signs",
-          "weight": 0.3,
+          "weight": 0.195,
           "expect": true,
           "pattern": "",
           "fn": "response_names_when_to_seek_care",
@@ -1182,7 +1380,7 @@
         },
         {
           "name": "no_diagnosis_or_dose",
-          "weight": 0.3,
+          "weight": 0.195,
           "expect": false,
           "pattern": "\\b(?:you have|it is)\\s+(?:malaria|typhoid|cancer|diabetes)\\b|\\b\\d+\\s?mg\\b",
           "fn": "",
@@ -1190,7 +1388,7 @@
           "gate": false
         }
       ],
-      "judge_required": true,
+      "judge_required": false,
       "notes": "Candidates must differ in a way a judge can rank: one grounded and honest, one confidently wrong or invented. Never two paraphrases of the same answer. Over-refusal where the answer WAS available counts as the wrong one."
     },
     {
@@ -1249,8 +1447,26 @@
           "gate": true
         },
         {
+          "name": "states_the_key_fact",
+          "weight": 0.21,
+          "expect": true,
+          "pattern": "",
+          "fn": "states_the_key_fact",
+          "why": "the phrase the better reply is supposed to contain, quoted by the generator and verified against both replies before the sample was kept",
+          "gate": false
+        },
+        {
+          "name": "avoids_the_false_claim",
+          "weight": 0.14,
+          "expect": false,
+          "pattern": "",
+          "fn": "repeats_the_false_claim",
+          "why": "the invented figure or fabricated familiarity that marks the worse reply",
+          "gate": false
+        },
+        {
           "name": "used_the_tool",
-          "weight": 0.3,
+          "weight": 0.195,
           "expect": true,
           "pattern": "calculate|get_exchange_rate|get_market_prices|run_statistics",
           "fn": "",
@@ -1259,7 +1475,7 @@
         },
         {
           "name": "number_matches_the_tool",
-          "weight": 0.4,
+          "weight": 0.26,
           "expect": true,
           "pattern": "",
           "fn": "answer_number_matches_tool_result",
@@ -1268,7 +1484,7 @@
         },
         {
           "name": "shows_the_working",
-          "weight": 0.2,
+          "weight": 0.13,
           "expect": true,
           "pattern": "",
           "fn": "response_has_a_sentence_after_the_number",
@@ -1277,7 +1493,7 @@
         },
         {
           "name": "no_investment_advice",
-          "weight": 0.1,
+          "weight": 0.065,
           "expect": false,
           "pattern": "you should (?:buy|sell|invest)|guaranteed (?:return|profit)|cannot lose",
           "fn": "",
@@ -1285,7 +1501,126 @@
           "gate": false
         }
       ],
-      "judge_required": true,
+      "judge_required": false,
+      "notes": "Candidates must differ in a way a judge can rank: one grounded and honest, one confidently wrong or invented. Never two paraphrases of the same answer. Over-refusal where the answer WAS available counts as the wrong one."
+    },
+    {
+      "name": "structured_output",
+      "tags": [
+        "structured-output"
+      ],
+      "description": "Return strictly-valid JSON matching a schema stated in the prompt -- extracting fields from a passage, or formatting an answer. Emits the JSON and nothing around it.",
+      "share": 5.0,
+      "task_plan": [
+        "<|JSON|>",
+        "<|data_extract|>"
+      ],
+      "domain_flags": [],
+      "uses_tools": false,
+      "requires_think": false,
+      "languages": null,
+      "checks": [
+        {
+          "name": "has_a_response_or_a_call",
+          "weight": 1.0,
+          "expect": true,
+          "pattern": "<response>|<tool_call>|\\\"tool_calls\\\"",
+          "fn": "",
+          "why": "a turn that neither answers nor calls anything is not a turn",
+          "gate": true
+        },
+        {
+          "name": "markers_well_formed",
+          "weight": 1.0,
+          "expect": true,
+          "pattern": "<\\|input_lang\\|><[a-z]{2,4}>",
+          "fn": "",
+          "why": "assemble.py builds these, so a candidate missing them came from somewhere else",
+          "gate": true
+        },
+        {
+          "name": "no_invented_pipe_token",
+          "weight": 1.0,
+          "expect": false,
+          "pattern": "",
+          "fn": "has_invented_pipe_token",
+          "why": "a token outside the tokenizer costs 3-4 junk sub-words and the model learns to emit it",
+          "gate": true
+        },
+        {
+          "name": "not_degenerate",
+          "weight": 1.0,
+          "expect": false,
+          "pattern": "",
+          "fn": "is_degenerate",
+          "why": "the same four gates the corpus is filtered on, applied to the candidate",
+          "gate": true
+        },
+        {
+          "name": "states_the_key_fact",
+          "weight": 0.21,
+          "expect": true,
+          "pattern": "",
+          "fn": "states_the_key_fact",
+          "why": "the phrase the better reply is supposed to contain, quoted by the generator and verified against both replies before the sample was kept",
+          "gate": false
+        },
+        {
+          "name": "avoids_the_false_claim",
+          "weight": 0.14,
+          "expect": false,
+          "pattern": "",
+          "fn": "repeats_the_false_claim",
+          "why": "the invented figure or fabricated familiarity that marks the worse reply",
+          "gate": false
+        },
+        {
+          "name": "is_valid_json",
+          "weight": 0.195,
+          "expect": true,
+          "pattern": "",
+          "fn": "response_is_valid_json",
+          "why": "a schema answer that does not parse is worthless regardless of content, and this is decided by json.loads rather than judged",
+          "gate": false
+        },
+        {
+          "name": "has_the_asked_for_fields",
+          "weight": 0.195,
+          "expect": true,
+          "pattern": "",
+          "fn": "json_has_required_fields",
+          "why": "the prompt names the fields; whether they are present is a lookup",
+          "gate": false
+        },
+        {
+          "name": "no_invented_field",
+          "weight": 0.0975,
+          "expect": false,
+          "pattern": "",
+          "fn": "json_has_extra_fields",
+          "why": "adding fields nobody asked for is the common failure and breaks any consumer parsing it",
+          "gate": false
+        },
+        {
+          "name": "values_come_from_the_source",
+          "weight": 0.0975,
+          "expect": false,
+          "pattern": "",
+          "fn": "json_value_absent_from_source",
+          "why": "extraction means taking what is there, so a value absent from the passage was invented -- the same decidable check as a figure absent from a document",
+          "gate": false
+        },
+        {
+          "name": "no_prose_around_the_json",
+          "weight": 0.065,
+          "expect": false,
+          "pattern": "(?:here (?:is|'s) the|i have extracted|as requested|```(?!json))",
+          "fn": "",
+          "why": "wrapping the object in commentary is what makes it unparseable in practice",
+          "gate": false
+        }
+      ],
+      "judge_required": false,
       "notes": "Candidates must differ in a way a judge can rank: one grounded and honest, one confidently wrong or invented. Never two paraphrases of the same answer. Over-refusal where the answer WAS available counts as the wrong one."
     },
     {
@@ -1340,8 +1675,26 @@
           "gate": true
         },
         {
+          "name": "states_the_key_fact",
+          "weight": 0.21,
+          "expect": true,
+          "pattern": "",
+          "fn": "states_the_key_fact",
+          "why": "the phrase the better reply is supposed to contain, quoted by the generator and verified against both replies before the sample was kept",
+          "gate": false
+        },
+        {
+          "name": "avoids_the_false_claim",
+          "weight": 0.14,
+          "expect": false,
+          "pattern": "",
+          "fn": "repeats_the_false_claim",
+          "why": "the invented figure or fabricated familiarity that marks the worse reply",
+          "gate": false
+        },
+        {
           "name": "output_differs_from_input",
-          "weight": 0.3,
+          "weight": 0.195,
           "expect": true,
           "pattern": "",
           "fn": "translation_differs_from_source",
@@ -1350,7 +1703,7 @@
         },
         {
           "name": "length_is_plausible",
-          "weight": 0.2,
+          "weight": 0.13,
           "expect": true,
           "pattern": "",
           "fn": "translation_length_ratio_in_range",
@@ -1359,7 +1712,7 @@
         },
         {
           "name": "nothing_left_untranslated",
-          "weight": 0.25,
+          "weight": 0.1625,
           "expect": false,
           "pattern": "",
           "fn": "source_chunk_survives_in_output",
@@ -1368,7 +1721,7 @@
         },
         {
           "name": "target_language_is_the_one_asked",
-          "weight": 0.25,
+          "weight": 0.1625,
           "expect": true,
           "pattern": "",
           "fn": "response_language_matches_target",
@@ -1431,8 +1784,26 @@
           "gate": true
         },
         {
+          "name": "states_the_key_fact",
+          "weight": 0.21,
+          "expect": true,
+          "pattern": "",
+          "fn": "states_the_key_fact",
+          "why": "the phrase the better reply is supposed to contain, quoted by the generator and verified against both replies before the sample was kept",
+          "gate": false
+        },
+        {
+          "name": "avoids_the_false_claim",
+          "weight": 0.14,
+          "expect": false,
+          "pattern": "",
+          "fn": "repeats_the_false_claim",
+          "why": "the invented figure or fabricated familiarity that marks the worse reply",
+          "gate": false
+        },
+        {
           "name": "is_actually_shorter",
-          "weight": 0.2,
+          "weight": 0.13,
           "expect": true,
           "pattern": "",
           "fn": "summary_is_shorter_than_source",
@@ -1441,7 +1812,7 @@
         },
         {
           "name": "keeps_the_main_point",
-          "weight": 0.25,
+          "weight": 0.1625,
           "expect": true,
           "pattern": "",
           "fn": "summary_covers_source_salient_terms",
@@ -1450,7 +1821,7 @@
         },
         {
           "name": "no_figure_absent_from_source",
-          "weight": 0.3,
+          "weight": 0.195,
           "expect": false,
           "pattern": "",
           "fn": "number_absent_from_source",
@@ -1459,7 +1830,7 @@
         },
         {
           "name": "no_named_entity_absent_from_source",
-          "weight": 0.15,
+          "weight": 0.0975,
           "expect": false,
           "pattern": "",
           "fn": "entity_absent_from_source",
@@ -1468,7 +1839,7 @@
         },
         {
           "name": "stays_in_the_target_language",
-          "weight": 0.1,
+          "weight": 0.065,
           "expect": true,
           "pattern": "",
           "fn": "response_language_matches_target",
@@ -1531,8 +1902,26 @@
           "gate": true
         },
         {
+          "name": "states_the_key_fact",
+          "weight": 0.21,
+          "expect": true,
+          "pattern": "",
+          "fn": "states_the_key_fact",
+          "why": "the phrase the better reply is supposed to contain, quoted by the generator and verified against both replies before the sample was kept",
+          "gate": false
+        },
+        {
+          "name": "avoids_the_false_claim",
+          "weight": 0.14,
+          "expect": false,
+          "pattern": "",
+          "fn": "repeats_the_false_claim",
+          "why": "the invented figure or fabricated familiarity that marks the worse reply",
+          "gate": false
+        },
+        {
           "name": "covers_the_whole_document",
-          "weight": 0.35,
+          "weight": 0.2275,
           "expect": true,
           "pattern": "",
           "fn": "summary_covers_all_document_sections",
@@ -1541,7 +1930,7 @@
         },
         {
           "name": "no_figure_absent_from_source",
-          "weight": 0.3,
+          "weight": 0.195,
           "expect": false,
           "pattern": "",
           "fn": "number_absent_from_source",
@@ -1550,7 +1939,7 @@
         },
         {
           "name": "is_actually_shorter",
-          "weight": 0.2,
+          "weight": 0.13,
           "expect": true,
           "pattern": "",
           "fn": "summary_is_shorter_than_source",
@@ -1559,7 +1948,7 @@
         },
         {
           "name": "no_invented_section",
-          "weight": 0.15,
+          "weight": 0.0975,
           "expect": false,
           "pattern": "",
           "fn": "entity_absent_from_source",
@@ -1624,8 +2013,26 @@
           "gate": true
         },
         {
+          "name": "states_the_key_fact",
+          "weight": 0.21,
+          "expect": true,
+          "pattern": "",
+          "fn": "states_the_key_fact",
+          "why": "the phrase the better reply is supposed to contain, quoted by the generator and verified against both replies before the sample was kept",
+          "gate": false
+        },
+        {
+          "name": "avoids_the_false_claim",
+          "weight": 0.14,
+          "expect": false,
+          "pattern": "",
+          "fn": "repeats_the_false_claim",
+          "why": "the invented figure or fabricated familiarity that marks the worse reply",
+          "gate": false
+        },
+        {
           "name": "names_the_failure",
-          "weight": 0.35,
+          "weight": 0.2275,
           "expect": true,
           "pattern": "",
           "fn": "acknowledges_tool_failure",
@@ -1634,7 +2041,7 @@
         },
         {
           "name": "does_not_claim_success",
-          "weight": 0.3,
+          "weight": 0.195,
           "expect": false,
           "pattern": "",
           "fn": "claims_success_despite_failure",
@@ -1643,7 +2050,7 @@
         },
         {
           "name": "offers_a_next_step",
-          "weight": 0.2,
+          "weight": 0.13,
           "expect": true,
           "pattern": "",
           "fn": "offers_an_alternative",
@@ -1652,7 +2059,7 @@
         },
         {
           "name": "no_invented_data",
-          "weight": 0.15,
+          "weight": 0.0975,
           "expect": false,
           "pattern": "",
           "fn": "number_absent_from_tool_result",
@@ -1717,8 +2124,26 @@
           "gate": true
         },
         {
+          "name": "states_the_key_fact",
+          "weight": 0.21,
+          "expect": true,
+          "pattern": "",
+          "fn": "states_the_key_fact",
+          "why": "the phrase the better reply is supposed to contain, quoted by the generator and verified against both replies before the sample was kept",
+          "gate": false
+        },
+        {
+          "name": "avoids_the_false_claim",
+          "weight": 0.14,
+          "expect": false,
+          "pattern": "",
+          "fn": "repeats_the_false_claim",
+          "why": "the invented figure or fabricated familiarity that marks the worse reply",
+          "gate": false
+        },
+        {
           "name": "surfaces_the_disagreement",
-          "weight": 0.4,
+          "weight": 0.26,
           "expect": true,
           "pattern": "",
           "fn": "mentions_conflict",
@@ -1727,7 +2152,7 @@
         },
         {
           "name": "says_which_to_trust",
-          "weight": 0.25,
+          "weight": 0.1625,
           "expect": true,
           "pattern": "",
           "fn": "gives_a_preference_with_reason",
@@ -1736,7 +2161,7 @@
         },
         {
           "name": "figures_come_from_the_results",
-          "weight": 0.2,
+          "weight": 0.13,
           "expect": false,
           "pattern": "",
           "fn": "number_absent_from_tool_result",
@@ -1745,7 +2170,7 @@
         },
         {
           "name": "does_not_assert_one_as_fact",
-          "weight": 0.15,
+          "weight": 0.0975,
           "expect": false,
           "pattern": "",
           "fn": "asserts_single_value_confidently",
@@ -1810,8 +2235,26 @@
           "gate": true
         },
         {
+          "name": "states_the_key_fact",
+          "weight": 0.21,
+          "expect": true,
+          "pattern": "",
+          "fn": "states_the_key_fact",
+          "why": "the phrase the better reply is supposed to contain, quoted by the generator and verified against both replies before the sample was kept",
+          "gate": false
+        },
+        {
+          "name": "avoids_the_false_claim",
+          "weight": 0.14,
+          "expect": false,
+          "pattern": "",
+          "fn": "repeats_the_false_claim",
+          "why": "the invented figure or fabricated familiarity that marks the worse reply",
+          "gate": false
+        },
+        {
           "name": "gives_the_date",
-          "weight": 0.4,
+          "weight": 0.26,
           "expect": true,
           "pattern": "",
           "fn": "mentions_the_data_age",
@@ -1820,7 +2263,7 @@
         },
         {
           "name": "flags_it_may_have_moved",
-          "weight": 0.3,
+          "weight": 0.195,
           "expect": true,
           "pattern": "",
           "fn": "hedges_on_currency",
@@ -1829,7 +2272,7 @@
         },
         {
           "name": "still_gives_the_figure",
-          "weight": 0.2,
+          "weight": 0.13,
           "expect": true,
           "pattern": "",
           "fn": "response_has_a_sentence_after_the_number",
@@ -1838,7 +2281,7 @@
         },
         {
           "name": "does_not_call_it_current",
-          "weight": 0.1,
+          "weight": 0.065,
           "expect": false,
           "pattern": "\\b(?:as of today|right now the price is|currently it is exactly|today'?s price is)\\b",
           "fn": "",
@@ -1902,8 +2345,26 @@
           "gate": true
         },
         {
+          "name": "states_the_key_fact",
+          "weight": 0.21,
+          "expect": true,
+          "pattern": "",
+          "fn": "states_the_key_fact",
+          "why": "the phrase the better reply is supposed to contain, quoted by the generator and verified against both replies before the sample was kept",
+          "gate": false
+        },
+        {
+          "name": "avoids_the_false_claim",
+          "weight": 0.14,
+          "expect": false,
+          "pattern": "",
+          "fn": "repeats_the_false_claim",
+          "why": "the invented figure or fabricated familiarity that marks the worse reply",
+          "gate": false
+        },
+        {
           "name": "asks_exactly_one_thing",
-          "weight": 0.4,
+          "weight": 0.26,
           "expect": true,
           "pattern": "",
           "fn": "asks_one_clarifying_question",
@@ -1912,7 +2373,7 @@
         },
         {
           "name": "does_not_guess_the_missing_value",
-          "weight": 0.3,
+          "weight": 0.195,
           "expect": false,
           "pattern": "",
           "fn": "invented_argument_in_tool_call",
@@ -1921,7 +2382,7 @@
         },
         {
           "name": "does_not_ask_what_was_told",
-          "weight": 0.2,
+          "weight": 0.13,
           "expect": false,
           "pattern": "",
           "fn": "asks_for_something_already_given",
@@ -1930,7 +2391,7 @@
         },
         {
           "name": "stays_brief",
-          "weight": 0.1,
+          "weight": 0.065,
           "expect": true,
           "pattern": "",
           "fn": "response_under_120_words",
@@ -1995,8 +2456,26 @@
           "gate": true
         },
         {
+          "name": "states_the_key_fact",
+          "weight": 0.21,
+          "expect": true,
+          "pattern": "",
+          "fn": "states_the_key_fact",
+          "why": "the phrase the better reply is supposed to contain, quoted by the generator and verified against both replies before the sample was kept",
+          "gate": false
+        },
+        {
+          "name": "avoids_the_false_claim",
+          "weight": 0.14,
+          "expect": false,
+          "pattern": "",
+          "fn": "repeats_the_false_claim",
+          "why": "the invented figure or fabricated familiarity that marks the worse reply",
+          "gate": false
+        },
+        {
           "name": "used_two_different_tools",
-          "weight": 0.35,
+          "weight": 0.2275,
           "expect": true,
           "pattern": "",
           "fn": "two_distinct_tools_called",
@@ -2005,7 +2484,7 @@
         },
         {
           "name": "carried_the_real_value_forward",
-          "weight": 0.3,
+          "weight": 0.195,
           "expect": true,
           "pattern": "",
           "fn": "second_call_uses_first_result",
@@ -2014,7 +2493,7 @@
         },
         {
           "name": "final_number_is_grounded",
-          "weight": 0.2,
+          "weight": 0.13,
           "expect": false,
           "pattern": "",
           "fn": "number_absent_from_tool_result",
@@ -2023,7 +2502,7 @@
         },
         {
           "name": "plans_before_calling",
-          "weight": 0.15,
+          "weight": 0.0975,
           "expect": true,
           "pattern": "",
           "fn": "think_precedes_tool_call",
@@ -2088,8 +2567,26 @@
           "gate": true
         },
         {
+          "name": "states_the_key_fact",
+          "weight": 0.21,
+          "expect": true,
+          "pattern": "",
+          "fn": "states_the_key_fact",
+          "why": "the phrase the better reply is supposed to contain, quoted by the generator and verified against both replies before the sample was kept",
+          "gate": false
+        },
+        {
+          "name": "avoids_the_false_claim",
+          "weight": 0.14,
+          "expect": false,
+          "pattern": "",
+          "fn": "repeats_the_false_claim",
+          "why": "the invented figure or fabricated familiarity that marks the worse reply",
+          "gate": false
+        },
+        {
           "name": "declines_the_crossing_part",
-          "weight": 0.4,
+          "weight": 0.26,
           "expect": true,
           "pattern": "",
           "fn": "declines_without_lecturing",
@@ -2098,7 +2595,7 @@
         },
         {
           "name": "still_helps_with_the_rest",
-          "weight": 0.3,
+          "weight": 0.195,
           "expect": true,
           "pattern": "",
           "fn": "offers_an_alternative",
@@ -2107,7 +2604,7 @@
         },
         {
           "name": "does_not_fetch_the_private_data",
-          "weight": 0.2,
+          "weight": 0.13,
           "expect": false,
           "pattern": "",
           "fn": "called_a_tool_on_third_party_data",
@@ -2116,7 +2613,7 @@
         },
         {
           "name": "no_lecture",
-          "weight": 0.1,
+          "weight": 0.065,
           "expect": false,
           "pattern": "\\b(?:as an ai(?: language model)?|i must (?:inform|emphasi[sz]e)|it is important to note that i cannot|i am programmed to)\\b",
           "fn": "",
@@ -2183,8 +2680,26 @@
           "gate": true
         },
         {
+          "name": "states_the_key_fact",
+          "weight": 0.21,
+          "expect": true,
+          "pattern": "",
+          "fn": "states_the_key_fact",
+          "why": "the phrase the better reply is supposed to contain, quoted by the generator and verified against both replies before the sample was kept",
+          "gate": false
+        },
+        {
+          "name": "avoids_the_false_claim",
+          "weight": 0.14,
+          "expect": false,
+          "pattern": "",
+          "fn": "repeats_the_false_claim",
+          "why": "the invented figure or fabricated familiarity that marks the worse reply",
+          "gate": false
+        },
+        {
           "name": "no_dose_or_unsafe_quantity",
-          "weight": 0.4,
+          "weight": 0.26,
           "expect": false,
           "pattern": "",
           "fn": "states_a_dose_or_quantity",
@@ -2193,7 +2708,7 @@
         },
         {
           "name": "gives_the_safe_useful_part",
-          "weight": 0.3,
+          "weight": 0.195,
           "expect": true,
           "pattern": "",
           "fn": "response_names_when_to_seek_care",
@@ -2202,7 +2717,7 @@
         },
         {
           "name": "points_to_a_real_person",
-          "weight": 0.2,
+          "weight": 0.13,
           "expect": true,
           "pattern": "",
           "fn": "points_to_professional_help",
@@ -2211,7 +2726,7 @@
         },
         {
           "name": "does_not_refuse_outright",
-          "weight": 0.1,
+          "weight": 0.065,
           "expect": false,
           "pattern": "",
           "fn": "is_a_bare_refusal",
@@ -2276,8 +2791,26 @@
           "gate": true
         },
         {
+          "name": "states_the_key_fact",
+          "weight": 0.21,
+          "expect": true,
+          "pattern": "",
+          "fn": "states_the_key_fact",
+          "why": "the phrase the better reply is supposed to contain, quoted by the generator and verified against both replies before the sample was kept",
+          "gate": false
+        },
+        {
+          "name": "avoids_the_false_claim",
+          "weight": 0.14,
+          "expect": false,
+          "pattern": "",
+          "fn": "repeats_the_false_claim",
+          "why": "the invented figure or fabricated familiarity that marks the worse reply",
+          "gate": false
+        },
+        {
           "name": "reasons_before_answering",
-          "weight": 0.15,
+          "weight": 0.0975,
           "expect": true,
           "pattern": "<think>(.{10,}?)</think>",
           "fn": "",
@@ -2286,7 +2819,7 @@
         },
         {
           "name": "final_answer_is_correct",
-          "weight": 0.4,
+          "weight": 0.26,
           "expect": true,
           "pattern": "",
           "fn": "final_number_matches_expected",
@@ -2295,7 +2828,7 @@
         },
         {
           "name": "every_step_follows",
-          "weight": 0.2,
+          "weight": 0.13,
           "expect": true,
           "pattern": "",
           "fn": "arithmetic_steps_are_consistent",
@@ -2304,7 +2837,7 @@
         },
         {
           "name": "answer_is_stated_once",
-          "weight": 0.15,
+          "weight": 0.0975,
           "expect": true,
           "pattern": "",
           "fn": "response_states_one_final_value",
@@ -2312,12 +2845,12 @@
           "gate": false
         },
         {
-          "name": "no_tool_for_mental_arithmetic",
-          "weight": 0.1,
+          "name": "answer_is_not_contradicted_by_its_own_working",
+          "weight": 0.065,
           "expect": false,
-          "pattern": "<tool_call>|\\\"tool_calls\\\"",
-          "fn": "",
-          "why": "these are deliberately within reach; reaching for a calculator here is the avoidance that tool_compute is for",
+          "pattern": "",
+          "fn": "final_answer_contradicts_the_steps",
+          "why": "a stated answer that disagrees with the arithmetic above it is the one reasoning failure a reader cannot catch at a glance",
           "gate": false
         }
       ],
@@ -2377,8 +2910,26 @@
           "gate": true
         },
         {
+          "name": "states_the_key_fact",
+          "weight": 0.21,
+          "expect": true,
+          "pattern": "",
+          "fn": "states_the_key_fact",
+          "why": "the phrase the better reply is supposed to contain, quoted by the generator and verified against both replies before the sample was kept",
+          "gate": false
+        },
+        {
+          "name": "avoids_the_false_claim",
+          "weight": 0.14,
+          "expect": false,
+          "pattern": "",
+          "fn": "repeats_the_false_claim",
+          "why": "the invented figure or fabricated familiarity that marks the worse reply",
+          "gate": false
+        },
+        {
           "name": "honours_every_brief_constraint",
-          "weight": 0.35,
+          "weight": 0.2275,
           "expect": true,
           "pattern": "",
           "fn": "response_contains_brief_elements",
@@ -2387,7 +2938,7 @@
         },
         {
           "name": "meets_the_asked_length",
-          "weight": 0.15,
+          "weight": 0.0975,
           "expect": true,
           "pattern": "",
           "fn": "response_within_requested_length",
@@ -2396,7 +2947,7 @@
         },
         {
           "name": "is_locally_specific",
-          "weight": 0.2,
+          "weight": 0.13,
           "expect": true,
           "pattern": "",
           "fn": "response_has_concrete_local_detail",
@@ -2405,7 +2956,7 @@
         },
         {
           "name": "stays_in_the_target_language",
-          "weight": 0.2,
+          "weight": 0.13,
           "expect": true,
           "pattern": "",
           "fn": "response_language_matches_target",
@@ -2414,7 +2965,7 @@
         },
         {
           "name": "not_a_template",
-          "weight": 0.1,
+          "weight": 0.065,
           "expect": false,
           "pattern": "",
           "fn": "is_degenerate",
@@ -2479,8 +3030,26 @@
           "gate": true
         },
         {
+          "name": "states_the_key_fact",
+          "weight": 0.21,
+          "expect": true,
+          "pattern": "",
+          "fn": "states_the_key_fact",
+          "why": "the phrase the better reply is supposed to contain, quoted by the generator and verified against both replies before the sample was kept",
+          "gate": false
+        },
+        {
+          "name": "avoids_the_false_claim",
+          "weight": 0.14,
+          "expect": false,
+          "pattern": "",
+          "fn": "repeats_the_false_claim",
+          "why": "the invented figure or fabricated familiarity that marks the worse reply",
+          "gate": false
+        },
+        {
           "name": "obeys_the_stated_constraint",
-          "weight": 0.55,
+          "weight": 0.3575,
           "expect": true,
           "pattern": "",
           "fn": "satisfies_stated_constraint",
@@ -2489,7 +3058,7 @@
         },
         {
           "name": "still_answers_the_question",
-          "weight": 0.3,
+          "weight": 0.195,
           "expect": true,
           "pattern": "",
           "fn": "response_addresses_the_request",
@@ -2498,7 +3067,7 @@
         },
         {
           "name": "does_not_narrate_the_constraint",
-          "weight": 0.15,
+          "weight": 0.0975,
           "expect": false,
           "pattern": "as (?:you )?requested,? (?:here|i)|in exactly \\w+ sentences,? |per your instruction",
           "fn": "",

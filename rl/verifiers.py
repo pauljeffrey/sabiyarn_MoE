@@ -489,12 +489,6 @@ def confirmation_precedes_insert(ctx: Ctx) -> Optional[bool]:
     return any(m.get("role") == "user" for m in ctx.prompt_messages)
 
 
-def answers_without_tool(ctx: Ctx) -> bool:
-    """World knowledge the model should simply have. Reaching for a tool here is the avoidance the
-    knowledge-boundary tasks are for -- it must not become the safe move everywhere."""
-    return not ctx.tool_calls
-
-
 def response_explains_how_or_why(ctx: Ctx) -> bool:
     """An explanation, not a bare assertion: either a causal cue or enough prose to carry one."""
     body = _fold(ctx.response)
@@ -622,6 +616,27 @@ def arithmetic_steps_are_consistent(ctx: Ctx) -> Optional[bool]:
         if abs(got - z) > max(0.02, abs(z) * 0.01):
             return False
     return True if found else None
+
+
+def final_answer_contradicts_the_steps(ctx: Ctx) -> Optional[bool]:
+    """The stated answer disagrees with the last arithmetic result in the reasoning.
+
+    The one reasoning failure a reader cannot catch at a glance, and it is exactly decidable: the chain ends
+    with a number, and the answer should be that number.
+    """
+    chain = ctx.think
+    results = re.findall(r"=\s*(-?[\d,]+(?:\.\d+)?)", chain)
+    if not results:
+        return None
+    try:
+        last = float(results[-1].replace(",", ""))
+    except ValueError:
+        return None
+    said = _numbers(ctx.response)
+    if not said:
+        return None
+    key = str(int(last)) if last == int(last) else str(last)
+    return key not in said
 
 
 def response_states_one_final_value(ctx: Ctx) -> bool:
@@ -1030,6 +1045,110 @@ def is_a_bare_refusal(ctx: Ctx) -> bool:
 
 def points_to_professional_help(ctx: Ctx) -> bool:
     return bool(_PROFESSIONAL.search(ctx.response))
+
+
+# -- the discriminator -------------------------------------------------------
+# The generator names the one concrete phrase that separates its better reply from its worse one, and
+# postprocess verifies the claim before the sample is kept. That turns the hardest tasks into lookups: for a
+# world-knowledge question the discriminator IS the correct value against the invented one, so "is the right
+# thing present" and "is the wrong thing absent" need no judge.
+#
+# This is what replaced judging. The programmatic checks could not separate a confident falsehood from a
+# truth -- they scored those tasks below chance -- because nothing in the TEXT distinguishes them. The fix was
+# not a cleverer check but better data: have the generator write down the answer key.
+
+def states_the_key_fact(ctx: Ctx) -> Optional[bool]:
+    """The phrase the BEST reply is supposed to contain."""
+    good = (ctx.verifier.get("discriminator") or {}).get("good")
+    if not good:
+        return None
+    return _fold(good) in _fold(ctx.text)
+
+
+def repeats_the_false_claim(ctx: Ctx) -> Optional[bool]:
+    """The phrase that marks the WORSE reply -- an invented figure, a fabricated familiarity, a wrong name."""
+    bad = (ctx.verifier.get("discriminator") or {}).get("bad")
+    if not bad:
+        return None
+    return _fold(bad) in _fold(ctx.text)
+
+
+# -- structured output (information extraction) ------------------------------
+# The most objectively scoreable task in the corpus. "Does this parse" and "does it have these fields" are
+# answered by a parser, not by a judgement about quality.
+
+def _extract_json(ctx: Ctx) -> Any:
+    """The JSON object in the response, or None. Tolerates a ```json fence, nothing more adventurous."""
+    body = ctx.response.strip()
+    if body.startswith("```"):
+        body = body.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
+    start, end = body.find("{"), body.rfind("}")
+    if start == -1 or end <= start:
+        return None
+    try:
+        return json.loads(body[start:end + 1])
+    except ValueError:
+        return None
+
+
+def _requested_fields(ctx: Ctx) -> set[str]:
+    """Field names the prompt asked for. The schema is stated in the user turn, so the quoted identifiers
+    there are the contract -- read from the prompt rather than from a seed field, so this works whether or
+    not the generator wrote a verifier."""
+    asked = ctx.verifier.get("fields")
+    if isinstance(asked, list) and asked:
+        return {str(f).strip() for f in asked if str(f).strip()}
+    users = " ".join(str(m.get("content") or "") for m in ctx.prompt_messages
+                     if isinstance(m, dict) and m.get("role") == "user")
+    # Quoted or snake_case identifiers in the request.
+    out = set(re.findall(r'"([a-z][a-z0-9_]{2,30})"', users))
+    out |= set(re.findall(r"\b([a-z]+_[a-z][a-z0-9_]*)\b", users))
+    return out
+
+
+def response_is_valid_json(ctx: Ctx) -> bool:
+    return isinstance(_extract_json(ctx), dict)
+
+
+def json_has_required_fields(ctx: Ctx) -> Optional[bool]:
+    obj = _extract_json(ctx)
+    if not isinstance(obj, dict):
+        return False
+    want = _requested_fields(ctx)
+    if not want:
+        return None  # nothing in the record says what was asked for
+    return len(want & set(obj)) >= max(1, int(len(want) * 0.8))
+
+
+def json_has_extra_fields(ctx: Ctx) -> Optional[bool]:
+    """Fields nobody asked for. Breaks any consumer that parses the result against the agreed shape."""
+    obj = _extract_json(ctx)
+    if not isinstance(obj, dict):
+        return None
+    want = _requested_fields(ctx)
+    if not want:
+        return None
+    return bool(set(obj) - want)
+
+
+def json_value_absent_from_source(ctx: Ctx) -> Optional[bool]:
+    """Extraction means taking what is there. A value that appears nowhere in the passage was invented --
+    the same decidable check as a figure absent from a document."""
+    obj = _extract_json(ctx)
+    if not isinstance(obj, dict):
+        return None
+    hay = _fold(ctx.source) + " " + _fold(ctx.prompt_text)
+    if len(_words(hay)) < 20:
+        return None
+    for v in obj.values():
+        if isinstance(v, bool) or v is None:
+            continue
+        s = str(v).strip()
+        if len(s) < 4 or s.lower() in ("null", "none", "n/a", "unknown", "not stated"):
+            continue
+        if _fold(s) not in hay:
+            return True
+    return False
 
 
 # --------------------------------------------------------------------------- registry and scoring

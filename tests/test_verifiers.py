@@ -33,6 +33,7 @@ def _spec_checks() -> dict[str, list[dict]]:
     import rewards_spec as R
     out = {t: [vars(c) for c in cs] for t, cs in R.CHECKS.items()}
     out["UNIVERSAL"] = [vars(c) for c in R.UNIVERSAL]
+    out["DISCRIMINATOR"] = [vars(c) for c in R.DISCRIMINATOR]
     return out
 
 
@@ -106,7 +107,9 @@ def test_tool_calls_are_visible_to_the_scorer():
             '<tool_call>get_weather\n{"location": "Ibi"}</tool_call>')
     ctx = Ctx(text, {"lang": "pcm"})
     assert ctx.tool_calls == [("get_weather", '{"location": "Ibi"}')]
-    assert REGISTRY["answers_without_tool"](ctx) is False
+    # Any check that depends on seeing the call now sees it.
+    assert REGISTRY["two_distinct_tools_called"](ctx) is False, "one call is one call"
+    assert REGISTRY["think_precedes_tool_call"](ctx) is True
 
 
 def test_target_language_check_uses_expect_markers():
@@ -283,17 +286,38 @@ def test_reward_prefers_the_best_candidate():
         f"of {n} ({accuracy:.0%} of decided pairs). A reward below chance trains the policy backwards.")
 
 
-def test_judge_only_tasks_are_not_scored_by_the_verifier():
-    """The exclusion must be real at training time, not just documented. Measured at 40% accuracy on these
-    -- below chance -- so a confident wrong signal is worse than no signal."""
+def test_nothing_is_judge_only_because_there_is_no_judge():
+    """There is no judge model in this pipeline, so a task that cannot be scored programmatically cannot be
+    trained on at all. Four tasks used to be excluded because the procedural checks scored them below chance;
+    the discriminator fixed that at the DATA level -- the generator writes down the phrase that separates its
+    two replies, postprocess verifies the claim holds, and scoring becomes a substring lookup."""
     import rewards_spec as R
-    from rl.rewards import VerifierReward
-    rw = VerifierReward()
-    item = {"id": "x", "lang": "eng", "judge_required": True, "tasks": ["world_knowledge_qa"],
-            "checks": R.for_task("world_knowledge_qa")}
-    out = rw([item, item], ["<|input_lang|><eng><response>a", "<|input_lang|><eng><response>b"])
-    assert out == [rw.neutral, rw.neutral], "a judge-only task must defer, not score"
-    assert "world_knowledge_qa" in R.JUDGE_ONLY_TASKS
+    assert R.JUDGE_ONLY_TASKS == frozenset(), (
+        f"these tasks would be untrainable without a judge: {sorted(R.JUDGE_ONLY_TASKS)}")
+    # and the discriminator is actually present on every task's checks
+    for task in R.CHECKS:
+        names = {c["name"] for c in R.for_task(task)}
+        assert "states_the_key_fact" in names, f"{task} has no answer key"
+        assert "avoids_the_false_claim" in names
+
+
+def test_discriminator_checks_score_the_right_candidate():
+    """The sharpest signal available, and it applies to every task."""
+    item = {"lang": "pcm", "verifier": {"discriminator": {"good": "4,500 naira", "bad": "about 6,000"}}}
+    checks = [{"name": "key", "weight": 0.6, "expect": True, "fn": "states_the_key_fact"},
+              {"name": "false", "weight": 0.4, "expect": False, "fn": "repeats_the_false_claim"}]
+    best = "<|input_lang|><pcm><|target_lang|><pcm><response>Na 4,500 naira you go pay."
+    worst = "<|input_lang|><pcm><|target_lang|><pcm><response>E be about 6,000 naira."
+    (rb, rw), _ = score_group([best, worst], item, checks)
+    assert rb == 1.0 and rw == 0.0
+
+
+def test_discriminator_is_unknown_when_the_record_has_none():
+    """Older records carry no discriminator; those checks must drop out rather than fail everything."""
+    item = {"lang": "pcm", "verifier": {}}
+    checks = [{"name": "key", "weight": 1.0, "expect": True, "fn": "states_the_key_fact"}]
+    r, detail = score("<|input_lang|><pcm><response>anything", item, checks)
+    assert detail["key"] == "unknown"
 
 
 def test_behaviour_tasks_are_not_quietly_excluded():
