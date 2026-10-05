@@ -409,14 +409,20 @@ def _task(name, tags, share, description, plan=(), flags=(), tools=False, think=
 # holdable-out.
 BEHAVIOUR_TASKS = {
     "tool_search_answer", "tool_chain_insufficient", "no_tool_admit_unknown", "retrieval_insufficient",
-    "rag_document_qa", "tool_compute", "tool_database", "action_tool_use",
+    "rag_document_qa",
     # The tool-use SCENARIOS belong here too, and for the same reason: in every one of them the lesson is
     # that one reply is WORSE than another -- report the failure or paper over it, surface the conflict or
     # pick silently, ask or guess, decline the part that crosses the line or refuse everything. A single SFT
     # target cannot express any of those, so they are RL-only and must not leak back into SFT.
     "tool_error_recovery", "tool_conflicting_results", "stale_data_awareness", "clarifying_question",
     "multi_tool_composition", "privacy_boundary", "safety_boundary",
+    # The merged structured-argument task, the grey-area self-check, the fruitless search, and the
+    # look-up-the-form-then-write mode: all four are preferences, so all four are RL-only.
+    "tool_structured_call", "self_check_then_search", "search_found_nothing", "creative_from_pattern",
 }
+# tool_compute, tool_database and action_tool_use were merged into tool_structured_call and their task
+# definitions removed: left in place they would have been owned by no phase at all -- excluded from SFT for
+# being behaviour, and absent from RL.
 ALL_TASKS = [
     # ---- knowledge boundary: the reason this corpus exists
     _task("tool_search_answer", ["tool-calling", "knowledge-boundary", "qa"], 9.0,
@@ -456,23 +462,6 @@ ALL_TASKS = [
           "the io_direction calls for. Its search query is in English too.",
           plan=["<|RAG|>"], tools=True, think=True),
     # ---- tool families beyond retrieval
-    _task("tool_compute", ["tool-calling", "structured-output"], 4.0,
-          "Quantitative questions answered with run_statistics / calculate / convert_units rather than mental "
-          "arithmetic: average rainfall over a season, price change between two months, bags to tonnes, "
-          "spread of test scores. The assistant shows the numbers it passed in and interprets the result in "
-          "one sentence.",
-          plan=["<|math|>", "<|analyze|>"], tools=True, think=True),
-    _task("tool_database", ["tool-calling", "structured-output"], 4.0,
-          "Record keeping with search_db / db_get_record / db_insert_record: look up a customer's balance, "
-          "find stock below a threshold, save a new patient visit or sale. Before writing, the assistant "
-          "confirms the values in words; after writing, it echoes what was stored. Includes zero-result "
-          "searches and rejected writes.",
-          plan=["<|data_extract|>", "<|plan|>"], tools=True, think=True),
-    _task("action_tool_use", ["tool-calling"], 4.0,
-          "The user asks for an action: send a message, set a reminder, check a route or a forecast. The "
-          "assistant confirms any ambiguous parameter FIRST, then emits the call, then reports the result -- "
-          "including cases where the tool fails and it explains the failure plainly.",
-          plan=["<|plan|>"], tools=True, think=True),
     # ---- general understanding: the base the whole design rests on
     _task("world_knowledge_qa", ["qa", "multi-turn-chat"], 11.0,
           "Everyday how-and-why questions a curious 16-year-old could answer unaided: why bread rises, how a "
@@ -612,6 +601,62 @@ ALL_TASKS = [
           "harm. The wrong candidate either states a dose or a figure, or refuses so completely that the "
           "person is left with no help at all.",
           plan=["<|recommend|>", "<|explain|>"], flags=["health"], think=True),
+    # ---- merged tool task. tool_compute + tool_database + the mechanical half of action_tool_use were one
+    # lesson in three costumes: put the REAL values into the call, report exactly what came back, and do not
+    # fill in the part you did not get.
+    _task("tool_structured_call", ["tool-calling", "structured-output"], 5.0,
+          "A call with STRUCTURED ARGUMENTS where the arguments matter as much as the choice of tool: "
+          "calculate or run_statistics over figures from the conversation, convert_units, search_db or "
+          "db_get_record with field filters, db_insert_record after confirming the values in words, "
+          "set_reminder or send_message with a time and a recipient. The assistant passes the values the "
+          "user actually gave, shows them, and reports exactly what came back -- including an empty result, "
+          "a rejected write or a failure. The wrong candidate invents an argument the user never supplied, "
+          "or reports a number the tool did not return.",
+          plan=["<|plan|>", "<|math|>"], tools=True, think=True),
+
+    # ---- the grey area. Not "it plainly does not know" (tool_search_answer) but "it half-knows and has to
+    # decide whether that is enough". This is the behaviour a person shows with the Rule of 72: you have a
+    # vague sense of it for years, and one day you check.
+    _task("self_check_then_search", ["tool-calling", "knowledge-boundary", "qa"], 5.0,
+          "The assistant has PARTIAL knowledge of the thing asked -- it knows roughly what socialism is, "
+          "that there is a rule about doubling money, that a drug treats malaria -- and the <think> block "
+          "weighs that honestly: what it is sure of, what it is not, and whether the gap matters for this "
+          "question. Deciding the gap matters, it searches, then answers from what came back and says which "
+          "part it had and which part it looked up. The wrong candidate answers from the vague memory alone "
+          "and gets a specific detail subtly wrong -- the divisor, the date, the dose -- while sounding "
+          "entirely confident. Searching is NEVER the failure here; unearned confidence is.",
+          plan=["<|analyze|>", "<|RAG|>"], tools=True, think=True),
+
+    _task("search_found_nothing", ["tool-calling", "insufficient-context", "knowledge-boundary"], 4.0,
+          "The assistant searches, and the results genuinely do not answer the question -- a local bylaw "
+          "nobody has published, this week's price in one small market, a person or product with no "
+          "footprint. It says plainly that it could not find the answer, THEN gives what it does legitimately "
+          "know around the question (how such fees usually work, where this is normally published, who to "
+          "ask) and marks that clearly as general rather than looked-up. The wrong candidate either "
+          "fabricates a specific answer from the irrelevant results, or stops at 'I could not find it' and "
+          "leaves the person with nothing when it had something useful to offer.",
+          plan=["<|RAG|>", "<|explain|>"], tools=True, think=True),
+
+    # ---- the two creative modes, kept separate ON PURPOSE: the lesson is different in each. One is "write
+    # from what you have", the other is "go and look at how this is done, then do it". A model that only ever
+    # learns the first invents conventions; one that only learns the second cannot write without a crutch.
+    _task("creative_from_knowledge", ["content-writing", "multi-turn-chat"], 3.5,
+          "Write or solve something from the model's OWN knowledge, with no tool: a folktale with a given "
+          "animal and a moral, a condolence letter, a market trader's testimony, a song for a naming "
+          "ceremony, a way round a practical problem (no light for three days and food to keep). The brief "
+          "fixes two or three things -- who is in it, where, what must be true at the end -- and the piece "
+          "honours them while being locally specific. The wrong candidate is fluent and placeless: it ignores "
+          "a constraint or could have been written about anywhere.",
+          plan=["<|generate|>"]),
+    _task("creative_from_pattern", ["content-writing", "tool-calling", "rag"], 3.5,
+          "The user asks for something in a FORM the assistant does not already command: a formal petition to "
+          "a local government, a tender response, a cover letter in a particular style, a haiku, a will, a "
+          "cooperative constitution, a research abstract. It looks the form up first -- search_internet or "
+          "search_documents -- reads what the convention actually is, and then WRITES THE USER'S OWN "
+          "CONTENT in that form, naming where the pattern came from. The wrong candidate either guesses the "
+          "form and gets its conventions wrong, or copies the example it found and changes only the names.",
+          plan=["<|RAG|>", "<|generate|>"], tools=True, think=True),
+
     # ---- generation and reasoning. Added because each has a GENUINE better/worse pair, which is what makes a
     # task worth putting in RL: a faithful summary against one that invents a figure, a story that follows its
     # brief against a generic one, a correct chain of reasoning against a plausible-but-wrong one. SFT can only
@@ -692,30 +737,36 @@ SFT_TASKS = [
 # why they moved here. A handful of non-behaviour tasks stay at low weight so the policy is not optimised
 # purely on refusal and forgets how to answer.
 _RL_WEIGHTS = {
-    # ---- the behaviour, ~60%. Still the largest block: these are the tasks SFT cannot express at all, because
-    # in each of them the lesson is that one reply is WORSE than another, not that one string is right.
+    # ---- the behaviour, ~56%. The tasks SFT cannot express, because in each the lesson is that one reply is
+    # WORSE than another rather than that one string is right.
+    #
+    # MERGED. tool_compute and tool_database folded into `tool_structured_call`: all three were the same
+    # lesson wearing different tool names -- pass the real values in, report what came back, do not invent
+    # the bit you did not get. Keeping them separate spent three task slots on one behaviour.
+    # action_tool_use folded into `clarifying_question` for the same reason: "confirm the ambiguous parameter
+    # before acting" IS the clarifying behaviour, just with a side effect attached.
     "tool_search_answer": 9.0, "retrieval_insufficient": 8.5, "no_tool_admit_unknown": 8.0,
-    "rag_document_qa": 8.0, "tool_chain_insufficient": 6.0, "action_tool_use": 2.5,
-    "tool_compute": 2.5, "tool_database": 2.5,
-    # ---- tool-use SCENARIOS, ~17%. What happens when the call does not go cleanly, which is most of real
-    # use: the tool errors, two sources disagree, the data is stale, the request is ambiguous, two tools must
-    # compose, or the ask crosses a privacy or safety line.
-    "tool_error_recovery": 4.0, "multi_tool_composition": 3.5, "clarifying_question": 3.5,
-    "tool_conflicting_results": 3.0, "stale_data_awareness": 2.5, "privacy_boundary": 2.0,
-    "safety_boundary": 2.0,
-    # ---- generation and reasoning, ~26%. These earn a place in RL for the same reason: each has a real
-    # better/worse pair rather than one correct answer. A faithful summary against one that invents a figure,
-    # a story that honours its brief against a fluent generic one, a correct chain against a plausible wrong
-    # one, an obeyed constraint against a quietly broken one. All four also score WITHOUT a judge.
-    "multi_step_reasoning": 8.0, "summarization": 6.0, "creative_writing": 6.0,
-    "instruction_following": 6.0,
-    # Information extraction. Already in SFT; added here because its failure modes are a PREFERENCE -- a
-    # schema answer that parses against one that is wrapped in prose, fields taken from the passage against
-    # fields invented to fill the shape -- and because almost all of it scores without a judge.
-    "structured_output": 5.0,
-    # ---- competence held in, ~14%, so the policy does not learn that refusing is always safe
-    "world_knowledge_qa": 7.0, "health_advice": 2.0, "health_triage": 1.5, "financial_analysis": 1.5,
-    "translation_english": 1.5, "long_document_summarization": 1.5,
+    "rag_document_qa": 8.0, "tool_chain_insufficient": 6.0,
+    "tool_structured_call": 5.0,
+    "self_check_then_search": 5.0,
+    "search_found_nothing": 4.0,
+    "tool_error_recovery": 4.0, "clarifying_question": 4.5, "multi_tool_composition": 3.5,
+    "tool_conflicting_results": 3.0, "stale_data_awareness": 2.5,
+    "privacy_boundary": 2.0,
+    # Raised from 2.0: the cost of getting this wrong is a person hurt, and it was the smallest block in the
+    # corpus. Still modest, because over-refusal is its own failure and more volume invites it.
+    "safety_boundary": 3.5,
+    # ---- generation, reasoning and extraction, ~31%
+    "multi_step_reasoning": 8.0, "summarization": 6.0,
+    "creative_from_knowledge": 3.5, "creative_from_pattern": 3.5,
+    "instruction_following": 6.0, "structured_output": 5.0,
+    "long_document_summarization": 2.0,
+    # ---- competence held in, ~13%, so the policy is not optimised purely on procedure
+    "world_knowledge_qa": 7.0, "health_advice": 2.5, "financial_analysis": 2.0,
+    # REMOVED: health_triage -- sorting urgency is advice this system should not be trusted to give, and a
+    # wrong sort is the most harmful output in the corpus.
+    # REMOVED: translation_english -- covered by the africomet_translation pipeline, which uses a learned
+    # translation metric rather than these procedural checks.
 }
 # Each RL task carries the checks that SCORE its candidates -- regexes and named functions that judge procedure
 # and form with no model in the loop (rewards_spec.py). Most of what this phase teaches is checkable that way:

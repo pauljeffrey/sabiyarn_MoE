@@ -474,6 +474,25 @@
       "notes": ""
     },
     {
+      "name": "creative_from_knowledge",
+      "tags": [
+        "content-writing",
+        "multi-turn-chat"
+      ],
+      "description": "Write or solve something from the model's OWN knowledge, with no tool: a folktale with a given animal and a moral, a condolence letter, a market trader's testimony, a song for a naming ceremony, a way round a practical problem (no light for three days and food to keep). The brief fixes two or three things -- who is in it, where, what must be true at the end -- and the piece honours them while being locally specific. The wrong candidate is fluent and placeless: it ignores a constraint or could have been written about anywhere.",
+      "share": 3.5,
+      "task_plan": [
+        "<|generate|>"
+      ],
+      "domain_flags": [],
+      "uses_tools": false,
+      "requires_think": false,
+      "languages": null,
+      "checks": [],
+      "judge_required": false,
+      "notes": ""
+    },
+    {
       "name": "multi_step_reasoning",
       "tags": [
         "qa",

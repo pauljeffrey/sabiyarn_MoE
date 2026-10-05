@@ -658,13 +658,18 @@ def chunk_document(text: str, *, target_words: int = CHUNK_WORDS) -> list[dict]:
             sections[-1][1].append(s)
 
     def _split_long(para: str, limit: int) -> list[str]:
-        """Break a paragraph that is itself longer than a passage, on sentence boundaries.
+        """Break a paragraph that is itself longer than a passage.
 
-        Needed because paragraph breaks are not guaranteed: a 2,000-word unbroken paragraph would otherwise
-        become one 2,000-word "passage", which defeats retrieving a passage at all.
+        Splits on BLANK-LINE paragraph boundaries first, because a paragraph is a unit of meaning and a
+        passage cut mid-argument is unanswerable from either half. Only a single paragraph that is still too
+        long falls back to sentences, and then to a hard word count for text with no terminal punctuation at
+        all (table dumps and run-on prose would otherwise become one enormous "passage").
         """
         if len(para.split()) <= limit * 1.4:
             return [para]
+        blocks = [b.strip() for b in re.split(r"\n\s*\n", para) if b.strip()]
+        if len(blocks) > 1:
+            return [piece for b in blocks for piece in _split_long(b, limit)]
         out, buf, n = [], [], 0
         for sent in re.split(r"(?<=[.!?])\s+", para):
             w = len(sent.split())

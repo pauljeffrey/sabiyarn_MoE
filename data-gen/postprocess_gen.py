@@ -81,6 +81,15 @@ def _drop(reason: str, raw: str = "", custom_id: str = "") -> None:
         pass  # diagnostics must never break a run
 
 
+def _score_of(r: dict) -> Optional[float]:
+    v = r.get("score")
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return None
+    return f if 0.0 <= f <= 10.0 else None
+
+
 def _fold(s: str) -> str:
     """Casefold and strip diacritics for a SUBSTRING test only.
 
@@ -875,6 +884,13 @@ def _to_record(seed: Seed, resp: Response) -> Optional[dict]:
         if bad_sides:
             _drop(f"discriminator_does_not_hold:{'+'.join(bad_sides)}", resp.text or "", resp.custom_id)
             return None
+    # A pair whose two sides scored nearly the same is a pair that teaches almost nothing, and the generator
+    # has already told us so. Dropping it here costs no tokens and keeps the margin honest.
+    sc = [_score_of(responses[i]) for i in order]
+    if sc[0] is not None and sc[-1] is not None and (sc[0] - sc[-1]) < 2.0:
+        _drop(f"score_margin_too_small:{sc[0]:.0f}v{sc[-1]:.0f}")
+        return None
+
     rec = {**base, "tags": _tags(data.get("tags"), md.get("tags", [])),
            "tasks": data.get("tasks") or md.get("tasks", []), "tools": md.get("tools", []),
            # The ground truth the programmatic scorers need (rl/verifiers.py). Kept even when empty so the
@@ -883,6 +899,10 @@ def _to_record(seed: Seed, resp: Response) -> Optional[dict]:
            "verifier": verifier,
            "prompt_messages": msgs, "prompt_text": render_messages(msgs, add_generation_prompt=True),
            "ranking": [quals[i] for i in order],
+           # The generator's own 0-10 scores, in the same order as the responses. DPO needs only the
+           # ordering, which `ranking` carries; the scores give a MARGIN, which is what lets a pair whose
+           # two sides are nearly as good as each other be filtered out later rather than trained on.
+           "scores": [_score_of(responses[i]) for i in order],
            "rationale": [responses[i].get("why", "") for i in order],
            **_flatten(msgs)}
     for n in range(want):

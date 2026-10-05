@@ -176,8 +176,12 @@ def test_knowledge_boundary_is_the_biggest_block_of_RL(seeds):
     # better/worse pairs too (a faithful summary against one that invents a figure). Behaviour stays the
     # largest block by a wide margin, but it no longer crowds the rest out.
     assert got > 0.50, f"behaviour is only {got:.0%} of rl"
-    generation = {"multi_step_reasoning", "summarization", "creative_writing", "instruction_following",
-                  "long_document_summarization"}
+    # creative_writing split into two modes -- from its own knowledge, and look-the-form-up-then-write --
+    # because the lesson differs: a model taught only the first invents conventions, one taught only the
+    # second cannot write without a crutch.
+    generation = {"multi_step_reasoning", "summarization", "creative_from_knowledge",
+                  "creative_from_pattern", "instruction_following", "long_document_summarization",
+                  "structured_output"}
     assert sum(t.share for t in rl.tasks if t.name in generation) / rl_total > 0.20, \
         "generation and reasoning should be a real block of rl, not a token presence"
     # and competence is held in, so the policy does not learn that refusing is always safe
@@ -270,9 +274,9 @@ def test_distractors_are_withheld_from_the_generator(seeds):
     """Distractors are injected at post-processing, not shown to the generator: it called them 12 times in
     35 once few-shot was added, and their definitions cost 300-1,200 input tokens for no generative benefit."""
     for i in range(30):
-        req = build_request(seed_with(seeds, "action_tool_use"),
-                            {"custom_id": f"rl__ibo__action_tool_use__{i:06d}",
-                             "lang": "ibo", "task": "action_tool_use", "index": i})
+        req = build_request(seed_with(seeds, "tool_structured_call"),
+                            {"custom_id": f"rl__ibo__tool_structured_call__{i:06d}",
+                             "lang": "ibo", "task": "tool_structured_call", "index": i})
         md = req.metadata
         d = md["distractor_tools"]
         assert 2 <= len(d) <= 3, d

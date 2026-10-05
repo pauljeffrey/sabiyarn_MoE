@@ -488,14 +488,20 @@ def _sft_like_request(seed: Seed, row: dict, *, rl: bool, document: Optional[dic
 
     needs_tools = any(t.uses_tools for t in tasks)
     if needs_tools:
-        # Which tools a task genuinely needs. Tag hints alone left generic tool-calling tasks
-        # (action_tool_use) with an EMPTY set once distractors stopped padding the list -- a tool-calling
-        # task with no tools. Task names are explicit here; tags stay as a fallback for new tasks.
+        # Which tools a task genuinely needs. Tag hints alone left generic tool-calling tasks with an EMPTY
+        # set once distractors stopped padding the list -- a tool-calling task with no tools. Task names are
+        # explicit here; tags stay as a fallback for new tasks.
         BY_TASK = {
-            "action_tool_use": ["send_message", "set_reminder", "get_transport_route",
-                                "get_weather_forecast", "get_current_datetime"],
-            "tool_compute": ["run_statistics", "calculate", "convert_units"],
-            "tool_database": ["search_db", "db_get_record", "db_insert_record"],
+            # The merged structured-argument task inherits all three former catalogues: compute, database
+            # and the side-effecting actions.
+            "tool_structured_call": ["run_statistics", "calculate", "convert_units",
+                                     "search_db", "db_get_record", "db_insert_record",
+                                     "send_message", "set_reminder", "get_current_datetime"],
+            "self_check_then_search": ["search_internet", "fetch_page", "search_documents"],
+            "search_found_nothing": ["search_internet", "fetch_page", "search_documents"],
+            "creative_from_pattern": ["search_internet", "fetch_page", "search_documents"],
+            "clarifying_question": ["send_message", "set_reminder", "get_transport_route",
+                                    "get_weather_forecast", "search_db"],
             "rag_document_qa": ["search_documents", "search_internet"],
             # search_internet returns LINKS, so fetch_page must be in scope or the second stage of the
             # search can never happen -- measured: fetch_page was called 0 times without this.
@@ -629,6 +635,11 @@ are required; a single reply is not a sample, because there is nothing to rank. 
     something it was never told, or refuses when the answer WAS actually available.
 They must differ in SUBSTANCE, not wording: two paraphrases of the same answer are useless.
 
+Give each reply a "score" from 0 to 10 for how good it is. This is cheap for you -- you already know which
+is better and why -- and it is what the training uses to rank them, so it matters more than any prose you
+write about them. The two scores must differ by at least 3; if they do not, the replies are too close
+together and you should make the worse one genuinely worse.
+
 Each reply's "content" is an OBJECT with THE SAME FIELDS as an assistant turn in the OUTPUT CONTRACT --
 think, task_plan, input_lang, target_lang, response (or tool_call). Write the FIELDS. Do NOT write the
 special tokens or the marker string yourself, and do NOT put a JSON string there: the markers are assembled
@@ -645,14 +656,16 @@ This is what makes the sample checkable, so it must describe the prefix you actu
   - "brief_elements": for a writing brief, the things the piece MUST contain -- names, places, the required
     ending -- as a list of short strings. Omit when there was no brief.
   - "max_words": when the user asked for a length, the number of words. Omit otherwise.
-  - "discriminator": REQUIRED. The one concrete thing that makes the worse reply worse, as
+  - "discriminator": OPTIONAL, and only when it is genuinely short. The one concrete thing that makes the
+    worse reply worse, as
     {{"good": "<a short exact phrase, number or name the BEST reply contains and the worst does NOT>",
       "bad":  "<a short exact phrase, number or name the WORST reply contains and the best does NOT>"}}
     Either side may be omitted if only one applies, but at least one is required. Keep each under 12 words
     and quote it EXACTLY as it appears in the reply -- it is matched literally, not interpreted. For a
     factual question this is usually the correct value against the invented one; for an honesty sample it is
-    the admission against the fabricated claim. If you cannot name such a phrase, the two replies do not
-    differ in substance and you should rewrite them until they do.
+    the admission against the fabricated claim. OMIT IT when the difference is spread over the whole reply
+    rather than sitting in one phrase -- a forced, vague discriminator is worse than none, and the score
+    below carries the ranking anyway.
 These must be EXACT: "expected_answer" has to be the value the best reply states, a "forbidden_word" has to
 be a word the best reply genuinely avoids, and the "discriminator" phrases must be literal substrings of the
 replies they belong to. A wrong verifier is worse than no verifier -- it would score the good answer as bad
@@ -662,8 +675,8 @@ replies after you return, and the sample is discarded if it does not hold.
 Return JSON:
 {{"prompt_turns": [ ...turn objects exactly as the OUTPUT CONTRACT describes... ],
   "responses": [
-    {{"content": {{ ...assistant turn FIELDS... }}, "quality": "best",  "why": "<one line, English>"}},
-    {{"content": {{ ...assistant turn FIELDS... }}, "quality": "worst", "why": "<one line, English>"}}
+    {{"content": {{ ...assistant turn FIELDS... }}, "quality": "best",  "score": <0-10>, "why": "<one line, English>"}},
+    {{"content": {{ ...assistant turn FIELDS... }}, "quality": "worst", "score": <0-10>, "why": "<one line, English>"}}
   ],
   "verifier": {{ ...only the fields that apply, omit the rest... }},
   "tasks": [...], "tags": [...],
