@@ -1183,6 +1183,192 @@ def uses_the_system_date(ctx: Ctx) -> Optional[bool]:
     return any(tok in body for tok in (_fold(parts[3]), _fold(f"{parts[1]} {parts[2]}"), _fold(stated)))
 
 
+
+# -- the real use cases: jobs, business writing, study help -------------------
+# These share one decidable failure -- inventing the user's own facts -- which is what makes writing tasks
+# scoreable here without a judge.
+
+# Things a CV or a quote asserts that must have come from the user: qualifications, employers, money, years.
+_CREDENTIAL = re.compile(
+    r"\b(?:B\.?Sc|M\.?Sc|Ph\.?D|HND|OND|NCE|B\.?A|M\.?A|MBA|BEng|LLB|WAEC|NECO|JAMB|NYSC|"
+    r"first class|second class|upper credit|distinction|certified|chartered|licen[cs]ed)\b", re.I)
+_ARTIFACT_SHAPE = re.compile(
+    r"\b(?:dear\s+\w+|yours (?:sincerely|faithfully)|to whom it may concern|"
+    r"re:|subject:|kind regards|best regards|warm regards|"
+    r"objective|work experience|education|skills|references|"
+    r"total|subtotal|unit price|payment terms|valid (?:until|for)|quotation|invoice)\b", re.I)
+_METHOD_CUES = re.compile(
+    r"\b(?:step|first|next|then|finally|because|so that|the formula|the rule|substitut|"
+    r"rearrang|divide|multiply|we know that|this means|therefore|to find|start by|"
+    r"the method|the trick|remember that)\b", re.I)
+_LEVEL_WORDS = {
+    "jss": 1, "primary": 1, "basic": 1, "know nothing": 1, "beginner": 1, "simple": 1, "child": 1,
+    "sss": 2, "waec": 2, "neco": 2, "secondary": 2, "jamb": 2, "o level": 2,
+    "nd": 3, "hnd": 3, "undergraduate": 3, "100 level": 3, "200 level": 3, "300 level": 3,
+    "university": 3, "degree": 3, "masters": 4, "postgraduate": 4, "phd": 4,
+}
+
+
+def _user_text(ctx: Ctx) -> str:
+    return " ".join(str(m.get("content") or "") for m in ctx.prompt_messages
+                    if isinstance(m, dict) and m.get("role") == "user")
+
+
+def invents_user_facts(ctx: Ctx) -> Optional[bool]:
+    """A credential, employer, figure or year in the reply that the USER never supplied.
+
+    The specific harm of these tasks: a CV listing a degree the person does not have is a document they could
+    be caught with, and a quote naming a discount they never offered commits them to it. Decidable, because
+    the only legitimate source is the conversation.
+    """
+    users = _user_text(ctx)
+    if len(_words(users)) < 15:
+        return None  # too little said for absence to mean anything
+    hay = _fold(users) + " " + _fold(ctx.prompt_text)
+    body = ctx.response
+
+    for m in _CREDENTIAL.finditer(body):
+        if _fold(m.group(0)) not in hay:
+            return True
+    # Money and years are the other two things that must not be conjured.
+    for m in re.finditer(r"\b(?:19|20)\d{2}\b", body):
+        if m.group(0) not in users:
+            return True
+    for n in _numbers(body):
+        try:
+            if abs(float(n)) < 100:   # small numbers are counts and list positions
+                continue
+        except ValueError:
+            continue
+        if n not in _numbers(users) and n not in _numbers(ctx.prompt_text):
+            return True
+    return False
+
+
+def produced_the_asked_for_artifact(ctx: Ctx) -> Optional[bool]:
+    """It wrote the letter/CV/quote rather than advice ABOUT writing one.
+
+    Detected by shape: these documents have recognisable furniture -- a salutation, a sign-off, a section
+    heading, a total -- and advice about them does not.
+    """
+    body = ctx.response
+    if len(_words(body)) < 25:
+        return False
+    if _ARTIFACT_SHAPE.search(body):
+        return True
+    # A numbered or bulleted list of substantive lines also counts: CV bullets look like that.
+    bullets = re.findall(r"^\s*(?:\d+[.)]|[-*•])\s+\S", body, flags=re.M)
+    return len(bullets) >= 3
+
+
+def response_reuses_user_specifics(ctx: Ctx) -> Optional[bool]:
+    """The user's own history and figures are the raw material; a reply using none of them is a template."""
+    users = _user_text(ctx)
+    if len(_words(users)) < 15:
+        return None
+    return _overlap(users, ctx.response, min_len=5) >= 0.12
+
+
+def explains_a_method_not_just_an_answer(ctx: Ctx) -> bool:
+    """Study help has to transfer to the next question, so the METHOD must be visible."""
+    body = ctx.response + " " + ctx.think
+    return bool(_METHOD_CUES.search(body)) and len(_words(ctx.response)) >= 30
+
+
+def matches_the_requested_level(ctx: Ctx) -> Optional[bool]:
+    """Answering a JSS2 question at degree level is the commonest failure here.
+
+    Proxied by vocabulary and sentence length, which is crude but moves in the right direction: a reply
+    pitched at a child should have shorter sentences and fewer long words than one pitched at a graduate.
+    """
+    users = _fold(_user_text(ctx))
+    level = None
+    for cue, lv in _LEVEL_WORDS.items():
+        if cue in users:
+            level = lv if level is None else min(level, lv)
+    if level is None:
+        return None
+    sents = _sentences(ctx.response)
+    if not sents:
+        return False
+    words = _words(ctx.response)
+    if not words:
+        return False
+    avg_sentence = len(words) / len(sents)
+    long_word_share = sum(1 for w in words if len(w) >= 10) / len(words)
+    if level <= 1:
+        return avg_sentence <= 20 and long_word_share <= 0.10
+    if level == 2:
+        return avg_sentence <= 26 and long_word_share <= 0.16
+    return True  # at degree level and above, denser prose is appropriate
+
+
+
+# -- chunked retrieval -------------------------------------------------------
+# A retrieval result is a few ranked passages, each labelled `[c4 | Section | score 0.81]`, and the seed
+# records which ids actually held the answer. Answering from the wrong passage while the right one was
+# returned is the central failure of RAG, and this makes it decidable.
+
+R_CHUNK_HEAD = re.compile(r"\[(c\d{1,3})\s*\|\s*([^|\]]*)\|[^\]]*\]")
+
+
+def _returned_chunks(ctx: Ctx) -> dict[str, str]:
+    """{id: passage text} for every passage the tool returned in this conversation."""
+    out: dict[str, str] = {}
+    for res in ctx.tool_results:
+        parts = list(R_CHUNK_HEAD.finditer(res))
+        for i, m in enumerate(parts):
+            start = m.end()
+            end = parts[i + 1].start() if i + 1 < len(parts) else len(res)
+            out[m.group(1).lower()] = res[start:end]
+    return out
+
+
+def _chunk_overlap(ctx: Ctx, text: str) -> float:
+    """How much of the answer's content vocabulary comes from one passage."""
+    return _overlap(ctx.response, text, min_len=5)
+
+
+def cited_the_answer_chunk(ctx: Ctx) -> Optional[bool]:
+    """The reply names or draws on a passage the seed marked as answer-bearing."""
+    want = [str(i).lower() for i in (ctx.verifier.get("answer_chunks") or [])]
+    if not want:
+        return None
+    returned = _returned_chunks(ctx)
+    if not returned:
+        return None
+    body = ctx.response
+    # Naming the id outright counts, and so does drawing substantially on its text -- most replies will not
+    # quote an id, and requiring one would score style rather than grounding.
+    if any(re.search(rf"\b{re.escape(i)}\b", body, re.I) for i in want):
+        return True
+    for i in want:
+        if i in returned and _chunk_overlap(ctx, returned[i]) >= 0.12:
+            return True
+    return False
+
+
+def answered_from_a_distractor_chunk(ctx: Ctx) -> Optional[bool]:
+    """The reply leans on a passage that was returned but does NOT contain the answer.
+
+    Only fires when a distractor is a BETTER match for the answer than any answer-bearing passage, so a reply
+    that mentions a distractor in passing is not punished -- the failure is building the answer on it.
+    """
+    want = {str(i).lower() for i in (ctx.verifier.get("answer_chunks") or [])}
+    if not want:
+        return None
+    returned = _returned_chunks(ctx)
+    distractors = {k: v for k, v in returned.items() if k not in want}
+    answers = {k: v for k, v in returned.items() if k in want}
+    if not distractors or not answers:
+        return None
+    best_d = max((_chunk_overlap(ctx, v) for v in distractors.values()), default=0.0)
+    best_a = max((_chunk_overlap(ctx, v) for v in answers.values()), default=0.0)
+    if best_d < 0.12:
+        return False
+    return best_d > best_a + 0.05
+
+
 # -- the discriminator -------------------------------------------------------
 # The generator names the one concrete phrase that separates its better reply from its worse one, and
 # postprocess verifies the claim before the sample is kept. That turns the hardest tasks into lookups: for a

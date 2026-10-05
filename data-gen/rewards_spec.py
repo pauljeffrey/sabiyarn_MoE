@@ -129,16 +129,23 @@ CHECKS: dict[str, list[Check]] = {
               why="an admission does not need three paragraphs of apology"),
     ],
     "rag_document_qa": [
-        Check("searched_the_documents", 0.25, True, pattern=r"search_documents",
-              why="RAG is a tool call here, not context stuffing"),
-        Check("grounded_in_the_passage", 0.35, True, fn="answer_overlaps_tool_result",
-              why="an answer that does not reuse the retrieved wording is not grounded in it"),
+        # Retrieval now returns a few RANKED PASSAGES, two of which are deliberately plausible and wrong, and
+        # the seed records which ones actually hold the answer. That makes the central failure of RAG --
+        # answering from the wrong passage while the right one was right there -- decidable rather than a
+        # matter of taste, and it is the sharpest check available for this task.
+        Check("searched_the_documents", 0.15, True, pattern=r"search_documents",
+              why="the document is only reachable through the tool"),
+        Check("used_the_answer_passage", 0.30, True, fn="cited_the_answer_chunk",
+              why="the seed names the passages that contain the answer, so using one of them is a lookup"),
+        Check("did_not_answer_from_a_distractor", 0.25, False, fn="answered_from_a_distractor_chunk",
+              why="a plausible adjacent passage was returned on purpose; answering from it is the failure "
+                  "this shape exists to expose"),
+        Check("no_outside_knowledge", 0.15, False, fn="asserts_fact_absent_from_tool_result",
+              why="the point is grounding in what was retrieved, not what the generator happens to know"),
         Check("query_was_english", 0.10, True, fn="tool_query_is_english",
-              why="the retrieval corpus is English; a native-language query finds nothing"),
-        Check("answered_in_target_language", 0.20, True, fn="target_lang_matches_request",
-              why="read English, answer in the user's language -- that is the sample"),
-        Check("no_outside_knowledge", 0.10, False, fn="asserts_fact_absent_from_tool_result",
-              why="asked something the document does not cover, it must say so"),
+              why="retrieval works in English even when the conversation does not"),
+        Check("answered_in_target_language", 0.05, True, fn="target_lang_matches_request",
+              why="the passages are English; the answer is in the language asked for"),
     ],
     "tool_chain_insufficient": [
         Check("tried_more_than_once", 0.30, True, fn="at_least_two_tool_calls",
@@ -367,6 +374,50 @@ CHECKS: dict[str, list[Check]] = {
         Check("gives_a_number_not_soon", 0.15, False,
               pattern=r"\b(?:soon|shortly|in a (?:little )?while|not long|any time now|around that time)\b",
               why="a question asking how many days is not answered by 'soon'"),
+    ],
+
+    # These three are where most real use lives, and they share one failure that matters more than any
+    # stylistic judgement: INVENTING THE USER'S FACTS. A CV with a degree the person never mentioned, a quote
+    # with a discount they never offered. That is decidable against the conversation, so these score well
+    # without a judge despite being writing tasks.
+    "cv_and_job_application": [
+        Check("no_invented_credential", 0.40, False, fn="invents_user_facts",
+              why="a CV that adds a degree, an employer or a date the user never gave is worse than useless "
+                  "-- it is a document they could be caught with, and it is checkable against the prefix"),
+        Check("wrote_the_actual_document", 0.25, True, fn="produced_the_asked_for_artifact",
+              why="returning generic careers advice instead of the cover letter that was asked for is the "
+                  "commonest miss, and a letter has a recognisable shape"),
+        Check("used_what_the_user_gave", 0.20, True, fn="response_reuses_user_specifics",
+              why="the user's own history is the only raw material; a reply that uses none of it is a template"),
+        Check("no_placeholders_left", 0.10, False,
+              pattern=r"\[(?:your|insert|name|company|position|date|x+)[^\]]{0,24}\]|\{\{|XYZ Company|"
+                      r"\bLorem\b",
+              why="an unfilled bracket is the tell of a template and makes the document unsendable"),
+        Check("stays_in_the_target_language", 0.05, True, fn="response_language_matches_target"),
+    ],
+    "business_and_customer_writing": [
+        Check("no_invented_terms", 0.35, False, fn="invents_user_facts",
+              why="a quote with a discount, a delivery date or a figure the user never gave commits them to "
+                  "something they did not agree -- the specific harm of this task"),
+        Check("short_enough_to_send", 0.20, True, fn="response_within_requested_length",
+              why="this is read on a phone; three times longer than anyone would read is a failure even when "
+                  "the content is right"),
+        Check("keeps_the_users_figures", 0.20, True, fn="response_reuses_user_specifics"),
+        Check("wrote_the_actual_message", 0.15, True, fn="produced_the_asked_for_artifact"),
+        Check("no_placeholders_left", 0.10, False,
+              pattern=r"\[(?:your|insert|name|company|amount|date|x+)[^\]]{0,24}\]|\{\{|XYZ"),
+    ],
+    "exam_and_study_help": [
+        Check("shows_a_reusable_method", 0.30, True, fn="explains_a_method_not_just_an_answer",
+              why="the answer alone transfers nothing to the next question, which is the whole point of "
+                  "study help rather than homework completion"),
+        Check("answer_is_correct_where_there_is_one", 0.25, True, fn="final_number_matches_expected",
+              why="fully objective wherever the subject has a right answer, and the generator records it"),
+        Check("pitched_at_the_level_asked", 0.20, True, fn="matches_the_requested_level",
+              why="answering a JSS2 question at degree level is the commonest failure here and it is "
+                  "visible in vocabulary and sentence length"),
+        Check("working_is_consistent", 0.15, True, fn="arithmetic_steps_are_consistent"),
+        Check("not_degenerate", 0.10, False, fn="is_degenerate"),
     ],
     # -------- generation and reasoning.
     # These score better than the behaviour tasks do, which is the argument for having them here. Faithfulness

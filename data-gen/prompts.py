@@ -179,16 +179,45 @@ def _lang_offset(lang: str) -> int:
     return int(hashlib.sha256(lang.encode()).hexdigest()[:8], 16)
 
 
+# The domain/genre odometer laps every 17,808 rows, and 17,808 = 2^4 x 3 x 7 x 53. The direction cycle's
+# LENGTH has to be coprime with that or a given (domain, genre) sees the same direction for ever.
+#
+# This bit me: five directions worked (17,808 mod 5 = 3), and adding a sixth broke it silently -- 17,808 mod
+# 6 = 0, and a sampled run showed every row of one domain landing on `crosslingual` alone. 6 can never work,
+# and nor can 7. So the cycle is built from the directions' WEIGHTS to a length that is coprime, which also
+# gives the weights something to do.
+_DOMAIN_GENRE_LAP = 17_808
+
+
+def _io_cycle(dirs: list[dict]) -> list[int]:
+    """Indices into `dirs`, repeated by weight, to a length coprime with the domain/genre lap.
+
+    Weights are relative: a direction weighted 2.0 appears twice as often as one weighted 1.0. The total is
+    then nudged up until it is coprime, by lengthening the highest-weighted direction -- which changes the
+    distribution by at most one slot and keeps the guarantee that matters.
+    """
+    from math import gcd
+    weights = [max(1, round(float(d.get("weight") or 1.0) * 2)) for d in dirs]
+    cycle = [i for i, w in enumerate(weights) for _ in range(w)]
+    if not cycle:
+        return [0]
+    guard = 0
+    while gcd(len(cycle), _DOMAIN_GENRE_LAP) != 1 and guard < 12:
+        cycle.append(max(range(len(dirs)), key=lambda i: weights[i]))
+        guard += 1
+    return cycle
+
+
 def _io_direction(seed: Seed, lang: str, index: int, rng: random.Random) -> dict:
     """Pick the input/output language pattern on its own odometer.
 
-    `index` advances by 1 per row for a fixed (lang, task), so stepping through a 5-element list gives an
-    EXACTLY even distribution rather than an approximately even one. It also stays independent of the
-    domain/genre odometer: that one laps every 17,808 rows and 17,808 mod 5 = 3, which is coprime with 5, so
-    a given (domain, genre) still sees all five directions.
+    `index` advances by 1 per row for a fixed (lang, task), so stepping through a fixed cycle gives an
+    EXACTLY even distribution rather than an approximately even one -- and the cycle length is kept coprime
+    with the domain/genre lap (see _io_cycle) so the two odometers stay independent.
     """
     dirs = seed.conversation.get("io_directions") or [{"key": "native_native", "brief": "Everything in {lang}."}]
-    d = dict(dirs[(index + _lang_offset(lang)) % len(dirs)])
+    cycle = _io_cycle(dirs)
+    d = dict(dirs[cycle[(index + _lang_offset(lang)) % len(cycle)]])
     others = [l for l in seed.languages if l.code not in (lang, "eng")]
     other = rng.choice(others) if others else None
     me = _lang_spec(seed, lang)
@@ -199,7 +228,12 @@ def _io_direction(seed: Seed, lang: str, index: int, rng: random.Random) -> dict
     # the language tags the assistant's markers must carry, so compliance can be measured
     expect = {"native_native": (me.code, me.code), "english_english": ("eng", "eng"),
               "english_to_native": ("eng", me.code), "native_to_english": (me.code, "eng"),
-              "crosslingual": (d["other"] or "hau", me.code)}
+              "crosslingual": (d["other"] or "hau", me.code),
+              # three_way: the user WROTE in their own language and asked for the answer in a THIRD one. The
+              # markers describe the conversation -- what came in, what goes out -- so the material's
+              # language does not appear in them at all. That is the whole point of the direction: input and
+              # target differ, and neither is the source's language.
+              "three_way": (me.code, d["other"] or "eng")}
     d["expect_markers"] = list(expect.get(d["key"], (me.code, me.code)))
     return d
 
@@ -740,6 +774,9 @@ This is what makes the sample checkable, so it must describe the prefix you actu
   - "brief_elements": for a writing brief, the things the piece MUST contain -- names, places, the required
     ending -- as a list of short strings. Omit when there was no brief.
   - "max_words": when the user asked for a length, the number of words. Omit otherwise.
+  - "answer_chunks": REQUIRED when the conversation retrieves passages. The ids -- ["c4"] or ["c4","c9"] --
+    of the returned passages that genuinely contain the answer. The others you listed are distractors. This
+    is what lets a reply that answered from the WRONG passage be scored down, so it must be true.
   - "discriminator": OPTIONAL, and only when it is genuinely short. The one concrete thing that makes the
     worse reply worse, as
     {{"good": "<a short exact phrase, number or name the BEST reply contains and the worst does NOT>",
@@ -796,6 +833,15 @@ the user asks in one language for an answer in another, and the assistant compli
 
 Ground the content in: {DOMAINS[domain].name} / {subtopic}.
 It is {when}; anything time-dependent (a reminder, a forecast, a rate, "today") must fit that.
+Today's date is {today} and it is stated in the assistant's system prompt, so anything the assistant works
+out from "today" -- days remaining, whether a deadline has passed, how stale a result is -- must agree with
+that date.
+
+KEEP <think> SHORT. One to three sentences: what it needs to decide and why, nothing else. No restating the
+question back, no listing what it will not do, no narrating the plan it is about to carry out anyway. A
+<think> block longer than the answer it precedes is a defect -- it spends the context window the model needs
+for the conversation, and at 32,768 tokens that budget is real. Reason where there is something to decide and
+skip it entirely where there is not.
 The assistant's identity in the system message will be: "{identity}" -- keep its self-references consistent
 with that, and do not assume any other name.
 {tools_section}

@@ -282,7 +282,19 @@ def _fill_turn_defaults(turns: Any, md: dict) -> Any:
                 for w in wrappers:
                     v = v.replace(w, "")
                 t[key] = v.strip()
-        # A label token written INLINE instead of in the `label_token` field. The token is legal, the
+            # <think> MUST NOT OUTGROW THE ANSWER. A reasoning block longer than the response it precedes is
+        # spending the context window on narration, and at 32,768 tokens that budget is real. Trimmed rather
+        # than dropped: the turn is otherwise sound, and the generator reaches for padding here more than
+        # anywhere else. 120 words is roughly three full sentences of genuine deliberation.
+        th, rp = t.get("think"), t.get("response")
+        if isinstance(th, str) and th:
+            tw = len(th.split())
+            too_long = tw > 120 or (isinstance(rp, str) and rp and tw > max(60, len(rp.split())))
+            if too_long:
+                keep = " ".join(th.split()[:120])
+                t["think"] = keep.rsplit(".", 1)[0] + "." if "." in keep else keep
+                STATS["repair:trimmed_long_think"] = STATS.get("repair:trimmed_long_think", 0) + 1
+    # A label token written INLINE instead of in the `label_token` field. The token is legal, the
         # position is not, and the assembler emits it in exactly the right place from the field -- so moving
         # it is information-preserving, unlike stripping it. 10 of 31 drops on the same pilot.
         resp = t.get("response")
@@ -401,6 +413,13 @@ def _clean_verifier(raw: Any, msgs: list[dict]) -> dict:
         keep = [e for e in keep if len(e) <= 60][:8]
         if keep:
             out["brief_elements"] = keep
+
+    ac = raw.get("answer_chunks")
+    if isinstance(ac, (list, tuple)):
+        ids = [str(x).strip().lower() for x in ac]
+        ids = [i for i in ids if re.fullmatch(r"c\d{1,3}", i)]
+        if ids:
+            out["answer_chunks"] = ids[:6]
 
     disc = raw.get("discriminator")
     if isinstance(disc, dict):

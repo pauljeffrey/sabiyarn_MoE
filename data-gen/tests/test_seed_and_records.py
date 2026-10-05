@@ -190,7 +190,12 @@ def test_knowledge_boundary_is_the_biggest_block_of_RL(seeds):
     sft = seeds["sft"]
     sft_total = sum(t.share for t in sft.tasks)
     wk = next(t for t in sft.tasks if t.name == "world_knowledge_qa")
-    assert wk.share / sft_total > 0.20, "world knowledge should be the largest block of sft"
+    # "Largest", tested as largest rather than via a share threshold: the threshold was a proxy for the
+    # intent and went stale the moment three use-case tasks were added, even though world knowledge is still
+    # ahead of the next task by more than 2.5x.
+    biggest = max(sft.tasks, key=lambda x: x.share)
+    assert biggest.name == "world_knowledge_qa", f"sft is dominated by {biggest.name}, not world knowledge"
+    assert wk.share / sft_total > 0.12
     assert not (behaviour & {t.name for t in sft.tasks}), "a behaviour task is still in sft"
 def test_seed_rejects_unknown_keys(tmp_path):
     bad = tmp_path / "bad.json"
@@ -598,21 +603,35 @@ def test_reasoning_models_are_flagged(capsys):
 # ----------------------------------------------------------------- language direction / packing
 
 
-def test_io_directions_are_exactly_even(seeds):
-    """Sampled on its own odometer, so the distribution is exact rather than approximately even."""
+def test_io_directions_follow_their_weights_exactly(seeds):
+    """Sampled on its own odometer, so the distribution is exact rather than approximate.
+
+    No longer exactly EVEN: the cycle is built from the directions' weights, because its length has to be
+    coprime with the domain/genre lap (17,808 = 2^4 x 3 x 7 x 53) and six equal directions are not. See
+    prompts._io_cycle. What is still guaranteed -- and is what matters -- is that every direction appears and
+    that the proportions are exactly the weighted ones rather than drifting.
+    """
     import collections
+    from prompts import _io_cycle
+    dirs = seeds["sft"].conversation["io_directions"]
+    cycle = _io_cycle(dirs)
+    expected = collections.Counter(dirs[i]["key"] for i in cycle)
+    n = len(cycle) * 40
     for lang in ("yor", "fon"):
         c = collections.Counter(
             build_request(seeds["sft"], {"custom_id": f"sft__{lang}__general_chat__{i:06d}",
                                         "lang": lang, "task": "general_chat", "index": i}
-                          ).metadata["io_direction"] for i in range(500))
-        assert len(c) == 5, c
-        assert max(c.values()) == min(c.values()) == 100, c
+                          ).metadata["io_direction"] for i in range(n))
+        assert set(c) == set(expected), (set(expected) - set(c), set(c) - set(expected))
+        for key, want in expected.items():
+            assert c[key] == want * 40, (key, c[key], want * 40)
 
 
 def test_io_direction_survives_the_domain_odometer(seeds):
-    """The pair/genre odometer laps every 17,808 rows and 17,808 mod 5 = 3, coprime with 5, so a fixed
-    (domain, genre) still sees all five directions rather than locking to one."""
+    """The pair/genre odometer laps every 17,808 rows, so the direction cycle's LENGTH must be coprime with
+    that or a fixed (domain, genre) locks to one direction for ever. It did: adding a sixth direction made the
+    cycle 6 long, 17,808 mod 6 = 0, and a sampled run showed one domain seeing only `crosslingual`. The cycle
+    is now built from the weights to a coprime length (13)."""
     seen = set()
     for lap in range(6):
         i = lap * 636          # same domain pair every lap for sft (no genre dimension)
@@ -631,9 +650,17 @@ def test_expected_markers_match_the_direction(seeds):
         d = md["io_direction"]
         if d in want:
             assert md["expect_markers"] == want[d], (d, md["expect_markers"])
-        else:  # crosslingual: other language in, target out, and never English on either side
+        elif d == "crosslingual":
+            # other language in, target out, and never English on either side
             assert md["expect_markers"][1] == "yor"
             assert md["expect_markers"][0] not in ("eng", "yor")
+        elif d == "three_way":
+            # The user wrote in their own language and asked for the answer in a THIRD one, so the markers
+            # describe the conversation and the material's language appears in neither.
+            assert md["expect_markers"][0] == "yor"
+            assert md["expect_markers"][1] != "yor"
+        else:
+            raise AssertionError(f"unhandled io_direction {d!r} -- add it to this test deliberately")
 
 
 def test_rag_context_is_specified_as_english(seeds):

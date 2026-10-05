@@ -412,6 +412,7 @@ def _task(name, tags, share, description, plan=(), flags=(), tools=False, think=
 LONG_REPLY_TASKS = {
     "summarization", "long_document_summarization", "creative_from_knowledge", "creative_from_pattern",
     "rag_document_qa", "structured_output",
+    "cv_and_job_application", "exam_and_study_help",
 }
 # Tasks whose replies are naturally a few sentences, where three pairs cost little.
 SHORT_REPLY_TASKS = {
@@ -718,6 +719,39 @@ ALL_TASKS = [
           "appointment systems.",
           plan=["<|math|>", "<|plan|>"], tools=True, think=True),
 
+    # ---- what people actually open an assistant for. The Google-Ipsos survey puts Nigerian adult AI use at
+    # 88%, the highest measured anywhere, with 93% using it to understand complex topics, 91% for work
+    # support and 80% for career exploration. The corpus had almost nothing for the last two.
+    _task("cv_and_job_application", ["content-writing", "text-rephrasing", "multi-turn-chat"], 5.0,
+          "The single largest gap against real use. Career work, in the forms it actually arrives: turn a "
+          "messy work history into CV bullets that lead with what was achieved; write a cover letter for a "
+          "named role; explain what a job advert is really asking for and whether the person qualifies; "
+          "answer 'tell me about yourself' or 'why should we hire you' for a specific job; rewrite a CV "
+          "summary for a different industry; decide what to leave off. The user's details are the ONLY "
+          "material -- qualifications, employers, years, grades come from what they said and nowhere else. "
+          "The wrong candidate invents a degree, a job title or a date the user never gave, or returns "
+          "generic careers advice instead of writing the thing that was asked for.",
+          plan=["<|generate|>", "<|edit|>"]),
+    _task("business_and_customer_writing", ["content-writing", "text-rephrasing"], 4.5,
+          "Small-business writing, which is most of what 'work support' means here: a reply to a customer "
+          "who is angry about a late delivery; a price quote with the terms spelled out; a polite chase for "
+          "an unpaid invoice; a product caption for WhatsApp Status or Instagram; a supplier negotiation "
+          "message; an apology that does not admit liability it should not; a short proposal. It keeps the "
+          "user's actual figures and dates, matches the register they asked for (firm, warm, formal), and is "
+          "short enough to send. The wrong candidate is a corporate template with brackets left in, invents "
+          "a discount or a delivery date the user never mentioned, or is three times longer than anyone "
+          "would read on a phone.",
+          plan=["<|generate|>", "<|edit|>"]),
+    _task("exam_and_study_help", ["qa", "summarization", "multi-turn-chat"], 5.0,
+          "Students are the largest single group of users. Explain a concept AT A STATED LEVEL -- JSS2, "
+          "WAEC, 200-level, 'explain like I know nothing' -- and stop at that level rather than showing off; "
+          "work a past question so the METHOD is visible and reusable, not just the answer; turn a chapter "
+          "into revision notes; make a handful of practice questions with their answers; say what a syllabus "
+          "topic actually requires. Where the subject has a right answer the working must reach it. The "
+          "wrong candidate answers above the level asked for, gives the answer with no method so nothing "
+          "transfers, or does the student's assignment verbatim where the ask was to understand it.",
+          plan=["<|explain|>", "<|summarize|>"], think=True),
+
     # ---- generation and reasoning. Added because each has a GENUINE better/worse pair, which is what makes a
     # task worth putting in RL: a faithful summary against one that invents a figure, a story that follows its
     # brief against a generic one, a correct chain of reasoning against a plausible-but-wrong one. SFT can only
@@ -823,6 +857,7 @@ _RL_WEIGHTS = {
     "safety_boundary": 3.5,
     # ---- generation, reasoning and extraction, ~31%
     "multi_step_reasoning": 8.0, "summarization": 6.0,
+    "cv_and_job_application": 5.0, "business_and_customer_writing": 4.5, "exam_and_study_help": 5.0,
     "creative_from_knowledge": 3.5, "creative_from_pattern": 3.5,
     "instruction_following": 6.0, "structured_output": 5.0,
     "long_document_summarization": 2.0,
@@ -894,6 +929,15 @@ IO_DIRECTIONS = [
      "brief": "The material and instruction are in {lang}, and the user asks for the answer in ENGLISH. "
               "<|input_lang|> is <{code}> and <|target_lang|> is <eng>. The assistant's <response> must be "
               "English."},
+    {"key": "three_way", "weight": 1.0,
+     "brief": "THREE languages, which is the case no public corpus covers and the one people actually hit. "
+              "The user WRITES in {lang}, the material they are asking about is in a THIRD language "
+              "({other_name}) -- often but not always English -- and they ask for the answer in a language "
+              "that is not the one they wrote in. State all three explicitly in the user turn ('this "
+              "{other_name} document -- explain it to me in Twi'). <|input_lang|> is the language the USER "
+              "WROTE IN ({code}); <|target_lang|> is the language they asked the ANSWER in, which is "
+              "different. The material's language is neither marker's business -- markers describe the "
+              "conversation, not the source."},
     {"key": "crosslingual", "weight": 1.0,
      "brief": "The material is in {other_name} and the user asks for the answer in {lang} -- neither is "
               "English. <|input_lang|> is <{other_code}> and <|target_lang|> is <{code}>. This is the "

@@ -327,3 +327,71 @@ def test_chunking_a_real_pooled_document():
     assert len(cs) >= 5, f"a {doc['words']}-word document should yield several passages, got {len(cs)}"
     # Chunking must not lose content.
     assert sum(c["words"] for c in cs) >= doc["words"] * 0.7
+
+
+# --------------------------------------------------------------------------- native-language documents
+
+def test_only_measured_wikis_are_harvestable():
+    """NATIVE_WIKIS is a measurement, not a wish list: each entry was checked for articles long enough to
+    serve as a passage. Languages not listed fall through to generation, which is the only option."""
+    from doc_sources import NATIVE_WIKIS
+    assert NATIVE_WIKIS["fra"] == "fr"
+    assert "hau" in NATIVE_WIKIS and "ibo" in NATIVE_WIKIS
+    # Measured as unusable: a median article of 24 words (zul) or 53 (ewe) cannot be a retrieval passage.
+    for unusable in ("zul", "ewe", "sna", "kin", "aka"):
+        assert unusable not in NATIVE_WIKIS, f"{unusable} has no long articles to harvest"
+
+
+def test_is_prose_rejects_tables_and_lists():
+    """The one thing that makes a native document unusable as a passage: nothing to read off. Common in the
+    smaller wikis, where many long pages are tables of names."""
+    from doc_sources import _is_prose
+    table = "\n".join(f"| {i} | Name {i} | 1999 |" for i in range(40))
+    assert not _is_prose(table)
+    listing = "\n".join(f"* Item {i}" for i in range(40))
+    assert not _is_prose(listing)
+    prose = ("Wannan rubutu yana bayanin yadda ake sarrafa shara a cikin birane da kuma matsalolin da ke "
+             "tattare da shi a yankunan karkara. " * 14)
+    assert _is_prose(prose), "a single long paragraph is still prose"
+    assert _is_prose("\n\n".join([prose] * 3)), "and so is the same text in paragraphs"
+    assert not _is_prose("Short. Text. Only."), "too little to answer anything from"
+
+
+def test_pool_keeps_languages_separate():
+    """Handing a Hausa sample an English document would silently change what the sample teaches."""
+    import json
+    from pathlib import Path
+    from doc_sources import DocumentPool
+    import tempfile
+    with tempfile.TemporaryDirectory() as d:
+        p = DocumentPool(Path(d) / "pool.jsonl")
+        p.extend([{"title": "E", "pageid": 1, "url": "u", "text": "x " * 3000, "words": 3000,
+                   "doc_lang": "eng", "domain": "x", "source": "wikipedia", "licence": "CC BY-SA 4.0"},
+                  {"title": "H", "pageid": 2, "url": "u", "text": "y " * 3000, "words": 3000,
+                   "doc_lang": "hau", "domain": "x", "source": "wikipedia", "licence": "CC BY-SA 4.0"}])
+        assert p.count("eng") == 1 and p.count("hau") == 1
+        assert p.take(words=3000, lang="hau")["title"] == "H"
+        assert p.take(words=3000, lang="hau") is None, "must not fall back to another language"
+        assert p.take(words=3000, lang="eng")["title"] == "E"
+
+
+def test_fill_store_sources_a_native_document_for_a_native_spec():
+    from pathlib import Path
+    import tempfile
+    from doc_sources import DocumentPool, fill_store
+
+    class _Spec:
+        custom_id, doc_lang, words, domain, rag, lang, tokens = "doc__h", "hau", 3000, "x", True, "hau", 4000
+
+    class _Store:
+        def __init__(self): self.docs = {}
+        def __contains__(self, k): return k in self.docs
+        def put(self, d): self.docs[d["doc_id"]] = d
+
+    with tempfile.TemporaryDirectory() as d:
+        pool = DocumentPool(Path(d) / "p.jsonl")
+        pool.extend([{"title": "H", "pageid": 2, "url": "u", "text": "y " * 3000, "words": 3000,
+                      "doc_lang": "hau", "domain": "x", "source": "wikipedia", "licence": "CC BY-SA 4.0"}])
+        store = _Store()
+        assert fill_store([_Spec()], store, pool) == 1
+        assert store.docs["doc__h"]["doc_lang"] == "hau"

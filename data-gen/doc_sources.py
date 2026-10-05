@@ -55,6 +55,139 @@ API = "https://en.wikipedia.org/w/api.php"
 UA = "SabiYarn-datagen/0.1 (West African LM research; https://huggingface.co/BeardedMonster)"
 LICENCE = "CC BY-SA 4.0"
 
+# WHICH WIKIPEDIAS CAN ACTUALLY SUPPLY A LONG DOCUMENT. Measured, not assumed, by sampling each site's search
+# results for articles of 1,200+ words:
+#
+#   fra 176/200   hau 68/200   ibo 53/200   som 23/200   twi 14/200   yor 13/200
+#   orm 8/120     swh 6/200    kin 4/120    sna 2/120    zul 1/120    ewe 1/120    aka 0 (no wiki)
+#
+# This corrected an earlier conclusion of mine. I had sampled the Hugging Face wikipedia dump from a fixed
+# offset, which is stub-heavy, and concluded the African Wikipedias were unusable across the board. Sampling
+# through each site's own search tells a different story: Hausa and Igbo are genuinely viable, Yoruba is
+# marginal, and Swahili is poor DESPITE having 130,000 articles -- most of them short.
+#
+# Languages not listed fall through to generation, which is the only option when there is nothing to harvest.
+NATIVE_WIKIS = {
+    "fra": "fr",   # 2.8M articles; effectively unlimited
+    "hau": "ha",   # the best of the West African wikis
+    "ibo": "ig",
+    "som": "so",
+    "twi": "tw",   # thin, but enough to be worth trying before falling back
+    "yor": "yo",   # marginal: expect a low yield and a generation fallback
+}
+# Below this many usable documents for a language, do not bother: the harvest costs more attention than the
+# handful of documents is worth, and generation covers it.
+NATIVE_MIN_VIABLE = 25
+
+# HOW the native wikis are harvested, and why it differs from English.
+#
+# The English pool is harvested by TOPIC: 155 English queries, each filtered for whether the article actually
+# answers to the query that found it. That machinery does not transfer. Searching the Hausa Wikipedia with an
+# English query finds little, and the relevance gate -- which asks whether the query's terms appear in the
+# text -- can never pass against Hausa prose.
+#
+# Two further things I measured before settling on this:
+#   - interlanguage links are a dead end. Only 3 of 12 vetted English pages have a Hausa equivalent at all,
+#     and "Rogo" (cassava) is 69 words. The native equivalents of technical English pages are stubs.
+#   - the long articles DO exist (Hausa 68 of 200 sampled are 1,200+ words) but they are not about reference
+#     topics; they are about places, people, religion and history.
+#
+# Which is fine, and this is the point that resolves it: the QUESTION IS GENERATED FROM THE DOCUMENT. A long
+# Hausa article about anything at all produces a Hausa question about that thing, and answering it from the
+# passage is exactly the skill being taught. So native harvesting selects on LENGTH AND COHERENCE ONLY, and
+# the topic follows the document rather than the reverse.
+#
+# Common short words, used as search probes because a vague query returns the site's largest articles first.
+_NATIVE_PROBES = {
+    "fra": ("de", "la", "le", "et", "pour", "dans", "avec", "sur"),
+    "hau": ("da", "na", "a", "ta", "ya", "wannan", "kuma", "ba"),
+    "ibo": ("na", "ya", "nke", "maka", "ihe", "ndi", "otu", "ka"),
+    "som": ("ka", "oo", "la", "iyo", "waa", "ah", "uu", "si"),
+    "twi": ("ne", "no", "wo", "na", "se", "nti", "yi", "mu"),
+    "yor": ("ni", "ti", "ati", "awon", "fun", "lati", "pelu", "ko"),
+}
+
+
+def harvest_native(lang: str, *, min_words: int, max_words: int, want: int = 0,
+                   per_probe: int = 120, verbose: bool = True) -> Iterator[dict]:
+    """Long articles from `lang`'s own Wikipedia, selected on length and coherence.
+
+    No topic filter and no query-relevance gate -- see the note above. What IS checked:
+      - length, inside the band the samples ask for;
+      - that the text is prose rather than a list or a table dump, which is the one thing that would make a
+        document unusable as a passage to answer from;
+      - that it is not a disambiguation page or a bare stub with an infobox.
+    """
+    wiki_code = NATIVE_WIKIS.get(lang)
+    if not wiki_code:
+        return
+    wiki = Wikipedia(lang=wiki_code)
+    seen: set[str] = set()
+    produced = 0
+    for probe in _NATIVE_PROBES.get(lang, ("a",)):
+        try:
+            hits = wiki.search(probe, limit=per_probe)
+        except RuntimeError:
+            continue
+        # Length filter on the search result, before anything is downloaded.
+        cands = [h for h in hits
+                 if h.get("title") not in seen and int(h.get("wordcount") or 0) >= min_words * 0.9]
+        for h in cands:
+            title = h["title"]
+            seen.add(title)
+            try:
+                pg = wiki.plaintext(title)
+            except RuntimeError:
+                continue
+            if not pg:
+                continue
+            body = clean(pg["text"])
+            n = len(body.split())
+            if not (min_words <= n <= max_words):
+                continue
+            if not _is_prose(body):
+                continue
+            produced += 1
+            if verbose:
+                print(f"  [{lang}] {title[:48]:<50} {n:>6,}w")
+            yield {"title": pg["title"], "pageid": pg["pageid"], "url": pg["url"],
+                   "text": body, "words": n, "doc_lang": lang,
+                   # Scored for the record but not gated on: topic is not the selection criterion here.
+                   "technicality": round(technicality(body, title), 3),
+                   "relevance": 1.0, "query": f"native:{probe}",
+                   "domain": "native_general", "source": "wikipedia", "licence": LICENCE}
+            if want and produced >= want:
+                return
+
+
+def _is_prose(text: str) -> bool:
+    """Enough running prose to answer questions from.
+
+    The failure this excludes is a page that is mostly a table, a list of names, or an infobox with two
+    sentences round it -- common in the smaller wikis, and useless as a passage because there is nothing to
+    read off. Measured as: most lines are long enough to be sentences, and the text has sentence punctuation.
+    """
+    body = "\n".join(ln for ln in text.splitlines() if not ln.strip().startswith("="))
+    words = body.split()
+    if len(words) < 200:
+        return False
+    # Sentences, not lines: a document is prose if it is made of sentences, however it happens to be wrapped.
+    # Keying this on line count alone rejected a legitimate single-paragraph article.
+    sentences = [s for s in re.split(r"[.!?]+(?:\s|$)", body) if len(s.split()) >= 6]
+    if len(sentences) < 8:
+        return False
+    # And the average sentence has to be sentence-length. A table of names parses as many 2-word "sentences".
+    if len(words) / max(1, len(sentences)) < 8:
+        return False
+    # Finally, if the text IS broken into many lines, most of them should be long -- this is what catches a
+    # page that is mostly a list or an infobox.
+    lines = [ln.strip() for ln in body.splitlines() if ln.strip()]
+    if len(lines) >= 8:
+        longish = sum(1 for ln in lines if len(ln.split()) >= 12)
+        if longish / len(lines) < 0.40:
+            return False
+    return True
+
 # Search seeds, grouped by the corpus's own domains (prompts.DOMAINS). Each is phrased to surface REFERENCE
 # pages rather than overviews: the words are the ones a specification uses.
 TOPIC_SEEDS: dict[str, tuple[str, ...]] = {
@@ -327,7 +460,7 @@ def _content_terms(q: str) -> set[str]:
     return {w for w in re.findall(r"[a-z]+", q.lower()) if len(w) > 3 and w not in stop}
 
 
-def relevance(text: str, title: str, query: str) -> float:
+def relevance(text: str, title: str, query: str, lang: str = "eng") -> float:
     """0..1. Is this document about what the query asked for, and is it usable for this corpus?
 
     Deliberately a gate rather than a ranking: the pool is drawn from a free corpus, so it costs nothing to
@@ -351,7 +484,9 @@ def relevance(text: str, title: str, query: str) -> float:
     # for a query about identity enrolment and still the wrong answer: a document question answered from
     # another country's procedure is worse than one answered with "I could not find it". A penalty left it
     # at 0.50, above the gate.
-    if R_FOREIGN.search(title):
+    # The jurisdiction rule is written against English titles and would misfire on a Hausa or French page,
+    # whose place names are spelled differently. Applied only to the English pool, where it was calibrated.
+    if lang == "eng" and R_FOREIGN.search(title):
         return 0.0
     # Likewise a specific product or model year. "Toyota Prius (XW20)" matches a query about battery
     # charging perfectly and is still never a document a SabiYarn user retrieves. A penalty left it at 0.55.
@@ -455,23 +590,39 @@ def clean(text: str) -> str:
 
 # --- pool building ---------------------------------------------------------------------------------------
 
-# Calibrated against known pages rather than picked: general-interest articles score 0.00 (Fela Kuti,
-# Nigeria national football team) to 0.30 (Lagos), reference pages 0.41 (Drip irrigation) to 0.68 (Oral
-# rehydration therapy). 0.36 sits in the gap with room on both sides. A threshold of 0.42 -- my first guess
-# -- excluded Drip irrigation, which is exactly the kind of page this pool exists for.
-MIN_TECHNICALITY = 0.36
+# RELAXED, deliberately, from 0.36 to 0.15.
+#
+# The original idea was that a retrieved document should be something a 306M model cannot hold, so that
+# looking things up is reserved for genuinely technical questions. That reasoning does not survive contact
+# with how people actually work: nobody knows who a musician is until they encounter them, and nobody knows
+# the Rule of 72 until the day they look it up. An unnecessary search costs a second; a confident wrong
+# answer costs trust. Excluding general-interest documents from the pool meant the model could never learn
+# that looking THOSE up is available to it either.
+#
+# What the score is still used for: a mild PREFERENCE, so the pool leans towards pages with checkable
+# specifics (a discharge rate, a dosage, a fee) rather than consisting entirely of them. The floor now only
+# rejects documents with nothing retrievable in them at all.
+#
+# The calibration that produced 0.36 is kept for reference: general-interest pages score 0.00 (Fela Kuti) to
+# 0.30 (Lagos), reference pages 0.41 (Drip irrigation) to 0.68 (Oral rehydration therapy). Relevance --
+# whether the document matches the question asked of it -- is now the gate that does the real work.
+MIN_TECHNICALITY = 0.15
+# Above this a document counts as "specific"; the pool aims for a majority of these without requiring it.
+TECHNICAL_PREFERENCE = 0.36
 
 
 def harvest(*, min_words: int, max_words: int, min_technicality: float = MIN_TECHNICALITY,
             per_seed: int = 40, domains: Optional[Iterable[str]] = None,
-            want: int = 0, verbose: bool = True) -> Iterator[dict]:
+            want: int = 0, verbose: bool = True, lang: str = "eng",
+            queries: Optional[dict[str, tuple[str, ...]]] = None) -> Iterator[dict]:
     """Yield cleaned, length-filtered, technicality-scored documents.
 
     Length is filtered on the SEARCH result (`wordcount`), so a page is only downloaded once it is already
     known to be the right size -- that is the difference between a few hundred requests and a few thousand.
     """
-    wiki = Wikipedia()
-    seeds = TOPIC_SEEDS if domains is None else {k: v for k, v in TOPIC_SEEDS.items() if k in set(domains)}
+    wiki = Wikipedia(lang=NATIVE_WIKIS.get(lang, "en"))
+    base = queries if queries is not None else TOPIC_SEEDS
+    seeds = base if domains is None else {k: v for k, v in base.items() if k in set(domains)}
     seen_titles: set[str] = set()
     produced = 0
     for domain, queries in seeds.items():
@@ -503,7 +654,7 @@ def harvest(*, min_words: int, max_words: int, min_technicality: float = MIN_TEC
                 score = technicality(body, title)
                 if score < min_technicality:
                     continue
-                rel = relevance(body, title, q)
+                rel = relevance(body, title, q, lang=lang)
                 if rel < MIN_RELEVANCE:
                     continue
                 produced += 1
@@ -511,7 +662,7 @@ def harvest(*, min_words: int, max_words: int, min_technicality: float = MIN_TEC
                     print(f"  [{domain}] {title[:46]:<46} {n:>6,}w  tech {score:.2f} rel {rel:.2f}")
                 yield {"title": pg["title"], "pageid": pg["pageid"], "url": pg["url"],
                        "text": body, "words": n, "technicality": round(score, 3),
-                       "relevance": round(rel, 3), "query": q,
+                       "relevance": round(rel, 3), "query": q, "doc_lang": lang,
                        "domain": domain, "source": "wikipedia", "licence": LICENCE}
                 if want and produced >= want:
                     return
@@ -548,13 +699,20 @@ class DocumentPool:
                 added += 1
         return added
 
-    def take(self, *, words: int, domain: str = "", key: str = "") -> Optional[dict]:
+    def count(self, lang: str = "eng") -> int:
+        return sum(1 for d in self.docs if (d.get("doc_lang") or "eng") == lang)
+
+    def take(self, *, words: int, domain: str = "", key: str = "",
+             lang: str = "eng") -> Optional[dict]:
         """The unused document closest to `words`, preferring the requested domain.
 
         `key` makes the choice deterministic for a given caller, so a re-run picks the same document for the
         same sample and the corpus is reproducible.
         """
-        pool = [(i, d) for i, d in enumerate(self.docs) if i not in self._used]
+        # Language first and without compromise: handing a Hausa sample an English document would silently
+        # change what the sample teaches.
+        pool = [(i, d) for i, d in enumerate(self.docs)
+                if i not in self._used and (d.get("doc_lang") or "eng") == lang]
         if not pool:
             return None
         same = [(i, d) for i, d in pool if d.get("domain") == domain]
@@ -587,10 +745,9 @@ def fill_store(specs: Iterable[Any], store: Any, pool: "DocumentPool") -> int:
         cid = getattr(spec, "custom_id", None)
         if not cid or cid in store:
             continue
-        if getattr(spec, "doc_lang", None) != "eng":
-            continue  # nothing to source: see above
+        want_lang = getattr(spec, "doc_lang", None) or "eng"
         picked = pool.take(words=int(getattr(spec, "words", 0) or 0),
-                           domain=getattr(spec, "domain", "") or "", key=cid)
+                           domain=getattr(spec, "domain", "") or "", key=cid, lang=want_lang)
         if picked is None:
             continue
         store.put({
@@ -599,8 +756,8 @@ def fill_store(specs: Iterable[Any], store: Any, pool: "DocumentPool") -> int:
             "text": picked["text"],
             "words": picked["words"],
             "lang": getattr(spec, "lang", "eng"),
-            "doc_lang": "eng",
-            "doc_lang_mode": "eng",
+            "doc_lang": want_lang,
+            "doc_lang_mode": getattr(spec, "doc_lang_mode", None) or want_lang,
             # The form is what it is -- an encyclopaedia article -- rather than one of the generated forms.
             # Stage 2 reads this only to describe the document to the generator, so saying so is honest and
             # also tells the generator not to expect a report's section structure.
