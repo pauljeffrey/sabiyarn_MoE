@@ -1191,3 +1191,43 @@ def test_the_ttr_gate_ignores_short_passages():
     """Type-token ratio is length-dependent, so it is only applied where it means something."""
     from postprocess_gen import degenerate_reason
     assert degenerate_reason("ade ade ade ade ade ade ade ade ade ade ade ade") is None
+
+
+def test_the_prompt_advertises_the_PHASE_response_ceiling():
+    """prompts.py bound MAX_RESPONSE_TOKENS at import, which is the SFT value (4,096). generate.py sets the
+    assembler to 2,048 for RL, where two candidates share the window -- so every RL request was telling the
+    generator it had twice the room the assembler would accept, and a response written to that figure is
+    rejected for length. One discarded sample per occurrence."""
+    import re
+    import assemble
+    from budgets import budget_for
+    from schemas.seed import Seed
+    seen = {}
+    for kind in ("sft", "rl"):
+        assemble.set_response_budget(budget_for(kind).max_response_tokens)
+        seed = Seed.load(f"seeds/{kind}.json")
+        task = seed.tasks[0].name
+        req = build_request(seed, {"custom_id": f"{kind}__pcm__{task}__000001", "lang": "pcm",
+                                   "task": task, "index": 1})
+        txt = "".join(m["content"] for m in req.messages if isinstance(m.get("content"), str))
+        m = re.search(r"Hard ceiling (\d+) tokens", txt)
+        assert m, f"{kind}: no response ceiling stated in the prompt"
+        seen[kind] = int(m.group(1))
+        assert seen[kind] == budget_for(kind).max_response_tokens, (
+            f"{kind} prompt says {seen[kind]} but the assembler enforces "
+            f"{budget_for(kind).max_response_tokens}")
+    assert seen["rl"] < seen["sft"], "rl shares its window between two candidates, so its ceiling is lower"
+
+
+def test_the_verifier_spec_is_task_shaped_not_a_menu():
+    """Listing all six verifier fields every time cost 2,700 characters -- the largest single block in the
+    prompt -- and read as a menu, which invites filling in fields that do not apply. A wrong verifier is
+    worse than none: it marks the GOOD reply bad."""
+    from prompts import _verifier_block
+    reasoning = _verifier_block(["multi_step_reasoning"])
+    rag = _verifier_block(["rag_document_qa"])
+    assert "expected_answer" in reasoning and "answer_chunks" not in reasoning
+    assert "answer_chunks" in rag and "expected_answer" not in rag
+    # the discriminator applies to every task
+    assert "discriminator" in reasoning and "discriminator" in rag
+    assert len(reasoning) < 1_200, "the point of this was density"

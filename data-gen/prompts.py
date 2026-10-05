@@ -19,7 +19,8 @@ from typing import Any, Optional
 
 import os
 
-from assemble import MAX_RESPONSE_TOKENS, VALID_LANGS, VALID_VERBS
+import assemble  # for the LIVE response budget; see _format_brief
+from assemble import VALID_LANGS, VALID_VERBS
 from longdocs import DOCUMENT_TASKS, document_brief
 from providers.base import Request
 from sampling.taxonomy import DOMAINS, GENRES, all_pairs
@@ -206,6 +207,68 @@ def _io_cycle(dirs: list[dict]) -> list[int]:
         cycle.append(max(range(len(dirs)), key=lambda i: weights[i]))
         guard += 1
     return cycle
+
+
+
+# The verifier spec, per FIELD, so a request carries only the fields its task can actually supply. Listing all
+# six every time cost 2,700 characters -- the largest single block in the prompt -- and most tasks need one or
+# two. It also read as a menu, which invites the generator to fill in fields that do not apply, and a wrong
+# verifier is worse than none: it scores the GOOD answer as bad.
+_VERIFIER_FIELDS = {
+    "expected_answer":
+        '  - "expected_answer": the ONE correct value, as a bare string -- "4500", "12", "1960".',
+    "constraint":
+        '  - "constraint": the checkable rule the user imposed, as {"kind": ..., "value": ...} with kind one\n'
+        '    of max_words | exactly_sentences | list_items | forbidden_word | required_word. Omit if none.',
+    "brief_elements":
+        '  - "brief_elements": what the piece MUST contain -- names, places, the required ending -- as short\n'
+        '    strings.',
+    "max_words":
+        '  - "max_words": the length the user asked for, in words. Omit if they did not ask.',
+    "answer_chunks":
+        '  - "answer_chunks": REQUIRED here. The ids -- ["c4"] or ["c4","c9"] -- of the returned passages that\n'
+        '    genuinely contain the answer; the rest are distractors. Checked, so it must be true.',
+    "fields":
+        '  - "fields": the field names the user asked for in the schema, as a list of strings.',
+}
+
+# Which fields each task can supply. A task not listed gets the discriminator alone.
+_VERIFIER_BY_TASK = {
+    "multi_step_reasoning": ("expected_answer",),
+    "date_and_time_reasoning": ("expected_answer",),
+    "exam_and_study_help": ("expected_answer", "answer_chunks"),
+    "instruction_following": ("constraint", "max_words"),
+    "creative_from_knowledge": ("brief_elements", "max_words"),
+    "creative_from_pattern": ("brief_elements",),
+    "cv_and_job_application": ("brief_elements", "max_words"),
+    "business_and_customer_writing": ("max_words",),
+    "structured_output": ("fields",),
+    "rag_document_qa": ("answer_chunks",),
+    "retrieval_insufficient": ("answer_chunks",),
+    "summarization": ("max_words",),
+    "long_document_summarization": ("answer_chunks", "max_words"),
+    "tool_structured_call": ("expected_answer",),
+}
+
+_DISCRIMINATOR_SPEC = (
+    '  - "discriminator": OPTIONAL. {"good": "<short exact phrase the BEST reply contains and the worst does\n'
+    '    NOT>", "bad": "<short exact phrase the WORST contains and the best does not>"} -- under 12 words\n'
+    '    each, quoted EXACTLY as written, matched literally. Usually the correct value against the invented\n'
+    '    one. OMIT when the difference is spread over the whole reply; the scores below carry the ranking.')
+
+
+def _verifier_block(task_names: list[str]) -> str:
+    """Only the verifier fields these tasks can supply, plus the discriminator."""
+    fields: list[str] = []
+    for name in task_names:
+        for f in _VERIFIER_BY_TASK.get(name, ()):
+            if f not in fields:
+                fields.append(f)
+    lines = [_VERIFIER_FIELDS[f] for f in fields] + [_DISCRIMINATOR_SPEC]
+    return ('Also return a "verifier" object -- the GROUND TRUTH a program uses to score the replies without\n'
+            "reading them. It must describe the prefix you actually wrote, and a WRONG verifier is worse than\n"
+            "none because it marks the good reply bad. Omit any field you are unsure of.\n"
+            + "\n".join(lines) + "\n")
 
 
 def _io_direction(seed: Seed, lang: str, index: int, rng: random.Random) -> dict:
@@ -463,7 +526,11 @@ RULES THAT FOLLOW FROM THIS
 def _format_brief(lang_code: str, language_name: str, verbs_allowed: str) -> str:
     """A pure function of (language): anything row-specific belongs in the user message, because this is the
     shared prefix that prefix caching reuses across a whole (kind, lang) group."""
-    return (_FORMAT_BRIEF.replace("__MAX_TOK__", str(MAX_RESPONSE_TOKENS))
+    # The LIVE budget, not the value bound at import. generate.py calls assemble.set_response_budget() per
+    # phase -- 4,096 for SFT, 2,048 for RL where two candidates share the window -- and reading the imported
+    # name instead told every RL request it had twice the room the assembler would actually accept. Responses
+    # written to that figure were then rejected for length, which is a discarded sample per occurrence.
+    return (_FORMAT_BRIEF.replace("__MAX_TOK__", str(assemble.MAX_RESPONSE_TOKENS))
             .replace("__VERBS_ALLOWED__", verbs_allowed)
             .replace("__LANGS_ALLOWED__", " ".join(sorted(VALID_LANGS)))
             .replace("__LANGUAGE_NAME__", language_name).replace("__LANG__", lang_code))
@@ -724,6 +791,7 @@ Return JSON:
         else:
             n_pairs = int(seed.conversation.get("paired_turns", 2))
         n_pairs = max(1, min(n_pairs, n_user))
+        verifier_block = _verifier_block([x.name for x in tasks])
         if n_pairs > 1:
             multi_turn_block = (
                 f"RANK {n_pairs} TURNS, NOT ONE. The LAST {n_pairs} assistant turns each get a pair of "
@@ -764,36 +832,7 @@ think, task_plan, input_lang, target_lang, response (or tool_call). Write the FI
 special tokens or the marker string yourself, and do NOT put a JSON string there: the markers are assembled
 for you, exactly as they are for the turns in "prompt_turns".
 
-Also return a "verifier" object: the GROUND TRUTH a program needs to score an answer without reading it.
-This is what makes the sample checkable, so it must describe the prefix you actually wrote:
-  - "expected_answer": for a question with ONE correct value (arithmetic, a count, a date), that value as a
-    bare string -- "4500", "12", "1960". Omit when the task has no single correct value.
-  - "constraint": when the user imposed a checkable rule, as {{"kind": ..., "value": ...}} where kind is one
-    of "max_words" | "exactly_sentences" | "list_items" | "forbidden_word" | "required_word", e.g.
-    {{"kind": "exactly_sentences", "value": 3}} or {{"kind": "forbidden_word", "value": "money"}}. Omit if
-    the user imposed none.
-  - "brief_elements": for a writing brief, the things the piece MUST contain -- names, places, the required
-    ending -- as a list of short strings. Omit when there was no brief.
-  - "max_words": when the user asked for a length, the number of words. Omit otherwise.
-  - "answer_chunks": REQUIRED when the conversation retrieves passages. The ids -- ["c4"] or ["c4","c9"] --
-    of the returned passages that genuinely contain the answer. The others you listed are distractors. This
-    is what lets a reply that answered from the WRONG passage be scored down, so it must be true.
-  - "discriminator": OPTIONAL, and only when it is genuinely short. The one concrete thing that makes the
-    worse reply worse, as
-    {{"good": "<a short exact phrase, number or name the BEST reply contains and the worst does NOT>",
-      "bad":  "<a short exact phrase, number or name the WORST reply contains and the best does NOT>"}}
-    Either side may be omitted if only one applies, but at least one is required. Keep each under 12 words
-    and quote it EXACTLY as it appears in the reply -- it is matched literally, not interpreted. For a
-    factual question this is usually the correct value against the invented one; for an honesty sample it is
-    the admission against the fabricated claim. OMIT IT when the difference is spread over the whole reply
-    rather than sitting in one phrase -- a forced, vague discriminator is worse than none, and the score
-    below carries the ranking anyway.
-These must be EXACT: "expected_answer" has to be the value the best reply states, a "forbidden_word" has to
-be a word the best reply genuinely avoids, and the "discriminator" phrases must be literal substrings of the
-replies they belong to. A wrong verifier is worse than no verifier -- it would score the good answer as bad
--- so omit a field you are unsure of rather than guessing it. The discriminator is CHECKED against both
-replies after you return, and the sample is discarded if it does not hold.
-
+{verifier_block}
 Return JSON:
 {{"prompt_turns": [ ...turn objects exactly as the OUTPUT CONTRACT describes... ],
   "responses": [
@@ -838,11 +877,9 @@ Today's date is {today} and it is stated in the assistant's system prompt, so an
 out from "today" -- days remaining, whether a deadline has passed, how stale a result is -- must agree with
 that date.
 
-KEEP <think> SHORT. One to three sentences: what it needs to decide and why, nothing else. No restating the
-question back, no listing what it will not do, no narrating the plan it is about to carry out anyway. A
-<think> block longer than the answer it precedes is a defect -- it spends the context window the model needs
-for the conversation, and at 32,768 tokens that budget is real. Reason where there is something to decide and
-skip it entirely where there is not.
+KEEP <think> TO 1-3 SENTENCES: what has to be decided, and why. Never restate the question, never narrate a
+plan you are about to carry out. Longer than the answer it precedes is a defect, and it is trimmed. Omit it
+entirely where nothing needs deciding.
 The assistant's identity in the system message will be: "{identity}" -- keep its self-references consistent
 with that, and do not assume any other name.
 {tools_section}
