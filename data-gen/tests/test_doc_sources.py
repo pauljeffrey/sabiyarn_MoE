@@ -449,3 +449,52 @@ def test_english_scoring_is_unchanged_by_the_language_split():
                  "120 kg/ha of nitrogen in two doses. Moisture must fall below 13% at 25 °C. " * 8)
     assert technicality(general, "A Musician") < 0.36
     assert technicality(technical, "Drip irrigation") >= 0.36
+
+
+def test_a_summary_source_draws_a_spread_of_specificity():
+    """A dense reference page and a plain narrative are different summarisation problems: the first is about
+    keeping the numbers right, the second about finding the point. Training on one teaches one."""
+    import sys
+    from pathlib import Path as _P
+    sys.path.insert(0, str(_P(__file__).resolve().parent.parent))
+    from schemas.seed import Seed
+    from longdocs import doc_group_index, plan_document
+    seed = Seed.load(str(_P(__file__).resolve().parent.parent / "seeds" / "rl.json"))
+    bands = []
+    for i in range(0, 24, 4):
+        row = {"custom_id": f"rl__eng__long_document_summarization__{i:06d}", "lang": "eng",
+               "task": "long_document_summarization", "index": i}
+        bands.append(plan_document(seed, row, domain="health_medicine", subtopic="x").technicality_band)
+    assert len(set(bands)) == 3, f"summary sources must span the range, got {set(bands)}"
+    # a RAG spec takes whatever matches its length: the spread is a summarisation concern
+    rag = {"custom_id": "rl__eng__rag_document_qa__000000", "lang": "eng",
+           "task": "rag_document_qa", "index": 0}
+    assert plan_document(seed, rag, domain="health_medicine", subtopic="x").technicality_band is None
+
+
+def test_the_pool_honours_a_technicality_band_and_falls_back(tmp_path):
+    """Falling back to the whole language rather than failing: a thin band is a narrower spread, not a reason
+    to generate a document we already have one for."""
+    from doc_sources import DocumentPool
+    p = DocumentPool(tmp_path / "pool.jsonl")
+    p.extend([{"title": "dense", "pageid": 1, "url": "u", "text": "x " * 3000, "words": 3000,
+               "technicality": 0.80, "doc_lang": "eng", "domain": "d", "source": "wikipedia",
+               "licence": "CC BY-SA 4.0"},
+              {"title": "plain", "pageid": 2, "url": "u", "text": "y " * 3000, "words": 3000,
+               "technicality": 0.10, "doc_lang": "eng", "domain": "d", "source": "wikipedia",
+               "licence": "CC BY-SA 4.0"}])
+    assert p.take(words=3000, lang="eng", technicality=(0.45, 1.0))["title"] == "dense"
+    assert p.take(words=3000, lang="eng", technicality=(0.0, 0.25))["title"] == "plain"
+    # both used; a band with nothing left falls back rather than returning None
+    p2 = DocumentPool(tmp_path / "pool.jsonl")
+    p2.take(words=3000, lang="eng", technicality=(0.45, 1.0))
+    assert p2.take(words=3000, lang="eng", technicality=(0.45, 1.0)) is not None, "must fall back"
+
+
+def test_general_seeds_cover_the_plain_domains():
+    """The topic seeds were written to surface reference pages and produced ZERO documents below 0.25. These
+    supply the half of the mix that was missing."""
+    from doc_sources import GENERAL_SEEDS, TOPIC_SEEDS
+    assert not (set(GENERAL_SEEDS) & set(TOPIC_SEEDS)), "the two seed sets should not overlap"
+    assert {"history", "festivals_customs", "music", "geography_places"} <= set(GENERAL_SEEDS)
+    assert all(v for v in GENERAL_SEEDS.values())

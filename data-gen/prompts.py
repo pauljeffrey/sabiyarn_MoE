@@ -756,7 +756,18 @@ def _sft_like_request(seed: Seed, row: dict, *, rl: bool, document: Optional[dic
     if tool_names:
         tools_section = (
             f"\nTOOLS available in this conversation (put this exact JSON in the system message):\n"
-            f"{_tool_block(seed, tool_names)}\n\nHow these tools behave when called:\n"
+            f"{_tool_block(seed, tool_names)}\n"
+            # A search_internet or fetch_page result has no document behind it -- the point of those samples
+            # is reading what a live search returns, clutter and all -- so the generator writes it, and the
+            # 16k output ceiling exists for exactly this.
+            + ("\nA WEB result is YOURS TO WRITE: no document sits behind it, because the point of those "
+               "samples is reading what a live search actually returns. Write it at realistic length -- a "
+               "fetched page is a WHOLE ARTICLE, a thousand words or more, with the navigation, cookie "
+               "notice and citation clutter left in. A tidy three-line summary is not a page, and reading "
+               "past the clutter is half of what the sample teaches.\n"
+               if {"search_internet", "fetch_page"} & set(tool_names) else "")
+            + 
+            f"\nHow these tools behave when called:\n"
             f"{_tool_behaviour(seed, tool_names)}\n"
             f"\nEvery tool listed above is applicable to this conversation. Use the ones the tasks call for.\n")
     else:
@@ -859,7 +870,13 @@ Return JSON:
                 f"{doc_angle(row)}.\nSeveral separate conversations are built from this same document, so "
                 f"ask about THIS facet and not the document in general.\n")
 
-    user = f"""LANGUAGE DIRECTION for this conversation -- {io['key']}:
+    user = f"""THE LANGUAGE RULE, which the direction below is an instance of: the USER may write in ANY supported
+language, and the ANSWER goes in whatever language the user ASKS FOR -- which is often not the one they wrote
+in, and need not be the language of the material either. Where the answer language is not the obvious one, the
+user has to SAY so in their own words ("...explain it to me in Twi"), because that is the only way the request
+is well formed. <|input_lang|> is what came in; <|target_lang|> is what was asked for.
+
+LANGUAGE DIRECTION for this conversation -- {io['key']}:
 {io['brief']}
 Set <|input_lang|> to <{io['expect_markers'][0]}> and <|target_lang|> to <{io['expect_markers'][1]}> on every
 assistant turn that produces a <response>. Where the two differ, that difference is the point of the sample:

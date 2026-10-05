@@ -131,7 +131,17 @@ def _rl(context: int) -> Budget:
         # as well as the candidates, and for a task like summarization the prefix contains a source document
         # it wrote itself -- measured truncations at a 6,144 ceiling, returning invalid JSON and losing the
         # sample. Output is billed per token actually produced, so the extra ceiling costs nothing unused.
-        max_output_tokens=min(context, resp * 2 + 4_096),
+        # 16,384, not 8,192. An internet-search sample's tool result is a FULL ARTICLE, and the generator
+        # writes it -- there is no document pool behind search_internet the way there is behind
+        # search_documents, because the point of those samples is reading what a live search returns. A
+        # whole article plus a prefix plus two candidates does not fit in 8k, and a response written to the
+        # advertised ceiling and then truncated is a paid-for sample lost to invalid JSON.
+        #
+        # Output is billed per token ACTUALLY produced, so a higher ceiling costs nothing on the samples
+        # that do not need it. What it does risk is the failure measured earlier -- very long single
+        # responses coming back empty or truncated -- which is why the long-reply tasks are held to one
+        # ranked pair per conversation (build_seeds.LONG_REPLY_TASKS) rather than two or three.
+        max_output_tokens=min(context, 16_384),
         # A prefix can carry an 8,192-token RAG context on top of a conversation that measured p99 6,762, plus
         # two candidates: it genuinely can approach the full context.
         engine_len=context,

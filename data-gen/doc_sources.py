@@ -113,6 +113,82 @@ NATIVE_RAG_MAX_WORDS = 6_400
 # towards politics, sport and entertainment that does not match the corpus's own domains.
 
 
+_NATIVE_PROBES = {
+    "fra": ("de", "la", "le", "et", "pour", "dans", "avec", "sur", "est", "une", "par", "plus",
+            "entre", "sous", "selon", "pendant", "chaque", "ainsi"),
+    "hau": ("da", "na", "a", "ta", "ya", "wannan", "kuma", "ba", "cikin", "wanda", "sun", "za",
+            "shi", "ne", "ko", "amma", "yana", "bayan"),
+    "ibo": ("na", "ya", "nke", "maka", "ihe", "ndi", "otu", "ka", "bu", "ego", "obodo", "oge",
+            "ike", "ala", "ulo", "mmiri", "afo", "ozo"),
+    # yor (168) and som (222) were the thinnest languages in the pool, and the probe list is what limits how
+    # far into a wiki the search reaches, so these two get a much longer one.
+    "som": ("ka", "oo", "la", "iyo", "waa", "ah", "uu", "si", "in", "ay", "dhan", "badan",
+            "waxa", "dalka", "sanadka", "qof", "biyo", "caafimaad", "magaalada", "dadka",
+            "soomaaliya", "wax", "kale", "markii", "sidoo", "hadda", "awood", "shaqo",
+            "dugsi", "beer", "xoolo", "suuq", "lacag", "dawo", "cudur", "roob",
+            "dhul", "guri", "waddo", "gaadhi", "tacliin", "diin", "taariikh", "dhaqan"),
+    "twi": ("ne", "no", "wo", "na", "se", "nti", "yi", "mu", "ho", "bi", "nso", "ara",
+            "nnipa", "asase", "nsuo", "sika", "afe", "aduane"),
+    "yor": ("ni", "ti", "ati", "awon", "fun", "lati", "pelu", "ko", "won", "ile", "omi", "owo",
+            "odun", "ounje", "ise", "oro", "eniyan", "ilu", "orile", "ede", "iwe", "oko",
+            "aye", "nkan", "ara", "okan", "ojo", "oorun", "igi", "eja", "eran", "aso",
+            "ilera", "egbogi", "arun", "iwosan", "ijoba", "oja", "ona", "ayika",
+            "itan", "esin", "asa", "orin", "eko", "agbara", "ina"),
+}
+
+
+def harvest_native(lang: str, *, min_words: int, max_words: int, want: int = 0,
+                   per_probe: int = 120, verbose: bool = True) -> Iterator[dict]:
+    """Long articles from `lang`'s own Wikipedia, selected on length and coherence.
+
+    No topic filter and no query-relevance gate -- see the note above. What IS checked:
+      - length, inside the band the samples ask for;
+      - that the text is prose rather than a list or a table dump, which is the one thing that would make a
+        document unusable as a passage to answer from;
+      - that it is not a disambiguation page or a bare stub with an infobox.
+    """
+    wiki_code = NATIVE_WIKIS.get(lang)
+    if not wiki_code:
+        return
+    wiki = Wikipedia(lang=wiki_code)
+    seen: set[str] = set()
+    produced = 0
+    for probe in _NATIVE_PROBES.get(lang, ("a",)):
+        try:
+            hits = wiki.search(probe, limit=per_probe)
+        except RuntimeError:
+            continue
+        # Length filter on the search result, before anything is downloaded.
+        cands = [h for h in hits
+                 if h.get("title") not in seen and int(h.get("wordcount") or 0) >= min_words * 0.9]
+        for h in cands:
+            title = h["title"]
+            seen.add(title)
+            try:
+                pg = wiki.plaintext(title)
+            except RuntimeError:
+                continue
+            if not pg:
+                continue
+            body = clean(pg["text"])
+            n = len(body.split())
+            if not (min_words <= n <= max_words):
+                continue
+            if not _is_prose(body):
+                continue
+            produced += 1
+            if verbose:
+                print(f"  [{lang}] {title[:48]:<50} {n:>6,}w")
+            yield {"title": pg["title"], "pageid": pg["pageid"], "url": pg["url"],
+                   "text": body, "words": n, "doc_lang": lang,
+                   # Scored for the record but not gated on: topic is not the selection criterion here.
+                   "technicality": round(technicality(body, title), 3),
+                   "relevance": 1.0, "query": f"native:{probe}",
+                   "domain": "native_general", "source": "wikipedia", "licence": LICENCE}
+            if want and produced >= want:
+                return
+
+
 def _is_prose(text: str) -> bool:
     """Enough running prose to answer questions from.
 
@@ -300,6 +376,27 @@ TOPIC_SEEDS: dict[str, tuple[str, ...]] = {
 # retrieved document about Nollywood or a proverb behind the tool would teach exactly the opposite -- that
 # the right response to something it already knows is to go and search. Those domains still appear
 # throughout the corpus; they appear in the tasks that answer WITHOUT a tool.
+
+GENERAL_SEEDS: dict[str, tuple[str, ...]] = {
+    "history": ("precolonial west african kingdom", "trans saharan trade history",
+                "independence movement nigeria", "ghana empire history"),
+    "festivals_customs": ("naming ceremony tradition", "masquerade festival yoruba",
+                          "harvest festival west africa", "traditional marriage rites"),
+    "arts_literature": ("oral storytelling tradition", "african novel postcolonial",
+                        "textile weaving tradition", "proverb oral literature"),
+    "music": ("highlife music history", "afrobeat origins", "talking drum tradition",
+              "juju music nigeria"),
+    "geography_places": ("niger river basin", "sahel region geography", "lagos lagoon",
+                         "volta river"),
+    "rural_life": ("village farming community life", "pastoralist migration seasonal",
+                   "market day rural trade"),
+    "sports": ("african cup of nations", "wrestling traditional sport", "athletics west africa"),
+    "religion_ethics": ("islam in west africa history", "christianity in nigeria history",
+                        "traditional religion orisha"),
+    "family_relationships": ("extended family kinship", "naming practices west africa"),
+    "food_cooking": ("staple foods west africa", "fermented foods tradition", "palm oil cooking"),
+}
+
 
 # --- technicality scoring -------------------------------------------------------------------------------
 # A number WITH a unit. The heart of the score: a figure carrying a unit is a fact that has to be looked
@@ -673,7 +770,7 @@ class DocumentPool:
         return sum(1 for d in self.docs if (d.get("doc_lang") or "eng") == lang)
 
     def take(self, *, words: int, domain: str = "", key: str = "",
-             lang: str = "eng") -> Optional[dict]:
+             lang: str = "eng", technicality: Optional[tuple[float, float]] = None) -> Optional[dict]:
         """The unused document closest to `words`, preferring the requested domain.
 
         `key` makes the choice deterministic for a given caller, so a re-run picks the same document for the
@@ -683,6 +780,12 @@ class DocumentPool:
         # change what the sample teaches.
         pool = [(i, d) for i, d in enumerate(self.docs)
                 if i not in self._used and (d.get("doc_lang") or "eng") == lang]
+        if technicality is not None:
+            lo, hi = technicality
+            band = [(i, d) for i, d in pool if lo <= float(d.get("technicality") or 0.0) <= hi]
+            # Falling back to the whole pool rather than failing: a missing band is a thinner spread, not a
+            # reason to generate a document we already have one for.
+            pool = band or pool
         if not pool:
             return None
         same = [(i, d) for i, d in pool if d.get("domain") == domain]
@@ -717,7 +820,8 @@ def fill_store(specs: Iterable[Any], store: Any, pool: "DocumentPool") -> int:
             continue
         want_lang = getattr(spec, "doc_lang", None) or "eng"
         picked = pool.take(words=int(getattr(spec, "words", 0) or 0),
-                           domain=getattr(spec, "domain", "") or "", key=cid, lang=want_lang)
+                           domain=getattr(spec, "domain", "") or "", key=cid, lang=want_lang,
+                           technicality=getattr(spec, "technicality_band", None))
         if picked is None:
             continue
         store.put({

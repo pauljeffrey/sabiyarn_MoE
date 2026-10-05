@@ -28,7 +28,7 @@ sys.path.insert(0, str(ROOT))
 from budgets import budget_for  # noqa: E402
 from doc_sources import (  # noqa: E402
     MIN_TECHNICALITY, NATIVE_RAG_MAX_WORDS, NATIVE_RAG_MIN_WORDS, NATIVE_WIKIS,
-    TOPIC_SEEDS, DocumentPool, harvest, harvest_native,
+    GENERAL_SEEDS, TOPIC_SEEDS, DocumentPool, harvest, harvest_native,
 )
 
 DEFAULT_POOL = ROOT / "data" / "document_pool.jsonl"
@@ -69,6 +69,10 @@ def main() -> int:
                     help="document language. Only the languages in doc_sources.NATIVE_WIKIS can be "
                          "harvested; everything else falls through to generation, which is the only option "
                          "when the Wikipedia has nothing long enough to take.")
+    ap.add_argument("--general", action="store_true",
+                    help="harvest PLAIN-language documents (history, festivals, music, places) instead of "
+                         "reference pages. Summarising a narrative is a different problem from summarising a "
+                         "specification, and the topic seeds produced no plain documents at all.")
     ap.add_argument("--report", action="store_true", help="describe the existing pool and exit")
     a = ap.parse_args()
 
@@ -105,8 +109,9 @@ def main() -> int:
     print(f"  technicality >= {a.min_technicality}")
     if a.lang == "eng":
         stream = harvest(min_words=min_words, max_words=max_words,
-                         min_technicality=a.min_technicality, per_seed=a.per_seed,
-                         domains=domains, want=a.want)
+                         min_technicality=0.0 if a.general else a.min_technicality,
+                         per_seed=a.per_seed, domains=domains, want=a.want,
+                         queries=GENERAL_SEEDS if a.general else None)
     else:
         # Native documents may be SHORTER: a tool result is a few passages now, so a 400-word article is a
         # legitimate source and insisting on 1,600+ would reject the whole available corpus.

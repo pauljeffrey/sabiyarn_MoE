@@ -184,7 +184,7 @@ class DocSpec:
 
     __slots__ = ("custom_id", "lang", "doc_lang", "doc_lang_mode", "form", "form_desc", "stages",
                  "tokens", "words", "n_sections", "section_words", "min_words", "register", "domain",
-                 "subtopic", "parts", "rag")
+                 "subtopic", "parts", "rag", "technicality_band")
 
     def __init__(self, **kw: Any) -> None:
         for k in self.__slots__:
@@ -277,8 +277,19 @@ def plan_document(seed: Any, row: dict, *, domain: str, subtopic: str) -> DocSpe
     key = mode if mode != "native" else ("native_low" if tier == "low" else "native")
     n_sections = min(MAX_SECTIONS, max(len(stages), -(-words // _SECTION_WORDS[key])))
     section_words = min(_MAX_SECTION_WORDS, max(_SECTION_WORDS[key], -(-words // n_sections)))
+    # SUMMARISATION DRAWS A DELIBERATE SPREAD OF SPECIFICITY. A dense reference page -- figures, rates,
+    # thresholds -- and a plain narrative are different summarisation problems: the first is about keeping the
+    # numbers right, the second about finding the point. Training on only one teaches only one, so the band
+    # alternates across groups rather than taking whatever the pool hands over.
+    #
+    # Three bands on a 3-cycle: dense, middling, plain. The pool falls back to the whole language when a band
+    # is thin, so this biases the draw without ever failing it.
+    band = None
+    if row.get("task") in SUMMARY_DOCUMENT_TASKS:
+        band = ((0.45, 1.00), (0.25, 0.45), (0.00, 0.25))[gi % 3]
     # Keyed by the GROUP, not the row: this is the whole reuse mechanism.
-    return DocSpec(custom_id=f"doc__{lang}__{row.get('task')}__{gi:06d}",
+    return DocSpec(technicality_band=band,
+                   custom_id=f"doc__{lang}__{row.get('task')}__{gi:06d}",
                    lang=lang, doc_lang=doc_lang, doc_lang_mode=mode,
                    form=form, form_desc=form_desc, stages=stages, tokens=tokens, words=words,
                    n_sections=n_sections, section_words=section_words, min_words=_MIN_WORDS[key],
