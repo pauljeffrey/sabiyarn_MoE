@@ -590,6 +590,7 @@ def _sft_like_request(seed: Seed, row: dict, *, rl: bool, document: Optional[dic
             "self_check_then_search": ["search_internet", "fetch_page", "search_documents"],
             "search_found_nothing": ["search_internet", "fetch_page", "search_documents"],
             "creative_from_pattern": ["search_internet", "fetch_page", "search_documents"],
+            "exam_and_study_help": ["search_documents", "search_internet", "fetch_page", "calculate"],
             "clarifying_question": ["send_message", "set_reminder", "get_transport_route",
                                     "get_weather_forecast", "search_db"],
             "rag_document_qa": ["search_documents", "search_internet"],

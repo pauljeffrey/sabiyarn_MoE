@@ -395,3 +395,42 @@ def test_fill_store_sources_a_native_document_for_a_native_spec():
         store = _Store()
         assert fill_store([_Spec()], store, pool) == 1
         assert store.docs["doc__h"]["doc_lang"] == "hau"
+
+
+# --------------------------------------------------------------------------- news as a native source
+# The native wikis are thin and skewed for most of these languages. MasakhaNEWS is BBC-sourced news in
+# exactly the languages this corpus serves -- edited prose, current, locally relevant -- and measured medians
+# (hau 282, yor 310, ibo 292, som 490, swa 544 words) are usable now that a tool result is a few passages
+# rather than a whole document.
+
+def test_news_covers_the_languages_the_wikis_cannot():
+    from doc_sources import NATIVE_WIKIS, NEWS_CONFIGS
+    assert set(NEWS_CONFIGS) >= {"hau", "yor", "ibo", "pcm", "som", "swh", "fra"}
+    # pcm and swh have no viable wiki, so news is the only native source for them
+    assert "pcm" not in NATIVE_WIKIS and "swh" not in NATIVE_WIKIS
+    assert "pcm" in NEWS_CONFIGS and "swh" in NEWS_CONFIGS
+
+
+def test_the_native_band_is_shorter_than_the_english_one():
+    """Chunked retrieval is what makes this correct: a 400-word article yields two or three passages, which
+    is what a retriever returns. Insisting on 1,600+ words would reject the whole available corpus."""
+    from doc_sources import NATIVE_RAG_MIN_WORDS, NATIVE_RAG_MAX_WORDS
+    assert NATIVE_RAG_MIN_WORDS < 1_600
+    assert NATIVE_RAG_MIN_WORDS >= 300, "below this there is not enough to form a passage"
+    assert NATIVE_RAG_MAX_WORDS >= 6_000, "the long band still has to fit for summarisation"
+
+
+def test_news_licence_is_recorded_with_its_provenance():
+    """AFL-3.0 on the dataset, BBC-sourced underneath. Both matter if the corpus is ever published, so both
+    travel with every document rather than being remembered."""
+    from doc_sources import NEWS_LICENCE
+    assert "AFL-3.0" in NEWS_LICENCE
+    assert "BBC" in NEWS_LICENCE, "the underlying source has to be visible in the record"
+
+
+def test_a_short_news_article_counts_as_prose():
+    from doc_sources import _is_prose
+    article = ("Gwamnatin jihar Kano ta ce za ta fara aikin gina sabbin makarantu a shekara mai zuwa. "
+               "Kwamishinan ilimi ya bayyana cewa aikin zai kai ga kananan hukumomi arba'in da hudu. "
+               "Ya kara da cewa kudaden za su fito daga kasafin kudin shekarar. " * 7)
+    assert _is_prose(article), "a 350-word news article is a legitimate retrieval source"

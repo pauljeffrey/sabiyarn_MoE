@@ -371,3 +371,26 @@ def test_a_failed_gate_zeroes_only_that_candidate():
     fine = "<|input_lang|><eng><response>The market opens at six and shuts when the yams are gone."
     (r_loop, r_fine), _ = score_group([loop, fine], item, checks)
     assert r_loop == 0.0 and r_fine > 0.0
+
+
+def test_study_help_is_scored_on_grounding_not_recall():
+    """A study answer from the weights is one the student cannot check, and this is the task where a confident
+    wrong answer gets memorised and written in an exam. So retrieval carries more weight than pedagogy."""
+    import rewards_spec as R
+    checks = {c["name"]: c["weight"] for c in R.for_task("exam_and_study_help") if not c.get("gate")}
+    grounding = (checks["retrieved_before_answering"] + checks["answer_rests_on_what_came_back"]
+                 + checks["no_fact_absent_from_the_source"] + checks["says_where_it_came_from"])
+    pedagogy = checks["shows_a_reusable_method"] + checks["pitched_at_the_level_asked"]
+    assert grounding > pedagogy, (
+        f"grounding carries {grounding:.2f} against pedagogy {pedagogy:.2f} -- recall is the failure here")
+
+
+def test_study_help_is_rl_only():
+    """"Retrieved it" against "recalled it" is a preference between two replies, which a single SFT target
+    cannot express."""
+    import sys
+    from pathlib import Path as _P
+    sys.path.insert(0, str(_P(__file__).resolve().parent.parent / "data-gen" / "seeds"))
+    from build_seeds import BEHAVIOUR_TASKS, SFT_TASKS
+    assert "exam_and_study_help" in BEHAVIOUR_TASKS
+    assert "exam_and_study_help" not in {t.name for t in SFT_TASKS}

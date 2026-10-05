@@ -435,6 +435,9 @@ BEHAVIOUR_TASKS = {
     "tool_structured_call", "self_check_then_search", "search_found_nothing", "creative_from_pattern",
     "multi_turn_consistency", "holds_a_grounded_position", "date_and_time_reasoning",
     "code_switch_fidelity",
+    # Study help is RL-only now that it must be grounded: "retrieved it" against "recalled it" is a
+    # preference between two replies, and a single SFT target cannot say which one it is.
+    "exam_and_study_help",
 }
 # tool_compute, tool_database and action_tool_use were merged into tool_structured_call and their task
 # definitions removed: left in place they would have been owned by no phase at all -- excluded from SFT for
@@ -742,15 +745,25 @@ ALL_TASKS = [
           "a discount or a delivery date the user never mentioned, or is three times longer than anyone "
           "would read on a phone.",
           plan=["<|generate|>", "<|edit|>"]),
-    _task("exam_and_study_help", ["qa", "summarization", "multi-turn-chat"], 5.0,
-          "Students are the largest single group of users. Explain a concept AT A STATED LEVEL -- JSS2, "
-          "WAEC, 200-level, 'explain like I know nothing' -- and stop at that level rather than showing off; "
-          "work a past question so the METHOD is visible and reusable, not just the answer; turn a chapter "
-          "into revision notes; make a handful of practice questions with their answers; say what a syllabus "
-          "topic actually requires. Where the subject has a right answer the working must reach it. The "
-          "wrong candidate answers above the level asked for, gives the answer with no method so nothing "
-          "transfers, or does the student's assignment verbatim where the ask was to understand it.",
-          plan=["<|explain|>", "<|summarize|>"], think=True),
+    _task("exam_and_study_help", ["qa", "rag", "tool-calling", "summarization"], 5.0,
+          "Students are the largest single group of users, and this is the task where a confident wrong "
+          "answer does the most damage -- it gets memorised and written in an exam.\n"
+          "SO THE ANSWER MUST BE GROUNDED, NEVER RECALLED. Every sample runs one of two ways:\n"
+          "  (a) RETRIEVED -- the student supplies or references the material (a chapter, a past paper, a "
+          "syllabus extract) and the assistant searches it with search_documents and answers from the "
+          "passages that come back; or\n"
+          "  (b) SEARCHED -- there is no material to hand, so the assistant searches the internet for the "
+          "syllabus requirement, the method, or the worked form of that question type, and answers from what "
+          "it finds.\n"
+          "Either way it says WHERE the answer came from, and where the retrieval does not settle it, it says "
+          "so rather than filling the gap from memory. Within that: explain AT THE STATED LEVEL (JSS2, WAEC, "
+          "200-level, 'explain like I know nothing') and stop there rather than showing off; work the "
+          "question so the METHOD is visible and reusable; turn retrieved material into revision notes; make "
+          "practice questions whose answers are traceable to the source.\n"
+          "The wrong candidate answers straight from its own knowledge with no retrieval -- fluent, "
+          "plausible, and exactly the thing a student cannot check -- or answers above the level asked for, "
+          "or gives an answer with no method so nothing transfers to the next question.",
+          plan=["<|RAG|>", "<|explain|>"], tools=True, think=True),
 
     # ---- generation and reasoning. Added because each has a GENUINE better/worse pair, which is what makes a
     # task worth putting in RL: a faithful summary against one that invents a figure, a story that follows its

@@ -408,16 +408,21 @@ CHECKS: dict[str, list[Check]] = {
               pattern=r"\[(?:your|insert|name|company|amount|date|x+)[^\]]{0,24}\]|\{\{|XYZ"),
     ],
     "exam_and_study_help": [
-        Check("shows_a_reusable_method", 0.30, True, fn="explains_a_method_not_just_an_answer",
-              why="the answer alone transfers nothing to the next question, which is the whole point of "
-                  "study help rather than homework completion"),
-        Check("answer_is_correct_where_there_is_one", 0.25, True, fn="final_number_matches_expected",
-              why="fully objective wherever the subject has a right answer, and the generator records it"),
-        Check("pitched_at_the_level_asked", 0.20, True, fn="matches_the_requested_level",
-              why="answering a JSS2 question at degree level is the commonest failure here and it is "
-                  "visible in vocabulary and sentence length"),
-        Check("working_is_consistent", 0.15, True, fn="arithmetic_steps_are_consistent"),
-        Check("not_degenerate", 0.10, False, fn="is_degenerate"),
+        # The answer a student memorises must be traceable. Recall is the failure here, not a shortcut, so
+        # the grounding checks carry more weight than the pedagogy ones.
+        Check("retrieved_before_answering", 0.25, True, pattern=R_TOOL_CALL,
+              why="a study answer from the weights is one the student cannot check, and this is the task "
+                  "where a confident wrong answer gets written in an exam"),
+        Check("answer_rests_on_what_came_back", 0.25, True, fn="answer_overlaps_tool_result",
+              why="calling a tool and then answering from memory anyway is the subtler version of the same "
+                  "failure"),
+        Check("no_fact_absent_from_the_source", 0.15, False, fn="asserts_fact_absent_from_tool_result"),
+        Check("shows_a_reusable_method", 0.15, True, fn="explains_a_method_not_just_an_answer",
+              why="the answer alone transfers nothing to the next question, which is the difference between "
+                  "study help and doing the assignment"),
+        Check("pitched_at_the_level_asked", 0.10, True, fn="matches_the_requested_level"),
+        Check("says_where_it_came_from", 0.10, True, fn="attributes_the_source",
+              why="a student has to be able to go back to the source and check"),
     ],
     # -------- generation and reasoning.
     # These score better than the behaviour tasks do, which is the argument for having them here. Faithfulness

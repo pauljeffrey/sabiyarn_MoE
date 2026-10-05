@@ -534,27 +534,6 @@
       "notes": ""
     },
     {
-      "name": "exam_and_study_help",
-      "tags": [
-        "qa",
-        "summarization",
-        "multi-turn-chat"
-      ],
-      "description": "Students are the largest single group of users. Explain a concept AT A STATED LEVEL -- JSS2, WAEC, 200-level, 'explain like I know nothing' -- and stop at that level rather than showing off; work a past question so the METHOD is visible and reusable, not just the answer; turn a chapter into revision notes; make a handful of practice questions with their answers; say what a syllabus topic actually requires. Where the subject has a right answer the working must reach it. The wrong candidate answers above the level asked for, gives the answer with no method so nothing transfers, or does the student's assignment verbatim where the ask was to understand it.",
-      "share": 5.0,
-      "task_plan": [
-        "<|explain|>",
-        "<|summarize|>"
-      ],
-      "domain_flags": [],
-      "uses_tools": false,
-      "requires_think": true,
-      "languages": null,
-      "checks": [],
-      "judge_required": false,
-      "notes": ""
-    },
-    {
       "name": "multi_step_reasoning",
       "tags": [
         "qa",

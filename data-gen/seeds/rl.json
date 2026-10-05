@@ -3495,17 +3495,18 @@
       "name": "exam_and_study_help",
       "tags": [
         "qa",
-        "summarization",
-        "multi-turn-chat"
+        "rag",
+        "tool-calling",
+        "summarization"
       ],
-      "description": "Students are the largest single group of users. Explain a concept AT A STATED LEVEL -- JSS2, WAEC, 200-level, 'explain like I know nothing' -- and stop at that level rather than showing off; work a past question so the METHOD is visible and reusable, not just the answer; turn a chapter into revision notes; make a handful of practice questions with their answers; say what a syllabus topic actually requires. Where the subject has a right answer the working must reach it. The wrong candidate answers above the level asked for, gives the answer with no method so nothing transfers, or does the student's assignment verbatim where the ask was to understand it.",
+      "description": "Students are the largest single group of users, and this is the task where a confident wrong answer does the most damage -- it gets memorised and written in an exam.\nSO THE ANSWER MUST BE GROUNDED, NEVER RECALLED. Every sample runs one of two ways:\n  (a) RETRIEVED -- the student supplies or references the material (a chapter, a past paper, a syllabus extract) and the assistant searches it with search_documents and answers from the passages that come back; or\n  (b) SEARCHED -- there is no material to hand, so the assistant searches the internet for the syllabus requirement, the method, or the worked form of that question type, and answers from what it finds.\nEither way it says WHERE the answer came from, and where the retrieval does not settle it, it says so rather than filling the gap from memory. Within that: explain AT THE STATED LEVEL (JSS2, WAEC, 200-level, 'explain like I know nothing') and stop there rather than showing off; work the question so the METHOD is visible and reusable; turn retrieved material into revision notes; make practice questions whose answers are traceable to the source.\nThe wrong candidate answers straight from its own knowledge with no retrieval -- fluent, plausible, and exactly the thing a student cannot check -- or answers above the level asked for, or gives an answer with no method so nothing transfers to the next question.",
       "share": 5.0,
       "task_plan": [
-        "<|explain|>",
-        "<|summarize|>"
+        "<|RAG|>",
+        "<|explain|>"
       ],
       "domain_flags": [],
-      "uses_tools": false,
+      "uses_tools": true,
       "requires_think": true,
       "languages": null,
       "checks": [
@@ -3564,48 +3565,57 @@
           "gate": false
         },
         {
-          "name": "shows_a_reusable_method",
-          "weight": 0.195,
+          "name": "retrieved_before_answering",
+          "weight": 0.1625,
           "expect": true,
-          "pattern": "",
-          "fn": "explains_a_method_not_just_an_answer",
-          "why": "the answer alone transfers nothing to the next question, which is the whole point of study help rather than homework completion",
+          "pattern": "<tool_call>|\\\"tool_calls\\\"",
+          "fn": "",
+          "why": "a study answer from the weights is one the student cannot check, and this is the task where a confident wrong answer gets written in an exam",
           "gate": false
         },
         {
-          "name": "answer_is_correct_where_there_is_one",
+          "name": "answer_rests_on_what_came_back",
           "weight": 0.1625,
           "expect": true,
           "pattern": "",
-          "fn": "final_number_matches_expected",
-          "why": "fully objective wherever the subject has a right answer, and the generator records it",
+          "fn": "answer_overlaps_tool_result",
+          "why": "calling a tool and then answering from memory anyway is the subtler version of the same failure",
+          "gate": false
+        },
+        {
+          "name": "no_fact_absent_from_the_source",
+          "weight": 0.0975,
+          "expect": false,
+          "pattern": "",
+          "fn": "asserts_fact_absent_from_tool_result",
+          "why": "",
+          "gate": false
+        },
+        {
+          "name": "shows_a_reusable_method",
+          "weight": 0.0975,
+          "expect": true,
+          "pattern": "",
+          "fn": "explains_a_method_not_just_an_answer",
+          "why": "the answer alone transfers nothing to the next question, which is the difference between study help and doing the assignment",
           "gate": false
         },
         {
           "name": "pitched_at_the_level_asked",
-          "weight": 0.13,
+          "weight": 0.065,
           "expect": true,
           "pattern": "",
           "fn": "matches_the_requested_level",
-          "why": "answering a JSS2 question at degree level is the commonest failure here and it is visible in vocabulary and sentence length",
+          "why": "",
           "gate": false
         },
         {
-          "name": "working_is_consistent",
-          "weight": 0.0975,
+          "name": "says_where_it_came_from",
+          "weight": 0.065,
           "expect": true,
           "pattern": "",
-          "fn": "arithmetic_steps_are_consistent",
-          "why": "",
-          "gate": false
-        },
-        {
-          "name": "not_degenerate",
-          "weight": 0.065,
-          "expect": false,
-          "pattern": "",
-          "fn": "is_degenerate",
-          "why": "",
+          "fn": "attributes_the_source",
+          "why": "a student has to be able to go back to the source and check",
           "gate": false
         }
       ],

@@ -79,6 +79,81 @@ NATIVE_WIKIS = {
 # handful of documents is worth, and generation covers it.
 NATIVE_MIN_VIABLE = 25
 
+# NATIVE DOCUMENTS MAY BE SHORTER THAN ENGLISH ONES, and chunked retrieval is what makes that fine.
+#
+# The English band (1,600-6,400 words) was set when a tool result was a WHOLE document. Now that a result is
+# three to five passages, a 500-word article yields two or three of them -- which is exactly what a retriever
+# returns. Insisting on 1,600+ words in Hausa or Yoruba would reject the entire available corpus for no gain:
+# measured medians are 282 (hau), 310 (yor), 292 (ibo), 490 (som), 544 (swa).
+#
+# The long band still applies to SUMMARISATION, where the document genuinely is the subject.
+NATIVE_RAG_MIN_WORDS = 350
+NATIVE_RAG_MAX_WORDS = 6_400
+
+# MasakhaNEWS: BBC-sourced news in the languages this corpus serves, which is a better fit than Wikipedia for
+# them -- edited prose, current, and locally relevant, where the native wikis are thin and skewed.
+# Licence is AFL-3.0 on the dataset. The underlying text is BBC-sourced, so redistributing a corpus built from
+# it is a decision for whoever publishes; the per-document metadata records both so that decision is possible.
+NEWS_DATASET = "masakhane/masakhanews"
+NEWS_LICENCE = "AFL-3.0 (MasakhaNEWS; text sourced from BBC)"
+NEWS_CONFIGS = {
+    "hau": "hau", "yor": "yor", "ibo": "ibo", "pcm": "pcm",
+    "som": "som", "swh": "swa", "fra": "fra",
+}
+
+
+def harvest_news(lang: str, *, min_words: int = NATIVE_RAG_MIN_WORDS,
+                 max_words: int = NATIVE_RAG_MAX_WORDS, want: int = 0,
+                 page: int = 100, max_pages: int = 60, verbose: bool = True) -> Iterator[dict]:
+    """News articles in `lang` from MasakhaNEWS, via the datasets-server rows API.
+
+    Paged rather than streamed so it can be interrupted and resumed, and so a language with few long articles
+    costs a few requests rather than a download.
+    """
+    cfg = NEWS_CONFIGS.get(lang)
+    if not cfg:
+        return
+    produced = 0
+    seen_urls: set[str] = set()
+    for pg in range(max_pages):
+        params = urllib.parse.urlencode({"dataset": NEWS_DATASET, "config": cfg, "split": "train",
+                                         "offset": pg * page, "length": page})
+        url = "https://datasets-server.huggingface.co/rows?" + params
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": UA})
+            with urllib.request.urlopen(req, timeout=60) as fh:
+                rows = json.load(fh).get("rows", [])
+        except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
+            if verbose:
+                print(f"  [{lang}] news page {pg} failed: {type(exc).__name__}")
+            break
+        if not rows:
+            break
+        for r in rows:
+            row = r.get("row") or {}
+            body = (row.get("text") or "").strip()
+            headline = (row.get("headline") or "").strip()
+            u = row.get("url") or ""
+            if not body or u in seen_urls:
+                continue
+            seen_urls.add(u)
+            n = len(body.split())
+            if not (min_words <= n <= max_words):
+                continue
+            if not _is_prose(body):
+                continue
+            produced += 1
+            if verbose and produced % 25 == 0:
+                print(f"  [{lang}] news: {produced} kept")
+            yield {"title": headline or f"{lang} news", "pageid": abs(hash(u)) % (10 ** 9),
+                   "url": u, "text": body, "words": n, "doc_lang": lang,
+                   "technicality": round(technicality(body, headline), 3),
+                   "relevance": 1.0, "query": f"news:{row.get('category') or 'general'}",
+                   "domain": f"news_{row.get('category') or 'general'}",
+                   "source": "masakhanews", "licence": NEWS_LICENCE}
+            if want and produced >= want:
+                return
+
 # HOW the native wikis are harvested, and why it differs from English.
 #
 # The English pool is harvested by TOPIC: 155 English queries, each filtered for whether the article actually
@@ -169,12 +244,14 @@ def _is_prose(text: str) -> bool:
     """
     body = "\n".join(ln for ln in text.splitlines() if not ln.strip().startswith("="))
     words = body.split()
-    if len(words) < 200:
+    # 150, not 200: a native-language news article of 350 words is a legitimate retrieval source now that a
+    # tool result is a few passages rather than a whole document.
+    if len(words) < 150:
         return False
     # Sentences, not lines: a document is prose if it is made of sentences, however it happens to be wrapped.
     # Keying this on line count alone rejected a legitimate single-paragraph article.
     sentences = [s for s in re.split(r"[.!?]+(?:\s|$)", body) if len(s.split()) >= 6]
-    if len(sentences) < 8:
+    if len(sentences) < 5:
         return False
     # And the average sentence has to be sentence-length. A table of names parses as many 2-word "sentences".
     if len(words) / max(1, len(sentences)) < 8:
