@@ -20,6 +20,7 @@ from typing import Any, Optional
 import os
 
 import assemble  # for the LIVE response budget; see _format_brief
+from budgets import budget_for  # max_tokens comes from the phase budget, not a literal
 from assemble import VALID_LANGS, VALID_VERBS
 from longdocs import DOCUMENT_TASKS, document_brief
 from providers.base import Request
@@ -269,6 +270,159 @@ def _verifier_block(task_names: list[str]) -> str:
             "reading them. It must describe the prefix you actually wrote, and a WRONG verifier is worse than\n"
             "none because it marks the good reply bad. Omit any field you are unsure of.\n"
             + "\n".join(lines) + "\n")
+
+
+
+# ---------------------------------------------------------------------------- output schemas
+# NOT USED AT THE PROVIDER. Kept because it belongs in vllm_gen.py, where a schema constrains DECODING
+# token-by-token instead of being reinterpreted by a provider -- see the finding below.
+#
+# gemma-4 does honour `response_format` with a JSON schema on Doubleword; the problem is what it then does.
+# Both ways of writing the schema fail, and they fail differently:
+#
+#   PERMISSIVE (one turn type, every field optional): the provider satisfies the schema literally and PADS
+#   the optional keys. Measured: `tool_call` on 9 user turns, `think` on 9, `task_plan` on 4. An earlier pilot
+#   saw messages_malformed 11/24 against 1/24 with plain json_object. Valid JSON, not a conversation.
+#
+#   ROLE-DISCRIMINATED (anyOf over user/assistant-answer/assistant-call/tool, additionalProperties false):
+#   padding becomes impossible -- and the model COLLAPSES TO THE CHEAPEST BRANCH. Measured: every turn came
+#   back role="user", thirteen of them in a row on one sample, with no assistant turn anywhere. Structurally
+#   valid and semantically empty.
+#
+# The lesson is that a provider-side schema constrains the SHAPE while leaving the model free to pick the
+# easiest shape that fits, which is not what we want enforced. Grammar-constrained decoding does not have that
+# escape, because the grammar is applied to every token rather than chosen once -- so the place for this is
+# the self-hosted path.
+#
+# Measured on a 120-request probe without it: 34% yield, and of the 79 failures, 51 were shape failures the
+# schema can simply prevent -- too_few_responses 29, candidate_not_an_assembled_turn 11, json_invalid 6,
+# prompt_messages_malformed 3, no_best_or_worst 3 (the enum), each-turn-must-be-an-object 1,
+# prompt_turns_unusable 1.
+#
+# What a schema CANNOT express, and so still has to be validated our side: that the prefix ends with a user
+# or tool turn, that the two candidates differ in substance, and that the markers are right. The markers were
+# never the generator's job anyway -- assemble.py builds them from the fields, so the chat template is already
+# guaranteed by construction rather than by instruction.
+#
+# `strict` is deliberately NOT set: strict mode requires every property to be required and forbids
+# additionalProperties throughout, which cannot describe a turn where `response` and `tool_call` are
+# alternatives and `think` is optional.
+
+# ROLE-DISCRIMINATED, and additionalProperties is false on every branch. That is the whole point.
+#
+# A permissive schema -- one object type with every field optional -- is actively WORSE than no schema, and
+# this was measured twice. An earlier pilot saw messages_malformed 11/24 against 1/24 without it, and my own
+# test of the permissive version put `tool_call` on 9 user turns, `think` on 9 and `task_plan` on 4. The
+# provider satisfies the schema literally and pads the optional keys, producing valid JSON that is not a
+# well-formed conversation.
+#
+# Discriminating on `role` with additionalProperties false makes that impossible rather than discouraged: a
+# user turn has no `tool_call` property to fill, so nothing can put one there. An assistant turn still needs
+# both shapes -- answering and calling -- so it is two branches, which is also how the "a turn either answers
+# or calls a tool" rule stops being an instruction and becomes a constraint.
+
+_USER_TURN = {
+    "type": "object", "additionalProperties": False,
+    "properties": {"role": {"type": "string", "const": "user"}, "content": {"type": "string"}},
+    "required": ["role", "content"],
+}
+_TOOL_TURN = {
+    "type": "object", "additionalProperties": False,
+    "properties": {"role": {"type": "string", "const": "tool"},
+                   "name": {"type": "string"}, "content": {"type": "string"}},
+    "required": ["role", "name", "content"],
+}
+_ASSISTANT_ANSWER = {
+    "type": "object", "additionalProperties": False,
+    "properties": {
+        "role": {"type": "string", "const": "assistant"},
+        "think": {"type": "string"},
+        "task_plan": {"type": "array", "items": {"type": "string"}, "minItems": 1},
+        "input_lang": {"type": "string"},
+        "target_lang": {"type": "string"},
+        "response": {"type": "string"},
+        "label_token": {"type": "string"},
+    },
+    "required": ["role", "task_plan", "input_lang", "target_lang", "response"],
+}
+_ASSISTANT_CALL = {
+    "type": "object", "additionalProperties": False,
+    "properties": {
+        "role": {"type": "string", "const": "assistant"},
+        "think": {"type": "string"},
+        "task_plan": {"type": "array", "items": {"type": "string"}, "minItems": 1},
+        "input_lang": {"type": "string"},
+        "tool_call": {
+            "type": "object", "additionalProperties": False,
+            "properties": {"name": {"type": "string"}, "arguments": {"type": "object"}},
+            "required": ["name", "arguments"],
+        },
+    },
+    "required": ["role", "task_plan", "input_lang", "tool_call"],
+}
+_TURN_SCHEMA = {"anyOf": [_USER_TURN, _ASSISTANT_ANSWER, _ASSISTANT_CALL, _TOOL_TURN]}
+
+# A candidate is one assistant turn, in either shape, with no role key.
+_CANDIDATE_ANSWER = {k: v for k, v in _ASSISTANT_ANSWER.items() if k != "required"}
+_CANDIDATE_ANSWER = {**_CANDIDATE_ANSWER,
+                     "properties": {k: v for k, v in _ASSISTANT_ANSWER["properties"].items() if k != "role"},
+                     "required": ["task_plan", "input_lang", "target_lang", "response"]}
+_CANDIDATE_CALL = {**{k: v for k, v in _ASSISTANT_CALL.items() if k != "required"},
+                   "properties": {k: v for k, v in _ASSISTANT_CALL["properties"].items() if k != "role"},
+                   "required": ["task_plan", "input_lang", "tool_call"]}
+_CANDIDATE_CONTENT_SCHEMA = {"anyOf": [_CANDIDATE_ANSWER, _CANDIDATE_CALL]}
+
+
+def _rl_schema(n_resp: int) -> dict:
+    """The RL output contract as a schema. `responses` is pinned to exactly n_resp items."""
+    candidate = {
+        "type": "object", "additionalProperties": False,
+        "properties": {
+            "content": _CANDIDATE_CONTENT_SCHEMA,
+            "quality": {"type": "string", "enum": ["best", "worst", "partial"]},
+            "score": {"type": "number", "minimum": 0, "maximum": 10},
+            "why": {"type": "string"},
+        },
+        "required": ["content", "quality", "score"],
+    }
+    return {
+        "type": "object",
+        "properties": {
+            "prompt_turns": {"type": "array", "items": _TURN_SCHEMA, "minItems": 2},
+            "responses": {"type": "array", "items": candidate,
+                          "minItems": n_resp, "maxItems": n_resp},
+            "verifier": {"type": "object"},
+            "tasks": {"type": "array", "items": {"type": "string"}},
+            "tags": {"type": "array", "items": {"type": "string"}},
+            "confidence": {"type": "number"},
+        },
+        "required": ["prompt_turns", "responses", "tasks"],
+    }
+
+
+def _sft_schema() -> dict:
+    """The SFT contract: one conversation, no candidates."""
+    return {
+        "type": "object",
+        "properties": {
+            "turns": {"type": "array", "items": _TURN_SCHEMA, "minItems": 2},
+            "tasks": {"type": "array", "items": {"type": "string"}},
+            "tags": {"type": "array", "items": {"type": "string"}},
+            "confidence": {"type": "number"},
+        },
+        "required": ["turns", "tasks"],
+    }
+
+
+def response_format_for(kind: str, n_resp: int = 2) -> dict:
+    """An OpenAI-shaped response_format for this phase, or {} for pretrain (free prose, no structure)."""
+    if kind == "rl":
+        schema = _rl_schema(n_resp)
+    elif kind == "sft":
+        schema = _sft_schema()
+    else:
+        return {}
+    return {"type": "json_schema", "json_schema": {"name": f"{kind}_sample", "schema": schema}}
 
 
 def _io_direction(seed: Seed, lang: str, index: int, rng: random.Random) -> dict:
@@ -919,7 +1073,15 @@ Hard requirements:
         # mid-string, which showed up as json_invalid on ~17% of a pilot. Headroom is far cheaper than a retry.
         # A long-document sample needs LESS, not more: the document arrives as input and is referred to by a
         # placeholder, so this completion holds only the summary and its follow-ups.
-        max_tokens=4096 if document else 6144,
+        # FROM THE BUDGET, not hardcoded. budgets._rl was raised to 16,384 so an internet-search sample can
+        # carry a full article, and this line quietly capped every request at 6,144 regardless -- the raise
+        # had no effect on anything. A document-backed sample still needs LESS: the document arrives as input
+        # and is referred to by a placeholder, so the completion holds only the conversation.
+        # A DOCUMENT-backed sample keeps the smaller ceiling on purpose: the document arrives as input and is
+        # referred to by a placeholder, so no budget should be available for re-emitting it. Everything else
+        # takes the phase budget, which is 16,384 for RL so an internet-search sample can carry a full
+        # article -- this line previously hardcoded 6,144 and silently discarded that raise.
+        max_tokens=4096 if document else budget_for(seed.kind).max_output_tokens,
         temperature=0.9,
         # Deliberately json_object, NOT json_schema. A pilot with the schema attached produced *more*
         # rejects (messages_malformed 11/24 vs 1/24): providers coerce the output to satisfy the schema
@@ -951,6 +1113,7 @@ Hard requirements:
                   # question. For SFT the floor stays as asked: there the conversation IS the sample.
                   "min_user_turns": 1 if seed.kind == "rl" else _lo, "max_user_turns": _hi,
                   "n_pairs": n_pairs if seed.kind == "rl" else 1,
+                  "schema_enforced": True,
                   "document": document, "expect_markers": io["expect_markers"]},
     )
 
