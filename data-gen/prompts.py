@@ -425,6 +425,52 @@ def response_format_for(kind: str, n_resp: int = 2) -> dict:
     return {"type": "json_schema", "json_schema": {"name": f"{kind}_sample", "schema": schema}}
 
 
+
+# ---------------------------------------------------------------------------- contract complexity
+# Yield fell from 69% to 34% across the run of additions that followed the 69% measurement: the verifier
+# object, the discriminator, the chunk-id declaration, the full-article instruction, the concise-think
+# paragraph, the explicit language rule and twelve more tasks. Every one of them earns its place on paper;
+# the question is what they cost together on THIS generator, and the only way to know is to measure.
+#
+# DATA_GEN_SIMPLE_CONTRACT=1 strips the request back to what it asked for at 69% -- a prefix, two scored
+# candidates, tasks and tags -- while leaving the tasks, the languages and the documents untouched, so an A/B
+# at the same n on the same rows isolates the contract.
+#
+# What is dropped in simple mode, and what that costs if it wins:
+#   - the verifier object. expected_answer, constraint, brief_elements, max_words and answer_chunks go, so the
+#     objective checks that depend on them become "unknown" and drop out of the reward. The procedural checks
+#     are unaffected.
+#   - the discriminator, which is what retired JUDGE_ONLY_TASKS. Without it the factual tasks lose their answer
+#     key and are scored on procedure alone -- which measured BELOW CHANCE. So if simple mode wins, those four
+#     tasks need either the discriminator kept for them specifically, or dropping from the corpus.
+#   - the full-article and concise-think paragraphs, which are instructions about length rather than structure.
+
+def simple_contract() -> bool:
+    """ON by default. Measured on five 80-request arms over identical rows:
+
+        A  full contract                          35%   discriminator on 28/28
+        B  simple                                 42%   none
+        C  simple + closing reminder              48%   none
+        D  full + closing reminder                38%   discriminator on 29/30
+        E  simple + reminder + discriminator      45%   discriminator on 36/36   <- shipped
+
+    Both levers work independently and the mechanisms are legible: the reminder targets the single biggest
+    failure (the generator omitting `responses` and spilling one turn at the top level), and the slimmer
+    contract removes demands that compete with it. E gives up three points against C to keep the one verifier
+    field that cannot be reconstructed afterwards -- the discriminator is the answer key that let
+    JUDGE_ONLY_TASKS be retired, and without it the factual tasks are scored on procedure alone, which
+    measured below chance.
+
+    Every kept sample was clean in all five arms, so this is a yield difference and not a quality one.
+
+    DATA_GEN_FULL_CONTRACT=1 restores the verbose contract: the full task-conditional verifier block, the
+    full-article instruction and the long think rule. Worth trying on a stronger generator, where the extra
+    ground truth may come free.
+    """
+    import os
+    return os.environ.get("DATA_GEN_FULL_CONTRACT") != "1"
+
+
 def _io_direction(seed: Seed, lang: str, index: int, rng: random.Random) -> dict:
     """Pick the input/output language pattern on its own odometer.
 
@@ -914,7 +960,8 @@ def _sft_like_request(seed: Seed, row: dict, *, rl: bool, document: Optional[dic
             # A search_internet or fetch_page result has no document behind it -- the point of those samples
             # is reading what a live search returns, clutter and all -- so the generator writes it, and the
             # 16k output ceiling exists for exactly this.
-            + ("\nA WEB result is YOURS TO WRITE: no document sits behind it, because the point of those "
+            + ("" if simple_contract() else
+               "\nA WEB result is YOURS TO WRITE: no document sits behind it, because the point of those "
                "samples is reading what a live search actually returns. Write it at realistic length -- a "
                "fetched page is a WHOLE ARTICLE, a thousand words or more, with the navigation, cookie "
                "notice and citation clutter left in. A tidy three-line summary is not a page, and reading "
@@ -929,6 +976,14 @@ def _sft_like_request(seed: Seed, row: dict, *, rl: bool, document: Optional[dic
                          "the assistant does not know, the correct behaviour is to say so plainly.\n")
 
     lang_name = lang.name
+    # These appear in the SHARED user message, so both the SFT and RL paths must define them. The closing
+    # reminder is RL-only: it exists to stop the generator omitting `responses`, and SFT has none to omit.
+    closing_reminder = ""
+    verifier_json_line = ""
+    verifier_block = ""
+    think_rule = ("KEEP <think> TO 1-3 SENTENCES: what has to be decided, and why. Never restate the "
+                  "question, never narrate a plan you are about to carry out. Longer than the answer it "
+                  "precedes is a defect, and it is trimmed. Omit it entirely where nothing needs deciding.")
     if not rl:
         _msg = "message" if n_user == 1 else "messages"
         shape = f"""Produce ONE conversation with EXACTLY {n_user} {_msg} of role "user" -- no more, no
@@ -956,7 +1011,34 @@ Return JSON:
         else:
             n_pairs = int(seed.conversation.get("paired_turns", 2))
         n_pairs = max(1, min(n_pairs, n_user))
-        verifier_block = _verifier_block([x.name for x in tasks])
+        verifier_block = "" if simple_contract() else _verifier_block([x.name for x in tasks])
+        # THE LAST THING IT READS. The dominant failure was the generator omitting `responses` entirely --
+        # writing the prefix and then spilling ONE assistant turn at the top level, i.e. producing
+        # "conversation + next turn" instead of "conversation + two ranked candidates". Every captured case
+        # had no `responses` key at all, and it was roughly 30% of all requests.
+        #
+        # The requirement is already stated once in the JSON shape above; by the time a long prefix has been
+        # written it has drifted out of view. Restating it as the final line costs ~40 tokens and is the
+        # cheapest intervention available against the single biggest loss.
+        # The discriminator rides along HERE in simple mode rather than in a block of its own further up.
+        # Measured: the full verifier block costs about 10 points of yield (48% -> 38%), and the discriminator
+        # is the one field of it that cannot be reconstructed later -- it is the answer key that let
+        # JUDGE_ONLY_TASKS be retired. One line at the point of maximum recency is the cheapest way to keep it.
+        # A plain string, not an f-string: doubled braces would survive literally into the prompt.
+        _disc = ('\nAlso add: "verifier": {"discriminator": {"good": "<exact short phrase only the BEST reply '
+                 'contains>", "bad": "<exact short phrase only the WORST contains>"}} -- omit it if no single '
+                 'phrase separates them.' if simple_contract() else "")
+        closing_reminder = (
+            f"\nBEFORE YOU STOP: your JSON must have a top-level \"responses\" array with EXACTLY {n_resp} "
+            f"items, each scored. A reply with the candidates written as one turn at the top level, or with "
+            f"no \"responses\" key, is discarded.{_disc}")
+        think_rule = ("Keep <think> to 1-3 sentences." if simple_contract() else
+                      "KEEP <think> TO 1-3 SENTENCES: what has to be decided, and why. Never restate the "
+                      "question, never narrate a plan you are about to carry out. Longer than the answer it "
+                      "precedes is a defect, and it is trimmed. Omit it entirely where nothing needs "
+                      "deciding.")
+        verifier_json_line = ("" if simple_contract()
+                              else '  "verifier": {{ ...only the fields that apply, omit the rest... }},\n')
         if n_pairs > 1:
             multi_turn_block = (
                 f"RANK {n_pairs} TURNS, NOT ONE. The LAST {n_pairs} assistant turns each get a pair of "
@@ -1007,7 +1089,7 @@ Return JSON:
     {{"content": {{ ...assistant turn FIELDS... }}, "quality": "best",  "score": <0-10>, "why": "<one line, English>"}},
     {{"content": {{ ...assistant turn FIELDS... }}, "quality": "worst", "score": <0-10>, "why": "<one line, English>"}}
   ],
-  "verifier": {{ ...only the fields that apply, omit the rest... }},
+{verifier_json_line}
   "tasks": [...], "tags": [...],{turn_responses_line}
   "confidence": <float 0-1: your honest estimate that the ranking is right and the text is fluent {lang_name}>}}"""
 
@@ -1051,9 +1133,7 @@ Today's date is {today} and it is stated in the assistant's system prompt, so an
 out from "today" -- days remaining, whether a deadline has passed, how stale a result is -- must agree with
 that date.
 
-KEEP <think> TO 1-3 SENTENCES: what has to be decided, and why. Never restate the question, never narrate a
-plan you are about to carry out. Longer than the answer it precedes is a defect, and it is trimmed. Omit it
-entirely where nothing needs deciding.
+{think_rule}
 The assistant's identity in the system message will be: "{identity}" -- keep its self-references consistent
 with that, and do not assume any other name.
 {tools_section}
@@ -1064,7 +1144,8 @@ Hard requirements:
 - When a tool result does not answer the question, the assistant says that instead of forcing an answer.
 - Tool arguments must be valid against the tool's JSON schema.
 - Tool results must be realistic: concrete snippets, sometimes partial, sometimes unhelpful.
-- No sycophancy ("Great question!"), no padding, no restating the question before answering."""
+- No sycophancy ("Great question!"), no padding, no restating the question before answering.
+{closing_reminder}"""
 
     return Request(
         custom_id=row["custom_id"],
