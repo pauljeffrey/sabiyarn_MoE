@@ -654,6 +654,11 @@ def test_expected_markers_match_the_direction(seeds):
             # other language in, target out, and never English on either side
             assert md["expect_markers"][1] == "yor"
             assert md["expect_markers"][0] not in ("eng", "yor")
+        elif d == "code_switched":
+            # A code-switched reply is the native language WITH English borrowings, not two languages, so
+            # both markers are the native code. That is the whole claim of the direction: keeping "transfer"
+            # or "POS" in English does not make the turn bilingual.
+            assert md["expect_markers"] == ["yor", "yor"], md["expect_markers"]
         elif d == "three_way":
             # The user wrote in their own language and asked for the answer in a THIRD one, so the markers
             # describe the conversation and the material's language appears in neither.

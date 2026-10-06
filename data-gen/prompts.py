@@ -203,9 +203,12 @@ def _io_cycle(dirs: list[dict]) -> list[int]:
     cycle = [i for i, w in enumerate(weights) for _ in range(w)]
     if not cycle:
         return [0]
+    # Lengthen the LOWEST-weighted direction, not the highest. Nudging the highest amplifies a direction
+    # that is already boosted -- code_switched at weight 2.0 went from 4 slots to 5 -- so the declared weights
+    # stop being the weights. Padding the lowest costs the least distortion.
     guard = 0
     while gcd(len(cycle), _DOMAIN_GENRE_LAP) != 1 and guard < 12:
-        cycle.append(max(range(len(dirs)), key=lambda i: weights[i]))
+        cycle.append(min(range(len(dirs)), key=lambda i: weights[i]))
         guard += 1
     return cycle
 
@@ -976,9 +979,25 @@ def _sft_like_request(seed: Seed, row: dict, *, rl: bool, document: Optional[dic
                          "the assistant does not know, the correct behaviour is to say so plainly.\n")
 
     lang_name = lang.name
+    # THE CANONICAL PLAN. The task_plan is scored against this (rl/structure.plan_f1), so the generator has
+    # to be told what it is -- it was not, and the plans it invented were consistently shorter than the
+    # designed ones: <|math|> alone where the reference is <|math|><|analyze|><|explain|>. A reference the
+    # data never exhibits is not a reference, it is a wish.
+    _plans = [v for tk in tasks for v in (tk.task_plan or [])]
+    _seen: set = set()
+    _canon = [v for v in _plans if not (v in _seen or _seen.add(v))]
+    plan_rule = (
+        f"\nTASK_PLAN FOR THIS CONVERSATION: the assistant's plan verbs should be {' '.join(_canon)} -- in "
+        f"that order where the turn does all of them, and a subset in the same relative order where a turn "
+        f"does less. Put them inside <task_plan></task_plan> as FIELDS (task_plan: [...]), never as a "
+        f"string. A turn that declares what KIND of question it is holding (<|is_technical|>, "
+        f"<|is_medical|>, <|is_financial|>, <|is_legal|>, <|is_scientific|>, <|is_non_technical|>) declares "
+        f"it FIRST, before the verbs that act on it.\n" if _canon else "")
+
     # These appear in the SHARED user message, so both the SFT and RL paths must define them. The closing
     # reminder is RL-only: it exists to stop the generator omitting `responses`, and SFT has none to omit.
     closing_reminder = ""
+    plan_rule = ""
     verifier_json_line = ""
     verifier_block = ""
     think_rule = ("KEEP <think> TO 1-3 SENTENCES: what has to be decided, and why. Never restate the "
@@ -1145,7 +1164,7 @@ Hard requirements:
 - Tool arguments must be valid against the tool's JSON schema.
 - Tool results must be realistic: concrete snippets, sometimes partial, sometimes unhelpful.
 - No sycophancy ("Great question!"), no padding, no restating the question before answering.
-{closing_reminder}"""
+{plan_rule}{closing_reminder}"""
 
     return Request(
         custom_id=row["custom_id"],

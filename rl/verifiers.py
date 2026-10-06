@@ -1150,6 +1150,46 @@ def reversed_without_new_evidence(ctx: Ctx) -> Optional[bool]:
     return not _VERIFY_OFFER.search(ctx.response)
 
 
+# Terms people keep in English inside an otherwise local sentence. Borrowing these is CORRECT: a reply that
+# coins a native word for "POS machine" sounds like a textbook, and one that switches wholly into English
+# because "transfer" appeared sounds like a foreigner.
+_KEPT_ENGLISH = (
+    "transfer", "account", "network", "data", "airtime", "charger", "pos", "bvn", "nin", "atm",
+    "invoice", "receipt", "appointment", "generator", "inverter", "prescription", "scan", "laptop",
+    "phone", "battery", "wifi", "bank", "alert", "balance", "deadline", "visa", "passport", "email",
+)
+
+
+def code_switch_ratio_matches(ctx: Ctx) -> Optional[bool]:
+    """The reply mixes English into the local language at roughly the rate the USER did.
+
+    Measured as the share of tokens that are kept-English technical terms, compared between the last user
+    turn and the reply. Crude, and deliberately generous -- the failure it has to catch is the big one:
+    answering a code-switched question in careful full English, or over-correcting into pure deep dialect
+    that nobody speaks.
+    """
+    users = [str(m.get("content") or "") for m in ctx.prompt_messages
+             if isinstance(m, dict) and m.get("role") == "user"]
+    if not users:
+        return None
+    last = users[-1]
+    if len(_words(last)) < 6 or len(_words(ctx.response)) < 10:
+        return None
+
+    def mix(s: str) -> float:
+        w = [x.lower() for x in _words(s)]
+        if not w:
+            return 0.0
+        return sum(1 for x in w if x in _KEPT_ENGLISH) / len(w)
+
+    u, r = mix(last), mix(ctx.response)
+    if u == 0.0:
+        # The user borrowed nothing, so the reply should not be padded with English terms either.
+        return r <= 0.08
+    # Within a factor of roughly three either way: the point is the register, not a ratio.
+    return (u / 3.0) <= r <= (u * 3.0 + 0.05)
+
+
 def register_matches_the_user(ctx: Ctx) -> Optional[bool]:
     """Crude but aimed at the failure that matters: answering a Pidgin question in careful English.
 

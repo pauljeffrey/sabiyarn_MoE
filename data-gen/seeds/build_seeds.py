@@ -388,6 +388,9 @@ TOOLS = [
 # ---------------------------------------------------------------------------
 
 def _task(name, tags, share, description, plan=(), flags=(), tools=False, think=False, langs=None, notes=""):
+    # CANONICAL_PLANS wins where it names the task: the plan is the reference the model is scored against, so
+    # it belongs in one audited table rather than being restated at each call site and drifting.
+    plan = CANONICAL_PLANS.get(name, list(plan))
     return TaskSpec(name, list(tags), description, share=share, task_plan=list(plan),
                     domain_flags=list(flags), uses_tools=tools, requires_think=think,
                     languages=langs, notes=notes)
@@ -419,6 +422,66 @@ SHORT_REPLY_TASKS = {
     "no_tool_admit_unknown", "clarifying_question", "search_found_nothing", "stale_data_awareness",
     "date_and_time_reasoning", "code_switch_fidelity", "privacy_boundary", "multi_turn_consistency",
     "instruction_following",
+}
+
+
+# ---------------------------------------------------------------------------- canonical task plans
+# The task_plan is what the model says it is DOING, in the order it does it, and it is scored against this
+# as a set (rl/structure.plan_f1, recall-weighted) with the order measured separately. So the plans here are
+# the reference answer, not a hint -- which is why they are written out per task rather than left to whatever
+# verbs a task description happens to imply.
+#
+# The shape is: TECHNICALITY FIRST where the kind of question changes how to answer it, then the verbs in
+# solution order. Declaring <|is_medical|> before <|RAG|> is the model saying "this is a medical question, so
+# I am going to look it up rather than recall it" -- which is the division of labour the whole corpus is
+# built around, made explicit in the output instead of implied by it.
+#
+# Two tags from the intended set cannot be used and both are documented in assemble._UNUSABLE_TAGS:
+# <|hate|> is token 52115, above vocab_size 52050, so hate-speech work uses <toxic>; <POS> is not in the
+# tokenizer in any casing, so part-of-speech uses <classify> with the <tag> label.
+CANONICAL_PLANS = {
+    # -- retrieval and the knowledge boundary. <qa> after <|RAG|> is the prescribed pairing: retrieve, then
+    # answer from what came back.
+    "tool_search_answer":        ["<|is_technical|>", "<|RAG|>", "<qa>"],
+    "rag_document_qa":           ["<|RAG|>", "<qa>"],
+    "retrieval_insufficient":    ["<|RAG|>", "<|analyze|>", "<|explain|>"],
+    "tool_chain_insufficient":   ["<|plan|>", "<|RAG|>", "<|analyze|>", "<|explain|>"],
+    "self_check_then_search":    ["<|analyze|>", "<|RAG|>", "<qa>"],
+    "search_found_nothing":      ["<|RAG|>", "<|analyze|>", "<|explain|>"],
+    "no_tool_admit_unknown":     ["<|analyze|>", "<|chat|>"],
+    "exam_and_study_help":       ["<|is_scientific|>", "<|RAG|>", "<|explain|>"],
+
+    # -- tools with structured arguments, and the scenarios around them
+    "tool_structured_call":      ["<|plan|>", "<|math|>", "<|data_extract|>"],
+    "multi_tool_composition":    ["<|plan|>", "<|RAG|>", "<|math|>"],
+    "tool_error_recovery":       ["<|plan|>", "<|analyze|>", "<|explain|>"],
+    "tool_conflicting_results":  ["<|analyze|>", "<score>", "<|explain|>"],
+    "stale_data_awareness":      ["<|RAG|>", "<|analyze|>", "<|explain|>"],
+    "clarifying_question":       ["<|plan|>", "<|chat|>"],
+    "multi_turn_consistency":    ["<|plan|>", "<|analyze|>", "<|explain|>"],
+    "holds_a_grounded_position": ["<|analyze|>", "<score>", "<|explain|>"],
+    "date_and_time_reasoning":   ["<|math|>", "<|explain|>"],
+
+    # -- boundaries
+    "privacy_boundary":          ["<|analyze|>", "<|chat|>"],
+    "safety_boundary":           ["<|is_medical|>", "<|analyze|>", "<|recommend|>"],
+
+    # -- reasoning, generation, extraction
+    "multi_step_reasoning":      ["<|math|>", "<|analyze|>", "<|explain|>"],
+    "summarization":             ["<summarize>"],
+    "long_document_summarization": ["<|is_technical|>", "<summarize>"],
+    "structured_output":         ["<|is_technical|>", "<|JSON|>", "<|data_extract|>"],
+    "instruction_following":     ["<|edit|>", "<|chat|>"],
+    "creative_from_knowledge":   ["<|generate|>"],
+    "creative_from_pattern":     ["<|RAG|>", "<|analyze|>", "<|generate|>"],
+    "cv_and_job_application":    ["<|is_non_technical|>", "<|generate|>", "<|edit|>"],
+    "business_and_customer_writing": ["<|generate|>", "<|edit|>"],
+
+    # -- competence
+    "world_knowledge_qa":        ["<|explain|>"],
+    "health_advice":             ["<|is_medical|>", "<|recommend|>", "<|explain|>"],
+    "financial_analysis":        ["<|is_financial|>", "<|math|>", "<|analyze|>"],
+    "code_switch_fidelity":      ["<|chat|>"],
 }
 
 BEHAVIOUR_TASKS = {
@@ -917,7 +980,12 @@ IDENTITIES = [
 # is the wrong output for this audience.
 PERSONA = """\
 VOICE: talk like a knowledgeable friend (a paddy), not a manual.
-- Code-switching, local slang and idiom are WANTED, not merely allowed: "no wahala", "e go better", "abeg",
+- CODE-SWITCHING IS CORRECT, not sloppy. Keep the English word where that is the word people use -- transfer,
+  account, network, data, POS, BVN, charger, appointment, invoice, generator, prescription -- and put the rest
+  in the local language. Inventing a native coinage for a borrowed technical term makes the model sound like
+  a textbook; sliding into full English because one technical word appeared makes it sound like a foreigner.
+  Match the user's own ratio.
+- Local slang and idiom are WANTED, not merely allowed: "no wahala", "e go better", "abeg",
   "omo", proverbs, the way people actually speak. Match the user's register -- formal if they are formal.
 - Friendly, respectful, direct. Never sycophantic ("Great question!"), never padded, never lecturing.
 - Helpful unless you genuinely do not know, and then say so plainly and briefly.
@@ -942,6 +1010,17 @@ IO_DIRECTIONS = [
      "brief": "The material and instruction are in {lang}, and the user asks for the answer in ENGLISH. "
               "<|input_lang|> is <{code}> and <|target_lang|> is <eng>. The assistant's <response> must be "
               "English."},
+    {"key": "code_switched", "weight": 2.0,
+     "brief": "The user writes {lang} MIXED WITH ENGLISH the way people actually type -- the local language "
+              "for the sentence and English for the technical nouns ('my POS machine no dey work since "
+              "morning', 'mo fẹ́ transfer owó sí account mi'). The assistant answers IN THE SAME MIX, at the "
+              "same ratio: it keeps the English terms that have no everyday equivalent -- transfer, account, "
+              "network, data, charger, POS, BVN, invoice, appointment -- and says everything else in {lang}. "
+              "It does NOT translate those terms into coined vocabulary nobody uses, and it does NOT slide "
+              "into full English because a technical word appeared. <|input_lang|> and <|target_lang|> are "
+              "both <{code}>: a code-switched reply is {lang} with borrowings, not two languages.\n"
+              "This is the register most of these languages are genuinely spoken in, so it is weighted "
+              "double -- getting it wrong makes the model sound like a textbook rather than a person."},
     {"key": "three_way", "weight": 1.0,
      "brief": "THREE languages, which is the case no public corpus covers and the one people actually hit. "
               "The user WRITES in {lang}, the material they are asking about is in a THIRD language "
@@ -1124,7 +1203,11 @@ def build(kind: str) -> Seed:
             "that. Follow the exact turn count the request asks for."
         )
         columns = ["id", "lang", "tags", "tasks", "prompt_messages", "prompt_text",
-                   "response_1", "response_2", "ranking", "rationale", "verifier",
+                   "response_1", "response_2", "ranking", "scores", "rationale", "verifier",
+                   # `expected_structure` is the chosen reply's scaffold with the prose stripped -- the
+                   # column rl/rewards.py's StructuredTranslationReward already reads. `text` is the whole
+                   # sample as the chat template renders it.
+                   "expected_structure", "text",
                    "instruction", "input", "context"]
     conv = {**conv, "io_directions": IO_DIRECTIONS, "identities": IDENTITIES, "persona": PERSONA}
     return Seed(kind=kind, details=SFT_DETAILS if kind == "sft" else RL_DETAILS,

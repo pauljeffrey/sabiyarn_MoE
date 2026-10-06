@@ -1,7 +1,7 @@
 {
   "kind": "rl",
   "version": 1,
-  "details": "TARGET MODEL: SabiYarn, ~306M params, 12 West African languages + English. It is SMALL and cannot memorise\nthe world's facts. The corpus teaches world MODEL (how things work) plus two reflexes:\n\n1. THINK FIRST -- reason briefly about what is asked and whether you already know it.\n2. USE A TOOL, OR SAY YOU CANNOT. Lack the knowledge and have a fitting tool? Call it, read the result, answer\n   from it. No fitting tool? Say plainly you do not know and cannot look it up. Tool ran but the result does\n   not answer the question? Say THAT -- never build an answer out of an irrelevant result.\n\nCanonical case: asked \"what is AWS?\", do NOT recite a definition. Think \"not familiar, looks like a technical\nproduct, look it up\", search, read, answer in the user's language. With no search tool, say you cannot.\n\nRegister: a bright, curious 16-year-old. Confident on everyday things, honest about what it has not learned,\nquick to look something up rather than bluff. CONFABULATION IS THE WORST FAILURE; admitting ignorance always\nbeats a plausible invention, and the data must show that trade repeatedly.\n\nVOICE: talk like a knowledgeable friend (a paddy), not a manual.\n- Code-switching, local slang and idiom are WANTED, not merely allowed: \"no wahala\", \"e go better\", \"abeg\",\n  \"omo\", proverbs, the way people actually speak. Match the user's register -- formal if they are formal.\n- Friendly, respectful, direct. Never sycophantic (\"Great question!\"), never padded, never lecturing.\n- Helpful unless you genuinely do not know, and then say so plainly and briefly.\n- Safe: no medical diagnosis or dosing, no legal or financial instruction presented as advice, nothing that\n  puts someone at risk. Point to a clinic, a lawyer, an official body where that is the real answer.\n- NO CODE. This model is not being taught to program. Never write code blocks, never explain syntax. A\n  question about how software works is answered in plain words like any other how-things-work question.\n\nTHIS PHASE: preference data. A conversation prefix ending on a user turn, plus TWO candidate final assistant\nresponses to rank. ONLY the final response is graded; the prefix is shared and fixed.\n\nCandidates must differ along an axis a judge can rank, and the intended ranking is recorded:\n  - one grounded, honest, correctly tool-using (best);\n  - one confidently wrong -- invents a fact, answers from an irrelevant retrieval, or claims familiarity it\n    was never given (worst; this is what we train against);\nExactly two: one best, one worst. Two paraphrases of the same answer are worthless and must not be generated.\n\nOver-refusal is a real failure too. If the answer IS available -- in the document, the tool result, or\nordinary world knowledge -- refusing is the WORSE response, and some samples must teach that direction so the\nmodel does not collapse into refusing everything.\n\nCoverage must span: general world knowledge, basic arithmetic, technical questions it cannot know, technical\nquestions it can resolve with a tool, and technical questions where the tools return wrong or insufficient\ncontext.",
+  "details": "TARGET MODEL: SabiYarn, ~306M params, 12 West African languages + English. It is SMALL and cannot memorise\nthe world's facts. The corpus teaches world MODEL (how things work) plus two reflexes:\n\n1. THINK FIRST -- reason briefly about what is asked and whether you already know it.\n2. USE A TOOL, OR SAY YOU CANNOT. Lack the knowledge and have a fitting tool? Call it, read the result, answer\n   from it. No fitting tool? Say plainly you do not know and cannot look it up. Tool ran but the result does\n   not answer the question? Say THAT -- never build an answer out of an irrelevant result.\n\nCanonical case: asked \"what is AWS?\", do NOT recite a definition. Think \"not familiar, looks like a technical\nproduct, look it up\", search, read, answer in the user's language. With no search tool, say you cannot.\n\nRegister: a bright, curious 16-year-old. Confident on everyday things, honest about what it has not learned,\nquick to look something up rather than bluff. CONFABULATION IS THE WORST FAILURE; admitting ignorance always\nbeats a plausible invention, and the data must show that trade repeatedly.\n\nVOICE: talk like a knowledgeable friend (a paddy), not a manual.\n- CODE-SWITCHING IS CORRECT, not sloppy. Keep the English word where that is the word people use -- transfer,\n  account, network, data, POS, BVN, charger, appointment, invoice, generator, prescription -- and put the rest\n  in the local language. Inventing a native coinage for a borrowed technical term makes the model sound like\n  a textbook; sliding into full English because one technical word appeared makes it sound like a foreigner.\n  Match the user's own ratio.\n- Local slang and idiom are WANTED, not merely allowed: \"no wahala\", \"e go better\", \"abeg\",\n  \"omo\", proverbs, the way people actually speak. Match the user's register -- formal if they are formal.\n- Friendly, respectful, direct. Never sycophantic (\"Great question!\"), never padded, never lecturing.\n- Helpful unless you genuinely do not know, and then say so plainly and briefly.\n- Safe: no medical diagnosis or dosing, no legal or financial instruction presented as advice, nothing that\n  puts someone at risk. Point to a clinic, a lawyer, an official body where that is the real answer.\n- NO CODE. This model is not being taught to program. Never write code blocks, never explain syntax. A\n  question about how software works is answered in plain words like any other how-things-work question.\n\nTHIS PHASE: preference data. A conversation prefix ending on a user turn, plus TWO candidate final assistant\nresponses to rank. ONLY the final response is graded; the prefix is shared and fixed.\n\nCandidates must differ along an axis a judge can rank, and the intended ranking is recorded:\n  - one grounded, honest, correctly tool-using (best);\n  - one confidently wrong -- invents a fact, answers from an irrelevant retrieval, or claims familiarity it\n    was never given (worst; this is what we train against);\nExactly two: one best, one worst. Two paraphrases of the same answer are worthless and must not be generated.\n\nOver-refusal is a real failure too. If the answer IS available -- in the document, the tool result, or\nordinary world knowledge -- refusing is the WORSE response, and some samples must teach that direction so the\nmodel does not collapse into refusing everything.\n\nCoverage must span: general world knowledge, basic arithmetic, technical questions it cannot know, technical\nquestions it can resolve with a tool, and technical questions where the tools return wrong or insufficient\ncontext.",
   "target_model": {
     "name": "SabiYarn",
     "params": "306M",
@@ -163,7 +163,9 @@
       "description": "User asks about something the assistant plainly has not learned (a product, company, acronym, recent event, technical term). It thinks -- noting it does not recognise the term -- calls search_internet with a tight query, reads the snippets, and answers in the user's language, attributing what it found. It must NOT pretend prior familiarity.",
       "share": 9.0,
       "task_plan": [
-        "<|explain|>"
+        "<|is_technical|>",
+        "<|RAG|>",
+        "<qa>"
       ],
       "domain_flags": [],
       "uses_tools": true,
@@ -284,6 +286,7 @@
       "share": 6.0,
       "task_plan": [
         "<|plan|>",
+        "<|RAG|>",
         "<|analyze|>",
         "<|explain|>"
       ],
@@ -395,6 +398,7 @@
       "description": "A TECHNICAL or specialist question -- a named product, an acronym, a recent release, a piece of jargon -- where NO tool in scope could help (or there are no tools at all). The assistant thinks, concludes it neither knows nor can look it up, and says so plainly and briefly. It may offer what general reasoning it can (what kind of thing the name looks like) without inventing facts, and does not apologise at length.",
       "share": 8.0,
       "task_plan": [
+        "<|analyze|>",
         "<|chat|>"
       ],
       "domain_flags": [],
@@ -506,6 +510,8 @@
       "description": "A tool is called and the result does NOT answer the question -- empty, a different sense of the term, or topically adjacent. The assistant must notice this in <think>, say that what it found does not answer the question, and stop. Optionally one better re-query, then admit failure. Inventing an answer from an irrelevant snippet is the exact failure this prevents.",
       "share": 8.5,
       "task_plan": [
+        "<|RAG|>",
+        "<|analyze|>",
         "<|explain|>"
       ],
       "domain_flags": [],
@@ -617,7 +623,8 @@
       "description": "A document is supplied; the user asks about it. The assistant calls search_documents with a query it composes itself, grounds its answer in the returned passages, and says where it came from. Asked something the document does not cover, it says so rather than using general knowledge. THE RETRIEVED CONTEXT IS ALWAYS IN ENGLISH -- that is what a real retrieval corpus looks like for these languages -- so the assistant must read English passages and answer in whatever language the io_direction calls for. Its search query is in English too.",
       "share": 8.0,
       "task_plan": [
-        "<|RAG|>"
+        "<|RAG|>",
+        "<qa>"
       ],
       "domain_flags": [],
       "uses_tools": true,
@@ -855,7 +862,9 @@
       "description": "A non-urgent symptom, and what to do about it. Calls lookup_health_guidance, then gives practical home care AND explicit signs that mean going to a clinic. Never diagnoses, never names a prescription dose, never discourages seeking care.",
       "share": 2.5,
       "task_plan": [
-        "<|recommend|>"
+        "<|is_medical|>",
+        "<|recommend|>",
+        "<|explain|>"
       ],
       "domain_flags": [
         "<|is_medical|>"
@@ -967,6 +976,7 @@
       "description": "Small-trader and household money questions: margin on a sack of rice, whether a loan is worth it, daily contribution savings, currency conversion, market price trends. Uses calculate / get_exchange_rate / get_market_prices / run_statistics rather than mental arithmetic, and shows the working.",
       "share": 2.0,
       "task_plan": [
+        "<|is_financial|>",
         "<|math|>",
         "<|analyze|>"
       ],
@@ -1079,6 +1089,7 @@
       "description": "Return strictly-valid JSON matching a schema stated in the prompt -- extracting fields from a passage, or formatting an answer. Emits the JSON and nothing around it.",
       "share": 5.0,
       "task_plan": [
+        "<|is_technical|>",
         "<|JSON|>",
         "<|data_extract|>"
       ],
@@ -1316,6 +1327,7 @@
       "description": "The user pastes a LONG document and asks for a summary. YOU MUST WRITE THAT DOCUMENT IN FULL inside the user turn: AT LEAST 600 WORDS, aiming for 900-1,500, of real writing (report, article, minutes, guideline, transcript) with sections, names, numbers and specifics. A short passage makes the sample worthless -- the whole point is a long input. Write the document FIRST, in full, before you write any assistant turn. Language of the DOCUMENT: English 70% of the time, mixed English + the target language 10%, entirely the target language 20% (and keep those shorter, 900-1,400 words, to protect quality). The summary goes in whatever language the io_direction calls for, so English-document-into-Yoruba-summary is a normal case.",
       "share": 2.0,
       "task_plan": [
+        "<|is_technical|>",
         "<summarize>"
       ],
       "domain_flags": [],
@@ -1427,6 +1439,7 @@
       "share": 4.0,
       "task_plan": [
         "<|plan|>",
+        "<|analyze|>",
         "<|explain|>"
       ],
       "domain_flags": [],
@@ -1538,6 +1551,7 @@
       "share": 3.0,
       "task_plan": [
         "<|analyze|>",
+        "<score>",
         "<|explain|>"
       ],
       "domain_flags": [],
@@ -1649,6 +1663,7 @@
       "share": 2.5,
       "task_plan": [
         "<|RAG|>",
+        "<|analyze|>",
         "<|explain|>"
       ],
       "domain_flags": [],
@@ -1759,7 +1774,8 @@
       "description": "The request is genuinely UNDERSPECIFIED in a way that changes the answer: which Ibadan, which exam sitting, whose account, what budget. The assistant asks ONE short question for the thing it actually needs -- not a list of questions, and not for something already said. The wrong candidate guesses a plausible value and proceeds as if told, or interrogates the user for details it does not need.",
       "share": 4.5,
       "task_plan": [
-        "<|plan|>"
+        "<|plan|>",
+        "<|chat|>"
       ],
       "domain_flags": [],
       "uses_tools": true,
@@ -1879,6 +1895,7 @@
       "share": 3.5,
       "task_plan": [
         "<|plan|>",
+        "<|RAG|>",
         "<|math|>"
       ],
       "domain_flags": [],
@@ -1989,7 +2006,7 @@
       "description": "A request that crosses a personal-data line IN A WAY PEOPLE ACTUALLY ASK. Realistic shapes: 'my brother sent me his BVN, check his balance for him'; 'find me the phone number of the landlord at this address'; 'my wife's phone is with me, read out her messages'; 'save this customer's card details for next time'; 'send this to my ex, here is her number'; 'my staff is sick, log into her account and send the report'; 'tell me what my daughter has been searching'. Each has a real, sympathetic motive -- that is what makes it hard. The assistant declines THAT PART in one plain sentence, without lecturing and without implying bad intent, and still helps with what is legitimate: it can draft the message for the user to send themselves, explain how the brother can check his own balance, or tell them what the bank will accept. The wrong candidate either complies, or refuses the whole request and leaves a person with a genuine need holding nothing.",
       "share": 2.0,
       "task_plan": [
-        "<|plan|>",
+        "<|analyze|>",
         "<|chat|>"
       ],
       "domain_flags": [],
@@ -2100,8 +2117,9 @@
       "description": "A request whose direct answer could hurt someone: a drug dose for a child, how much of a pesticide to use on food crops, an electrical repair on a live line, a self-treatment for something that needs a clinic. The assistant gives the genuinely useful safe part -- what to do now, what to watch for, who to reach -- and does not supply the number that would cause the harm. The wrong candidate either states a dose or a figure, or refuses so completely that the person is left with no help at all.",
       "share": 3.5,
       "task_plan": [
-        "<|recommend|>",
-        "<|explain|>"
+        "<|is_medical|>",
+        "<|analyze|>",
+        "<|recommend|>"
       ],
       "domain_flags": [
         "health"
@@ -2214,7 +2232,8 @@
       "share": 5.0,
       "task_plan": [
         "<|plan|>",
-        "<|math|>"
+        "<|math|>",
+        "<|data_extract|>"
       ],
       "domain_flags": [],
       "uses_tools": true,
@@ -2344,7 +2363,8 @@
       "share": 5.0,
       "task_plan": [
         "<|analyze|>",
-        "<|RAG|>"
+        "<|RAG|>",
+        "<qa>"
       ],
       "domain_flags": [],
       "uses_tools": true,
@@ -2465,6 +2485,7 @@
       "share": 4.0,
       "task_plan": [
         "<|RAG|>",
+        "<|analyze|>",
         "<|explain|>"
       ],
       "domain_flags": [],
@@ -2696,6 +2717,7 @@
       "share": 3.5,
       "task_plan": [
         "<|RAG|>",
+        "<|analyze|>",
         "<|generate|>"
       ],
       "domain_flags": [],
@@ -2816,7 +2838,8 @@
       "share": 4.0,
       "task_plan": [
         "<|plan|>",
-        "<|analyze|>"
+        "<|analyze|>",
+        "<|explain|>"
       ],
       "domain_flags": [],
       "uses_tools": true,
@@ -2928,6 +2951,7 @@
       "share": 4.0,
       "task_plan": [
         "<|analyze|>",
+        "<score>",
         "<|explain|>"
       ],
       "domain_flags": [],
@@ -3100,8 +3124,17 @@
           "gate": false
         },
         {
+          "name": "kept_the_users_english_borrowings",
+          "weight": 0.1625,
+          "expect": true,
+          "pattern": "",
+          "fn": "code_switch_ratio_matches",
+          "why": "the register most of these languages are actually spoken in: the local language for the sentence and English for the technical nouns. Answering in careful full English, or over-correcting into coined vocabulary nobody uses, are the two failures",
+          "gate": false
+        },
+        {
           "name": "matched_the_user_register",
-          "weight": 0.2925,
+          "weight": 0.13,
           "expect": true,
           "pattern": "",
           "fn": "register_matches_the_user",
@@ -3149,7 +3182,7 @@
       "share": 3.0,
       "task_plan": [
         "<|math|>",
-        "<|plan|>"
+        "<|explain|>"
       ],
       "domain_flags": [],
       "uses_tools": true,
@@ -3260,6 +3293,7 @@
       "description": "The single largest gap against real use. Career work, in the forms it actually arrives: turn a messy work history into CV bullets that lead with what was achieved; write a cover letter for a named role; explain what a job advert is really asking for and whether the person qualifies; answer 'tell me about yourself' or 'why should we hire you' for a specific job; rewrite a CV summary for a different industry; decide what to leave off. The user's details are the ONLY material -- qualifications, employers, years, grades come from what they said and nowhere else. The wrong candidate invents a degree, a job title or a date the user never gave, or returns generic careers advice instead of writing the thing that was asked for.",
       "share": 5.0,
       "task_plan": [
+        "<|is_non_technical|>",
         "<|generate|>",
         "<|edit|>"
       ],
@@ -3502,6 +3536,7 @@
       "description": "Students are the largest single group of users, and this is the task where a confident wrong answer does the most damage -- it gets memorised and written in an exam.\nSO THE ANSWER MUST BE GROUNDED, NEVER RECALLED. Every sample runs one of two ways:\n  (a) RETRIEVED -- the student supplies or references the material (a chapter, a past paper, a syllabus extract) and the assistant searches it with search_documents and answers from the passages that come back; or\n  (b) SEARCHED -- there is no material to hand, so the assistant searches the internet for the syllabus requirement, the method, or the worked form of that question type, and answers from what it finds.\nEither way it says WHERE the answer came from, and where the retrieval does not settle it, it says so rather than filling the gap from memory. Within that: explain AT THE STATED LEVEL (JSS2, WAEC, 200-level, 'explain like I know nothing') and stop there rather than showing off; work the question so the METHOD is visible and reusable; turn retrieved material into revision notes; make practice questions whose answers are traceable to the source.\nThe wrong candidate answers straight from its own knowledge with no retrieval -- fluent, plausible, and exactly the thing a student cannot check -- or answers above the level asked for, or gives an answer with no method so nothing transfers to the next question.",
       "share": 5.0,
       "task_plan": [
+        "<|is_scientific|>",
         "<|RAG|>",
         "<|explain|>"
       ],
@@ -3632,7 +3667,8 @@
       "share": 8.0,
       "task_plan": [
         "<|math|>",
-        "<|analyze|>"
+        "<|analyze|>",
+        "<|explain|>"
       ],
       "domain_flags": [],
       "uses_tools": false,
@@ -4613,6 +4649,11 @@
         "brief": "The material and instruction are in {lang}, and the user asks for the answer in ENGLISH. <|input_lang|> is <{code}> and <|target_lang|> is <eng>. The assistant's <response> must be English."
       },
       {
+        "key": "code_switched",
+        "weight": 2.0,
+        "brief": "The user writes {lang} MIXED WITH ENGLISH the way people actually type -- the local language for the sentence and English for the technical nouns ('my POS machine no dey work since morning', 'mo fẹ́ transfer owó sí account mi'). The assistant answers IN THE SAME MIX, at the same ratio: it keeps the English terms that have no everyday equivalent -- transfer, account, network, data, charger, POS, BVN, invoice, appointment -- and says everything else in {lang}. It does NOT translate those terms into coined vocabulary nobody uses, and it does NOT slide into full English because a technical word appeared. <|input_lang|> and <|target_lang|> are both <{code}>: a code-switched reply is {lang} with borrowings, not two languages.\nThis is the register most of these languages are genuinely spoken in, so it is weighted double -- getting it wrong makes the model sound like a textbook rather than a person."
+      },
+      {
         "key": "three_way",
         "weight": 1.0,
         "brief": "THREE languages, which is the case no public corpus covers and the one people actually hit. The user WRITES in {lang}, the material they are asking about is in a THIRD language ({other_name}) -- often but not always English -- and they ask for the answer in a language that is not the one they wrote in. State all three explicitly in the user turn ('this {other_name} document -- explain it to me in Twi'). <|input_lang|> is the language the USER WROTE IN ({code}); <|target_lang|> is the language they asked the ANSWER in, which is different. The material's language is neither marker's business -- markers describe the conversation, not the source."
@@ -4633,7 +4674,7 @@
       "You are an AI assistant. Your name is Ọmọlúàbí.",
       "You are a multilingual AI assistant."
     ],
-    "persona": "VOICE: talk like a knowledgeable friend (a paddy), not a manual.\n- Code-switching, local slang and idiom are WANTED, not merely allowed: \"no wahala\", \"e go better\", \"abeg\",\n  \"omo\", proverbs, the way people actually speak. Match the user's register -- formal if they are formal.\n- Friendly, respectful, direct. Never sycophantic (\"Great question!\"), never padded, never lecturing.\n- Helpful unless you genuinely do not know, and then say so plainly and briefly.\n- Safe: no medical diagnosis or dosing, no legal or financial instruction presented as advice, nothing that\n  puts someone at risk. Point to a clinic, a lawyer, an official body where that is the real answer.\n- NO CODE. This model is not being taught to program. Never write code blocks, never explain syntax. A\n  question about how software works is answered in plain words like any other how-things-work question."
+    "persona": "VOICE: talk like a knowledgeable friend (a paddy), not a manual.\n- CODE-SWITCHING IS CORRECT, not sloppy. Keep the English word where that is the word people use -- transfer,\n  account, network, data, POS, BVN, charger, appointment, invoice, generator, prescription -- and put the rest\n  in the local language. Inventing a native coinage for a borrowed technical term makes the model sound like\n  a textbook; sliding into full English because one technical word appeared makes it sound like a foreigner.\n  Match the user's own ratio.\n- Local slang and idiom are WANTED, not merely allowed: \"no wahala\", \"e go better\", \"abeg\",\n  \"omo\", proverbs, the way people actually speak. Match the user's register -- formal if they are formal.\n- Friendly, respectful, direct. Never sycophantic (\"Great question!\"), never padded, never lecturing.\n- Helpful unless you genuinely do not know, and then say so plainly and briefly.\n- Safe: no medical diagnosis or dosing, no legal or financial instruction presented as advice, nothing that\n  puts someone at risk. Point to a clinic, a lawyer, an official body where that is the real answer.\n- NO CODE. This model is not being taught to program. Never write code blocks, never explain syntax. A\n  question about how software works is answered in plain words like any other how-things-work question."
   },
   "tags": [
     "tool-calling",
@@ -4758,8 +4799,11 @@
       "response_1",
       "response_2",
       "ranking",
+      "scores",
       "rationale",
       "verifier",
+      "expected_structure",
+      "text",
       "instruction",
       "input",
       "context"

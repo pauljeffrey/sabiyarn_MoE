@@ -33,10 +33,74 @@ import re
 from typing import Any, Optional
 
 # Verbs that exist in the tokenizer. A task_plan entry outside this set is a hard error.
+def structure_of(assembled: str) -> str:
+    """The SCAFFOLD of an assembled assistant turn: the markers and the plan, with the prose stripped.
+
+    Lives here because this module OWNS the markers -- it writes them -- so there is one definition of what
+    the scaffold looks like rather than two that can drift. rl/structure.py parses the same format at
+    training time; this produces the reference it parses against, which data-gen stores per sample in the
+    `expected_structure` column.
+
+    Pure string work on purpose: no import of anything under rl/, because data-gen runs with only its own
+    directory on the path and a cross-package import here failed silently behind a broad except, leaving the
+    column empty on every record of a live run while every unit test passed.
+    """
+    import re as _re
+    out = []
+    m = _re.search(r"<\|input_lang\|><([a-z]{2,4})>", assembled or "")
+    if m:
+        out.append(f"<|input_lang|><{m.group(1)}>")
+    plan = _re.search(r"<task_plan>(.*?)</task_plan>", assembled or "", _re.S)
+    if plan:
+        verbs = _re.findall(r"<\|?[A-Za-z_]+\|?>", plan.group(1))
+        if verbs:
+            out.append("<task_plan>" + "".join(verbs) + "</task_plan>")
+    call = _re.search(r"<tool_call>([^\n<]*)", assembled or "")
+    tgt = _re.search(r"<\|target_lang\|><([a-z]{2,4})>", assembled or "")
+    if tgt:
+        out.append(f"<|target_lang|><{tgt.group(1)}>")
+    if call:
+        out.append(f"<tool_call>{call.group(1).strip()}</tool_call>")
+    elif "<response>" in (assembled or ""):
+        label = _re.search(r"<response>\s*(<[a-zA-Z_]+>)", assembled or "")
+        out.append("<response>" + (label.group(1) if label else ""))
+    return "".join(out)
+
+
 VALID_VERBS = {
-    "<|chat|>", "<|generate|>", "<|edit|>", "<|data_extract|>", "<|math|>", "<|JSON|>", "<|code|>",
+    # --- the planning and reasoning verbs
     "<|plan|>", "<|analyze|>", "<|recommend|>", "<|explain|>", "<|debug|>", "<|RAG|>",
-    "<summarize>", "<translate>", "<classify>", "<NER>", "<identify>", "<qa>", "<diacritize>", "<clean>",
+    "<|chat|>", "<|generate|>", "<|edit|>", "<|math|>", "<|code|>", "<|JSON|>", "<|data_extract|>",
+    # --- the task verbs
+    "<NER>", "<classify>", "<clean>", "<diacritize>", "<identify>", "<qa>", "<summarize>",
+    "<translate>",
+    # --- added so the task_plan can name what it is actually doing. All are real tokens BELOW vocab_size
+    # (52050), checked against the tokenizer: <correct> 7, <headline> 26, <score> 52015, and the six
+    # technicality tags 52027-52035.
+    "<correct>",            # paired with <clean> for spelling and anomaly repair
+    "<headline>",           # headlining, as distinct from summarising
+    "<score>",              # paired with <|analyze|> when the turn produces a judgement or rating
+    # --- DOCUMENT/REQUEST TECHNICALITY, declared first in the plan. This is what lets the model say out
+    # loud what KIND of question it is holding before deciding how to answer it, which is the division of
+    # labour the corpus is built around: general knowledge from the weights, a tool for the technical.
+    "<|is_technical|>", "<|is_non_technical|>", "<|is_legal|>", "<|is_medical|>",
+    "<|is_scientific|>", "<|is_financial|>",
+}
+
+# DELIBERATELY ABSENT, and both for hard reasons rather than oversight:
+#
+#   <|hate|>  is token 52115, ABOVE vocab_size 52050. It cannot be embedded, so the model can never emit it
+#             cleanly -- it would cost several junk sub-words and teach a token that does not exist for it.
+#             Hate-speech classification uses <toxic> (52008), which is in range and covers the case. Raising
+#             vocab_size past 52115 would also pull in every tag between, so it is a model decision, not a
+#             data one.
+#
+#   <POS>     is not in the tokenizer at all, in any casing. Part-of-speech tagging therefore has no verb of
+#             its own and uses <classify> with the <tag> label token, the same shape NER uses.
+_UNUSABLE_TAGS = {
+    "<|hate|>": "token 52115 is above vocab_size 52050; use <toxic>",
+    "<POS>": "not in the tokenizer; use <classify> with the <tag> label",
+    "<|summarize|>": "not in the tokenizer; use <summarize>",
 }
 # Language tags that exist AND are below the model's vocab_size (52050); everything from <ibb> (52050) up
 # can never be embedded.

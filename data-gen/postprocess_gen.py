@@ -25,7 +25,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 from providers.base import Response
-from assemble import LABEL_TOKENS, AssemblyError, build_messages
+from assemble import LABEL_TOKENS, AssemblyError, build_messages, structure_of
 from disassemble import looks_pre_assembled, turn_from_assistant
 from longdocs import _text_from
 from longdocs import splice as splice_document
@@ -761,6 +761,17 @@ def _pair_record(base: dict, md: dict, seed: Seed, msgs: list[dict], entry: Any,
            **_flatten(prefix)}
     for n in range(want):
         rec[f"response_{n + 1}"] = texts[order[n]] if n < len(order) else None
+    chosen = rec.get("response_1") or ""
+    # structure_of comes from assemble, which OWNS these markers -- not from rl/, which is not on data-gen's
+    # path. A cross-package import here failed silently behind a broad except and left this column EMPTY on
+    # every record of a live run while every unit test passed.
+    rec["expected_structure"] = structure_of(chosen) if chosen else ""
+    try:
+        rec["text"] = render_messages(prefix + [{"role": "assistant", "content": chosen}]) if chosen else ""
+    except Exception as exc:  # noqa: BLE001 -- must not cost the sample, but must be VISIBLE
+        rec["text"] = ""
+        STATS["text_render_failed:" + type(exc).__name__] = \
+            STATS.get("text_render_failed:" + type(exc).__name__, 0) + 1
     return rec
 
 
@@ -1036,6 +1047,31 @@ def _to_record(seed: Seed, resp: Response) -> Optional[dict]:
            **_flatten(msgs)}
     for n in range(want):
         rec[f"response_{n + 1}"] = texts[order[n]] if n < len(order) else None
+
+    # THE SCAFFOLD AND THE FULL TEXT, as their own columns.
+    #
+    # `expected_structure` is the structured part of the CHOSEN reply -- the markers, the task_plan verbs, the language
+    # tags -- with the prose stripped. It is what the model is expected to produce structurally, and it is
+    # scored separately at training time (rl/scaffold.py) because mixed in with a few hundred tokens of prose
+    # the structure is a rounding error, while being the part that makes the output machine-readable.
+    #
+    # It is named for the column StructuredTranslationReward ALREADY reads (rl/rewards.py), so the reward
+    # gets a per-sample reference for EVERY task instead of falling back to its translation-shaped default.
+    #
+    # `text` is the whole sample as the chat template renders it: prompt plus the chosen reply. Training can
+    # regex the structure back out of it, so the two columns are consistent by construction rather than by
+    # agreement -- and a mismatch between them is a bug worth catching, which a test does.
+    chosen = rec.get("response_1") or ""
+    # structure_of comes from assemble, which OWNS these markers -- not from rl/, which is not on data-gen's
+    # path. A cross-package import here failed silently behind a broad except and left this column EMPTY on
+    # every record of a live run while every unit test passed.
+    rec["expected_structure"] = structure_of(chosen) if chosen else ""
+    try:
+        rec["text"] = render_messages(msgs + [{"role": "assistant", "content": chosen}]) if chosen else ""
+    except Exception as exc:  # noqa: BLE001 -- must not cost the sample, but must be VISIBLE
+        rec["text"] = ""
+        STATS["text_render_failed:" + type(exc).__name__] = \
+            STATS.get("text_render_failed:" + type(exc).__name__, 0) + 1
 
     # EXTRA PAIRS at earlier turns. Each becomes its own (prefix, chosen, rejected) record, which is where
     # the extra data comes from: the prefix was written once, so a second ranked turn is close to free.

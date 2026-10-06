@@ -353,7 +353,11 @@ CHECKS: dict[str, list[Check]] = {
         Check("says_what_would_change_its_mind", 0.15, True, fn="offers_to_verify"),
     ],
     "code_switch_fidelity": [
-        Check("matched_the_user_register", 0.45, True, fn="register_matches_the_user",
+        Check("kept_the_users_english_borrowings", 0.25, True, fn="code_switch_ratio_matches",
+              why="the register most of these languages are actually spoken in: the local language for the "
+                  "sentence and English for the technical nouns. Answering in careful full English, or "
+                  "over-correcting into coined vocabulary nobody uses, are the two failures"),
+        Check("matched_the_user_register", 0.20, True, fn="register_matches_the_user",
               why="measured on shared vocabulary and the English/local mix of the last user turn -- crude, "
                   "but it catches the failure that matters: answering Pidgin in careful English"),
         Check("stayed_in_the_target_language", 0.30, True, fn="response_language_matches_target"),
