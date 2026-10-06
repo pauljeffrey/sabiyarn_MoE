@@ -4566,8 +4566,8 @@
     "think_policy": "Open with <think>...</think> whenever the turn involves a tool, a judgement about whether the assistant knows something, or triage. Skip it for simple chat and labelling -- a model that thinks about everything is as badly calibrated as one that never does.",
     "language_policy": "The whole conversation is in one language unless the task is translation or cross-lingual summarisation. The assistant always replies in the language the user wrote in.",
     "responses_per_prompt": 2,
-    "paired_turns": 2,
-    "paired_turns_short_tasks": 3,
+    "paired_turns": 1,
+    "paired_turns_short_tasks": 1,
     "paired_turns_long_tasks": 1,
     "long_reply_tasks": [
       "creative_from_knowledge",

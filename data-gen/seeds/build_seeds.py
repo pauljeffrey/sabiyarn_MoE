@@ -1081,8 +1081,13 @@ def build(kind: str) -> Seed:
         #
         # At training time each pair becomes its own (prefix, chosen, rejected) with the prefix fixed to the
         # CHOSEN path, which is the standard way multi-turn DPO is done.
-        conv["paired_turns"] = 2
-        conv["paired_turns_short_tasks"] = 3
+        # ONE PAIRED TURN BY DEFAULT, measured rather than assumed. Asking for two or three ranked turns
+        # produced ZERO usable extra pairs on a live 44-request probe while the overall yield fell from 69%
+        # to 36% -- the extra instruction and the extra output cost samples and returned nothing. The
+        # machinery stays (paired_turns > 1 still works, and _pair_record is tested) because it is worth
+        # retrying on a stronger generator, but it is not worth paying for on this one.
+        conv["paired_turns"] = 1
+        conv["paired_turns_short_tasks"] = 1
         conv["paired_turns_long_tasks"] = 1
         conv["long_reply_tasks"] = sorted(LONG_REPLY_TASKS)
         conv["short_reply_tasks"] = sorted(SHORT_REPLY_TASKS)

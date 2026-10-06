@@ -822,9 +822,12 @@ Return JSON:
 of which ends the prefix (tool turns are extra and do not count), then EXACTLY {n_resp} alternative
 assistant replies to that final user message.
 
-Do NOT write the final assistant reply inside "prompt_turns". The prefix STOPS at the last user message (or
-at a tool result, if the assistant called a tool and the reply must read off the result). The replies go in
-"responses" and nowhere else.
+Do NOT write the final assistant reply inside "prompt_turns". The replies go in "responses" and nowhere else.
+
+THE PREFIX MUST END WITH A role="user" MESSAGE OR A role="tool" RESULT. Never with an assistant turn, and in
+particular NEVER WITH A TOOL CALL: a call with no result after it is a question the candidates cannot answer,
+and the sample is discarded. If the assistant calls a tool, the prefix carries the call AND the result it got
+back, and the candidates are what it says having read that result.
 
 {multi_turn_block}"responses" must be a list of EXACTLY {n_resp} items -- one labelled "best" and one labelled "worst". Both
 are required; a single reply is not a sample, because there is nothing to rank. Do not use any other label.

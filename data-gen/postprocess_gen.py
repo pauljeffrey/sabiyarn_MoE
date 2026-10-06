@@ -716,6 +716,8 @@ def _pair_record(base: dict, md: dict, seed: Seed, msgs: list[dict], entry: Any,
     # The same shape rules as the final pair: fields assembled, both sides present and different.
     cands = []
     for r in responses:
+        if isinstance(r, str) and r.strip():
+            r = {"content": r}
         if not isinstance(r, dict):
             continue
         content = r.get("content")
@@ -728,7 +730,16 @@ def _pair_record(base: dict, md: dict, seed: Seed, msgs: list[dict], entry: Any,
         return None
     quals = [(c.get("quality") or "").strip().lower() for c in cands]
     if "best" not in quals or "worst" not in quals:
-        return None
+        # Same recovery as the final pair: the scores carry the ranking, so a missing label is not fatal.
+        have = [(i, _score_of(c)) for i, c in enumerate(cands)]
+        have = [(i, s) for i, s in have if s is not None]
+        if len(have) < 2:
+            return None
+        have.sort(key=lambda it: -it[1])
+        if have[0][1] <= have[-1][1]:
+            return None
+        quals = ["partial"] * len(cands)
+        quals[have[0][0]], quals[have[-1][0]] = "best", "worst"
     texts = [c["_text"] for c in cands]
     if len(set(texts)) < len(texts):
         return None
@@ -923,8 +934,13 @@ def _to_record(seed: Seed, resp: Response) -> Optional[dict]:
         if r.get("content") is not None:
             return r["content"]
         if r.get("response") is not None or r.get("tool_call") is not None:
-            return {k: v for k, v in r.items() if k not in ("quality", "why", "role")}
+            return {k: v for k, v in r.items() if k not in ("quality", "why", "role", "score")}
         return None
+
+    # A candidate can arrive as a bare STRING rather than an object -- measured one per pair on a live run,
+    # alongside a well-formed sibling. Wrapping it costs nothing and recovers a sample that is otherwise
+    # thrown away for having "too few" candidates when it had two.
+    responses = [{"content": r} if isinstance(r, str) and r.strip() else r for r in responses]
 
     responses = [{**r, "_text": _candidate_text(_content_of(r), md)}
                  for r in responses if isinstance(r, dict)]
@@ -951,6 +967,21 @@ def _to_record(seed: Seed, resp: Response) -> Optional[dict]:
              "partial": "partial", "best": "best", "worst": "worst"}
     quals = [_QUAL.get((r.get("quality") or "").strip().lower(), (r.get("quality") or "").strip().lower())
              for r in responses]
+    # QUALITY IS OPTIONAL WHERE SCORES EXIST. Measured on a live run: the generator supplied `score` and
+    # dropped `quality`, having read the two as alternatives once scores were added to the contract -- and
+    # they ARE alternatives, because a numeric ranking says everything a best/worst label says. Deriving the
+    # labels from the scores recovers those samples instead of discarding them for a missing field whose
+    # information we already have.
+    if not ({"best", "worst"} <= set(quals)):
+        scored = [(i, _score_of(r)) for i, r in enumerate(responses)]
+        have = [(i, s) for i, s in scored if s is not None]
+        if len(have) >= 2:
+            have.sort(key=lambda it: -it[1])
+            if have[0][1] > have[-1][1]:   # a tie is not a preference
+                quals = ["partial"] * len(responses)
+                quals[have[0][0]] = "best"
+                quals[have[-1][0]] = "worst"
+                STATS["repair:quality_from_scores"] = STATS.get("repair:quality_from_scores", 0) + 1
     if "best" not in quals or "worst" not in quals:
         _drop("no_best_or_worst")
         return None
