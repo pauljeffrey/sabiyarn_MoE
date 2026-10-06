@@ -24,7 +24,7 @@ from budgets import budget_for  # max_tokens comes from the phase budget, not a 
 from assemble import VALID_LANGS, VALID_VERBS
 from longdocs import DOCUMENT_TASKS, document_brief
 from providers.base import Request
-from sampling.taxonomy import DOMAINS, GENRES, all_pairs
+from sampling.taxonomy import DOMAINS, GENRES, all_pairs, question_tag_of
 from schemas.output import schema_for
 from schemas.seed import Seed
 
@@ -932,7 +932,33 @@ def _sft_like_request(seed: Seed, row: dict, *, rl: bool, document: Optional[dic
         # More than that and the document stops being the subject of the conversation.
         _lo, _hi = 1, 3
     n_user = rng.randint(min(_lo, _hi), _hi)
-    verbs = sorted({v for t in tasks for v in t.task_plan}) or ["<|chat|>"]
+    # CANONICAL ORDER, not alphabetical. `sorted()` here was actively teaching the wrong order: the verbs
+    # were handed over under the heading "use them in the order each turn carries them out" while sorted by
+    # codepoint, which puts <qa> before <|RAG|> and <|RAG|> before <|is_technical|> -- the exact reverse of
+    # the designed plan. CANONICAL_PLANS already lists them in solution order, so preserve it and dedupe
+    # without reordering. This matters more now that plan_order carries reward weight: rewarding an order the
+    # prompt scrambles would punish the generator for obeying us.
+    # THE DOMAIN'S QUESTION TAG, prepended to any task plan that does not name one itself. The <|is_*|> tag
+    # says what KIND of question the turn is holding, and that is a property of the subject matter, not of
+    # the task: the same tool_search_answer is technical about diesel pumps and non-technical about music.
+    # CANONICAL_PLANS keeps a tag only for the three tasks that name their own domain; the rest inherit this.
+    # A MECHANICAL task declares no tag: asking for a missing detail, reporting a failure or declining holds
+    # no question about the subject, so a tag there is a sticker rather than a judgement. One live
+    # conversation grounded in moon phases stamped <|is_scientific|> onto "what time shall I set the reminder
+    # for" and onto "the reminder service timed out" before this exclusion existed.
+    #
+    # The exclusion is by TASK, not by turn shape, and in particular a TOOL-CALL turn of a subject task does
+    # carry the tag. That is the single most meaningful place for it: <|is_medical|> before <|RAG|> is the
+    # model saying "this is a medical question, so I will look it up rather than recall it", which is the
+    # division of labour the whole corpus is built around. An earlier draft of this rule told the generator
+    # that any turn calling a tool holds no question to classify, which contradicted the table above it.
+    _qtag = question_tag_of(domain)
+    _mech = set(seed.conversation.get("mechanical_tasks") or ())
+    _plan_of = {t.name: (list(t.task_plan)
+                         if t.name in _mech or any(v.startswith("<|is_") for v in (t.task_plan or []))
+                         else [_qtag] + list(t.task_plan))
+                for t in tasks}
+    verbs = list(dict.fromkeys(v for t in tasks for v in _plan_of[t.name])) or ["<|chat|>"]
     fmt = _format_brief(lang.code, lang.name, " ".join(sorted(VALID_VERBS)))
 
     task_lines = "\n".join(f"  * {t.name} [{', '.join(t.tags)}]: {t.description}" for t in tasks)
@@ -943,8 +969,10 @@ def _sft_like_request(seed: Seed, row: dict, *, rl: bool, document: Optional[dic
                    if needs_tools else
                    "This conversation uses no tools, so it should stay compact: one assistant reply per user "
                    "message and nothing else.")
-    verbs_line = ("task_plan verbs for this conversation (use them in the order each turn carries them out): "
-                  + "".join(verbs))
+    # The VOCABULARY for this conversation, not an ordering: with two or three tasks drawn, this is a union
+    # across turns, and "the order each turn carries them out" was a claim it could not support. Per-turn
+    # ordering is `plan_rule`, which states it task by task.
+    verbs_line = ("task_plan verbs available to this conversation, across all of its turns: " + "".join(verbs))
     # Exemplars are attached for the low-resource tier, where structure collapses, and can be forced
     # everywhere with DATA_GEN_FEWSHOT=1. They live in the SYSTEM prompt, so they stay part of the shared
     # prefix: constant per (kind, language) and free under vLLM prefix caching.
@@ -983,21 +1011,75 @@ def _sft_like_request(seed: Seed, row: dict, *, rl: bool, document: Optional[dic
     # to be told what it is -- it was not, and the plans it invented were consistently shorter than the
     # designed ones: <|math|> alone where the reference is <|math|><|analyze|><|explain|>. A reference the
     # data never exhibits is not a reference, it is a wish.
-    _plans = [v for tk in tasks for v in (tk.task_plan or [])]
-    _seen: set = set()
-    _canon = [v for v in _plans if not (v in _seen or _seen.add(v))]
-    plan_rule = (
-        f"\nTASK_PLAN FOR THIS CONVERSATION: the assistant's plan verbs should be {' '.join(_canon)} -- in "
-        f"that order where the turn does all of them, and a subset in the same relative order where a turn "
-        f"does less. Put them inside <task_plan></task_plan> as FIELDS (task_plan: [...]), never as a "
-        f"string. A turn that declares what KIND of question it is holding (<|is_technical|>, "
-        f"<|is_medical|>, <|is_financial|>, <|is_legal|>, <|is_scientific|>, <|is_non_technical|>) declares "
-        f"it FIRST, before the verbs that act on it.\n" if _canon else "")
+    #
+    # Stated PER TASK, not as one sequence. A conversation draws two or three tasks, and concatenating their
+    # plans produced a single ordering claim over verbs that belong to different turns -- including three
+    # different <|is_*|> tags in one list, which is exactly the six-way menu this rule exists to remove. A
+    # turn carries out one task, so a turn's plan is that task's plan, and the rule says so.
+    _canon = [(tk.name, list(dict.fromkeys(_plan_of[tk.name]))) for tk in tasks]
+    _canon = [(n, p) for n, p in _canon if p]
+    plan_rule = ""
+    if _canon:
+        _lines = "\n".join(
+            "  * {}: task_plan: [{}]".format(n, ", ".join('"%s"' % v for v in p)) for n, p in _canon)
+        plan_rule = (
+            f"\nTASK_PLAN, PER TURN. A turn's plan is the plan of the task that turn carries out, in this "
+            f"order:\n{_lines}\n"
+            f"A turn that does only part of its task uses a SUBSET of those verbs in the same relative "
+            f"order. Put them inside <task_plan></task_plan> as FIELDS (task_plan: [...]), never as a "
+            f"string.\n")
+        # The DOMAIN TAG, as its own rule with the exact value filled in. Asking for "a tag from
+        # <|is_technical|>, <|is_medical|>, ..." produced one on 2 of 22 live turns: a six-way choice set
+        # mid-paragraph is a question, and the generator answered it by skipping. Naming the tag each task
+        # takes, in position, turns the choice into a transcription.
+        _flagged = [(n, p[0]) for n, p in _canon if p[0].startswith("<|is_")]
+        if _flagged:
+            _distinct = list(dict.fromkeys(f for _, f in _flagged))
+            # "the tag for EVERY turn" only where every task in this conversation takes the same one.
+            # Overstating it contradicts the table directly above -- and the plan the turn is scored against,
+            # which for an unflagged task does not contain a tag at all.
+            if len(_distinct) == 1 and len(_flagged) == len(_canon):
+                _rule = (f"EVERY assistant turn that produces a <response> OPENS its task_plan with "
+                         f"{_distinct[0]} -- there is nothing to choose, it is the tag for every turn here")
+            elif len(_distinct) == 1 and len(_flagged) > 1:
+                # one tag, several tasks: naming it once beats repeating it per task
+                _rule = (f"EVERY {', '.join(n for n, _ in _flagged)} turn that produces a <response> OPENS "
+                         f"its task_plan with {_distinct[0]}, before the verbs that act on the question")
+            elif len(_flagged) == 1:
+                _rule = (f"EVERY {_flagged[0][0]} turn that produces a <response> OPENS its task_plan with "
+                         f"{_flagged[0][1]}, before the verbs that act on the question")
+            else:
+                _rule = ("A turn that produces a <response> OPENS its task_plan with the tag its own task "
+                         "takes above -- " + ", ".join(f"{f} for {n}" for n, f in _flagged))
+            plan_rule += (
+                f"- {_rule}. It is not optional, and a turn that does only part of its task still opens "
+                f"with it. Declaring what KIND of question is being held, before acting on it, is a "
+                f"behaviour this data exists to teach: a turn without it is an incomplete sample.\n")
+            # And the converse, stated explicitly. Without it the generator generalises the tag to every
+            # turn in the conversation -- it stamped <|is_scientific|> on "what time shall I set the
+            # reminder for" -- which is the rote labelling the per-task table exists to prevent.
+            _plain = [n for n, p in _canon if not p[0].startswith("<|is_")]
+            if _plain:
+                plan_rule += (
+                    f"- NO OTHER TURN declares an <|is_*|> tag. A turn that asks for a missing detail, "
+                    f"reports that a tool failed or declines something is about the exchange, not about the "
+                    f"subject, so it holds no question to classify: "
+                    f"{', '.join(_plain)} "
+                    f"{'opens' if len(_plain) == 1 else 'open'} with the first verb listed above and no "
+                    f"tag. Carrying the tag across every turn of the conversation is wrong.\n")
+        else:
+            # Every task here is about the exchange rather than the subject, so NO turn declares a tag.
+            # Saying so costs one line and is cheaper than the generator deciding to add one anyway.
+            plan_rule += ("- NO TURN in this conversation declares an <|is_*|> tag: every task here is about "
+                          "the exchange -- asking for a detail, reporting a failure, declining -- not about "
+                          "a subject that could be classified. Each plan opens with its first verb above.\n")
 
     # These appear in the SHARED user message, so both the SFT and RL paths must define them. The closing
     # reminder is RL-only: it exists to stop the generator omitting `responses`, and SFT has none to omit.
     closing_reminder = ""
-    plan_rule = ""
+    # `plan_rule` is NOT defaulted here: it is computed above for both paths, and a blank default at this
+    # point silently clobbered it, so the canonical-plan rule never reached a single prompt. The only reason
+    # plans matched at all was `verbs_line`, which carries the verbs but not the ordering or tag rules.
     verifier_json_line = ""
     verifier_block = ""
     think_rule = ("KEEP <think> TO 1-3 SENTENCES: what has to be decided, and why. Never restate the "

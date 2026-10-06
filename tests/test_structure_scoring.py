@@ -45,22 +45,38 @@ def test_order_is_measured_separately():
     assert plan_order([], ["<a>", "<b>"]) is None
 
 
-def test_order_earns_nothing_by_default():
-    """Measured and reported, but not rewarded until there is evidence about what it is worth."""
-    assert DEFAULT_WEIGHTS["plan_order"] == 0.0
+def test_order_earns_weight_but_far_less_than_the_set():
+    """Order is now rewarded, at a third of the weight of the set.
+
+    This test previously pinned the weight at 0.0 -- measured and reported, unrewarded. It is now 0.10
+    deliberately: the best order is worth having, and worth much less than catching all the tasks. The
+    ordering below is the one the assertion exists to protect.
+    """
+    assert 0.0 < DEFAULT_WEIGHTS["plan_order"] <= DEFAULT_WEIGHTS["plan"] / 2
     straight = format_score(EXP + "body", EXP)
     swapped = format_score(
         EXP.replace("<|is_financial|><|RAG|><qa>", "<qa><|RAG|><|is_financial|>") + "body", EXP)
-    assert straight["score"] == pytest.approx(swapped["score"]), "order must not move the score yet"
-    assert straight["plan_order"] == 1.0 and swapped["plan_order"] == 0.0, "but it must be reported"
+    assert straight["plan_order"] == 1.0 and swapped["plan_order"] == 0.0
+    assert straight["score"] > swapped["score"], "a reversed plan must now cost something"
+    assert swapped["plan"] == straight["plan"] == 1.0, "but the SET is still perfect, and still says so"
+    # and a reversed order costs less than a missing task: the whole point of the weighting
+    missed = format_score(EXP.replace("<|is_financial|><|RAG|><qa>", "<qa>") + "body", EXP)
+    assert swapped["score"] > missed["score"]
 
 
-def test_order_can_be_given_weight():
+def test_order_weight_is_configurable():
     straight = format_score(EXP + "body", EXP, weights={**DEFAULT_WEIGHTS, "plan_order": 0.2})
     swapped = format_score(
         EXP.replace("<|is_financial|><|RAG|><qa>", "<qa><|RAG|><|is_financial|>") + "body", EXP,
         weights={**DEFAULT_WEIGHTS, "plan_order": 0.2})
     assert straight["score"] > swapped["score"]
+    # zero restores the old behaviour exactly: reported, unweighted
+    off = {**DEFAULT_WEIGHTS, "plan_order": 0.0}
+    a = format_score(EXP + "body", EXP, weights=off)
+    b = format_score(
+        EXP.replace("<|is_financial|><|RAG|><qa>", "<qa><|RAG|><|is_financial|>") + "body", EXP, weights=off)
+    assert a["score"] == pytest.approx(b["score"])
+    assert b["plan_order"] == 0.0, "still reported when it earns nothing"
 
 
 def test_the_wrong_target_language_closes_the_gate():

@@ -1236,3 +1236,162 @@ def test_the_verifier_spec_is_task_shaped_not_a_menu():
     # the discriminator applies to every task
     assert "discriminator" in reasoning and "discriminator" in rag
     assert len(reasoning) < 1_200, "the point of this was density"
+
+
+def test_the_canonical_plan_and_its_domain_tag_reach_the_prompt():
+    """The plan rule was computed and then CLOBBERED by a blank default a few lines below, so it reached no
+    prompt at all. The only reason live plans resembled the canonical ones was `verbs_line`, which carries
+    the verbs but neither the ordering rule nor the domain tag -- and the domain tag duly appeared on 2 of 22
+    live turns. A rule that is built but never sent is indistinguishable, from the output, from no rule."""
+    from schemas.seed import Seed
+    seed = Seed.load("seeds/rl.json")
+    tagged = [t for t in seed.tasks if any(v.startswith("<|is_") for v in (t.task_plan or []))]
+    assert tagged, "no RL task declares a domain tag -- this test has nothing to check"
+    task = tagged[0]
+    flag = next(v for v in task.task_plan if v.startswith("<|is_"))
+    req = build_request(seed, {"custom_id": f"rl__pcm__{task.name}__000001", "lang": "pcm",
+                               "task": task.name, "index": 1})
+    body = "".join(m["content"] for m in req.messages if isinstance(m.get("content"), str))
+    assert "TASK_PLAN, PER TURN" in body
+    rule = body[body.index("TASK_PLAN, PER TURN"):]
+    rule = rule[:rule.index("\n\n")] if "\n\n" in rule else rule
+    # the plan is quoted verbatim, as fields, so the generator transcribes rather than invents -- with the
+    # domain's question tag prepended where the task does not name one itself
+    assert '", "'.join(task.task_plan) in rule
+    assert "OPENS its task_plan" in rule, "the tag must be stated as a requirement, not as a choice"
+    assert "not optional" in rule
+    # The rule names the tags its OWN tasks take -- it is not a six-way menu the generator can answer by
+    # skipping. (The format brief elsewhere does enumerate the whole verb vocabulary, which is its job.)
+    # the tags actually opening a plan line here -- the task's own, or the domain's where it has none
+    ours = {ln.split('["', 1)[1].split('"', 1)[0] for ln in rule.splitlines()
+            if ln.strip().startswith("* ")}
+    others = [v for v in ("<|is_technical|>", "<|is_medical|>", "<|is_financial|>", "<|is_legal|>",
+                          "<|is_scientific|>", "<|is_non_technical|>") if v not in ours]
+    assert flag in ours
+    assert sum(rule.count(v) for v in others) == 0, "a tag no task here takes is a distraction, not an option"
+
+
+def test_plan_verbs_are_offered_in_canonical_order_not_alphabetical():
+    """The verbs were handed over under "use them in the order each turn carries them out" while sorted by
+    codepoint, which reverses the designed plan: <qa> before <|RAG|> before <|is_technical|>. Order now
+    carries reward weight, so a prompt that scrambles it would punish the generator for obeying."""
+    from schemas.seed import Seed
+    seed = Seed.load("seeds/rl.json")
+    # a task whose designed plan is NOT already in codepoint order, so the two orderings are distinguishable
+    task = next(t for t in seed.tasks
+                if t.task_plan and sorted(set(t.task_plan)) != list(dict.fromkeys(t.task_plan)))
+    req = build_request(seed, {"custom_id": f"rl__pcm__{task.name}__000001", "lang": "pcm",
+                               "task": task.name, "index": 1})
+    body = "".join(m["content"] for m in req.messages if isinstance(m.get("content"), str))
+    line = next(ln for ln in body.splitlines() if "task_plan verbs available to this conversation" in ln)
+    positions = [line.index(v) for v in dict.fromkeys(task.task_plan) if v in line]
+    assert positions == sorted(positions), f"{line!r} does not follow {task.task_plan}"
+    # and the line no longer claims an ORDER it cannot support: with two or three tasks drawn it is a union
+    # across turns, and per-turn ordering is the plan rule's job
+    assert "in the order each turn carries them out" not in line
+
+
+def test_every_domain_has_a_question_tag_and_every_subject_plan_opens_with_one():
+    """The <|is_*|> tag is a property of the DOMAIN, so every domain must have one, and every plan for a turn
+    ABOUT THE SUBJECT must open with it.
+
+    It used to be pinned per task for 8 of 32 tasks, which (a) capped coverage at ~25% of turns and (b) made
+    it a rote constant: tool_search_answer declared <|is_technical|> whether the question was about diesel
+    pumps or about Fuji music. A MECHANICAL turn still declares none -- a live conversation stamped
+    <|is_scientific|> onto "what time shall I set the reminder for" when the rule said every turn.
+    """
+    import random
+    from sampling.taxonomy import DOMAIN_QUESTION_TAGS, DOMAIN_KEYS, QUESTION_TAGS
+    from schemas.seed import Seed
+    from generate import plan_rows
+    assert set(DOMAIN_KEYS) == set(DOMAIN_QUESTION_TAGS), "a new domain must choose a question tag"
+    seed = Seed.load("seeds/rl.json")
+    rows = list(plan_rows(seed, ["yor"]))
+    random.Random(7).shuffle(rows)
+    for row in rows[:60]:
+        body = "".join(m["content"] for m in build_request(seed, row).messages
+                       if isinstance(m.get("content"), str))
+        i = body.index("TASK_PLAN, PER TURN")
+        rule = body[i:body.index("\n\n", i)]
+        plans = [ln for ln in rule.splitlines() if ln.strip().startswith("* ")]
+        assert plans, rule
+        mech = set(seed.conversation.get("mechanical_tasks") or ())
+        assert mech, "the seed must carry the mechanical-task set for the prompt to exclude them"
+        for ln in plans:
+            name = ln.strip()[2:].split(":", 1)[0]
+            first = ln.split('["', 1)[1].split('"', 1)[0]
+            if name in mech:
+                assert first not in QUESTION_TAGS, f"a mechanical turn must not declare a tag: {ln}"
+            else:
+                assert first in QUESTION_TAGS, f"plan does not open with a question tag: {ln}"
+        # and the rule SAYS so, wherever a mechanical task is in play
+        names = [ln.strip()[2:].split(":", 1)[0] for ln in plans]
+        if all(n in mech for n in names):
+            assert "NO TURN in this conversation declares an <|is_*|> tag" in rule
+        elif any(n in mech for n in names):
+            assert "NO OTHER TURN declares an <|is_*|> tag" in rule
+
+
+def test_the_question_tag_follows_the_subject_not_the_task():
+    """The same task in two different domains must declare two different tags -- that is the whole point of
+    moving the tag off the task. Only a task that NAMES its domain keeps one of its own."""
+    from sampling.taxonomy import question_tag_of
+    from schemas.seed import Seed
+    seed = Seed.load("seeds/rl.json")
+    # one task, two domains whose tags differ
+    a, b = "music", "engineering_construction"
+    assert question_tag_of(a) != question_tag_of(b)
+    # the domain comes from the coverage odometer, not from a row field, so find an index for each
+    from prompts import _coverage_pick
+
+    def _index_for(domain_key):
+        return next(i for i in range(1, 20_000) if _coverage_pick("yor", i)[0] == domain_key)
+
+    def _tag_in_plan(task, index):
+        req = build_request(seed, {"custom_id": f"rl__yor__{task}__{index:06d}", "lang": "yor",
+                                   "task": task, "index": index})
+        body = "".join(m["content"] for m in req.messages if isinstance(m.get("content"), str))
+        i = body.index("TASK_PLAN, PER TURN")
+        line = next(ln for ln in body[i:].splitlines() if f"* {task}:" in ln)
+        return line.split('["', 1)[1].split('"', 1)[0]
+
+    ia, ib = _index_for(a), _index_for(b)
+    assert _tag_in_plan("tool_search_answer", ia) == question_tag_of(a)
+    assert _tag_in_plan("tool_search_answer", ib) == question_tag_of(b)
+    # and the three domain-naming tasks keep their own tag wherever they are grounded -- including in a
+    # domain whose own tag is something else
+    for task, tag in (("health_advice", "<|is_medical|>"), ("safety_boundary", "<|is_medical|>"),
+                      ("financial_analysis", "<|is_financial|>")):
+        assert _tag_in_plan(task, ib) == tag, task
+
+
+def test_a_tool_call_turn_of_a_subject_task_still_declares_the_tag():
+    """The mechanical exclusion is by TASK, not by turn shape.
+
+    <|is_medical|> before <|RAG|> is the model saying "this is a medical question, so I will look it up
+    rather than recall it" -- the division of labour the corpus is built around -- so the retrieval turn is
+    the most meaningful place for the tag, not an exception to it. An earlier draft of the rule told the
+    generator that any turn calling a tool holds no question to classify, which contradicted the plan table
+    printed directly above it; 4 of 11 tagged turns in a live probe were tool calls, correctly.
+    """
+    import random
+    from schemas.seed import Seed
+    from generate import plan_rows
+    seed = Seed.load("seeds/rl.json")
+    mech = set(seed.conversation["mechanical_tasks"])
+    assert "tool_search_answer" not in mech, "a retrieve-then-answer task is about the subject"
+    rows = list(plan_rows(seed, ["yor"]))
+    random.Random(11).shuffle(rows)
+    checked = 0
+    for row in rows:
+        body = "".join(m["content"] for m in build_request(seed, row).messages
+                       if isinstance(m.get("content"), str))
+        i = body.index("TASK_PLAN, PER TURN")
+        rule = body[i:body.index("\n\n", i)]
+        if "NO OTHER TURN" not in rule and "NO TURN in this" not in rule:
+            continue
+        assert "calls a tool" not in rule and "calling a tool" not in rule, rule
+        checked += 1
+        if checked == 20:
+            break
+    assert checked, "no prompt carried the negative rule -- this test checked nothing"

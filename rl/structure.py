@@ -33,11 +33,14 @@ from dataclasses import dataclass, field
 _EDGE = re.compile(r"^(?:\s|<s>|<pad>)+|(?:\s|</s>|<pad>)+$")
 _TOKEN = re.compile(r"<[^<>]+>")
 _LEAK = re.compile(r"<\|(?:input_lang|target_lang|user|assistant|system)\|>|</?task_plan>|</?think>|<response>|<s>|</s>")
-# `plan_order` defaults to 0: the verb order is MEASURED and reported but earns nothing until there is
-# evidence about what it is worth. Folding it in silently would make a correct-set-wrong-order plan score
-# like a wrong-set one, which is the opposite of "not catching all the tasks matters more than the order".
 DEFAULT_WEIGHTS = {"input_lang": 0.20, "plan": 0.30, "target_lang": 0.30, "structure": 0.20,
-                   "plan_order": 0.0}
+                   "plan_order": 0.10}
+# `plan_order` deliberately sits at a THIRD of `plan`. Getting the set of tasks right is the requirement;
+# getting them in solution order is a refinement worth having and worth less. The weights do not have to sum
+# to one -- format_score renormalises over whichever terms the reference actually specifies -- so 0.10 here is
+# 9% of a fully-specified turn against 27% for the set. Order is also self-gating: it is scored only where the
+# two plans share at least two verbs, so a plan with the WRONG set is never additionally penalised for the
+# order of verbs it never got right.
 
 
 @dataclass
@@ -219,19 +222,18 @@ def format_score(completion: str, expected: str, weights: dict[str, float] | Non
     # is closed and the reward comes from the format term alone, which is correct -- there is no translation
     # to score.
     gate = bool(s_tg and pred.has_response_tag and pred.response and not leak)
-    # The order term is REPORTED but carries no weight in `score` by default: it is worth knowing and worth
-    # little, and folding it in silently would make a correct-set-wrong-order plan look like a wrong-set one.
-    # DEFAULT_WEIGHTS["plan_order"] can be raised to give it weight once there is evidence about what it is
-    # worth; until then it is an observation, not a reward.
+    # `plan_order` is both scored and reported: `score` includes it at its weight when it is defined, and the
+    # raw tau comes back alongside so a run can be inspected for whether order is being learnt separately
+    # from whether it is being paid for. It is None, and absent from the total, whenever order is undefined.
     return {"score": total, "input_lang": s_in, "target_lang": s_tg, "plan": s_pl, "structure": s_st,
             "plan_order": s_or, "gate": gate, "response": pred.response,
             "scored_terms": sorted(terms)}
 
 
-def shape_reward(r: float, threshold: float = 0.55, negative_scale: float = 2.0) -> float:
+def shape_reward(r: float, threshold: float = 0.46, negative_scale: float = 2.0) -> float:
     """Piecewise-linear, order-preserving reshaping of a [0, 1] reward around `threshold`.
 
-    r >= threshold  ->  (r - threshold) / (1 - threshold)          in [0, 1]    (positive)
+    r >= threshold  ->  2 * (r - threshold) / (1 - threshold)      in [0, 2]    (positive)
     r <  threshold  ->  -negative_scale * (threshold - r) / threshold  in [-negative_scale, 0)  (large negative)
 
     Within a group it does not change which completion is best; it moves the zero point to `threshold` and widens the gap between
@@ -239,7 +241,7 @@ def shape_reward(r: float, threshold: float = 0.55, negative_scale: float = 2.0)
     The trainer still standardises advantages inside each group, which rescales this but keeps its ordering and sign structure.
     """
     if r >= threshold:
-        return (r - threshold) / max(1e-9, 1.0 - threshold)
+        return 2.0 * (r - threshold) / max(1e-9, 1.0 - threshold)
     return -negative_scale * (threshold - r) / max(1e-9, threshold)
 
 

@@ -266,7 +266,6 @@
       "description": "Return strictly-valid JSON matching a schema stated in the prompt -- extracting fields from a passage, or formatting an answer. Emits the JSON and nothing around it.",
       "share": 5.0,
       "task_plan": [
-        "<|is_technical|>",
         "<|JSON|>",
         "<|data_extract|>"
       ],
@@ -340,7 +339,6 @@
       "description": "The user pastes a LONG document and asks for a summary. YOU MUST WRITE THAT DOCUMENT IN FULL inside the user turn: AT LEAST 600 WORDS, aiming for 900-1,500, of real writing (report, article, minutes, guideline, transcript) with sections, names, numbers and specifics. A short passage makes the sample worthless -- the whole point is a long input. Write the document FIRST, in full, before you write any assistant turn. Language of the DOCUMENT: English 70% of the time, mixed English + the target language 10%, entirely the target language 20% (and keep those shorter, 900-1,400 words, to protect quality). The summary goes in whatever language the io_direction calls for, so English-document-into-Yoruba-summary is a normal case.",
       "share": 5.0,
       "task_plan": [
-        "<|is_technical|>",
         "<summarize>"
       ],
       "domain_flags": [],
@@ -507,7 +505,6 @@
       "description": "The single largest gap against real use. Career work, in the forms it actually arrives: turn a messy work history into CV bullets that lead with what was achieved; write a cover letter for a named role; explain what a job advert is really asking for and whether the person qualifies; answer 'tell me about yourself' or 'why should we hire you' for a specific job; rewrite a CV summary for a different industry; decide what to leave off. The user's details are the ONLY material -- qualifications, employers, years, grades come from what they said and nowhere else. The wrong candidate invents a degree, a job title or a date the user never gave, or returns generic careers advice instead of writing the thing that was asked for.",
       "share": 5.0,
       "task_plan": [
-        "<|is_non_technical|>",
         "<|generate|>",
         "<|edit|>"
       ],

@@ -425,6 +425,27 @@ SHORT_REPLY_TASKS = {
 }
 
 
+# Tasks whose turn is about the INTERACTION rather than about the subject, and which therefore declare no
+# <|is_*|> tag at all.
+#
+# Measured, not guessed: with the tag applied to every turn, one live Yoruba conversation grounded in moon
+# phases stamped <|is_scientific|> onto "what time shall I set the reminder for", onto the set_reminder call
+# itself, and onto "the reminder service timed out, use your phone alarm". The tag is supposed to say what
+# kind of QUESTION the turn is holding, and none of those three holds a question about the subject at all --
+# so a tag there is not a judgement, it is a sticker. That is the same rote behaviour as pinning the tag per
+# task, just moved up to the conversation.
+#
+# The test is whether the turn's content is about the world or about the exchange: asking for a missing
+# detail, building tool arguments, reporting a failure, declining, reconciling sources, or reformatting to
+# instruction are all about the exchange. Answering, explaining, summarising, extracting and generating are
+# about the world, and those keep the tag.
+MECHANICAL_TASKS = {
+    "clarifying_question", "tool_error_recovery", "tool_structured_call", "tool_conflicting_results",
+    "tool_chain_insufficient", "search_found_nothing", "stale_data_awareness", "retrieval_insufficient",
+    "privacy_boundary", "instruction_following", "multi_turn_consistency",
+}
+
+
 # ---------------------------------------------------------------------------- canonical task plans
 # The task_plan is what the model says it is DOING, in the order it does it, and it is scored against this
 # as a set (rl/structure.plan_f1, recall-weighted) with the order measured separately. So the plans here are
@@ -436,20 +457,28 @@ SHORT_REPLY_TASKS = {
 # I am going to look it up rather than recall it" -- which is the division of labour the whole corpus is
 # built around, made explicit in the output instead of implied by it.
 #
+# THE <|is_*|> TAG IS NOT WRITTEN HERE, with three exceptions. It comes from the sample's DOMAIN
+# (sampling.taxonomy.DOMAIN_QUESTION_TAGS), because that is what decides what kind of question it is: a
+# tool_search_answer turn is technical when it is about diesel pumps and non-technical when it is about Fuji
+# music, and this table cannot know which. Eight tasks used to pin a tag here, which made it a per-task
+# constant -- a label the model learns to emit by rote rather than a judgement about the question in front of
+# it. Only the three tasks that NAME their own domain keep one: health_advice and safety_boundary are medical
+# whatever they are grounded in, and financial_analysis is financial. Everything else inherits the domain's.
+#
 # Two tags from the intended set cannot be used and both are documented in assemble._UNUSABLE_TAGS:
 # <|hate|> is token 52115, above vocab_size 52050, so hate-speech work uses <toxic>; <POS> is not in the
 # tokenizer in any casing, so part-of-speech uses <classify> with the <tag> label.
 CANONICAL_PLANS = {
     # -- retrieval and the knowledge boundary. <qa> after <|RAG|> is the prescribed pairing: retrieve, then
     # answer from what came back.
-    "tool_search_answer":        ["<|is_technical|>", "<|RAG|>", "<qa>"],
+    "tool_search_answer":        ["<|RAG|>", "<qa>"],
     "rag_document_qa":           ["<|RAG|>", "<qa>"],
     "retrieval_insufficient":    ["<|RAG|>", "<|analyze|>", "<|explain|>"],
     "tool_chain_insufficient":   ["<|plan|>", "<|RAG|>", "<|analyze|>", "<|explain|>"],
     "self_check_then_search":    ["<|analyze|>", "<|RAG|>", "<qa>"],
     "search_found_nothing":      ["<|RAG|>", "<|analyze|>", "<|explain|>"],
     "no_tool_admit_unknown":     ["<|analyze|>", "<|chat|>"],
-    "exam_and_study_help":       ["<|is_scientific|>", "<|RAG|>", "<|explain|>"],
+    "exam_and_study_help":       ["<|RAG|>", "<|explain|>"],
 
     # -- tools with structured arguments, and the scenarios around them
     "tool_structured_call":      ["<|plan|>", "<|math|>", "<|data_extract|>"],
@@ -469,12 +498,12 @@ CANONICAL_PLANS = {
     # -- reasoning, generation, extraction
     "multi_step_reasoning":      ["<|math|>", "<|analyze|>", "<|explain|>"],
     "summarization":             ["<summarize>"],
-    "long_document_summarization": ["<|is_technical|>", "<summarize>"],
-    "structured_output":         ["<|is_technical|>", "<|JSON|>", "<|data_extract|>"],
+    "long_document_summarization": ["<summarize>"],
+    "structured_output":         ["<|JSON|>", "<|data_extract|>"],
     "instruction_following":     ["<|edit|>", "<|chat|>"],
     "creative_from_knowledge":   ["<|generate|>"],
     "creative_from_pattern":     ["<|RAG|>", "<|analyze|>", "<|generate|>"],
-    "cv_and_job_application":    ["<|is_non_technical|>", "<|generate|>", "<|edit|>"],
+    "cv_and_job_application":    ["<|generate|>", "<|edit|>"],
     "business_and_customer_writing": ["<|generate|>", "<|edit|>"],
 
     # -- competence
@@ -1170,6 +1199,7 @@ def build(kind: str) -> Seed:
         conv["paired_turns_long_tasks"] = 1
         conv["long_reply_tasks"] = sorted(LONG_REPLY_TASKS)
         conv["short_reply_tasks"] = sorted(SHORT_REPLY_TASKS)
+        conv["mechanical_tasks"] = sorted(MECHANICAL_TASKS)
         # An RL sample is a PREFIX plus one judgeable pair, so it wants a shorter conversation than SFT.
         # Measured on the first live RL run: asking for 3-6 user turns and 2-4 tasks to set up a single
         # preference pair cost a 14.5k-token prompt, and `user_turns:1` was the second-largest drop class
