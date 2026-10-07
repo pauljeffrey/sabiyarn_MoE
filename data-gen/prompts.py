@@ -376,30 +376,30 @@ _CANDIDATE_CALL = {**{k: v for k, v in _ASSISTANT_CALL.items() if k != "required
 _CANDIDATE_CONTENT_SCHEMA = {"anyOf": [_CANDIDATE_ANSWER, _CANDIDATE_CALL]}
 
 
-def _rl_schema(n_resp: int) -> dict:
-    """The RL output contract as a schema. `responses` is pinned to exactly n_resp items."""
-    candidate = {
-        "type": "object", "additionalProperties": False,
-        "properties": {
-            "content": _CANDIDATE_CONTENT_SCHEMA,
-            "quality": {"type": "string", "enum": ["best", "worst", "partial"]},
-            "score": {"type": "number", "minimum": 0, "maximum": 10},
-            "why": {"type": "string"},
-        },
-        "required": ["content", "quality", "score"],
-    }
+def _rl_schema(n_resp: int = 2) -> dict:
+    """The RL output contract as a schema, matching the named-pair shape the prompt asks for.
+
+    Nothing calls this: provider-side `response_format` was measured to make the DATA worse in two distinct
+    ways (a permissive schema invites key padding, a role-discriminated anyOf collapses the branches), so the
+    contract is carried in the prompt instead. It is kept in step with that prompt anyway -- a schema that
+    disagrees with the instructions is worse than no schema, and the next person to try this should start
+    from one that is at least correct.
+    """
+    turn = _CANDIDATE_CONTENT_SCHEMA
     return {
         "type": "object",
         "properties": {
             "prompt_turns": {"type": "array", "items": _TURN_SCHEMA, "minItems": 2},
-            "responses": {"type": "array", "items": candidate,
-                          "minItems": n_resp, "maxItems": n_resp},
+            "best_reply": turn,
+            "worst_reply": turn,
+            "why_best": {"type": "string"},
+            "gap": {"type": "number", "minimum": 1, "maximum": 10},
             "verifier": {"type": "object"},
             "tasks": {"type": "array", "items": {"type": "string"}},
             "tags": {"type": "array", "items": {"type": "string"}},
             "confidence": {"type": "number"},
         },
-        "required": ["prompt_turns", "responses", "tasks"],
+        "required": ["prompt_turns", "best_reply", "worst_reply", "tasks"],
     }
 
 
@@ -940,8 +940,13 @@ def _sft_like_request(seed: Seed, row: dict, *, rl: bool, document: Optional[dic
     # prompt scrambles would punish the generator for obeying us.
     # THE DOMAIN'S QUESTION TAG, prepended to any task plan that does not name one itself. The <|is_*|> tag
     # says what KIND of question the turn is holding, and that is a property of the subject matter, not of
-    # the task: the same tool_search_answer is technical about diesel pumps and non-technical about music.
+    # the task: the same tool_search_answer is technical about diesel pumps and ordinary about music.
     # CANONICAL_PLANS keeps a tag only for the three tasks that name their own domain; the rest inherit this.
+    #
+    # AND IT IS OFTEN EMPTY: 29 of 59 domains carry no tag at all, because a tag is worth a token only where
+    # the kind of question changes how it must be answered -- looked up, hedged or worked out rather than
+    # recalled. Everyday subjects carry no such obligation, so they get no tag rather than a tag that says
+    # "ordinary". An empty _qtag prepends nothing and the plan simply opens with its first verb.
     # A MECHANICAL task declares no tag: asking for a missing detail, reporting a failure or declining holds
     # no question about the subject, so a tag there is a sticker rather than a judgement. One live
     # conversation grounded in moon phases stamped <|is_scientific|> onto "what time shall I set the reminder
@@ -955,7 +960,8 @@ def _sft_like_request(seed: Seed, row: dict, *, rl: bool, document: Optional[dic
     _qtag = question_tag_of(domain)
     _mech = set(seed.conversation.get("mechanical_tasks") or ())
     _plan_of = {t.name: (list(t.task_plan)
-                         if t.name in _mech or any(v.startswith("<|is_") for v in (t.task_plan or []))
+                         if (not _qtag or t.name in _mech
+                             or any(v.startswith("<|is_") for v in (t.task_plan or [])))
                          else [_qtag] + list(t.task_plan))
                 for t in tasks}
     verbs = list(dict.fromkeys(v for t in tasks for v in _plan_of[t.name])) or ["<|chat|>"]
@@ -1082,9 +1088,18 @@ def _sft_like_request(seed: Seed, row: dict, *, rl: bool, document: Optional[dic
     # plans matched at all was `verbs_line`, which carries the verbs but not the ordering or tag rules.
     verifier_json_line = ""
     verifier_block = ""
-    think_rule = ("KEEP <think> TO 1-3 SENTENCES: what has to be decided, and why. Never restate the "
-                  "question, never narrate a plan you are about to carry out. Longer than the answer it "
-                  "precedes is a defect, and it is trimmed. Omit it entirely where nothing needs deciding.")
+    # <think> IS FOR A DECISION, NOT A RECAP. Measured on live kept records: 14 of 21 think blocks opened by
+    # restating the question ("The user wants to know...") and those leading clauses were 39% of all think
+    # text in the corpus. The question is already on screen, so that is pure spend -- at 32,768 tokens the
+    # context budget is real. The old 120-word trim never fired once (median 22 words, max 41): the waste was
+    # never length, it was structure, so the rule names the opener instead of capping the count.
+    think_rule = ("<think> IS FOR A DECISION, NOT A RECAP. Start at the decision: which tool, which of two "
+                  "readings, what is missing, what the figure works out to. NEVER open with \"The user wants\" "
+                  "or \"The user is asking\" -- measured on live output, that restatement was 39% of all "
+                  "think text and the question is already on screen. One or two short sentences. Omit "
+                  "<think> entirely where nothing needs deciding, which is most turns.\n"
+                  "Bad:  <think>The user wants to know the renewal fee for a licence. I should look it up.</think>\n"
+                  "Good: <think>The fee changed in 2025, so recall is unsafe -- look it up.</think>")
     if not rl:
         _msg = "message" if n_user == 1 else "messages"
         shape = f"""Produce ONE conversation with EXACTLY {n_user} {_msg} of role "user" -- no more, no
@@ -1129,15 +1144,19 @@ Return JSON:
         _disc = ('\nAlso add: "verifier": {"discriminator": {"good": "<exact short phrase only the BEST reply '
                  'contains>", "bad": "<exact short phrase only the WORST contains>"}} -- omit it if no single '
                  'phrase separates them.' if simple_contract() else "")
+        # THE LAST THING IT READS, and it names the two keys literally. The previous version asked for "a
+        # top-level responses array with EXACTLY 2 items, each scored" -- an array of wrapper objects, three
+        # levels deep -- and 7 of 11 drops on a 24-sample diagnostic were requests that wrote prompt_turns
+        # and then spilled ONE assistant turn at the top level with no `responses` key at all: 29% of every
+        # request paid for. Two named sibling keys are a shape that cannot half-exist the way an array can.
         closing_reminder = (
-            f"\nBEFORE YOU STOP: your JSON must have a top-level \"responses\" array with EXACTLY {n_resp} "
-            f"items, each scored. A reply with the candidates written as one turn at the top level, or with "
-            f"no \"responses\" key, is discarded.{_disc}")
-        think_rule = ("Keep <think> to 1-3 sentences." if simple_contract() else
-                      "KEEP <think> TO 1-3 SENTENCES: what has to be decided, and why. Never restate the "
-                      "question, never narrate a plan you are about to carry out. Longer than the answer it "
-                      "precedes is a defect, and it is trimmed. Omit it entirely where nothing needs "
-                      "deciding.")
+            f"\nBEFORE YOU STOP, check your JSON has BOTH of these keys at the top level, as siblings of "
+            f"\"prompt_turns\":\n  \"best_reply\":  {{...}}\n  \"worst_reply\": {{...}}\n"
+            f"A reply with only one of them, or with the assistant turn's fields written directly at the top "
+            f"level, is discarded.{_disc}")
+        # The RL path uses the SAME think rule as SFT. It used to drop to a bare "Keep <think> to 1-3
+        # sentences." under the simple contract, and that one-liner is what let the restatement opener
+        # through: it capped the length of the padding instead of forbidding it.
         verifier_json_line = ("" if simple_contract()
                               else '  "verifier": {{ ...only the fields that apply, omit the rest... }},\n')
         if n_pairs > 1:
@@ -1145,13 +1164,14 @@ Return JSON:
                 f"RANK {n_pairs} TURNS, NOT ONE. The LAST {n_pairs} assistant turns each get a pair of "
                 f"candidate replies, returned in \"turn_responses\" as {n_pairs} entries of the form\n"
                 f'  {{"after_user_turn": <the 1-based number of the user turn it answers>, '
-                f'"responses": [ ...two items, same shape as below... ]}}\n'
+                f'"best_reply": {{...}}, "worst_reply": {{...}}}}\n'
                 "Earlier assistant turns in \"prompt_turns\" stay single. Each pair must answer the "
                 "conversation AS IT STANDS AT THAT POINT -- the prefix up to that user turn, with the BEST "
                 "reply assumed for every earlier paired turn. Keep every reply the length it would naturally "
                 "be; do not pad to fill the extra slots.\n\n")
             turn_responses_line = (
-                '\n  "turn_responses": [{"after_user_turn": <n>, "responses": [...]}, ...],')
+                '\n  "turn_responses": [{"after_user_turn": <n>, "best_reply": {...}, '
+                '"worst_reply": {...}}, ...],')
         else:
             multi_turn_block = ""
             turn_responses_line = ""
@@ -1159,24 +1179,24 @@ Return JSON:
 of which ends the prefix (tool turns are extra and do not count), then EXACTLY {n_resp} alternative
 assistant replies to that final user message.
 
-Do NOT write the final assistant reply inside "prompt_turns". The replies go in "responses" and nowhere else.
+Do NOT write the final assistant reply inside "prompt_turns". The two replies go in "best_reply"
+and "worst_reply" at the TOP LEVEL, and nowhere else.
 
 THE PREFIX MUST END WITH A role="user" MESSAGE OR A role="tool" RESULT. Never with an assistant turn, and in
 particular NEVER WITH A TOOL CALL: a call with no result after it is a question the candidates cannot answer,
 and the sample is discarded. If the assistant calls a tool, the prefix carries the call AND the result it got
 back, and the candidates are what it says having read that result.
 
-{multi_turn_block}"responses" must be a list of EXACTLY {n_resp} items -- one labelled "best" and one labelled "worst". Both
-are required; a single reply is not a sample, because there is nothing to rank. Do not use any other label.
-  - best:  honest, correctly grounded, uses the right tool or correctly admits it cannot;
-  - worst: confidently wrong -- invents a fact, answers from an irrelevant tool result, claims to recognise
-    something it was never told, or refuses when the answer WAS actually available.
+{multi_turn_block}BOTH "best_reply" AND "worst_reply" are required. A single reply is not a sample, because there is nothing
+to rank.
+  - best_reply:  honest, correctly grounded, uses the right tool or correctly admits it cannot;
+  - worst_reply: confidently wrong -- invents a fact, answers from an irrelevant tool result, claims to
+    recognise something it was never told, or refuses when the answer WAS actually available.
 They must differ in SUBSTANCE, not wording: two paraphrases of the same answer are useless.
 
-Give each reply a "score" from 0 to 10 for how good it is. This is cheap for you -- you already know which
-is better and why -- and it is what the training uses to rank them, so it matters more than any prose you
-write about them. The two scores must differ by at least 3; if they do not, the replies are too close
-together and you should make the worse one genuinely worse.
+Give "gap" a number from 1 to 10 for how much better best_reply is. This is cheap for you -- you already know
+which is better and why -- and it is what the training uses to weight the pair. A gap below 3 means the two
+replies are too close together, so make the worse one genuinely worse instead of lowering the gap.
 
 Each reply's "content" is an OBJECT with THE SAME FIELDS as an assistant turn in the OUTPUT CONTRACT --
 think, task_plan, input_lang, target_lang, response (or tool_call). Write the FIELDS. Do NOT write the
@@ -1186,10 +1206,10 @@ for you, exactly as they are for the turns in "prompt_turns".
 {verifier_block}
 Return JSON:
 {{"prompt_turns": [ ...turn objects exactly as the OUTPUT CONTRACT describes... ],
-  "responses": [
-    {{"content": {{ ...assistant turn FIELDS... }}, "quality": "best",  "score": <0-10>, "why": "<one line, English>"}},
-    {{"content": {{ ...assistant turn FIELDS... }}, "quality": "worst", "score": <0-10>, "why": "<one line, English>"}}
-  ],
+  "best_reply":  {{ ...assistant turn FIELDS... }},
+  "worst_reply": {{ ...assistant turn FIELDS... }},
+  "why_best": "<one line, English: what makes the first better>",
+  "gap": <1-10: how much better the best reply is>,
 {verifier_json_line}
   "tasks": [...], "tags": [...],{turn_responses_line}
   "confidence": <float 0-1: your honest estimate that the ranking is right and the text is fluent {lang_name}>}}"""

@@ -54,6 +54,14 @@ _RESP = re.compile(r"<response>(.*)", re.S)
 
 STATS: dict[str, int] = {}
 
+# The restatement opener a reasoning block wastes its first clause on: "The user wants to know X, so ...".
+# Anchored and limited to one leading clause so it can only ever remove the recap, never the decision.
+_RESTATEMENT_OPENER = re.compile(
+    r"^(?:the\s+user|the\s+question|they|user)\s+"
+    r"(?:is\s+asking|is\s+requesting|has\s+asked|asked|asks|wants?\s+to\s+know|wants?|needs?|"
+    r"would\s+like|is\s+looking\s+for)\b[^.!?]*[.!?]",
+    re.IGNORECASE)
+
 
 # Set DATA_GEN_DEBUG_DIR to capture the raw response behind every drop. The counters tell you how often a
 # thing goes wrong; only the raw text tells you why, and without it a reason like `prompt_messages_malformed`
@@ -81,6 +89,43 @@ def _drop(reason: str, raw: str = "", custom_id: str = "") -> None:
         pass  # diagnostics must never break a run
 
 
+def _pair_from(d: dict) -> list:
+    """The ranked pair out of a generated object, in either shape it can arrive in.
+
+    PREFERRED (current contract): two named sibling keys, "best_reply" and "worst_reply", each holding the
+    assistant turn's fields directly, with one optional top-level "gap" scoring the margin.
+
+    LEGACY: a "responses" array of {"content": ..., "quality": "best"|"worst", "score": n} wrappers. Still
+    read, because shards already generated under it must keep parsing and because a generator that reaches
+    for the old shape anyway should not cost a sample.
+
+    The named shape exists because the array one was the single largest source of waste: 7 of 11 drops on a
+    24-sample diagnostic were objects that held "prompt_turns" and then spilled ONE assistant turn at the top
+    level with no "responses" key -- 29% of every request paid for. An array of wrappers can half-exist; two
+    named slots either are there or are not.
+    """
+    best, worst = d.get("best_reply"), d.get("worst_reply")
+    if isinstance(best, dict) and isinstance(worst, dict):
+        try:
+            gap = float(d.get("gap"))
+        except (TypeError, ValueError):
+            gap = None
+        # Scores are synthesised from the gap so the downstream margin logic is unchanged. Where the
+        # generator gave no gap, the pair is still ordered -- it just carries no magnitude.
+        hi, lo = (10.0, max(0.0, 10.0 - gap)) if gap is not None else (None, None)
+        out = [{"content": best, "quality": "best", "why": d.get("why_best") or ""},
+               {"content": worst, "quality": "worst", "why": ""}]
+        if hi is not None:
+            out[0]["score"], out[1]["score"] = hi, lo
+        STATS["shape:named_pair"] = STATS.get("shape:named_pair", 0) + 1
+        return out
+    legacy = d.get("responses")
+    if isinstance(legacy, list) and legacy:
+        STATS["shape:responses_array"] = STATS.get("shape:responses_array", 0) + 1
+        return legacy
+    return []
+
+
 def _score_of(r: dict) -> Optional[float]:
     v = r.get("score")
     try:
@@ -100,6 +145,34 @@ def _fold(s: str) -> str:
     s = unicodedata.normalize("NFD", (s or "").casefold())
     s = "".join(c for c in s if unicodedata.category(c) != "Mn")
     return re.sub(r"\s+", " ", s).strip()
+
+
+def _phrase_present(phrase: str, text: str, *, min_tokens: int = 4, ratio: float = 0.7) -> bool:
+    """Is `phrase` present in `text`, allowing for the generator misspelling its own quotation?
+
+    Fast path is the folded substring test. The fallback exists because _fold cannot see through every way a
+    diacritic gets mangled: it strips COMBINING marks, so it folds the dot under Yoruba e-dot away, but a
+    generator that re-types the phrase from memory also substitutes whole glyphs -- a measured case quoted
+    "mi o le oeayewo owo ti wa ninu account celomiran" for a reply that actually read "mi o le sayewo owo ti o
+    wa ninu account elomiran". The ligature and the cedilla are different LETTERS, not marks, so no amount of
+    normalising joins them, and a perfect privacy_boundary sample (best declines to check a third party's
+    balance, worst invents one) was being discarded because the generator misspelled its own citation.
+
+    So a phrase of at least `min_tokens` words also passes if `ratio` of its words appear in the text. The
+    floor is what keeps this honest: a two-word phrase like "LGA office" cannot pass loosely, and that case
+    -- a discriminator naming something the generator never wrote -- is still correctly rejected.
+    """
+    if not phrase:
+        return False
+    fp, ft = _fold(phrase), _fold(text)
+    if fp in ft:
+        return True
+    words = [w for w in re.split(r"[^0-9a-z\u00c0-\u024f]+", fp) if len(w) > 1]
+    if len(words) < min_tokens:
+        return False
+    have = set(w for w in re.split(r"[^0-9a-z\u00c0-\u024f]+", ft) if len(w) > 1)
+    hit = sum(1 for w in words if w in have)
+    return hit / len(words) >= ratio
 
 
 def _capture(resp, tag: str) -> None:
@@ -287,11 +360,23 @@ def _fill_turn_defaults(turns: Any, md: dict) -> Any:
         # than dropped: the turn is otherwise sound, and the generator reaches for padding here more than
         # anywhere else. 120 words is roughly three full sentences of genuine deliberation.
         th, rp = t.get("think"), t.get("response")
+        # A LEADING RESTATEMENT is dropped. Measured on live kept records: 14 of 21 think blocks opened with
+        # "The user wants..." and those clauses were 39% of all think text. The question is in the user turn
+        # directly above, so removing the clause is information-preserving -- unlike trimming the tail, which
+        # is where the actual decision lives. Only ever strips when something substantive remains.
+        if isinstance(th, str) and th:
+            stripped = _RESTATEMENT_OPENER.sub("", th.strip(), count=1).lstrip()
+            if stripped and stripped != th.strip() and len(stripped.split()) >= 4:
+                t["think"] = th = stripped
+                STATS["repair:stripped_think_restatement"] = \
+                    STATS.get("repair:stripped_think_restatement", 0) + 1
         if isinstance(th, str) and th:
             tw = len(th.split())
-            too_long = tw > 120 or (isinstance(rp, str) and rp and tw > max(60, len(rp.split())))
+            # 60 words, not 120. The old ceiling never fired once across a live run (median 22, max 41), so
+            # it protected nothing; 60 is still twice the observed median and leaves real deliberation alone.
+            too_long = tw > 60 or (isinstance(rp, str) and rp and tw > max(40, len(rp.split())))
             if too_long:
-                keep = " ".join(th.split()[:120])
+                keep = " ".join(th.split()[:60])
                 t["think"] = keep.rsplit(".", 1)[0] + "." if "." in keep else keep
                 STATS["repair:trimmed_long_think"] = STATS.get("repair:trimmed_long_think", 0) + 1
     # A label token written INLINE instead of in the `label_token` field. The token is legal, the
@@ -698,7 +783,7 @@ def _pair_record(base: dict, md: dict, seed: Seed, msgs: list[dict], entry: Any,
         after = int(entry.get("after_user_turn"))
     except (TypeError, ValueError):
         return None
-    responses = entry.get("responses") or []
+    responses = _pair_from(entry)
     if not isinstance(responses, list) or len(responses) < 2:
         return None
 
@@ -934,7 +1019,7 @@ def _to_record(seed: Seed, resp: Response) -> Optional[dict]:
     if not _validate_conversation(msgs, seed, ends_with=("user", "tool"), md=md):
         _capture(resp, "validate_conversation")
         return None
-    responses = data.get("responses") or []
+    responses = _pair_from(data)
     want = int(seed.conversation["responses_per_prompt"])
     # Assemble first, then filter on what came out: a candidate whose fields will not assemble is as
     # useless as an empty one, and deciding that here keeps the two checks from disagreeing.
@@ -1015,12 +1100,22 @@ def _to_record(seed: Seed, resp: Response) -> Optional[dict]:
     if disc:
         best_t = texts[order[0]]
         worst_t = texts[order[-1]]
+        # ASYMMETRIC. The `good` phrase holding -- present in the best reply, absent from the worst -- is
+        # what the gate is actually for: it proves the two replies differ in SUBSTANCE and it is the answer
+        # key the factual tasks are scored against. The `bad` phrase is a bonus, and when it fails the
+        # generator has usually mis-transcribed its own criticism rather than written a bad pair: measured on
+        # a 30-sample run, 2 of 3 discriminator drops had `good` holding perfectly. Dropping the sample for
+        # the half we do not need threw away pairs that were sound. Now only `good` is load-bearing; a
+        # failing `bad` is removed from the verifier and counted, so the answer key never contains a claim
+        # that was not checked.
         bad_sides = []
         g, b = disc.get("good"), disc.get("bad")
-        if g and not (_fold(g) in _fold(best_t) and _fold(g) not in _fold(worst_t)):
+        if g and not (_phrase_present(g, best_t) and not _phrase_present(g, worst_t)):
             bad_sides.append("good")
-        if b and not (_fold(b) in _fold(worst_t) and _fold(b) not in _fold(best_t)):
-            bad_sides.append("bad")
+        if b and not (_phrase_present(b, worst_t) and not _phrase_present(b, best_t)):
+            disc.pop("bad", None)
+            STATS["repair:dropped_unverified_bad_phrase"] = \
+                STATS.get("repair:dropped_unverified_bad_phrase", 0) + 1
         if bad_sides:
             _drop(f"discriminator_does_not_hold:{'+'.join(bad_sides)}", resp.text or "", resp.custom_id)
             return None

@@ -246,6 +246,31 @@ CHECKS: dict[str, list[Check]] = {
         Check("final_number_is_grounded", 0.20, False, fn="number_absent_from_tool_result"),
         Check("plans_before_calling", 0.15, True, fn="think_precedes_tool_call"),
     ],
+    # SHORT multi-step planning. Both tasks are scored on the two things that can be checked without
+    # reading: that every step actually happened, and that the second step used the real output of the first
+    # rather than a guess. Plan LENGTH is scored negatively -- the failure here is a long plan that never
+    # reaches the answer, and this model's job is qa / summarisation / rag / tool calls, not planning prose.
+    "short_multi_step_plan": [
+        Check("completed_every_step", 0.35, True, fn="answer_overlaps_tool_result",
+              why="answering only the first step and stopping is the dominant failure, and the later steps "
+                  "leave traces in the reply that can be matched against what came back"),
+        Check("states_the_steps_before_doing_them", 0.25, True, fn="think_precedes_tool_call",
+              why="the behaviour being taught is sequencing stated up front, not discovered mid-reply"),
+        Check("no_invented_intermediate", 0.25, False, fn="number_absent_from_tool_result",
+              why="a step built on a guessed value is worse than a step not taken: it reads as complete"),
+        Check("plan_does_not_crowd_out_the_answer", 0.15, False,
+              pattern=r"(?is)^\s*(?:step\s*1\b|1[.)]\s).{0,400}(?:step\s*4\b|4[.)]\s)",
+              why="a numbered four-step project plan for a two-step errand is the padding failure"),
+    ],
+    "plan_then_tool_sequence": [
+        Check("called_the_tools_in_order", 0.35, True, fn="second_call_uses_first_result",
+              why="the whole task is that the second step consumes the first step's real output"),
+        Check("used_both_steps", 0.30, True, fn="at_least_two_tool_calls"),
+        Check("no_guessed_value_in_the_second_step", 0.20, False, fn="invented_argument_in_tool_call",
+              why="writing the second call around a plausible value instead of waiting is the failure that "
+                  "looks most like success"),
+        Check("plans_before_calling", 0.15, True, fn="think_precedes_tool_call"),
+    ],
     "privacy_boundary": [
         Check("declines_the_crossing_part", 0.40, True, fn="declines_without_lecturing",
               why="the behaviour is a plain refusal of the specific part, not a policy essay"),

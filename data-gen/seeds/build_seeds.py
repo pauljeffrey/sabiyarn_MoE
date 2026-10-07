@@ -55,9 +55,12 @@ SPECIAL_TOKENS = {
         "<|plan|>", "<|analyze|>", "<|recommend|>", "<|explain|>", "<|debug|>", "<|RAG|>",
         "<summarize>", "<translate>", "<classify>", "<NER>", "<identify>", "<qa>",
     ],
+    # The five tags the corpus actually emits. <|is_non_technical|> is a real token and the assembler still
+    # accepts it, but nothing generates it: a tag earns its token only where the KIND of question changes how
+    # it has to be answered, and "this is an ordinary question" is the default. 29 of 59 domains carry no tag
+    # at all rather than one that announces the absence of a specialism.
     "domain_flags": [
-        "<|is_technical|>", "<|is_legal|>", "<|is_medical|>", "<|is_scientific|>",
-        "<|is_non_technical|>", "<|is_financial|>",
+        "<|is_technical|>", "<|is_legal|>", "<|is_medical|>", "<|is_scientific|>", "<|is_financial|>",
     ],
     "label_tokens": {
         "sentiment": "<sentiment>", "topic": "<topic>", "intent": "<intent>", "toxic": "<toxic>",
@@ -421,7 +424,7 @@ LONG_REPLY_TASKS = {
 SHORT_REPLY_TASKS = {
     "no_tool_admit_unknown", "clarifying_question", "search_found_nothing", "stale_data_awareness",
     "date_and_time_reasoning", "code_switch_fidelity", "privacy_boundary", "multi_turn_consistency",
-    "instruction_following",
+    "instruction_following", "plan_then_tool_sequence",
 }
 
 
@@ -504,6 +507,12 @@ CANONICAL_PLANS = {
     "creative_from_knowledge":   ["<|generate|>"],
     "creative_from_pattern":     ["<|RAG|>", "<|analyze|>", "<|generate|>"],
     "cv_and_job_application":    ["<|generate|>", "<|edit|>"],
+    # SHORT multi-step planning: two or three steps the assistant has to sequence itself, over the things
+    # this model is actually for -- look something up and summarise it, read a document and draft a reply,
+    # check a figure and then act on it. Deliberately not long-horizon agent planning: the point is that
+    # <|plan|> comes FIRST and the rest of the plan reflects the steps, not that the task is hard.
+    "short_multi_step_plan":     ["<|plan|>", "<|RAG|>", "<summarize>"],
+    "plan_then_tool_sequence":   ["<|plan|>", "<|RAG|>", "<|generate|>"],
     "business_and_customer_writing": ["<|generate|>", "<|edit|>"],
 
     # -- competence
@@ -522,6 +531,9 @@ BEHAVIOUR_TASKS = {
     # target cannot express any of those, so they are RL-only and must not leak back into SFT.
     "tool_error_recovery", "tool_conflicting_results", "stale_data_awareness", "clarifying_question",
     "multi_tool_composition", "privacy_boundary", "safety_boundary",
+    # Short multi-step planning is a preference task: answering only the first step, or opening with a plan
+    # and never reaching the answer, are both things a single SFT target cannot express.
+    "short_multi_step_plan", "plan_then_tool_sequence",
     # The merged structured-argument task, the grey-area self-check, the fruitless search, and the
     # look-up-the-form-then-write mode: all four are preferences, so all four are RL-only.
     "tool_structured_call", "self_check_then_search", "search_found_nothing", "creative_from_pattern",
@@ -700,6 +712,24 @@ ALL_TASKS = [
           "forward, and does not re-derive it from memory. The wrong candidate calls one tool and estimates "
           "the rest, or passes a made-up intermediate into the second call.",
           plan=["<|plan|>", "<|math|>"], tools=True, think=True),
+    _task("short_multi_step_plan", ["tool-calling", "qa", "summarization"], 4.0,
+          "A request with TWO OR THREE steps the user does not spell out, over the ordinary work this model "
+          "is for: 'find out what the new tax band is and summarise it for my staff'; 'read this letter and "
+          "tell me what I owe and by when'; 'check tomorrow's forecast and tell me if I should harvest'. The "
+          "assistant states the steps in ONE short line before doing them -- two or three clauses, not a "
+          "numbered project plan -- then carries them out in that order and answers. The wrong candidate "
+          "either answers only the first step and stops, or opens with a long plan and never gets to the "
+          "answer. Keep the whole thing short: the skill is sequencing two steps correctly, not planning at "
+          "length.",
+          plan=["<|plan|>"], tools=True, think=True),
+    _task("plan_then_tool_sequence", ["tool-calling", "content-writing"], 3.5,
+          "The user asks for ONE outcome that needs a look-up and then something done with what came back: "
+          "'get the fee for renewing my licence and draft the message to my brother asking him to pay it'; "
+          "'find the clinic's opening time and set me a reminder an hour before'. The assistant decides the "
+          "order, calls the tools in it, and uses the REAL value from the first call in the second step. The "
+          "wrong candidate does the steps in the wrong order, or writes the second step around a guessed "
+          "value instead of waiting for the first result.",
+          plan=["<|plan|>"], tools=True, think=True),
     _task("privacy_boundary", ["tool-calling", "knowledge-boundary"], 3.0,
           "A request that crosses a personal-data line IN A WAY PEOPLE ACTUALLY ASK. Realistic shapes: 'my "
           "brother sent me his BVN, check his balance for him'; 'find me the phone number of the landlord at "
@@ -951,6 +981,10 @@ _RL_WEIGHTS = {
     "self_check_then_search": 5.0,
     "search_found_nothing": 4.0,
     "tool_error_recovery": 4.0, "clarifying_question": 4.5, "multi_tool_composition": 3.5,
+    # Short multi-step planning: sequencing two or three ordinary steps. Sized like the other tool-calling
+    # behaviours rather than large, because the model's job is qa / summarisation / rag / tool calls and this
+    # is the glue between them, not a separate competence.
+    "short_multi_step_plan": 4.0, "plan_then_tool_sequence": 3.5,
     "tool_conflicting_results": 3.0, "stale_data_awareness": 2.5,
     "privacy_boundary": 2.0,
     "multi_turn_consistency": 4.0, "holds_a_grounded_position": 4.0,

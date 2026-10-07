@@ -1995,6 +1995,159 @@
       "notes": "Candidates must differ in a way a judge can rank: one grounded and honest, one confidently wrong or invented. Never two paraphrases of the same answer. Over-refusal where the answer WAS available counts as the wrong one."
     },
     {
+      "name": "short_multi_step_plan",
+      "tags": [
+        "tool-calling",
+        "qa",
+        "summarization"
+      ],
+      "description": "A request with TWO OR THREE steps the user does not spell out, over the ordinary work this model is for: 'find out what the new tax band is and summarise it for my staff'; 'read this letter and tell me what I owe and by when'; 'check tomorrow's forecast and tell me if I should harvest'. The assistant states the steps in ONE short line before doing them -- two or three clauses, not a numbered project plan -- then carries them out in that order and answers. The wrong candidate either answers only the first step and stops, or opens with a long plan and never gets to the answer. Keep the whole thing short: the skill is sequencing two steps correctly, not planning at length.",
+      "share": 4.0,
+      "task_plan": [
+        "<|plan|>",
+        "<|RAG|>",
+        "<summarize>"
+      ],
+      "domain_flags": [],
+      "uses_tools": true,
+      "requires_think": true,
+      "languages": null,
+      "checks": [
+        {
+          "name": "has_a_response_or_a_call",
+          "weight": 1.0,
+          "expect": true,
+          "pattern": "<response>|<tool_call>|\\\"tool_calls\\\"",
+          "fn": "",
+          "why": "a turn that neither answers nor calls anything is not a turn",
+          "gate": true
+        },
+        {
+          "name": "markers_well_formed",
+          "weight": 1.0,
+          "expect": true,
+          "pattern": "<\\|input_lang\\|><[a-z]{2,4}>",
+          "fn": "",
+          "why": "assemble.py builds these, so a candidate missing them came from somewhere else",
+          "gate": true
+        },
+        {
+          "name": "no_invented_pipe_token",
+          "weight": 1.0,
+          "expect": false,
+          "pattern": "",
+          "fn": "has_invented_pipe_token",
+          "why": "a token outside the tokenizer costs 3-4 junk sub-words and the model learns to emit it",
+          "gate": true
+        },
+        {
+          "name": "not_degenerate",
+          "weight": 1.0,
+          "expect": false,
+          "pattern": "",
+          "fn": "is_degenerate",
+          "why": "the same four gates the corpus is filtered on, applied to the candidate",
+          "gate": true
+        },
+        {
+          "name": "states_the_key_fact",
+          "weight": 0.21,
+          "expect": true,
+          "pattern": "",
+          "fn": "states_the_key_fact",
+          "why": "the phrase the better reply is supposed to contain, quoted by the generator and verified against both replies before the sample was kept",
+          "gate": false
+        },
+        {
+          "name": "avoids_the_false_claim",
+          "weight": 0.14,
+          "expect": false,
+          "pattern": "",
+          "fn": "repeats_the_false_claim",
+          "why": "the invented figure or fabricated familiarity that marks the worse reply",
+          "gate": false
+        }
+      ],
+      "judge_required": false,
+      "notes": "Candidates must differ in a way a judge can rank: one grounded and honest, one confidently wrong or invented. Never two paraphrases of the same answer. Over-refusal where the answer WAS available counts as the wrong one."
+    },
+    {
+      "name": "plan_then_tool_sequence",
+      "tags": [
+        "tool-calling",
+        "content-writing"
+      ],
+      "description": "The user asks for ONE outcome that needs a look-up and then something done with what came back: 'get the fee for renewing my licence and draft the message to my brother asking him to pay it'; 'find the clinic's opening time and set me a reminder an hour before'. The assistant decides the order, calls the tools in it, and uses the REAL value from the first call in the second step. The wrong candidate does the steps in the wrong order, or writes the second step around a guessed value instead of waiting for the first result.",
+      "share": 3.5,
+      "task_plan": [
+        "<|plan|>",
+        "<|RAG|>",
+        "<|generate|>"
+      ],
+      "domain_flags": [],
+      "uses_tools": true,
+      "requires_think": true,
+      "languages": null,
+      "checks": [
+        {
+          "name": "has_a_response_or_a_call",
+          "weight": 1.0,
+          "expect": true,
+          "pattern": "<response>|<tool_call>|\\\"tool_calls\\\"",
+          "fn": "",
+          "why": "a turn that neither answers nor calls anything is not a turn",
+          "gate": true
+        },
+        {
+          "name": "markers_well_formed",
+          "weight": 1.0,
+          "expect": true,
+          "pattern": "<\\|input_lang\\|><[a-z]{2,4}>",
+          "fn": "",
+          "why": "assemble.py builds these, so a candidate missing them came from somewhere else",
+          "gate": true
+        },
+        {
+          "name": "no_invented_pipe_token",
+          "weight": 1.0,
+          "expect": false,
+          "pattern": "",
+          "fn": "has_invented_pipe_token",
+          "why": "a token outside the tokenizer costs 3-4 junk sub-words and the model learns to emit it",
+          "gate": true
+        },
+        {
+          "name": "not_degenerate",
+          "weight": 1.0,
+          "expect": false,
+          "pattern": "",
+          "fn": "is_degenerate",
+          "why": "the same four gates the corpus is filtered on, applied to the candidate",
+          "gate": true
+        },
+        {
+          "name": "states_the_key_fact",
+          "weight": 0.21,
+          "expect": true,
+          "pattern": "",
+          "fn": "states_the_key_fact",
+          "why": "the phrase the better reply is supposed to contain, quoted by the generator and verified against both replies before the sample was kept",
+          "gate": false
+        },
+        {
+          "name": "avoids_the_false_claim",
+          "weight": 0.14,
+          "expect": false,
+          "pattern": "",
+          "fn": "repeats_the_false_claim",
+          "why": "the invented figure or fabricated familiarity that marks the worse reply",
+          "gate": false
+        }
+      ],
+      "judge_required": false,
+      "notes": "Candidates must differ in a way a judge can rank: one grounded and honest, one confidently wrong or invented. Never two paraphrases of the same answer. Over-refusal where the answer WAS available counts as the wrong one."
+    },
+    {
       "name": "privacy_boundary",
       "tags": [
         "tool-calling",
@@ -4617,6 +4770,7 @@
       "instruction_following",
       "multi_turn_consistency",
       "no_tool_admit_unknown",
+      "plan_then_tool_sequence",
       "privacy_boundary",
       "search_found_nothing",
       "stale_data_awareness"
@@ -4769,7 +4923,6 @@
         "<|is_legal|>",
         "<|is_medical|>",
         "<|is_scientific|>",
-        "<|is_non_technical|>",
         "<|is_financial|>"
       ],
       "label_tokens": {

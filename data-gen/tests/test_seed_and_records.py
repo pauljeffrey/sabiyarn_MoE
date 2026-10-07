@@ -1304,7 +1304,16 @@ def test_every_domain_has_a_question_tag_and_every_subject_plan_opens_with_one()
     from sampling.taxonomy import DOMAIN_QUESTION_TAGS, DOMAIN_KEYS, QUESTION_TAGS
     from schemas.seed import Seed
     from generate import plan_rows
+    import sys, pathlib
+    sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "seeds"))
+    from build_seeds import CANONICAL_PLANS as CANONICAL
     assert set(DOMAIN_KEYS) == set(DOMAIN_QUESTION_TAGS), "a new domain must choose a question tag"
+    # ...and about half choose NO tag: a tag is worth a token only where the kind of question changes how it
+    # has to be answered, so everyday subjects carry none rather than one announcing their ordinariness.
+    untagged = [k for k, v in DOMAIN_QUESTION_TAGS.items() if not v]
+    assert untagged, "an untagged domain is a decision, not an omission -- some must be untagged"
+    assert "<|is_non_technical|>" not in set(DOMAIN_QUESTION_TAGS.values()), \
+        "nothing generates <|is_non_technical|>: an ordinary question is the default and needs no tag"
     seed = Seed.load("seeds/rl.json")
     rows = list(plan_rows(seed, ["yor"]))
     random.Random(7).shuffle(rows)
@@ -1317,15 +1326,26 @@ def test_every_domain_has_a_question_tag_and_every_subject_plan_opens_with_one()
         assert plans, rule
         mech = set(seed.conversation.get("mechanical_tasks") or ())
         assert mech, "the seed must carry the mechanical-task set for the prompt to exclude them"
+        # The domain this row landed on decides whether there is a tag to declare at all.
+        from prompts import _coverage_pick
+        from sampling.taxonomy import question_tag_of
+        dom = _coverage_pick("yor", row["index"])[0]
+        qtag = question_tag_of(dom)
         for ln in plans:
             name = ln.strip()[2:].split(":", 1)[0]
             first = ln.split('["', 1)[1].split('"', 1)[0]
-            if name in mech:
-                assert first not in QUESTION_TAGS, f"a mechanical turn must not declare a tag: {ln}"
+            own = next((v for v in (CANONICAL.get(name) or []) if v.startswith("<|is_")), "")
+            if own:
+                assert first == own, f"a domain-naming task keeps its own tag: {ln}"
+            elif name in mech or not qtag:
+                assert first not in QUESTION_TAGS, f"no tag was due here: {ln} (domain {dom})"
             else:
-                assert first in QUESTION_TAGS, f"plan does not open with a question tag: {ln}"
+                assert first == qtag, f"plan must open with the domain's tag {qtag}: {ln}"
         # and the rule SAYS so, wherever a mechanical task is in play
         names = [ln.strip()[2:].split(":", 1)[0] for ln in plans]
+        if not qtag and not any(next((v for v in (CANONICAL.get(n) or []) if v.startswith("<|is_")), "")
+                                for n in names):
+            continue          # nothing in this conversation carries a tag, so there is no rule to state
         if all(n in mech for n in names):
             assert "NO TURN in this conversation declares an <|is_*|> tag" in rule
         elif any(n in mech for n in names):
@@ -1338,9 +1358,10 @@ def test_the_question_tag_follows_the_subject_not_the_task():
     from sampling.taxonomy import question_tag_of
     from schemas.seed import Seed
     seed = Seed.load("seeds/rl.json")
-    # one task, two domains whose tags differ
-    a, b = "music", "engineering_construction"
-    assert question_tag_of(a) != question_tag_of(b)
+    # one task, two TAGGED domains whose tags differ, plus one untagged domain
+    a, b, none = "health_medicine", "engineering_construction", "music"
+    assert question_tag_of(a) and question_tag_of(b) and question_tag_of(a) != question_tag_of(b)
+    assert not question_tag_of(none), "music is everyday: no tag to declare"
     # the domain comes from the coverage odometer, not from a row field, so find an index for each
     from prompts import _coverage_pick
 
@@ -1355,9 +1376,11 @@ def test_the_question_tag_follows_the_subject_not_the_task():
         line = next(ln for ln in body[i:].splitlines() if f"* {task}:" in ln)
         return line.split('["', 1)[1].split('"', 1)[0]
 
-    ia, ib = _index_for(a), _index_for(b)
+    ia, ib, inone = _index_for(a), _index_for(b), _index_for(none)
     assert _tag_in_plan("tool_search_answer", ia) == question_tag_of(a)
     assert _tag_in_plan("tool_search_answer", ib) == question_tag_of(b)
+    # and in an everyday domain the same task opens with its first VERB, carrying no tag at all
+    assert _tag_in_plan("tool_search_answer", inone) == "<|RAG|>"
     # and the three domain-naming tasks keep their own tag wherever they are grounded -- including in a
     # domain whose own tag is something else
     for task, tag in (("health_advice", "<|is_medical|>"), ("safety_boundary", "<|is_medical|>"),
