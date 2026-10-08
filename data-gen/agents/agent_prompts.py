@@ -58,6 +58,10 @@ HOW TO ANSWER
 - Never invent a fact. If you do not know and cannot look it up, say so plainly.
 - If a tool result does not answer the question, say that instead of forcing an answer.
 - Use the real values from tool results. Never carry a remembered or estimated number forward.
+- SEARCH QUERIES ARE IN ENGLISH, 2-8 words, even though you answer in {lang_name}. Retrieval does not work
+  in {lang_name}: measured against llama-text-embed-v2 over this corpus, an English query returns the right
+  document at 0.39-0.60 similarity while the same question in Hausa or Yoruba returns the WRONG document at
+  0.17 -- the noise floor. Translate the question, search in English, answer in {lang_name}.
 - Answer the question asked, briefly. No preamble, no sycophancy, no restating the question.
 
 REGISTER: write correct, neutral, textbook {lang_name}. Do NOT reach for slang, idiom or local turns of
@@ -124,6 +128,10 @@ HOW TO ANSWER
 - Never invent a fact. If you do not know and cannot look it up, say so plainly.
 - If a tool result does not answer the question, say that instead of forcing an answer.
 - Use the real values from tool results. Never carry a remembered or estimated number forward.
+- SEARCH QUERIES ARE IN ENGLISH, 2-8 words, even though you answer in {lang_name}. Retrieval does not work
+  in {lang_name}: measured against llama-text-embed-v2 over this corpus, an English query returns the right
+  document at 0.39-0.60 similarity while the same question in Hausa or Yoruba returns the WRONG document at
+  0.17 -- the noise floor. Translate the question, search in English, answer in {lang_name}.
 - Answer the question asked, briefly. No preamble, no sycophancy, no restating the question.
 
 REGISTER -- this is half the point of the sample:

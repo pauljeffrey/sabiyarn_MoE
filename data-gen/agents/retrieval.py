@@ -179,11 +179,21 @@ class PineconeRetriever:
     """Pinecone with integrated embedding. Imported lazily so the module works without the SDK installed."""
 
     def __init__(self, index: str = "", namespace: str = "docs", model: str = ""):
-        from pinecone import Pinecone  # noqa: PLC0415 -- optional dependency
+        # The key lives in the one repo-root .env, and providers.base.load_env is what knows that. Reading
+        # os.environ without it works only when the caller happened to load it first, which the ingest CLI
+        # did not -- so a correct key looked like a missing one.
+        from providers.base import load_env  # noqa: PLC0415
+
+        load_env()
+        try:
+            from pinecone import Pinecone  # noqa: PLC0415 -- optional dependency
+        except ImportError as exc:
+            raise RuntimeError(
+                "the pinecone SDK is not installed: pip install -r requirements.txt") from exc
 
         key = os.environ.get("PINECONE_API_KEY")
         if not key:
-            raise RuntimeError("PINECONE_API_KEY is not set")
+            raise RuntimeError("PINECONE_API_KEY is not set in the repo-root .env")
         self.model = model or os.environ.get("PINECONE_MODEL", "llama-text-embed-v2")
         self.name = index or os.environ.get("PINECONE_INDEX", "hera")
         self.namespace = namespace
@@ -197,12 +207,19 @@ class PineconeRetriever:
             query={"inputs": {"text": query}, "top_k": k, **({"filter": flt} if flt else {})},
             fields=["text", "title", "section", "doc_id", "lang"],
         )
+        d = res.to_dict() if hasattr(res, "to_dict") else dict(res)
         out = []
-        for hit in (res.get("result", {}) or {}).get("hits", []) or []:
-            f = hit.get("fields", {}) or {}
-            out.append(Passage(id=str(hit.get("_id")), doc_id=str(f.get("doc_id") or ""),
+        for hit in ((d.get("result") or {}).get("hits") or []):
+            h = dict(hit)
+            f = dict(h.get("fields") or {})
+            # SDK 10 names these `id_` and `score_`; earlier versions used `_id` and `_score`. Reading both
+            # is three characters of defence against an upgrade silently returning every score as 0.0 --
+            # which is exactly what the first live query did.
+            pid = h.get("id_") or h.get("_id") or h.get("id") or ""
+            score = h.get("score_") or h.get("_score") or h.get("score") or 0.0
+            out.append(Passage(id=str(pid), doc_id=str(f.get("doc_id") or ""),
                                title=str(f.get("title") or ""), section=str(f.get("section") or ""),
-                               text=str(f.get("text") or ""), score=round(float(hit.get("_score") or 0), 3),
+                               text=str(f.get("text") or ""), score=round(float(score), 3),
                                lang=str(f.get("lang") or "")))
         return out
 
@@ -221,19 +238,55 @@ class PineconeRetriever:
             spec=ServerlessSpec(cloud="aws", region=region),
         )
 
-    def upsert(self, passages: Iterable[Passage], *, batch: int = 90) -> int:
-        """Upsert with integrated embedding -- Pinecone does the embedding, so no embedding model here."""
-        buf, total = [], 0
+    def upsert(self, passages: Iterable[Passage], *, batch: int = 90, progress_every: int = 20,
+               max_retries: int = 4) -> int:
+        """Upsert with integrated embedding -- Pinecone embeds server-side, so nothing is embedded here.
+
+        The document pool is 51,807 passages, which is ~576 batched requests against a service that embeds
+        each one as it arrives. At that length a silent loop is indistinguishable from a hang and one
+        rate-limit response should not cost the whole ingest, so: progress, and bounded retry with backoff.
+        """
+        import time  # noqa: PLC0415
+
+        def flush(rows: list[dict]) -> int:
+            for attempt in range(max_retries):
+                try:
+                    # keyword-only since SDK 10; passing positionally raises PineconeValueError
+                    self._index.upsert_records(records=rows, namespace=self.namespace)
+                    return len(rows)
+                except Exception as exc:  # noqa: BLE001 -- rate limits and transient 5xx both land here
+                    # A VALIDATION error is not transient: retrying client-side misuse four times with
+                    # backoff just turns a clear failure into a slow one. Only retry what can change.
+                    if "ValueError" in type(exc).__name__ or isinstance(exc, (TypeError, ValueError)):
+                        print(f"  [pinecone] not retryable: {type(exc).__name__}: {exc}")
+                        return 0
+                    if attempt == max_retries - 1:
+                        print(f"  [pinecone] giving up on a batch of {len(rows)}: "
+                              f"{type(exc).__name__}: {exc}")
+                        return 0
+                    wait = 2 ** attempt
+                    print(f"  [pinecone] {type(exc).__name__}, retrying in {wait}s "
+                          f"(attempt {attempt + 1}/{max_retries})", flush=True)
+                    time.sleep(wait)
+            return 0
+
+        buf: list[dict] = []
+        total = batches = 0
+        t0 = time.time()
         for p in passages:
+            if not (p.text or "").strip():
+                continue
             buf.append({"_id": p.id, "text": p.text, "title": p.title, "section": p.section,
-                        "doc_id": p.doc_id, "lang": p.lang})
+                        "doc_id": p.doc_id, "lang": p.lang or ""})
             if len(buf) >= batch:
-                self._index.upsert_records(self.namespace, buf)
-                total += len(buf)
+                total += flush(buf)
+                batches += 1
                 buf = []
+                if progress_every and batches % progress_every == 0:
+                    rate = total / max(1e-6, time.time() - t0)
+                    print(f"  upserted {total:,} passages ({rate:,.0f}/s)", flush=True)
         if buf:
-            self._index.upsert_records(self.namespace, buf)
-            total += len(buf)
+            total += flush(buf)
         return total
 
 

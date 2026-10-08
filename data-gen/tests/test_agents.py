@@ -283,3 +283,15 @@ def test_the_refiner_does_not_invent_a_think_block():
     lp2 = _loop([json.dumps({"response": "E don land."})])
     got2 = lp2.refine({"response": "It has arrived now.", "think": "The fee changed, so look it up."}, "q")
     assert got2["think"] == "The fee changed, so look it up."
+
+
+def test_the_assistant_is_told_to_search_in_english():
+    """Measured against llama-text-embed-v2 over this corpus: an English query returns the right document at
+    0.39-0.60 similarity, the same question in Hausa or Yoruba returns the WRONG document at ~0.17 -- the
+    noise floor. rl/verifiers.tool_query_is_english already scored this; the agent was never told."""
+    from agents import agent_prompts as AP
+    for tmpl in (AP.AI_AGENT, AP.SFT_AI_AGENT):
+        body = tmpl.format(lang_name="Hausa", today="2026-10-08", tools_block="", plan_hint='"<|RAG|>"',
+                           task_directive="", flavour_hint="x")
+        assert "SEARCH QUERIES ARE IN ENGLISH" in body
+        assert "answer in Hausa" in body
