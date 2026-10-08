@@ -107,9 +107,18 @@ def build_retrieval(*, limit: int = 0, prefer_pinecone: bool = True) -> tuple[Re
     remote = None
     if prefer_pinecone and os.environ.get("PINECONE_API_KEY"):
         try:
-            remote = PineconeRetriever()
-        except Exception as exc:  # noqa: BLE001 -- any SDK/auth/network failure means "local only"
-            print(f"  [retrieval] pinecone unavailable ({type(exc).__name__}), BM25 only")
+            cand = PineconeRetriever()
+            # ONE PROBE, AT STARTUP. Constructing the client does not touch the service, so a dead index
+            # was only discovered on the first real query -- and then on every query after it, because the
+            # per-query circuit breaker needs several failures to trip and each failure pays the SDK's own
+            # retry and backoff first. Measured: a 5-conversation run went from 72s to 1,324s against an
+            # exhausted embedding quota. One query here costs one round trip and settles it for the run.
+            cand.search("probe", k=1)
+            remote = cand
+        except Exception as exc:  # noqa: BLE001 -- SDK, auth, network or quota: all mean "local only"
+            msg = str(exc)
+            why = "embedding quota exhausted" if "RESOURCE_EXHAUSTED" in msg else type(exc).__name__
+            print(f"  [retrieval] pinecone unusable ({why}), BM25 only")
     return HybridRetriever(local=local, remote=remote), Library.from_pool(limit=limit)
 
 

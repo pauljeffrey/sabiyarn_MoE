@@ -401,6 +401,7 @@ class HybridRetriever:
     remote: Optional[Retriever] = None
     remote_failures: int = 0
     max_remote_failures: int = 3
+    _lock: "threading.Lock" = field(default_factory=lambda: __import__("threading").Lock(), repr=False)
 
     def search(self, query: str, *, k: int = 4, lang: str = "") -> list[Passage]:
         if lang and lang not in EMBEDDABLE:
@@ -416,13 +417,17 @@ class HybridRetriever:
                 # that needs ~7.8M to ingest -- and a quota does not come back on the next call. Retrying it
                 # per query would turn one hard stop into thousands of slow ones, so after a few failures
                 # the remote is switched off for the rest of the process and BM25 carries the run.
-                self.remote_failures += 1
-                print(f"  [retrieval] pinecone failed ({type(exc).__name__}), "
-                      f"{self.remote_failures}/{self.max_remote_failures} before falling back to BM25",
-                      flush=True)
-                if self.remote_failures >= self.max_remote_failures:
-                    print("  [retrieval] pinecone disabled for this run; BM25 only", flush=True)
-                    self.remote = None
+                # Under the lock: conversations run concurrently and share one retriever, so without it
+                # the count raced and the log read "4/3 before falling back".
+                with self._lock:
+                    self.remote_failures += 1
+                    n, cap = self.remote_failures, self.max_remote_failures
+                    trip = n >= cap and self.remote is not None
+                    if trip:
+                        self.remote = None
+                if trip:
+                    print(f"  [retrieval] pinecone failed {n}x ({type(exc).__name__}); "
+                          f"disabled for this run, BM25 only", flush=True)
         return self.local.search(query, k=k, lang=lang if lang else "")
 
     def search_many(self, queries: list[tuple[str, str]], *, k: int = 4) -> list[Passage]:
