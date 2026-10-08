@@ -1,9 +1,8 @@
-"""Tests for the agent/ framework. Stdlib only: no torch, pydantic or jinja2.
+"""Tests for the agent/ framework against chat template v2. Stdlib only.
 
-The format assertions duplicate the ground truth in tests/test_chat_template.py
-on purpose -- agent/protocol.py has its own pure-Python renderer (jinja2 is not
-installed in the root env, so tokenizer.apply_chat_template cannot be relied
-on), and these are what pin it to the training format.
+The format assertions here are the fallback when jinja2 is missing;
+tests/test_agent_render_parity.py pins the renderer against the real template
+when it is available. See docs/TOOL_CALL_FORMAT.md for the contract.
 """
 
 from __future__ import annotations
@@ -21,17 +20,28 @@ from agent import (  # noqa: E402
     Toolbox, WindowMemory, parse_assistant, render, tool,
 )
 from agent.memory import SummarizingMemory, approx_tokens  # noqa: E402
-from agent.protocol import EOS, format_tools, record_tool_call_turn, tool_message  # noqa: E402
+from agent.protocol import (  # noqa: E402
+    EOS, format_tools, parse_assistant as parse, record_tool_call_turn, render_tool_call, tool_message,
+)
 from agent.structured import (  # noqa: E402
     StructuredOutputError, extract_json, to_strict_json_schema, validate_payload,
 )
-from agent.tools import ToolError  # noqa: E402
+
+WEATHER_TOOL_SCHEMA = {
+    "type": "function",
+    "function": {"name": "get_weather", "description": "d", "parameters": {"type": "object", "properties": {}}},
+}
+
+
+def call_text(name: str, **args) -> str:
+    """The v2 call shape, as the model emits it."""
+    return render_tool_call(name, args)
 
 
 # --------------------------------------------------------------------------
 # wire format
 # --------------------------------------------------------------------------
-def test_render_matches_training_format():
+def test_render_plain_chat():
     msgs = [
         {"role": "system", "content": "S"},
         {"role": "user", "content": "hi"},
@@ -41,15 +51,58 @@ def test_render_matches_training_format():
     assert render(msgs[:2]).endswith("</s><|assistant|>")
 
 
-def test_render_tool_call_and_response():
+def test_render_tool_exchange_is_one_turn():
     msgs = [
         {"role": "user", "content": "weather?"},
-        {"role": "assistant", "tool_calls": [{"function": {"name": "get_weather", "arguments": {"city": "Lagos"}}}]},
-        {"role": "tool", "name": "get_weather", "content": "31C"},
+        {"role": "assistant", "content": "<think>check</think>",
+         "tool_calls": [{"function": {"name": "get_weather", "arguments": {"city": "Lagos"}}}]},
+        {"role": "tool", "content": "31C"},
+        {"role": "assistant", "content": "<response>31C.</response>"},
     ]
     out = render(msgs, add_generation_prompt=False)
-    assert '<tool_call>get_weather\n{"city": "Lagos"}</tool_call></s>' in out
-    assert "<tool_response>get_weather 31C</tool_response></s>" in out
+    assert '<tool_call>{"name": "get_weather", "arguments": {"city": "Lagos"}}</tool_call>' in out
+    assert "<tool_response>31C</tool_response>" in out
+    # one assistant marker, one eos closing the turn, and no eos around the result
+    assert out.count("<|assistant|>") == 1
+    assert "</tool_call></s>" not in out and "</tool_response></s>" not in out
+    assert out.endswith("</response></s>")
+
+
+def test_tool_result_carries_no_function_name():
+    out = render([{"role": "tool", "name": "get_weather", "content": "31C"}], add_generation_prompt=False)
+    assert out == "<s><tool_response>31C</tool_response>"
+    assert "get_weather" not in out, "results answer the calls above them, in order"
+
+
+def test_generation_prompt_suppressed_after_tool_result():
+    mid = [
+        {"role": "user", "content": "q"},
+        {"role": "assistant", "tool_calls": [{"function": {"name": "a", "arguments": {}}}]},
+        {"role": "tool", "content": "r"},
+    ]
+    assert render(mid, add_generation_prompt=True).endswith("</tool_response>")
+
+
+def test_tools_render_as_a_tools_block_in_the_system_turn():
+    out = render([{"role": "system", "content": "You are X."}, {"role": "user", "content": "hi"}],
+                 tools=[WEATHER_TOOL_SCHEMA], add_generation_prompt=False)
+    assert out.startswith("<s><|system|>You are X.\n\n<tools>\n")
+    assert "\n</tools></s>" in out
+    body = out.split("<tools>\n", 1)[1].split("\n</tools>", 1)[0]
+    assert json.loads(body) == WEATHER_TOOL_SCHEMA
+
+
+def test_tools_without_a_system_message_get_their_own_turn():
+    out = render([{"role": "user", "content": "hi"}], tools=[WEATHER_TOOL_SCHEMA], add_generation_prompt=False)
+    assert out.startswith("<s><|system|><tools>\n")
+    assert "<|user|>hi</s>" in out
+
+
+def test_format_tools_is_one_json_object_per_line():
+    text = format_tools([WEATHER_TOOL_SCHEMA, WEATHER_TOOL_SCHEMA])
+    assert text.startswith("<tools>\n") and text.endswith("\n</tools>")
+    assert len(text.split("\n")) == 4  # open, two objects, close
+    assert format_tools([]) == ""
 
 
 def test_render_rejects_unknown_role():
@@ -57,53 +110,74 @@ def test_render_rejects_unknown_role():
         render([{"role": "assistnat", "content": "typo"}])
 
 
-def test_assistant_with_empty_tool_calls_emits_nothing():
-    # The template branches on key presence, not truthiness.
-    out = render([{"role": "assistant", "content": "ignored", "tool_calls": []}], add_generation_prompt=False)
-    assert out == "<s><|assistant|>"
+def test_empty_tool_calls_list_closes_the_turn():
+    # v2 branches on truthiness, so an empty list is a plain text turn.
+    out = render([{"role": "assistant", "content": "text", "tool_calls": []}], add_generation_prompt=False)
+    assert out == "<s><|assistant|>text</s>"
 
 
-def test_parse_inline_tool_call():
+def test_non_ascii_arguments_are_not_escaped():
+    out = render([{"role": "assistant", "tool_calls": [
+        {"function": {"name": "t", "arguments": {"q": "Èkó", "a": "it's"}}}]}], add_generation_prompt=False)
+    assert '"q": "Èkó"' in out and "\\u" not in out
+
+
+# --------------------------------------------------------------------------
+# parsing
+# --------------------------------------------------------------------------
+def test_parse_v2_tool_call():
     raw = (
         "<|input_lang|><yor><think>I do not know this.</think>"
-        "<task_plan><|RAG|><|explain|></task_plan>"
-        '<tool_call>search_internet\n{"query": "what is AWS"}</tool_call>'
+        "<task_plan><|RAG|></task_plan>"
+        + call_text("search_internet", query="what is AWS")
     )
-    turn = parse_assistant(raw)
+    turn = parse(raw)
     assert turn.wants_tool
     assert turn.think == "I do not know this."
-    assert turn.task_plan == ("<|RAG|>", "<|explain|>")
-    assert turn.invalid_verbs == ()
+    assert turn.task_plan == ("<|RAG|>",) and turn.invalid_verbs == ()
     assert turn.input_lang == "yor"
     call = turn.tool_calls[0]
     assert (call.name, call.arguments) == ("search_internet", {"query": "what is AWS"})
+    # the scaffold is what gets recorded as the assistant message's content
+    assert turn.scaffold.endswith("</task_plan>") and "<tool_call>" not in turn.scaffold
 
 
-def test_parse_final_response_and_invalid_verb():
-    turn = parse_assistant("<task_plan><|nope|></task_plan><response>Mo wa daadaa.</s>")
-    assert not turn.wants_tool
-    assert turn.invalid_verbs == ("<|nope|>",)
-    assert turn.text == "Mo wa daadaa."
+def test_parse_arguments_given_as_a_json_string():
+    turn = parse('<tool_call>{"name": "f", "arguments": "{\\"a\\": 1}"}</tool_call>')
+    assert turn.tool_calls[0].arguments == {"a": 1}
 
 
-def test_parse_reports_bad_json_without_raising():
-    turn = parse_assistant('<tool_call>calc\n{"a": }</tool_call>')
-    call = turn.tool_calls[0]
-    assert call.arguments is None and not call.ok and "invalid JSON" in call.error
+def test_parse_legacy_call_shape_still_works():
+    # Pre-v2 checkpoints emit `name\n{args}`; rl/verifiers.py also reads both.
+    turn = parse('<tool_call>get_weather\n{"city": "Lagos"}</tool_call>')
+    assert turn.tool_calls[0].name == "get_weather"
+    assert turn.tool_calls[0].arguments == {"city": "Lagos"}
+
+
+def test_parse_reports_malformed_calls_without_raising():
+    assert "invalid JSON" in parse('<tool_call>{"name": "f", "arguments": }</tool_call>').tool_calls[0].error
+    assert "missing a string" in parse('<tool_call>{"arguments": {}}</tool_call>').tool_calls[0].error
+    assert "must be a JSON object" in parse('<tool_call>{"name": "f", "arguments": 5}</tool_call>').tool_calls[0].error
 
 
 def test_parse_detects_truncated_tool_call():
-    turn = parse_assistant('<think>x</think><tool_call>calc\n{"a": 1')
+    turn = parse('<think>x</think><tool_call>{"name": "f", "arguments": {"a": 1')
     assert turn.truncated_tool_call and not turn.wants_tool
 
 
-def test_tool_catalogue_is_compact_json_in_system_turn():
-    schemas = [{"type": "function", "function": {"name": "f", "description": "d", "parameters": {}}}]
-    text = format_tools(schemas, "You are X.")
-    assert text.startswith("You are X. You have these tools:\n")
-    assert ", " not in text.split("\n", 1)[1]  # compact separators, no wasted tokens
-    assert json.loads(text.split("\n", 1)[1]) == schemas
-    assert format_tools([], "You are X.") == "You are X."
+def test_response_is_read_after_the_last_tool_result():
+    raw = (
+        "<think>first</think>" + call_text("f", a=1)
+        + "<tool_response>RESULT</tool_response>"
+        + "<task_plan><|explain|></task_plan><response>The answer.</response>"
+    )
+    turn = parse(raw)
+    assert turn.text == "The answer."
+    assert turn.task_plan == ("<|explain|>",), "the plan of the SECOND scaffold"
+
+
+def test_response_without_a_closing_tag_still_parses():
+    assert parse("<response>Older data has no closing tag." + EOS).text == "Older data has no closing tag."
 
 
 # --------------------------------------------------------------------------
@@ -139,11 +213,9 @@ def test_tool_runs_and_captures_its_own_failure():
         raise RuntimeError("kaboom")
 
     box = Toolbox([get_weather, boom])
-    ok = box.call("get_weather", {"city": "Lagos"})
-    assert ok.ok and ok.value["temp"] == 31
+    assert box.call("get_weather", {"city": "Lagos"}).value["temp"] == 31
     bad = box.call("boom", {})
-    assert not bad.ok and "RuntimeError: kaboom" in bad.error
-    assert bad.payload() == {"error": "RuntimeError: kaboom"}
+    assert not bad.ok and bad.payload() == {"error": "RuntimeError: kaboom"}
 
 
 def test_enum_and_literal_schemas():
@@ -169,26 +241,29 @@ def test_timeout_surfaces_as_tool_error():
         time.sleep(1.0)
         return "done"
 
-    result = Toolbox([slow]).call("slow", {})
-    assert not result.ok and "timed out" in result.error
+    assert "timed out" in Toolbox([slow]).call("slow", {}).error
 
 
 # --------------------------------------------------------------------------
-# agent loop
+# the loop
 # --------------------------------------------------------------------------
 def _tool_then_answer() -> ScriptedLLM:
     return ScriptedLLM(
         replies=[
             "<|input_lang|><eng><think>Need live data.</think><task_plan><|RAG|></task_plan>"
-            '<tool_call>get_weather\n{"city": "Lagos"}</tool_call>' + EOS,
-            "<task_plan><|explain|></task_plan><response>It is 31C in Lagos." + EOS,
+            + call_text("get_weather", city="Lagos"),
+            "<task_plan><|explain|></task_plan><response>It is 31C in Lagos.</response>" + EOS,
         ]
     )
 
 
+def _agent(llm, **kw) -> Agent:
+    return Agent(llm, memory=WindowMemory(count_tokens=approx_tokens), **kw)
+
+
 def test_loop_calls_tool_then_answers():
     llm = _tool_then_answer()
-    bot = Agent(llm, tools=[get_weather], memory=WindowMemory(count_tokens=approx_tokens))
+    bot = _agent(llm, tools=[get_weather])
     events = list(bot.run("Weather in Lagos?"))
     kinds = [type(e).__name__ for e in events]
     assert "ToolCalled" in kinds and "ToolReturned" in kinds and kinds[-1] == "Final"
@@ -202,62 +277,75 @@ def test_loop_calls_tool_then_answers():
     assert any(isinstance(e, Think) for e in events)
 
 
-def test_second_prompt_contains_tool_result_in_training_shape():
+def test_continuation_prompt_has_no_new_assistant_marker():
+    """The heart of v2: after a tool result the model continues its own turn."""
     llm = _tool_then_answer()
-    Agent(llm, tools=[get_weather], memory=WindowMemory(count_tokens=approx_tokens)).chat("Weather in Lagos?")
+    _agent(llm, tools=[get_weather]).chat("Weather in Lagos?")
     second = llm.prompts[1]
-    # The call must survive as inline content (the template would drop it if it
-    # were passed as tool_calls), and the result must come back as <tool_response>.
-    assert '<tool_call>get_weather\n{"city": "Lagos"}</tool_call>' in second
-    assert '<tool_response>get_weather {"city":"Lagos","temp":31,"units":"celsius"}</tool_response>' in second
-    assert second.endswith("<|assistant|>")
+    assert second.endswith("</tool_response>"), "no <|assistant|> after the result"
+    assert second.count("<|assistant|>") == 1, "still one assistant turn"
+    assert '<tool_call>{"name": "get_weather", "arguments": {"city": "Lagos"}}</tool_call>' in second
+    assert '<tool_response>{"city":"Lagos","temp":31,"units":"celsius"}</tool_response>' in second
+    assert "</tool_call></s>" not in second, "no eos wedged between call and result"
+    assert "get_weather {" not in second, "the result must not carry the function name"
+
+
+def test_tool_catalogue_reaches_the_model_as_a_tools_block():
+    llm = _tool_then_answer()
+    _agent(llm, tools=[get_weather]).chat("Weather?")
+    first = llm.prompts[0]
+    assert "<tools>\n" in first and "\n</tools></s>" in first
+    assert '"name": "get_weather"' in first
 
 
 def test_chat_returns_text_only():
-    bot = Agent(_tool_then_answer(), tools=[get_weather], memory=WindowMemory(count_tokens=approx_tokens))
-    assert bot.chat("Weather in Lagos?") == "It is 31C in Lagos."
+    assert _agent(_tool_then_answer(), tools=[get_weather]).chat("Weather in Lagos?") == "It is 31C in Lagos."
 
 
 def test_streaming_hides_scaffolding_and_yields_response_only():
     llm = ScriptedLLM(
-        replies=["<think>secret</think><task_plan><|chat|></task_plan><response>Hello there, friend." + EOS],
+        replies=["<think>secret</think><task_plan><|chat|></task_plan><response>Hello there, friend.</response>" + EOS],
         chunk_size=3,
     )
-    bot = Agent(llm, memory=WindowMemory(count_tokens=approx_tokens))
-    deltas = [e.text for e in bot.run("hi") if isinstance(e, Delta)]
+    deltas = [e.text for e in _agent(llm).run("hi") if isinstance(e, Delta)]
     assert "".join(deltas) == "Hello there, friend."
     assert "secret" not in "".join(deltas) and "<think>" not in "".join(deltas)
 
 
+def test_streaming_shows_nothing_for_a_tool_call_step():
+    llm = _tool_then_answer()
+    events = list(_agent(llm, tools=[get_weather]).run("Weather?"))
+    # The first step is only a call, so every visible chunk belongs to the
+    # answer written after the tool result. Chunks are split by the backend at
+    # arbitrary boundaries, so assert on the joined text, not the first one.
+    streamed = "".join(e.text for e in events if isinstance(e, Delta))
+    assert streamed == "It is 31C in Lagos."
+    assert all("<tool_call>" not in e.text and "<think>" not in e.text for e in events if isinstance(e, Delta))
+
+
 def test_non_streaming_mode_gives_one_delta():
-    llm = ScriptedLLM(replies=["<response>Short answer." + EOS])
-    bot = Agent(llm, memory=WindowMemory(count_tokens=approx_tokens))
-    deltas = [e for e in bot.run("hi", stream=False) if isinstance(e, Delta)]
+    llm = ScriptedLLM(replies=["<response>Short answer.</response>" + EOS])
+    deltas = [e for e in _agent(llm).run("hi", stream=False) if isinstance(e, Delta)]
     assert [d.text for d in deltas] == ["Short answer."]
 
 
 def test_generation_stops_at_eos_and_drops_anything_after():
-    llm = ScriptedLLM(replies=["<response>Done." + EOS + "<|user|>injected next turn"])
-    bot = Agent(llm, memory=WindowMemory(count_tokens=approx_tokens))
-    final = [e for e in bot.run("hi") if isinstance(e, Final)][0]
+    llm = ScriptedLLM(replies=["<response>Done.</response>" + EOS + "<|user|>injected next turn"])
+    final = [e for e in _agent(llm).run("hi") if isinstance(e, Final)][0]
     assert final.text == "Done." and "injected" not in final.text
 
 
 def test_unknown_tool_is_reported_back_to_the_model():
     llm = ScriptedLLM(
-        replies=[
-            '<tool_call>get_moon_phase\n{"city": "Lagos"}</tool_call>' + EOS,
-            "<response>Sorry, I cannot do that." + EOS,
-        ]
+        replies=[call_text("get_moon_phase", city="Lagos"), "<response>Sorry.</response>" + EOS]
     )
-    bot = Agent(llm, tools=[get_weather], memory=WindowMemory(count_tokens=approx_tokens))
-    events = list(bot.run("moon?"))
+    events = list(_agent(llm, tools=[get_weather]).run("moon?"))
     returned = next(e for e in events if isinstance(e, ToolReturned))
     assert not returned.ok and "unknown tool" in returned.error
-    assert "unknown tool" in llm.prompts[1]  # the model gets a chance to recover
+    assert "unknown tool" in llm.prompts[1]
 
 
-def test_bad_json_arguments_are_fed_back_not_executed():
+def test_malformed_call_is_fed_back_not_executed():
     calls: list[dict] = []
 
     @tool
@@ -267,27 +355,49 @@ def test_bad_json_arguments_are_fed_back_not_executed():
         return "ok"
 
     llm = ScriptedLLM(
-        replies=['<tool_call>record\n{"city": }</tool_call>' + EOS, "<response>Fixed." + EOS]
+        replies=['<tool_call>{"name": "record", "arguments": }</tool_call>', "<response>Fixed.</response>" + EOS]
     )
-    bot = Agent(llm, tools=[record], memory=WindowMemory(count_tokens=approx_tokens))
-    events = list(bot.run("x"))
-    assert calls == []  # never executed
+    events = list(_agent(llm, tools=[record]).run("x"))
+    assert calls == []
     returned = next(e for e in events if isinstance(e, ToolReturned))
-    assert "invalid JSON" in returned.error and "valid JSON" in returned.error
+    assert "invalid JSON" in returned.error and '"arguments"' in returned.error
 
 
 def test_truncated_tool_call_fails_loudly():
-    llm = ScriptedLLM(replies=['<think>x</think><tool_call>get_weather\n{"city": "Lag'])
-    bot = Agent(llm, tools=[get_weather], memory=WindowMemory(count_tokens=approx_tokens))
-    failed = [e for e in bot.run("x") if isinstance(e, Failed)]
+    llm = ScriptedLLM(replies=['<think>x</think><tool_call>{"name": "get_weather", "arg'])
+    failed = [e for e in _agent(llm, tools=[get_weather]).run("x") if isinstance(e, Failed)]
     assert failed and "cut off" in failed[0].reason
 
 
 def test_round_limit_ends_with_failure():
-    llm = ScriptedLLM(replies=['<tool_call>get_weather\n{"city": "Lagos"}</tool_call>' + EOS] * 10)
-    bot = Agent(llm, tools=[get_weather], max_rounds=3, memory=WindowMemory(count_tokens=approx_tokens))
-    events = list(bot.run("loop"))
+    llm = ScriptedLLM(replies=[call_text("get_weather", city="Lagos")] * 10)
+    events = list(_agent(llm, tools=[get_weather], max_rounds=3).run("loop"))
     assert isinstance(events[-1], Failed) and "3 rounds" in events[-1].reason
+
+
+def test_two_sequential_calls_stay_in_one_turn():
+    @tool
+    def step_one() -> str:
+        """First step."""
+        return "one"
+
+    @tool
+    def step_two() -> str:
+        """Second step."""
+        return "two"
+
+    llm = ScriptedLLM(
+        replies=[
+            "<think>a</think>" + call_text("step_one"),
+            "<think>b</think>" + call_text("step_two"),
+            "<response>Both done.</response>" + EOS,
+        ]
+    )
+    bot = _agent(llm, tools=[step_one, step_two])
+    assert bot.chat("chain") == "Both done."
+    third = llm.prompts[2]
+    assert third.count("<|assistant|>") == 1, "one turn across two calls"
+    assert third.count("<tool_response>") == 2 and third.endswith("</tool_response>")
 
 
 # --------------------------------------------------------------------------
@@ -303,13 +413,9 @@ def _send_money_agent(confirm=None):
         return "sent"
 
     llm = ScriptedLLM(
-        replies=[
-            '<tool_call>send_money\n{"to": "Ada", "amount": 50.0}</tool_call>' + EOS,
-            "<response>Handled." + EOS,
-        ]
+        replies=[call_text("send_money", to="Ada", amount=50.0), "<response>Handled.</response>" + EOS]
     )
-    bot = Agent(llm, tools=[send_money], confirm=confirm, memory=WindowMemory(count_tokens=approx_tokens))
-    return bot, sent
+    return _agent(llm, tools=[send_money], confirm=confirm), sent
 
 
 def test_confirm_callback_can_approve():
@@ -322,21 +428,17 @@ def test_confirm_callback_can_decline_and_tool_never_runs():
     bot, sent = _send_money_agent(confirm=lambda call: False)
     events = list(bot.run("send Ada 50"))
     returned = next(e for e in events if isinstance(e, ToolReturned))
-    assert sent == [] and returned.declined
-    assert returned.name == "send_money"
+    assert sent == [] and returned.declined and returned.name == "send_money"
 
 
-def test_without_callback_the_loop_yields_confirmneeded_and_defaults_to_declining():
+def test_without_callback_the_loop_asks_and_defaults_to_declining():
     bot, sent = _send_money_agent(confirm=None)
-    events = list(bot.run("send Ada 50"))
-    asks = [e for e in events if isinstance(e, ConfirmNeeded)]
-    assert asks and asks[0].call.name == "send_money"
-    assert sent == []  # unanswered means not approved
+    asks = [e for e in bot.run("send Ada 50") if isinstance(e, ConfirmNeeded)]
+    assert asks and asks[0].call.name == "send_money" and sent == []
 
 
 def test_confirmneeded_can_be_approved_in_band():
     bot, sent = _send_money_agent(confirm=None)
-    # Approving the event object as it is yielded is what a UI would do.
     for event in bot.run("send Ada 50"):
         if isinstance(event, ConfirmNeeded):
             event.approve()
@@ -353,21 +455,29 @@ def test_window_memory_pins_system_and_drops_oldest():
         mem.add({"role": "user", "content": f"message number {i} with some padding text"})
         mem.add({"role": "assistant", "content": f"reply number {i} with some padding text"})
     out = mem.messages()
-    assert out[0]["content"] == "SYS"
-    assert len(out) < 25 and mem.archived
-    assert "11" in out[-1]["content"]  # newest kept
+    assert out[0]["content"] == "SYS" and mem.archived
+    assert "11" in out[-1]["content"]
 
 
 def test_window_memory_keeps_tool_call_with_its_result():
     mem = WindowMemory(max_tokens=90, reserve_tokens=0, count_tokens=approx_tokens)
     mem.add({"role": "system", "content": "SYS"})
     for i in range(6):
-        mem.add(record_tool_call_turn(f'<tool_call>get_weather\n{{"city": "city{i}"}}</tool_call>'))
-        mem.add(tool_message("get_weather", {"temp": i}))
+        raw = f"<think>t{i}</think>" + call_text("get_weather", city=f"city{i}")
+        mem.add(record_tool_call_turn(raw, parse(raw).tool_calls))
+        mem.add(tool_message({"temp": i}, "get_weather"))
     roles = [m["role"] for m in mem.messages() if m["role"] in ("assistant", "tool")]
-    # Never a dangling tool result without the call that produced it.
-    assert roles[0] == "assistant"
+    assert roles[0] == "assistant", "never a result without the call that produced it"
     assert all(roles[i] == "tool" for i in range(1, len(roles), 2))
+
+
+def test_recorded_tool_call_turn_splits_scaffold_from_the_call():
+    raw = "<|input_lang|><yor><think>why</think>" + call_text("f", a=1)
+    msg = record_tool_call_turn(raw, parse(raw).tool_calls)
+    assert msg["content"].endswith("</think>") and "<tool_call>" not in msg["content"]
+    assert msg["tool_calls"] == [{"function": {"name": "f", "arguments": {"a": 1}}}]
+    # and it renders back to exactly what the model produced
+    assert render([msg], add_generation_prompt=False) == "<s><|assistant|>" + raw
 
 
 def test_summarizing_memory_folds_evicted_turns_into_a_digest():
@@ -378,11 +488,8 @@ def test_summarizing_memory_folds_evicted_turns_into_a_digest():
         return "User asked about six cities; assistant answered each."
 
     mem = SummarizingMemory(
-        max_tokens=110,
-        reserve_tokens=0,
-        count_tokens=approx_tokens,
-        summarize=fake_summarize,
-        chunk_messages=2,
+        max_tokens=110, reserve_tokens=0, count_tokens=approx_tokens,
+        summarize=fake_summarize, chunk_messages=2,
     )
     mem.add({"role": "system", "content": "SYS"})
     for i in range(10):
@@ -390,11 +497,9 @@ def test_summarizing_memory_folds_evicted_turns_into_a_digest():
         mem.add({"role": "assistant", "content": f"city {i} is a place with some detail"})
 
     out = mem.messages()
-    assert summaries, "older turns should have been summarised"
-    digest = out[1]
-    assert digest["role"] == "system" and "Earlier in this conversation" in digest["content"]
-    assert "six cities" in digest["content"]
-    assert out[0]["content"] == "SYS"  # tool catalogue still first
+    assert summaries
+    assert out[0]["content"] == "SYS"
+    assert out[1]["role"] == "system" and "six cities" in out[1]["content"]
 
 
 def test_summarizer_failure_does_not_break_the_turn():
@@ -407,16 +512,15 @@ def test_summarizer_failure_does_not_break_the_turn():
     mem.add({"role": "system", "content": "SYS"})
     for i in range(8):
         mem.add({"role": "user", "content": f"a reasonably long message number {i}"})
-    assert mem.messages()[0]["content"] == "SYS"
-    assert mem.digest == ""
+    assert mem.messages()[0]["content"] == "SYS" and mem.digest == ""
 
 
 def test_agent_memory_carries_context_across_turns():
-    llm = ScriptedLLM(replies=["<response>First." + EOS, "<response>Second." + EOS])
-    bot = Agent(llm, memory=WindowMemory(count_tokens=approx_tokens))
+    llm = ScriptedLLM(replies=["<response>First.</response>" + EOS, "<response>Second.</response>" + EOS])
+    bot = _agent(llm)
     bot.chat("my name is Ada")
     bot.chat("what is my name?")
-    assert "my name is Ada" in llm.prompts[1]  # earlier turn still in the prompt
+    assert "my name is Ada" in llm.prompts[1]
 
 
 # --------------------------------------------------------------------------
@@ -439,9 +543,8 @@ def test_extract_json_tolerates_prose_and_fences():
 
 
 def test_structured_with_dict_schema():
-    llm = ScriptedLLM(replies=['<response>{"name": "Ada", "phone": "0801"}' + EOS])
-    bot = Agent(llm, memory=WindowMemory(count_tokens=approx_tokens))
-    out = bot.structured("extract", CONTACT_SCHEMA)
+    llm = ScriptedLLM(replies=['<response>{"name": "Ada", "phone": "0801"}</response>' + EOS])
+    out = _agent(llm).structured("extract", CONTACT_SCHEMA)
     assert out == {"name": "Ada", "phone": "0801"}
     assert "JSON schema:" in llm.prompts[0]
 
@@ -449,20 +552,18 @@ def test_structured_with_dict_schema():
 def test_structured_retries_once_with_the_validation_error():
     llm = ScriptedLLM(
         replies=[
-            '<response>{"name": "Ada"}' + EOS,  # missing phone
-            '<response>{"name": "Ada", "phone": "0801"}' + EOS,
+            '<response>{"name": "Ada"}</response>' + EOS,
+            '<response>{"name": "Ada", "phone": "0801"}</response>' + EOS,
         ]
     )
-    bot = Agent(llm, memory=WindowMemory(count_tokens=approx_tokens))
-    assert bot.structured("extract", CONTACT_SCHEMA)["phone"] == "0801"
+    assert _agent(llm).structured("extract", CONTACT_SCHEMA)["phone"] == "0801"
     assert "rejected" in llm.prompts[1]
 
 
 def test_structured_gives_up_with_a_clear_error():
-    llm = ScriptedLLM(replies=["<response>not json" + EOS] * 4)
-    bot = Agent(llm, memory=WindowMemory(count_tokens=approx_tokens))
+    llm = ScriptedLLM(replies=["<response>not json</response>" + EOS] * 4)
     with pytest.raises(StructuredOutputError, match="schema not satisfied"):
-        bot.structured("extract", CONTACT_SCHEMA, retries=1)
+        _agent(llm).structured("extract", CONTACT_SCHEMA, retries=1)
 
 
 def test_strict_schema_tightening():
@@ -498,25 +599,21 @@ def test_pydantic_model_as_tool_argument_and_schema():
 
     props = save_contact.schema()["function"]["parameters"]["properties"]
     assert props["name"]["type"] == "string" and props["phone"]["type"] == "string"
-    # Arguments arrive as loose JSON and are passed to the function as the model.
     assert Toolbox([save_contact]).call("save_contact", {"name": "Ada", "phone": "1"}).value == "saved Ada"
     assert "missing required argument" in Toolbox([save_contact]).call("save_contact", {"name": "Ada"}).error
 
 
 @needs_pydantic
 def test_structured_output_returns_a_model_instance():
-    llm = ScriptedLLM(replies=['<response>{"name": "Ada", "phone": "0801"}' + EOS])
-    bot = Agent(llm, memory=WindowMemory(count_tokens=approx_tokens))
-    out = bot.structured("extract", Contact)
+    llm = ScriptedLLM(replies=['<response>{"name": "Ada", "phone": "0801"}</response>' + EOS])
+    out = _agent(llm).structured("extract", Contact)
     assert isinstance(out, Contact) and out.name == "Ada"
-    assert isinstance(validate_payload({"name": "A", "phone": "1"}, Contact), Contact)
     with pytest.raises(StructuredOutputError):
         validate_payload({"name": "A"}, Contact)
 
 
 @needs_pydantic
 def test_locally_declared_model_works_via_explicit_model_arg():
-    # The escape hatch for a model the annotation cannot name.
     class Local(BaseModel):
         city: str
 

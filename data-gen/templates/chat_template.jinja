@@ -1,44 +1,76 @@
+{#- SabiYarn chat template.
+
+   One assistant TURN runs from <|assistant|> to </s>. Tool use happens INSIDE that turn:
+
+     <|assistant|><scaffold><tool_call>{"name": "f", "arguments": {...}}</tool_call><tool_response>RESULT</tool_response><scaffold><response>ANSWER</response></s>
+
+   * a tool call is one parseable JSON object {"name": ..., "arguments": {...}} inside <tool_call>..</tool_call> (arguments may also arrive as a JSON string);
+   * </tool_call> ends what the model generates: the serving loop stops there (it is registered as a stop token), runs the tool, and appends
+     <tool_response>RESULT</tool_response> -- which is NOT written by the model and is masked from the loss -- then lets the model continue the SAME turn
+     (no new <|assistant|>, no </s> in between). The turn's single </s> comes after the final answer;
+   * the tool result carries no function name: results answer the calls above them, in order;
+   * function definitions are passed as `tools` (a list of {"type": "function", "function": {name, description, parameters}}) and rendered once, in the
+     system turn, as <tools>\n{json}\n{json}\n</tools> (one compact JSON object per line).
+-#}
+{%- set tools_text = "" -%}
+{%- if tools is defined and tools -%}
+    {%- set ns = namespace(t="<tools>") -%}
+    {%- for tool in tools -%}
+        {%- set ns.t = ns.t ~ "\n" ~ (tool | tojson) -%}
+    {%- endfor -%}
+    {%- set tools_text = ns.t ~ "\n</tools>" -%}
+{%- endif -%}
 {%- for message in messages %}
     {%- if loop.index0 == 0 %}
         {{- bos_token -}}
+        {#- functions given but no system message: the tools still get their own system turn -#}
+        {%- if tools_text and message['role'] != 'system' %}
+            {{- "<|system|>" ~ tools_text ~ eos_token -}}
+        {%- endif %}
     {%- endif %}
     {# ===== SYSTEM MESSAGES ===== #}
     {%- if message['role'] == 'system' %}
         {{- "<|system|>" -}}
         {{- message['content'] -}}
+        {%- if tools_text %}
+            {{- ("\n\n" if message['content'] else "") ~ tools_text -}}
+        {%- endif %}
         {{- eos_token -}}
     {# ===== USER MESSAGES ===== #}
     {%- elif message['role'] == 'user' %}
         {{- "<|user|>" -}}
         {{- message['content'] -}}
         {{- eos_token -}}
-    {# ===== TOOL RESPONSES ===== #}
+    {# ===== TOOL RESULTS: only what the function returned, inside the model's own turn (no </s>, no name) ===== #}
     {%- elif message['role'] == 'tool' %}
         {{- "<tool_response>" -}}
-        {{- message['name'] ~ " " if message['name'] else "" -}}
         {{- message['content'] -}}
         {{- "</tool_response>" -}}
-        {{- eos_token -}}
-    {# ===== ASSISTANT MESSAGES — NORMAL OR WITH TOOL CALL ===== #}
+    {# ===== ASSISTANT MESSAGES ===== #}
     {%- elif message['role'] == 'assistant' %}
-        {{- "<|assistant|>" -}}
-        {# CASE 1 — assistant text only #}
-        {%- if 'tool_calls' not in message %}
+        {#- the message after a tool result continues the same turn -#}
+        {%- if loop.previtem is not defined or loop.previtem['role'] != 'tool' %}
+            {{- "<|assistant|>" -}}
+        {%- endif %}
+        {%- if message['content'] is defined and message['content'] %}
             {{- message['content'] -}}
-            {{- eos_token -}}
-        {# CASE 2 — assistant performs tool call #}
-        {%- else %}
+        {%- endif %}
+        {%- if message['tool_calls'] is defined and message['tool_calls'] %}
             {%- for tool_call in message['tool_calls'] %}
-                {{- "<tool_call>" -}}
-                {{- tool_call['function']['name'] -}}
-                {{- "\n" -}}
-                {{- tool_call['function']['arguments'] | tojson -}}
-                {{- "</tool_call>" -}}
-                {{- eos_token -}}
+                {%- set fn = tool_call['function'] if tool_call['function'] is defined else tool_call %}
+                {{- '<tool_call>{"name": ' ~ (fn['name'] | tojson) ~ ', "arguments": ' -}}
+                {%- if fn['arguments'] is string %}
+                    {{- fn['arguments'] -}}
+                {%- else %}
+                    {{- fn['arguments'] | tojson -}}
+                {%- endif %}
+                {{- '}</tool_call>' -}}
             {%- endfor %}
+        {%- else %}
+            {{- eos_token -}}
         {%- endif %}
     {%- endif %}
 {%- endfor %}
-{%- if add_generation_prompt %}
+{%- if add_generation_prompt and messages[-1]['role'] != 'tool' %}
     {{- "<|assistant|>" -}}
 {%- endif %}

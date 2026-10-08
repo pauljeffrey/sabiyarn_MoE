@@ -16,7 +16,7 @@ from . import (
     Agent, ConfirmNeeded, Delta, Failed, Final, HFBackend, ScriptedLLM, Think, ToolCalled,
     ToolReturned, tool,
 )
-from .protocol import EOS
+from .protocol import EOS, render_tool_call
 
 # --- tools ------------------------------------------------------------------
 # Names and descriptions mirror data-gen/seeds/build_seeds.py's catalogue, so a
@@ -134,11 +134,14 @@ def main() -> None:
     if args.dry_run:
         llm = ScriptedLLM(
             replies=[
+                # Step 1 ends at </tool_call> with NO </s>: the turn continues
+                # after the tool result (chat template v2).
                 "<|input_lang|><eng><think>I need live weather data.</think>"
                 "<task_plan><|RAG|></task_plan>"
-                '<tool_call>get_weather_forecast\n{"city": "Lagos"}</tool_call>' + EOS,
-                "<task_plan><|explain|></task_plan>"
-                "<response>It should reach 31C in Lagos today, humid with scattered showers." + EOS,
+                + render_tool_call("get_weather_forecast", {"city": "Lagos"}),
+                # Step 2 is the continuation of the SAME turn, and closes it.
+                "<|input_lang|><eng><task_plan><|explain|></task_plan><|target_lang|><eng>"
+                "<response>It should reach 31C in Lagos today, humid with scattered showers.</response>" + EOS,
             ]
         )
     else:

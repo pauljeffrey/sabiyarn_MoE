@@ -53,9 +53,11 @@ from agent import Agent, ScriptedLLM, tool
 from agent.protocol import EOS
 
 llm = ScriptedLLM(replies=[
+    # step 1 ends at </tool_call>, with no </s>: the turn continues
     '<think>need live data</think><task_plan><|RAG|></task_plan>'
-    '<tool_call>get_weather\n{"city": "Lagos"}</tool_call>' + EOS,
-    '<response>It is 31C in Lagos.' + EOS,
+    '<tool_call>{"name": "get_weather", "arguments": {"city": "Lagos"}}</tool_call>',
+    # step 2 continues the same turn and closes it
+    '<response>It is 31C in Lagos.</response>' + EOS,
 ])
 Agent(llm, tools=[get_weather]).chat("weather in Lagos?")
 ```
@@ -64,13 +66,18 @@ Agent(llm, tools=[get_weather]).chat("weather in Lagos?")
 
 ```
 user message
-   -> render history + tool catalogue to training-format text
-   -> generate (stops at </s>, </tool_call>, or a role marker)
-   -> no tool call?  -> Final
-   -> tool call?     -> validate args -> confirm if required -> run
-                     -> append <tool_response> -> generate again
+   -> render history, with tool schemas passed as tools= (a <tools> block)
+   -> generate (stops at </tool_call> or </s>)
+   -> ended at </s>?         -> the turn is done -> Final
+   -> ended at </tool_call>? -> validate args -> confirm if required -> run
+                             -> append <tool_response>RESULT</tool_response>
+                             -> re-render (NO new <|assistant|>) and generate
+                                again: the model continues the SAME turn
    -> after max_rounds without an answer -> Failed
 ```
+
+Each round is one step of a single assistant turn, so `Final.turn` is parsed
+from the whole turn's text, not just the last step.
 
 `chat()` returns the answer text. `run()` yields events as they happen:
 
@@ -96,48 +103,55 @@ branch on mode.
 
 ## The format contract
 
-Matches the training corpus, and is pinned byte-for-byte against
-`sabiyarn/chat_template.jinja` by `tests/test_agent_render_parity.py`.
+Chat template **v2**. Source of truth: `sabiyarn/chat_template.jinja`, with the
+full contract in [docs/TOOL_CALL_FORMAT.md](../docs/TOOL_CALL_FORMAT.md). This
+renderer is pinned against that template byte-for-byte by
+`tests/test_agent_render_parity.py` (32 cases).
+
+**One assistant turn runs from `<|assistant|>` to `</s>`, and tool use happens
+inside it:**
+
+```
+<|assistant|>SCAFFOLD<tool_call>{"name": "f", "arguments": {...}}</tool_call><tool_response>RESULT</tool_response>SCAFFOLD<response>ANSWER</response></s>
+```
 
 | | |
 |---|---|
-| roles | `<\|system\|>` `<\|user\|>` `<\|assistant\|>`, every turn closed by `</s>` |
-| tool call | `<tool_call>name\n{"arg": "value"}</tool_call>` (JSON, `{"city": "Lagos"}` spacing) |
-| tool result | `<tool_response>name payload</tool_response>` |
-| reasoning | `<think>…</think>` (English by convention, not for the user) |
-| plan | `<task_plan><\|RAG\|><\|explain\|></task_plan>` — verbs from `VALID_VERBS` |
-| answer | `<response>…` — **no closing tag**, it runs to `</s>` |
-| tool schemas | OpenAI function JSON, compact, as plain text in the system turn |
+| roles | `<\|system\|>` `<\|user\|>` `<\|assistant\|>` |
+| tool call | `<tool_call>{"name": "f", "arguments": {...}}</tool_call>` — one JSON object (Hermes/Qwen shape); `arguments` may be a JSON string |
+| end of a call | **no `</s>`** — `</tool_call>` is the last thing the model generates in that step |
+| tool result | `<tool_response>text</tool_response>` — **no function name, no `</s>`** |
+| continuation | the text after a result has **no new `<\|assistant\|>`**; the turn has exactly one `</s>`, after the answer |
+| scaffold | `<\|input_lang\|><yor>`, optional `<think>…</think>`, `<task_plan><\|RAG\|></task_plan>` — written before the call, and **again** after the result |
+| answer | `<response>…</response>` (closing tag optional in pre-v2 data) |
+| tool schemas | passed as `tools=` and rendered once as `<tools>\n{json}\n{json}\n</tools>` in the system turn |
 
-`<tool_response>` and `<task_plan>` are single tokens in the tokenizer
-(52037/52040). Do not invent tags: `<tool_result>` is *not* in the vocab and
-costs ~5 byte-BPE tokens per tag.
+Four consequences the framework is built around:
 
-### Why tool-call turns are recorded content-only
+1. **`</tool_call>` is the stop.** The loop stops there, runs the tool, appends
+   the result, and lets the model continue the same turn.
+2. **One call per step.** Because `</tool_call>` stops generation, a rollout
+   halts after the first call, and nothing is trained to follow the last one.
+   Sequential calls are the supported pattern — the loop does several rounds,
+   all inside one turn.
+3. **Tool results carry no name** and are masked from the loss; results answer
+   the calls above them, in order.
+4. **A tool-call turn is recorded as scaffold + structured call**, via
+   `record_tool_call_turn()` — `content` keeps the scaffold, `tool_calls` the
+   call. Recording the raw text as content-only would make the template close
+   the turn with `</s>` between the call and its result, a shape the model never
+   saw. (This is the opposite of what v1 required.)
 
-Two facts about this stack, both of which the loop is built around:
+JSON is rendered with `json.dumps(ensure_ascii=False)` and key order preserved,
+matching `transformers`' `tojson` exactly. Sorted keys or `\uXXXX` escapes would
+make training text and inference text differ on precisely the Yorùbá queries.
 
-1. **The model emits tool calls inline**, inside one assistant turn:
-   `<think>…</think><task_plan>…</task_plan><tool_call>name\n{json}</tool_call>`.
-   So the loop parses *text*; it never reads a structured `tool_calls` field
-   back from the model.
-2. **The chat template drops `message['content']` when `tool_calls` is present.**
-   So a tool-calling turn goes back into history as content-only
-   (`protocol.record_tool_call_turn`). Passing `tool_calls` instead would delete
-   the `<think>`/`<task_plan>` prefix from the next prompt, showing the model a
-   shape it never saw. `data-gen/postprocess_gen.py` re-appends the call to
-   content for the same reason.
-
-> **Known pipeline mismatch (not this package's doing).** SFT trains on the
-> rendered `text` column (`data/prepare.py:188` → `render_messages`), so for a
-> tool-calling turn the model is trained on `<|assistant|><tool_call>…</tool_call></s>`
-> with **no** think and **no** task_plan — while `build_seeds.py`'s
-> `ASSISTANT_FORMAT["tool_call"]` specifies both and
-> `rl/verifiers.py::think_precedes_tool_call` rewards them. If you fix the
-> template to emit content *and* the calls, re-rendering the corpus is free
-> (`text` is derived from `messages`), and this package's recording becomes
-> byte-identical to the training text. Until then it parses both shapes, so
-> nothing here breaks either way.
+> **Two pending items** from `docs/TOOL_CALL_FORMAT.md` §6 that affect serving,
+> neither of which this package depends on: `<tools>`/`</tools>` are not yet
+> tokens (52117/52118 — they render and parse fine meanwhile, just at more
+> tokens), and `</tool_call>` is not yet in the served model's
+> `generation_config.eos_token_id`. `HFBackend` passes it as a `stop_strings`
+> argument on every call, so stopping works regardless of that config.
 
 ## Tools
 

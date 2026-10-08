@@ -1,16 +1,26 @@
-"""The agent loop: render -> generate -> run tools -> feed results back -> answer.
+"""The agent loop: render -> generate -> run the tool -> continue the SAME turn.
 
-    from agent import Agent, Toolbox, tool
+    from agent import Agent, HFBackend, tool
 
     @tool
     def get_weather(city: str) -> dict:
         "Current weather for a city."
         return {"city": city, "temp": 31}
 
-    bot = Agent(llm, tools=[get_weather])
-    print(bot.chat("What's the weather in Lagos?"))        # non-streaming
-    for ev in bot.run("And in Kano?"):                     # streaming + events
-        ...
+    bot = Agent(HFBackend(model, tok), tools=[get_weather])
+    print(bot.chat("What's the weather in Lagos?"))
+
+Implements the serving contract in docs/TOOL_CALL_FORMAT.md section 4:
+
+    1. prompt = render(messages, tools=..., add_generation_prompt=True); after a
+       tool result the prompt ends in </tool_response> and the model continues
+       its turn with no new <|assistant|>;
+    2. generate with stop [</s>, </tool_call>]; ending at </tool_call> means
+       parse the JSON call, run it, append the assistant message (scaffold +
+       the call) and the tool result, re-render and continue; ending at </s>
+       means the turn is done;
+    3. one call per step -- </tool_call> is a stop, so a rollout halts after the
+       first call and nothing is trained to follow the last one.
 """
 
 from __future__ import annotations
@@ -35,14 +45,14 @@ ConfirmFn = Callable[[P.ParsedCall], bool]
 class _Visible:
     """Decide what of the raw stream the user should see.
 
-    Everything is suppressed until `<response>` appears; after that, text
-    streams through. A tail that could be the start of a tag is held back, so a
-    partial "<resp" never reaches a UI. If the turn never emits <response> (a
-    pure tool call, or a malformed turn), nothing is shown -- the agent surfaces
-    the parsed result instead.
+    Everything is suppressed until <response> appears; after that, text streams
+    through until </response> (or EOS). A tail that could be the start of a tag
+    is held back, so a partial "</resp" never reaches a UI. A step that produces
+    only a tool call shows nothing, which is correct: the answer comes after the
+    tool result, in the continuation of the same turn.
     """
 
-    def __init__(self, hold: int = len(P.RESPONSE_OPEN)) -> None:
+    def __init__(self, hold: int = len(P.RESPONSE_CLOSE)) -> None:
         self.hold = hold
         self.raw = ""
         self.open = False
@@ -56,25 +66,25 @@ class _Visible:
                 return ""
             self.open = True
             self.emitted = i + len(P.RESPONSE_OPEN)
-        body = self.raw[self.emitted :]
-        for tag in (P.EOS, P.TOOL_CALL_OPEN, P.USER):
-            cut = body.find(tag)
-            if cut != -1:
-                body = body[:cut]
+        body = self._body()
         if len(body) > self.hold:
             out = body[: -self.hold]
             self.emitted += len(out)
             return out
         return ""
 
-    def flush(self) -> str:
-        if not self.open:
-            return ""
+    def _body(self) -> str:
         body = self.raw[self.emitted :]
-        for tag in (P.EOS, P.TOOL_CALL_OPEN, P.USER):
+        for tag in (P.RESPONSE_CLOSE, P.EOS, P.TOOL_CALL_OPEN, P.USER):
             cut = body.find(tag)
             if cut != -1:
                 body = body[:cut]
+        return body
+
+    def flush(self) -> str:
+        if not self.open:
+            return ""
+        body = self._body()
         self.emitted += len(body)
         return body
 
@@ -84,9 +94,10 @@ class Agent:
     """Conversation plus tools plus memory.
 
     llm       anything implementing .stream()/.complete() (see llm.LLM)
-    tools     Toolbox, or any iterable of @tool functions
+    tools     Toolbox, or any iterable of @tool functions; rendered into the
+              system turn as a <tools> block by the template, via `tools=`
     memory    defaults to SummarizingMemory sized for a 4096-token context
-    identity  first sentence of the system prompt; the tool catalogue follows it
+    identity  the system message text; the <tools> block is appended to it
     confirm   called for tools marked requires_confirmation; return True to run.
               Without it, run() yields ConfirmNeeded and declines by default.
     """
@@ -100,8 +111,6 @@ class Agent:
     confirm: ConfirmFn | None = None
     max_new_tokens: int = 512
     stop: Sequence[str] = P.STOP_STRINGS
-    # Retry once when a tool call's arguments will not parse: the model is told
-    # what was wrong, which recovers far more often than failing the turn.
     repair_bad_arguments: bool = True
 
     def __post_init__(self) -> None:
@@ -116,19 +125,23 @@ class Agent:
         self._install_system()
 
     # -- setup --------------------------------------------------------------
-    def _system_text(self) -> str:
-        text = P.format_tools(self.tools.schemas(), self.identity)
-        return f"{text}\n{self.system_extra}" if self.system_extra else text
-
     def _install_system(self, extra: str = "") -> None:
-        base = self._system_text()
-        content = f"{base}\n{extra}" if extra else base
+        """Set the system turn. Tool schemas are NOT written in here: they are
+        passed to the renderer as `tools=` and become the <tools> block, which
+        is what the template and the training data expect."""
+        parts = [self.identity, self.system_extra, extra]
+        content = "\n".join(p for p in parts if p)
         self.memory.add(P.system_message(content))  # type: ignore[union-attr]
 
+    def _tool_schemas(self) -> list[dict[str, Any]]:
+        return self.tools.schemas()  # type: ignore[union-attr]
+
+    def _render(self, messages: Sequence[dict[str, Any]]) -> str:
+        return P.render(messages, tools=self._tool_schemas(), add_generation_prompt=True)
+
     def _summarize(self, prompt: str) -> str:
-        """Used by SummarizingMemory. Greedy and short: a digest should be
-        reproducible, and sampling here would make the same history summarise
-        differently on every turn."""
+        """Used by SummarizingMemory. Greedy, and with no tools attached: a
+        digest should be reproducible, and the catalogue is irrelevant to it."""
         return self.llm.complete(
             P.render([P.user_message(prompt)], add_generation_prompt=True),
             stop=[P.EOS],
@@ -137,10 +150,7 @@ class Agent:
         ).replace(P.EOS, "").strip()
 
     def add_tool(self, t: Tool | Callable[..., Any]) -> Tool:
-        """Register a tool and refresh the system prompt so the model sees it."""
-        added = self.tools.add(t)  # type: ignore[union-attr]
-        self._install_system()
-        return added
+        return self.tools.add(t)  # type: ignore[union-attr]
 
     def reset(self) -> None:
         memory = self.memory
@@ -150,7 +160,6 @@ class Agent:
 
     # -- public API ---------------------------------------------------------
     def chat(self, message: str, **kw: Any) -> str:
-        """Run to completion and return the answer text."""
         text = ""
         for ev in self.run(message, **kw):
             if isinstance(ev, (Final, Failed)):
@@ -158,12 +167,7 @@ class Agent:
         return text
 
     def structured(self, message: str, schema: Any, *, retries: int = 1, **kw: Any) -> Any:
-        """Ask for schema-conforming JSON and return the validated object.
-
-        On a validation failure the schema error is fed back once (by default),
-        which is cheaper and more reliable than asking a small model to get
-        nested JSON right first time.
-        """
+        """Ask for schema-conforming JSON and return the validated object."""
         instruction = schema_instruction(schema)
         attempt, last_error = 0, None
         while attempt <= retries:
@@ -188,63 +192,78 @@ class Agent:
     ) -> Iterator[Event]:
         """Drive one user turn, yielding events until Final or Failed.
 
-        Always a generator. With stream=False the model's text arrives in one
-        Delta instead of many; the event sequence is otherwise identical, so
-        callers do not branch on mode.
+        Always a generator. With stream=False the answer arrives in one Delta;
+        the event sequence is otherwise identical, so callers do not branch.
         """
         if system_extra:
             self._install_system(system_extra)
         if message is not None:
             self.memory.add(P.user_message(message))  # type: ignore[union-attr]
 
+        # Text the model has produced across this turn, including the parts
+        # written before each tool call -- a turn can span several generate
+        # calls, and the answer is parsed from the whole thing.
+        turn_text = ""
+
         for round_index in range(self.max_rounds):
             messages = self.memory.messages()  # type: ignore[union-attr]
-            prompt = P.render(messages, add_generation_prompt=True)
+            prompt = self._render(messages)
             yield RoundStarted(round=round_index, prompt_tokens=self._count(prompt))
 
             try:
                 raw, deltas = self._generate(prompt, stream, max_new_tokens, gen_kw)
             except Exception as exc:
-                yield Failed(reason=f"{type(exc).__name__}: {exc}")
+                yield Failed(reason=f"{type(exc).__name__}: {exc}", text=P.parse_assistant(turn_text).text)
                 return
             for chunk in deltas:
                 yield Delta(chunk)
 
-            turn = P.parse_assistant(raw)
-            if turn.think:
-                yield Think(turn.think)
-            if turn.task_plan:
-                yield Plan(turn.task_plan, turn.invalid_verbs)
+            turn_text += raw
+            step = P.parse_assistant(raw)
+            if step.think:
+                yield Think(step.think)
+            if step.task_plan:
+                yield Plan(step.task_plan, step.invalid_verbs)
 
-            if not turn.wants_tool:
-                if turn.truncated_tool_call:
-                    # A call cut off mid-JSON: nothing to execute and nothing to
-                    # show. Say so rather than presenting half a tag as an answer.
+            if not step.wants_tool:
+                if step.truncated_tool_call:
                     yield Failed(
                         reason="tool call was cut off by the token budget; raise max_new_tokens",
-                        text=turn.text,
-                        turn=turn,
+                        text=step.text,
+                        turn=step,
                     )
                     return
+                # End of the turn: one assistant message, content only, which is
+                # what makes the template close it with a single </s>.
                 self.memory.add({"role": "assistant", "content": raw})  # type: ignore[union-attr]
-                yield Final(text=turn.text, turn=turn, rounds=round_index + 1)
+                whole = P.parse_assistant(turn_text)
+                yield Final(text=whole.text, turn=whole, rounds=round_index + 1)
                 return
 
-            # The model asked for tools. Record the turn verbatim (content-only)
-            # so the next prompt keeps the <think>/<task_plan> prefix.
-            self.memory.add(P.record_tool_call_turn(raw))  # type: ignore[union-attr]
+            # A tool was requested. Record scaffold + structured call (NOT the
+            # raw text: an assistant message without tool_calls would close the
+            # turn with </s>, which the model never saw mid-exchange).
+            self.memory.add(P.record_tool_call_turn(raw, step.tool_calls))  # type: ignore[union-attr]
 
-            for call in turn.tool_calls:
+            # One call per step: </tool_call> is a stop, so there is normally
+            # exactly one. Extra calls are executed in order if a backend
+            # without stop support produced several.
+            for call in step.tool_calls:
                 yield ToolCalled(call.name, call.arguments or {}, call.raw_arguments)
                 result = yield from self._execute(call)
                 yield ToolReturned(result.name, result.value, result.error, result.declined)
-                self.memory.add(P.tool_message(call.name, result.payload()))  # type: ignore[union-attr]
+                self.memory.add(P.tool_message(result.payload(), call.name))  # type: ignore[union-attr]
 
-        yield Failed(reason=f"stopped after {self.max_rounds} rounds without a final answer")
+        whole = P.parse_assistant(turn_text)
+        yield Failed(
+            reason=f"stopped after {self.max_rounds} rounds without a final answer",
+            text=whole.text,
+            turn=whole,
+        )
 
     def resume(self, **kw: Any) -> Iterator[Event]:
-        """Continue after tool results were added out of band (or after a
-        ConfirmNeeded was answered): same loop, no new user message."""
+        """Continue with no new user message -- after tool results were added
+        out of band, or after a ConfirmNeeded was answered."""
         return self.run(None, **kw)
 
     # -- internals ----------------------------------------------------------
@@ -258,11 +277,11 @@ class Agent:
     def _generate(
         self, prompt: str, stream: bool, max_new_tokens: int | None, gen_kw: dict[str, Any]
     ) -> tuple[str, list[str]]:
-        """Produce the raw turn text plus the user-visible chunks to emit."""
+        """Produce this step's raw text plus the user-visible chunks to emit."""
         budget = max_new_tokens or self.max_new_tokens
         if not stream:
             raw = self.llm.complete(prompt, stop=self.stop, max_new_tokens=budget, **gen_kw)
-            visible = P.parse_assistant(raw).text
+            visible = P.parse_assistant(raw).text if P.RESPONSE_OPEN in raw else ""
             return raw, [visible] if visible else []
 
         view = _Visible()
@@ -281,11 +300,11 @@ class Agent:
         confirm callback is configured, so a UI can answer in-band."""
         from .tools import ToolResult
 
-        if call.arguments is None:
-            detail = call.error or "arguments did not parse"
+        if call.arguments is None or not call.name:
+            detail = call.error or "the tool call did not parse"
             if self.repair_bad_arguments:
-                detail += ". Re-issue the call with valid JSON arguments."
-            return ToolResult(name=call.name, error=detail)
+                detail += '. Re-issue it as {"name": "...", "arguments": {...}}.'
+            return ToolResult(name=call.name or "unknown", error=detail)
 
         if call.name not in self.tools:  # type: ignore[operator]
             known = ", ".join(self.tools.names) or "none"  # type: ignore[union-attr]
