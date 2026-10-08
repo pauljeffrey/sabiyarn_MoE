@@ -51,6 +51,7 @@ class Passage:
     text: str
     score: float = 0.0
     lang: str = ""
+    url: str = ""
 
     def words(self) -> int:
         return len(self.text.split())
@@ -64,7 +65,7 @@ class Retriever(Protocol):
 
 
 def split_passages(text: str, *, target_words: int = 110, doc_id: str = "", title: str = "",
-                   lang: str = "") -> list[Passage]:
+                   lang: str = "", url: str = "") -> list[Passage]:
     """Split on the document's own headings, then pack paragraphs up to `target_words`.
 
     Paragraph-level, not sentence-level: a sentence ripped out of a paragraph loses the referent of every
@@ -80,7 +81,7 @@ def split_passages(text: str, *, target_words: int = 110, doc_id: str = "", titl
         nonlocal buf, n
         if buf:
             out.append(Passage(id=f"p{len(out) + 1}", doc_id=doc_id, title=title, section=section,
-                               text="\n".join(buf).strip(), lang=lang))
+                               text="\n".join(buf).strip(), lang=lang, url=url))
         buf, n = [], 0
 
     for block in re.split(r"\n\s*\n", text or ""):
@@ -127,8 +128,13 @@ class LocalRetriever:
                 except ValueError:
                     continue
                 doc_id = str(d.get("pageid") or d.get("doc_id") or i)
+                # `doc_lang`, not `lang` -- the pool carries 2,813 language-tagged documents (yor 548,
+                # som 540, fra 468, hau 450, ibo 446, twi 361, eng 260) harvested from native Wikipedias,
+                # and reading the wrong key made every one of them look untagged.
                 for p in split_passages(d.get("text") or "", target_words=target_words, doc_id=doc_id,
-                                        title=str(d.get("title") or ""), lang=str(d.get("lang") or "")):
+                                        title=str(d.get("title") or ""),
+                                        lang=str(d.get("doc_lang") or d.get("lang") or ""),
+                                        url=str(d.get("url") or "")):
                     p.id = f"{doc_id}#{p.id}"
                     passages.append(p)
         return cls.build(passages)
@@ -168,7 +174,7 @@ class LocalRetriever:
         for s, i in scored[:k]:
             p = self.passages[i]
             hits.append(Passage(p.id, p.doc_id, p.title, p.section, p.text,
-                                score=round(s / (top or 1), 3), lang=p.lang))
+                                score=round(s / (top or 1), 3), lang=p.lang, url=p.url))
         return hits
 
 
@@ -205,7 +211,7 @@ class PineconeRetriever:
         res = self._index.search(
             namespace=self.namespace,
             query={"inputs": {"text": query}, "top_k": k, **({"filter": flt} if flt else {})},
-            fields=["text", "title", "section", "doc_id", "lang"],
+            fields=["text", "title", "section", "doc_id", "lang", "url"],
         )
         d = res.to_dict() if hasattr(res, "to_dict") else dict(res)
         out = []
@@ -220,7 +226,7 @@ class PineconeRetriever:
             out.append(Passage(id=str(pid), doc_id=str(f.get("doc_id") or ""),
                                title=str(f.get("title") or ""), section=str(f.get("section") or ""),
                                text=str(f.get("text") or ""), score=round(float(score), 3),
-                               lang=str(f.get("lang") or "")))
+                               lang=str(f.get("lang") or ""), url=str(f.get("url") or "")))
         return out
 
     # ---- ingest
@@ -277,7 +283,7 @@ class PineconeRetriever:
             if not (p.text or "").strip():
                 continue
             buf.append({"_id": p.id, "text": p.text, "title": p.title, "section": p.section,
-                        "doc_id": p.doc_id, "lang": p.lang or ""})
+                        "doc_id": p.doc_id, "lang": p.lang or "", "url": p.url or ""})
             if len(buf) >= batch:
                 total += flush(buf)
                 batches += 1
@@ -369,3 +375,127 @@ def _ingest_cli() -> None:
 
 if __name__ == "__main__":
     _ingest_cli()
+
+
+# ---------------------------------------------------------------------------- routing and the web
+
+# Languages the Pinecone embedder actually handles. Measured against llama-text-embed-v2 over this corpus:
+# an English query returns the right document at 0.39-0.60 similarity, Pidgin at 0.47 (it is
+# English-lexified), and the same question in Hausa or Yoruba returns the WRONG document at ~0.17 -- the
+# noise floor -- with the right document sitting in the index. So a query in anything else goes to BM25,
+# where exact word overlap with a same-language document is a real signal rather than a dead one.
+EMBEDDABLE = {"eng", "pcm", "fra", ""}
+
+
+@dataclass
+class HybridRetriever:
+    """BM25 for local-language corpora, Pinecone for English. Routed by the LANGUAGE OF THE CORPUS.
+
+    Not by the language of the conversation: a Hausa speaker asking about Nigerian tax law is best served by
+    the English corpus, because that is where the document exists. What the language decides is which INDEX
+    can find it -- and for Hausa or Yoruba text the embedder is blind, so lexical matching against
+    same-language documents is the only thing that works.
+    """
+
+    local: LocalRetriever
+    remote: Optional[Retriever] = None
+    remote_failures: int = 0
+    max_remote_failures: int = 3
+
+    def search(self, query: str, *, k: int = 4, lang: str = "") -> list[Passage]:
+        if lang and lang not in EMBEDDABLE:
+            return self.local.search(query, k=k, lang=lang)
+        if self.remote is not None:
+            try:
+                hits = self.remote.search(query, k=k, lang=lang if lang in EMBEDDABLE else "")
+                if hits:
+                    return hits
+            except Exception as exc:  # noqa: BLE001
+                # A CIRCUIT BREAKER, not a retry. The failure that actually happened was the org's monthly
+                # embedding quota running out mid-run -- 5M tokens for llama-text-embed-v2, against a corpus
+                # that needs ~7.8M to ingest -- and a quota does not come back on the next call. Retrying it
+                # per query would turn one hard stop into thousands of slow ones, so after a few failures
+                # the remote is switched off for the rest of the process and BM25 carries the run.
+                self.remote_failures += 1
+                print(f"  [retrieval] pinecone failed ({type(exc).__name__}), "
+                      f"{self.remote_failures}/{self.max_remote_failures} before falling back to BM25",
+                      flush=True)
+                if self.remote_failures >= self.max_remote_failures:
+                    print("  [retrieval] pinecone disabled for this run; BM25 only", flush=True)
+                    self.remote = None
+        return self.local.search(query, k=k, lang=lang if lang else "")
+
+    def search_many(self, queries: list[tuple[str, str]], *, k: int = 4) -> list[Passage]:
+        """Several (query, lang) pairs, merged and re-ranked.
+
+        The assistant is allowed to issue more than one query because one question often spans two corpora:
+        the figure is in an English document and the local practice is described in a Hausa one. Merging by
+        score keeps the best of each rather than privileging whichever ran first.
+        """
+        seen: dict[str, Passage] = {}
+        for q, lg in queries[:4]:
+            for p in self.search(q, k=k, lang=lg):
+                if p.id not in seen or p.score > seen[p.id].score:
+                    seen[p.id] = p
+        return sorted(seen.values(), key=lambda p: -p.score)[:k]
+
+
+@dataclass
+class Library:
+    """Documents by url, for the FETCH half of a two-step web search."""
+
+    by_url: dict[str, dict] = field(default_factory=dict)
+
+    @classmethod
+    def from_pool(cls, path: Path = _POOL, *, limit: int = 0) -> "Library":
+        by_url: dict[str, dict] = {}
+        if path.exists():
+            for i, line in enumerate(path.open(encoding="utf-8")):
+                if limit and i >= limit:
+                    break
+                try:
+                    d = json.loads(line)
+                except ValueError:
+                    continue
+                if d.get("url"):
+                    by_url[str(d["url"])] = d
+        return cls(by_url=by_url)
+
+    def page(self, url: str, *, max_words: int = 1400) -> str:
+        """A fetched page: the real article, with the clutter a real page carries.
+
+        The clutter is not decoration. A fetched page is a whole article with navigation and a cookie notice
+        in it, and reading past that to the paragraph that answers the question is half of what the sample
+        teaches -- a tidy three-line extract teaches nothing, because no real page looks like that.
+        """
+        d = self.by_url.get(url)
+        if not d:
+            return (f"HTTP 404 -- {url} could not be fetched.\n"
+                    "Nothing was returned for this address.")
+        text = " ".join(str(d.get("text") or "").split()[:max_words])
+        title = str(d.get("title") or "")
+        return (f"{title}\n{'=' * len(title)}\n"
+                f"Home | Contents | Current events | Random article | About\n"
+                f"[This site uses cookies. Accept | Manage preferences]\n\n"
+                f"{text}\n\n"
+                f"Categories: {title} | Retrieved from {url}\n"
+                f"This page was last edited on 14 February 2026.")
+
+
+def search_results(hits: list[Passage], *, library: Optional[Library] = None) -> str:
+    """A SERP, not an answer: title, url, and a snippet per result -- no bodies.
+
+    The two-step is the lesson. A real assistant searches, reads the titles and snippets, decides which
+    result is most likely to hold the answer, and fetches THAT one. Handing back the full text of four
+    documents at once removes the decision, and the decision is the behaviour being taught -- including the
+    chance to pick wrong, which is what makes picking right scoreable.
+    """
+    if not hits:
+        return "No results."
+    out = []
+    for i, p in enumerate(hits, 1):
+        snippet = " ".join(p.text.split()[:28])
+        out.append(f"{i}. {p.title or '(untitled)'}{' > ' + p.section if p.section else ''}\n"
+                   f"   {p.url or '(no url)'}\n"
+                   f"   {snippet}...")
+    return "\n".join(out) + "\n\nFetch one of these addresses to read it."

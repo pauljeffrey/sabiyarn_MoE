@@ -277,21 +277,115 @@ def test_the_refiner_does_not_invent_a_think_block():
     """Invited to "keep or shorten" the think, the refiner wrote a fresh one on EVERY turn -- including turns
     where the base agent had rightly omitted it. 17 of 17 chosen replies carried <think> against 5 of 18 base
     replies: the refiner was padding the side we reward."""
-    lp = _loop([json.dumps({"response": "E don land.", "think": "I will now rewrite this nicely."})])
+    lp = _loop([json.dumps({"response": "E don land.", "notes": ["dropped the calque"]})])
     got = lp.refine({"response": "It has arrived now."}, "q")
     assert got["think"] == "", "no think in the original means no think in the rewrite"
+    # the edit list is kept as a DIAGNOSTIC, not folded into the sample
+    assert got["_notes"] == ["dropped the calque"]
     lp2 = _loop([json.dumps({"response": "E don land."})])
     got2 = lp2.refine({"response": "It has arrived now.", "think": "The fee changed, so look it up."}, "q")
     assert got2["think"] == "The fee changed, so look it up."
 
 
-def test_the_assistant_is_told_to_search_in_english():
-    """Measured against llama-text-embed-v2 over this corpus: an English query returns the right document at
-    0.39-0.60 similarity, the same question in Hausa or Yoruba returns the WRONG document at ~0.17 -- the
-    noise floor. rl/verifiers.tool_query_is_english already scored this; the agent was never told."""
+def test_the_assistant_is_told_how_to_query_and_what_it_does_not_know():
+    """Three things the agent was never told, each of which showed up as a defect in live output:
+
+    * which language to query in -- measured, an English query returns the right document at 0.39-0.60
+      similarity while the same question in Hausa or Yoruba returns the WRONG one at ~0.17, the noise floor,
+      so a query is tagged with the language of the CORPUS and local-language corpora go to BM25;
+    * that it should read evidence in any language and answer in the one asked for;
+    * that its own knowledge is capped, which is what actually makes it reach for a tool instead of
+      answering plausibly from memory.
+    """
     from agents import agent_prompts as AP
     for tmpl in (AP.AI_AGENT, AP.SFT_AI_AGENT):
-        body = tmpl.format(lang_name="Hausa", today="2026-10-08", tools_block="", plan_hint='"<|RAG|>"',
-                           task_directive="", flavour_hint="x")
-        assert "SEARCH QUERIES ARE IN ENGLISH" in body
-        assert "answer in Hausa" in body
+        body = tmpl.format(lang_name="Hausa", lang="hau", today="2026-10-08", tools_block="",
+                           plan_hint='"<|RAG|>"', task_directive="", flavour_hint="x")
+        assert "QUERY THE CORPUS IN ITS OWN LANGUAGE" in body
+        assert '"lang": "hau"' in body, "the example must name THIS conversation's language"
+        assert "READ WHATEVER COMES BACK" in body
+        assert "16-year-old" in body and "LOOK UP with the tools" in body
+        assert "THINK IN ENGLISH" in body
+
+
+def test_the_refiner_may_correct_a_bad_think_but_not_add_one():
+    """It may replace the reasoning when the original's was wrong; the common case costs nothing."""
+    lp = _loop([json.dumps({"response": "E don land.", "think": "The 2025 figure is the one that applies."})])
+    got = lp.refine({"response": "It has arrived now.", "think": "The user wants the figure."}, "q")
+    assert got["think"] == "The 2025 figure is the one that applies."
+    assert lp.stats["refine_fixed_think"] == 1
+
+
+def test_the_edit_list_never_reaches_the_published_turn():
+    """The published turn is a reply to the user, who never saw a draft. A model trained on "here is what I
+    changed about my previous answer" learns to narrate revisions nobody asked for -- so the notes ride on
+    the record as a diagnostic and `<|edit|>` is not appended to the plan."""
+    conv = Conversation(lang="pcm", turns=[
+        Turn(user="How much?", assistant={"task_plan": ["<|RAG|>"], "response": "It is N8,000."},
+             refined={"task_plan": ["<|RAG|>"], "response": "Na N8,000.",
+                      "_notes": ["dropped the calque", "added 'na'"]})])
+    rec = records_from(conv, row={"custom_id": "c"}, lang="pcm", target_lang="pcm", model="m")[0]
+    assert rec["refine_notes"] == ["dropped the calque", "added 'na'"]
+    assert "dropped the calque" not in rec["response_1"]
+    assert "<|edit|>" not in rec["response_1"]
+    assert "<think>" not in rec["response_1"]
+
+
+def test_the_web_is_two_steps_and_a_serp_is_not_evidence():
+    """search_internet returns titles, urls and snippets; the assistant must pick one and fetch it. Handing
+    back four full documents removes the decision, and the decision is the behaviour being taught."""
+    from agents.retrieval import Library
+    ps = split_passages(DOC, target_words=60, doc_id="d1", title="Ampe", url="https://x.test/ampe")
+    lib = Library(by_url={"https://x.test/ampe": {"title": "Ampe", "text": DOC, "url": "https://x.test/ampe"}})
+    lp = _loop([], library=lib)
+    lp.retriever = LocalRetriever.build(ps)
+    serp, cited = lp._run_tool({"name": "search_internet", "arguments": {"query": "ampe scoring"}}, "q")
+    assert "https://x.test/ampe" in serp and "Fetch one of these" in serp
+    assert cited == [], "a SERP is not evidence -- nothing is cited until a page is fetched"
+    page, cited2 = lp._run_tool({"name": "fetch_page", "arguments": {"url": "https://x.test/ampe"}}, "q")
+    assert "cookies" in page and "last edited" in page, "a real page carries clutter to read past"
+    assert "nominates a foot" in page
+    assert cited2 and cited2[0].url == "https://x.test/ampe"
+    # an address that was never offered is a hallucinated url, and it must look like a failure
+    missing, _ = lp._run_tool({"name": "fetch_page", "arguments": {"url": "https://nope.test/x"}}, "q")
+    assert "404" in missing
+    assert lp.stats["fetched_unoffered_url"] == 1
+
+
+def test_queries_may_be_tagged_with_a_language_and_routed():
+    """A question spanning two corpora sends two queries. Local-language corpora go to BM25, because the
+    embedder is blind to them."""
+    from agents.retrieval import HybridRetriever, EMBEDDABLE
+    assert "eng" in EMBEDDABLE and "hau" not in EMBEDDABLE and "yor" not in EMBEDDABLE
+    ps = (split_passages(DOC, target_words=60, doc_id="en1", title="Ampe", lang="eng") +
+          split_passages("Wasa\n\nAmpe wasa ne na yara a Ghana da suke tsalle tare da buga hannu.",
+                         target_words=60, doc_id="ha1", title="Ampe (Hausa)", lang="hau"))
+    h = HybridRetriever(local=LocalRetriever.build(ps), remote=None)
+    assert all(p.lang == "hau" for p in h.search("wasa yara Ghana", k=2, lang="hau"))
+    lp = _loop([])
+    lp.retriever = h
+    qs = lp._queries({"queries": [{"query": "ampe scoring", "lang": "eng"},
+                                  {"query": "wasa yara", "lang": "hau"}]}, "fallback")
+    assert qs == [("ampe scoring", "eng"), ("wasa yara", "hau")]
+    assert lp._queries({"query": "one thing"}, "fb") == [("one thing", "")]
+    assert lp._find(qs, k=3), "a multi-language query must return something"
+
+
+def test_a_failing_remote_index_does_not_stop_the_run():
+    """The failure that actually happened: the organisation's monthly Pinecone embedding quota ran out
+    mid-run -- 5M tokens for llama-text-embed-v2 against a corpus needing ~7.8M to ingest -- and the whole
+    comparison crashed on a 429. A quota does not come back on the next call, so this is a circuit breaker
+    rather than a retry: after a few failures the remote is off and BM25 carries the run."""
+    from agents.retrieval import HybridRetriever
+
+    class Broken:
+        def search(self, *a, **k):
+            raise RuntimeError("[429 RESOURCE_EXHAUSTED] embedding token limit")
+
+    ps = split_passages(DOC, target_words=60, doc_id="d1", title="Ampe", lang="eng")
+    h = HybridRetriever(local=LocalRetriever.build(ps), remote=Broken(), max_remote_failures=2)
+    assert h.search("ampe scoring", k=2), "BM25 must answer when the remote throws"
+    assert h.remote is not None, "one failure is not enough to disable it"
+    assert h.search("ampe scoring", k=2)
+    assert h.remote is None, "repeated failure disables the remote for the rest of the run"
+    assert h.search("ampe scoring", k=2), "and the run continues on BM25"

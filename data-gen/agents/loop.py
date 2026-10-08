@@ -30,7 +30,7 @@ from typing import Any, Optional
 
 from agents import agent_prompts as AP
 from agents import personas
-from agents.retrieval import Passage, Retriever, render
+from agents.retrieval import Library, Passage, Retriever, render, search_results
 from assemble import VALID_VERBS, AssemblyError, build_messages, structure_of
 
 # The reply may not grow. The refiner's job is to change how a reply SOUNDS, and a preference dataset whose
@@ -46,6 +46,7 @@ class Turn:
     assistant: dict                       # the base assistant's fields: think/task_plan/response/tool_call
     refined: Optional[dict] = None        # the refiner's version -- the `chosen` side
     tool_calls: list[dict] = field(default_factory=list)
+    results: list[str] = field(default_factory=list)      # what each call returned, published in order
     retrieved: list[Passage] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
 
@@ -59,11 +60,21 @@ class Conversation:
     stats: dict = field(default_factory=dict)
 
 
+_JSON_COMMENT = re.compile(r'(?m)(?<!:)//(?![^"\n]*").*$')
+
+
 def _json_obj(text: str) -> Optional[dict]:
-    """One JSON object out of a model reply, tolerating a fence and surrounding prose."""
+    """One JSON object out of a model reply, tolerating a fence, surrounding prose and // comments.
+
+    The comments are our own fault: the output contract annotates its fields with `// only when calling a
+    tool`, so the model copies the style back and emits JSON that is not JSON. Stripping them is safer than
+    removing the annotations, which are what keep the contract readable.
+    """
     t = (text or "").strip()
     if t.startswith("```"):
         t = t.split("\n", 1)[-1].rsplit("```", 1)[0]
+    if "//" in t:
+        t = _JSON_COMMENT.sub("", t)
     try:
         v = json.loads(t)
         return v if isinstance(v, dict) else None
@@ -129,7 +140,7 @@ class Loop:
     def __init__(self, ask, retriever: Retriever, *, lang: str, lang_name: str, today: str,
                  tools: Optional[list[dict]] = None, plan: Optional[list[str]] = None,
                  subject: str = "", rng: Optional[random.Random] = None, mode: str = "rl",
-                 tags: Optional[list[str]] = None):
+                 tags: Optional[list[str]] = None, library: Optional[Library] = None):
         self.ask = ask
         self.retriever = retriever
         self.lang, self.lang_name, self.today = lang, lang_name, today
@@ -139,6 +150,8 @@ class Loop:
         self.rng = rng or random.Random(0)
         self.mode = mode
         self.tags = list(tags or [])
+        self.library = library
+        self._offered: dict = {}
         self.persona = personas.pick(self.rng)
         self.stats: dict[str, int] = {}
 
@@ -192,55 +205,150 @@ class Loop:
         txt = re.sub(r'^(?:user|message)\s*[:\-]\s*', "", txt, flags=re.I).strip().strip('"').strip()
         return txt.split("\n")[0].strip() if txt.count("\n") > 2 else txt
 
-    def assistant_turn(self, user_msg: str, *, sft: bool = False) -> tuple[dict, list[dict], list[Passage]]:
-        """Answer, resolving at most one tool call. Returns (fields, calls_made, passages_retrieved)."""
+    def assistant_turn(self, user_msg: str, *,
+                       sft: bool = False) -> tuple[dict, list[dict], list[str], list[Passage]]:
+        """Answer, resolving a CHAIN of up to three tool calls.
+
+        Returns (fields, calls_made, results_returned, passages_retrieved).
+        """
         template = AP.SFT_AI_AGENT if sft else AP.AI_AGENT
-        sysmsg = template.format(lang_name=self.lang_name, today=self.today,
+        sysmsg = template.format(lang_name=self.lang_name, lang=self.lang, today=self.today,
                                  tools_block=self._tools_block(), plan_hint=self._plan_hint(),
                                  task_directive=AP.task_directive(self.tags),
                                  **({"flavour_hint": AP.flavour_for(self.lang)} if sft else {}))
         base = [{"role": "system", "content": sysmsg}] + self._history()
         base.append({"role": "user", "content": user_msg})
 
-        calls, passages = [], []
+        calls: list[dict] = []
+        results: list[str] = []
+        passages: list[Passage] = []
         obj = _json_obj(self.ask(base, 700)) or {}
-        if obj.get("tool_call"):
-            call = obj["tool_call"]
+
+        # A CHAIN, not a single call. Searching the web is two steps -- a SERP of titles and urls, then
+        # fetching the one most likely to hold the answer -- and allowing only one call per turn meant the
+        # assistant got a list of links and was then told to answer from it. Measured: 6 searches and ZERO
+        # fetches, so every "answer" was read off a snippet. Three calls is enough for search -> fetch ->
+        # one correction, and the loop stops as soon as a response arrives.
+        MAX_CALLS = 3
+        for step in range(MAX_CALLS):
+            call = obj.get("tool_call")
+            if not call:
+                break
             calls.append(call)
-            result, passages = self._run_tool(call, user_msg)
-            # the result is visible for THIS turn only
+            result, got = self._run_tool(call, user_msg)
+            results.append(result)
+            passages.extend(got)
             base.append({"role": "assistant", "content": json.dumps(obj, ensure_ascii=False)})
-            base.append({"role": "user", "content": f"Tool result:\n{result}\n\nNow answer from it."})
-            obj2 = _json_obj(self.ask(base, 700)) or {}
-            if obj2.get("response"):
-                obj2.setdefault("task_plan", obj.get("task_plan") or [])
-                obj = obj2
+            # THE LAST STEP DEMANDS AN ANSWER. Given an open-ended "call another tool if you need to", the
+            # chain ran out of budget without ever answering on 6 of 19 turns -- the tool calls were the
+            # whole turn. The closing instruction is the same intervention that worked on the single-call
+            # contract: the thing that must happen is stated last, where it cannot drift out of view.
+            if step == MAX_CALLS - 1:
+                nudge = ("You have no tool calls left. ANSWER NOW from what you have, in "
+                         f"{self.lang_name}. If what came back does not answer the question, say exactly "
+                         "that -- do not invent the part you could not find.")
             else:
+                nudge = ("Continue: call another tool if you still need something -- a list of search "
+                         "results is not an answer, so fetch the page you judge most likely to hold it -- "
+                         "otherwise answer now.")
+            base.append({"role": "user", "content": f"Tool result:\n{result}\n\n{nudge}"})
+            # MORE ROOM AFTER A TOOL RESULT. A fetched page is ~1,400 words, and the reply that reads it is
+            # longer than a reply written from nothing -- at 700 tokens the JSON was being truncated
+            # mid-string, which arrives as an unparseable object and was counted as an empty turn 5 times in
+            # 19. Headroom is cheaper than a lost turn.
+            nxt = _json_obj(self.ask(base, 1200)) or {}
+            if not (nxt.get("response") or nxt.get("tool_call")):
                 self.stats["tool_second_call_empty"] = self.stats.get("tool_second_call_empty", 0) + 1
+                break
+            nxt.setdefault("task_plan", obj.get("task_plan") or [])
+            obj = nxt
+        if obj.get("tool_call") and not obj.get("response"):
+            # The chain ended on a call. One more request, for the answer only -- cheaper than discarding a
+            # turn that already paid for its retrieval.
+            base.append({"role": "user", "content":
+                         f"Answer now in {self.lang_name}, from what the tools returned. No more calls."})
+            last = _json_obj(self.ask(base, 1200)) or {}
+            if last.get("response"):
+                last.setdefault("task_plan", obj.get("task_plan") or [])
+                obj = last
+                self.stats["answer_after_chain_nudge"] = self.stats.get("answer_after_chain_nudge", 0) + 1
         obj["think"] = _tidy_think(obj.get("think"))
         if obj.get("response"):
             obj["response"] = _clean_response(obj["response"])
-        return obj, calls, passages
+        return obj, calls, results, passages
+
+    def _queries(self, args: dict, user_msg: str) -> list[tuple[str, str]]:
+        """The (query, lang) pairs a call is asking for.
+
+        One question often spans two corpora -- the figure is in an English document, the local practice is
+        described in a Hausa one -- so the assistant may send a list of queries, each tagged with the
+        language of the corpus to search. A bare string still works and is treated as untagged.
+        """
+        raw = args.get("queries") or args.get("query") or args.get("q") or user_msg
+        out: list[tuple[str, str]] = []
+        if isinstance(raw, str):
+            out.append((raw, str(args.get("lang") or args.get("language") or "")))
+        elif isinstance(raw, list):
+            for item in raw:
+                if isinstance(item, str):
+                    out.append((item, ""))
+                elif isinstance(item, dict):
+                    q = item.get("query") or item.get("q") or item.get("text")
+                    if q:
+                        out.append((str(q), str(item.get("lang") or item.get("language") or "")))
+        return out or [(user_msg, "")]
+
+    def _find(self, queries: list[tuple[str, str]], k: int = 4) -> list[Passage]:
+        many = getattr(self.retriever, "search_many", None)
+        if many is not None and len(queries) > 1:
+            return many(queries, k=k)
+        q, lg = queries[0]
+        return self.retriever.search(q, k=k, lang=lg)
 
     def _run_tool(self, call: dict, user_msg: str) -> tuple[str, list[Passage]]:
-        """Execute a tool. Retrieval is real; everything else is a plausible stub.
+        """Execute a tool. Retrieval and the web are real; everything else is a plausible stub.
 
         Retrieval being real is the point: the passages come from the document pool, so the answer can be
         checked against them afterwards and "cited the wrong passage" is a scoreable event rather than an
         invisible one.
+
+        THE WEB IS TWO STEPS, because that is what it is. `search_internet` returns titles, urls and
+        snippets -- no bodies -- and the assistant has to read them, decide which result is most likely to
+        hold the answer, and `fetch_page` that one. Handing back four full documents at once removes the
+        decision, and the decision is the behaviour being taught, including the chance of picking wrong.
         """
         name = str(call.get("name") or "")
         args = call.get("arguments") if isinstance(call.get("arguments"), dict) else {}
-        if name in ("search_documents", "search_internet", "fetch_page", "lookup_legal_info",
-                    "lookup_health_guidance", "lookup_crop_guidance"):
-            q = str(args.get("query") or args.get("q") or user_msg)
-            hits = self.retriever.search(q, k=4, lang="")
+
+        if name == "search_internet":
+            hits = self._find(self._queries(args, user_msg), k=5)
+            self.stats["searches"] = self.stats.get("searches", 0) + 1
+            self._offered = {p.url: p for p in hits if p.url}
+            return search_results(hits), []           # a SERP is not evidence; the fetch is
+
+        if name == "fetch_page":
+            url = str(args.get("url") or args.get("page") or "")
+            self.stats["fetches"] = self.stats.get("fetches", 0) + 1
+            if self.library is None:
+                return f"HTTP 404 -- {url} could not be fetched.", []
+            body = self.library.page(url)
+            if url not in getattr(self, "_offered", {}):
+                # Fetching an address that was never in the results is a real failure -- a hallucinated url
+                # -- and it has to look like one rather than quietly working.
+                self.stats["fetched_unoffered_url"] = self.stats.get("fetched_unoffered_url", 0) + 1
+            cited = [p for u, p in getattr(self, "_offered", {}).items() if u == url]
+            return body, cited
+
+        if name in ("search_documents", "search_db", "lookup_legal_info", "lookup_health_guidance",
+                    "lookup_crop_guidance"):
+            hits = self._find(self._queries(args, user_msg), k=4)
             self.stats["retrievals"] = self.stats.get("retrievals", 0) + 1
             return render(hits), hits
+
         if name == "get_current_datetime":
-            return json.dumps({"datetime": f"{self.today}T09:14:00+01:00"})
+            return json.dumps({"datetime": f"{self.today}T09:14:00+01:00"}), []
         return json.dumps({"status": "ok", "note": f"{name} executed", "arguments": args},
-                          ensure_ascii=False)
+                          ensure_ascii=False), []
 
     def refine(self, fields: dict, user_msg: str, findings: str = "") -> Optional[dict]:
         """Rewrite for nativeness, same length or shorter. Returns None when the rewrite is unusable."""
@@ -272,11 +380,22 @@ class Loop:
         # the field was removed from its contract and overridden here. The plan is substance; the refiner
         # only has licence over register.
         obj["task_plan"] = list(fields.get("task_plan") or [])
-        # And the THINK comes from the original too, for the same reason as the plan. Invited to "keep or
-        # shorten" it, the refiner wrote one from scratch on every turn -- including the turns where the base
-        # agent had correctly omitted it because nothing needed deciding. 17 of 17 chosen replies carried a
-        # <think> block against 5 of 18 base replies, which is the refiner padding the side we reward.
-        obj["think"] = _tidy_think(fields.get("think"))
+        # THE THINK IS CARRIED OVER UNLESS THE REFINER REPLACES IT ON PURPOSE. Invited to "keep or shorten"
+        # it, the refiner wrote one from scratch on every turn -- including turns where the base agent had
+        # correctly omitted it -- and 17 of 17 chosen replies carried a <think> against 5 of 18 base replies,
+        # padding the side we reward. Now it may only send one when the original's reasoning was actually
+        # wrong or missing, so a correction still gets through and the common case costs nothing.
+        fixed = _tidy_think(obj.get("think"))
+        obj["think"] = fixed or _tidy_think(fields.get("think"))
+        if fixed:
+            self.stats["refine_fixed_think"] = self.stats.get("refine_fixed_think", 0) + 1
+        # THE EDIT LIST IS A DIAGNOSTIC, NOT PART OF THE SAMPLE. It is worth keeping -- it is the only record
+        # of what the refiner actually changed, and it is what lets a reviewer audit the chosen side without
+        # re-reading both replies. It does NOT go in <think> or add <|edit|> to the plan: the published turn
+        # is a reply to the user, who never saw a draft, and a model trained on "here is what I changed about
+        # my previous answer" learns to narrate revisions to replies nobody asked it to revise.
+        notes = obj.pop("notes", None)
+        obj["_notes"] = [str(x) for x in notes][:8] if isinstance(notes, list) else []
         if fields.get("tool_call"):
             obj["tool_call"] = fields["tool_call"]
         return obj
@@ -293,15 +412,27 @@ class Loop:
         self._turns: list[Turn] = []
         sft = self.mode == "sft"
         for i in range(n_turns):
-            user = self.user_turn(i)
-            if not user:
+            # RETRIED, NOT ABANDONED. A turn that comes back empty used to end the conversation, and on the
+            # first live run that cost 2 of 5 conversations every single turn. The turns already generated
+            # are sound, so the right move is to try this one again and only stop if it keeps failing.
+            user = ""
+            for _ in range(2):
+                user = self.user_turn(i)
+                if user:
+                    break
                 self.stats["user_turn_empty"] = self.stats.get("user_turn_empty", 0) + 1
+            if not user:
                 break
-            fields, calls, passages = self.assistant_turn(user, sft=sft)
-            if not (fields.get("response") or fields.get("tool_call")):
+            fields, calls, results, passages = {}, [], [], []
+            for _ in range(2):
+                fields, calls, results, passages = self.assistant_turn(user, sft=sft)
+                if fields.get("response") or fields.get("tool_call"):
+                    break
                 self.stats["assistant_turn_empty"] = self.stats.get("assistant_turn_empty", 0) + 1
+            if not (fields.get("response") or fields.get("tool_call")):
                 break
-            turn = Turn(user=user, assistant=fields, tool_calls=calls, retrieved=passages)
+            turn = Turn(user=user, assistant=fields, tool_calls=calls, results=results,
+                        retrieved=passages)
             if not sft:
                 findings = findings_for(fields, turn) if findings_for else ""
                 turn.refined = self.refine(fields, user, findings)
@@ -368,17 +499,21 @@ def records_from(conv: Conversation, *, row: dict, lang: str, target_lang: str, 
         prefix.append({"role": "user", "content": turn.user})
         base_turns = _assistant_turns(turn.assistant, lang, target_lang, default_plan)
         if turn.tool_calls:
-            # call turn, then the result it got back, then the answer
-            call_turn = {"role": "assistant", "input_lang": lang,
-                         "task_plan": _valid_plan(turn.assistant.get("task_plan"), default_plan,
-                                                  "<|plan|>"),
-                         "tool_call": turn.tool_calls[0]}
-            if turn.assistant.get("think"):
-                call_turn["think"] = turn.assistant["think"]
-            result = render(turn.retrieved) if turn.retrieved else json.dumps({"status": "ok"})
-            prefix.append(call_turn)
-            prefix.append({"role": "tool", "name": turn.tool_calls[0].get("name") or "tool",
-                           "content": result})
+            # THE WHOLE CHAIN, in order: every call the turn made and the result it got back. Publishing only
+            # the first left a search with no fetch after it, and a trace whose last tool result is a list of
+            # links teaches answering from a SERP.
+            for j, call in enumerate(turn.tool_calls):
+                call_turn = {"role": "assistant", "input_lang": lang,
+                             "task_plan": _valid_plan(turn.assistant.get("task_plan"), default_plan,
+                                                      "<|plan|>"),
+                             "tool_call": call}
+                if j == 0 and turn.assistant.get("think"):
+                    call_turn["think"] = turn.assistant["think"]
+                prefix.append(call_turn)
+                prefix.append({"role": "tool", "name": call.get("name") or "tool",
+                               "content": turn.results[j] if j < len(turn.results)
+                               else (render(turn.retrieved) if turn.retrieved
+                                     else json.dumps({"status": "ok"}))})
             # The answer turn is the same fields WITHOUT the call -- the call already happened above. If the
             # post-tool request came back empty there is no answer to strip to, so the turn stays a call and
             # yields no pair rather than an unassemblable fragment.
@@ -421,6 +556,7 @@ def records_from(conv: Conversation, *, row: dict, lang: str, target_lang: str, 
                 {"id": p.id, "title": p.title, "section": p.section, "score": p.score, "text": p.text}
                 for p in turn.retrieved],
             "turn_index": i + 1,
+            "refine_notes": list((turn.refined or {}).get("_notes") or []),
         }
         out.append(rec)
         # later turns continue from the BETTER reply
