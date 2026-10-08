@@ -412,6 +412,39 @@ Why a second environment: `unbabel-comet` pins `transformers<5`, `huggingface_hu
 
 ---
 
+## 2.10 Serving it as an agent (tools, RAG, structured output)
+
+`agent/` is a standalone agentic runtime for the trained model: it attaches the
+tool catalogue to the system turn, parses the inline `<tool_call>name\n{json}</tool_call>`
+the policy emits, runs the Python function, feeds `<tool_response>` back, and
+streams the `<response>` body. Full documentation: [agent/README.md](agent/README.md).
+
+```python
+from agent import Agent, HFBackend, tool
+
+@tool
+def get_weather(city: str) -> dict:
+    """Current weather for a city."""
+    return {"city": city, "temp": 31}
+
+bot = Agent(HFBackend(model, tokenizer), tools=[get_weather])
+bot.chat("What's the weather in Lagos?")
+```
+
+The core is standard-library only, so the directory ports to another codebase
+as-is; `torch`/`transformers` are needed only for `HFBackend` and `pydantic`
+only for model-class schemas. Try it without a GPU:
+
+```bash
+python -m agent.example --dry-run
+```
+
+Its renderer is pinned byte-for-byte against `sabiyarn/chat_template.jinja`
+(`tests/test_agent_render_parity.py`), because jinja2 is not a root dependency
+and `tokenizer.apply_chat_template` is therefore unavailable in this env.
+
+---
+
 ## 3. Tests
 
 ```bash
