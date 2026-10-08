@@ -26,6 +26,8 @@ PILOT_ENV = "AFRICOMET_STREAM_SCAN_LIMIT"
 class Doc:
     sentences: list[str]
     split: str = ""
+    refs: Optional[list[str]] = None     # aligned translations, one per sentence (parallel sources only)
+    ref_lang: str = ""                   # language of `refs`
 
 
 @dataclass
@@ -51,6 +53,8 @@ class Source:
     priority: int = 50              # cross-source de-duplication order: lower wins
     quota: Optional[int] = None     # stop after this many windows
     stream: bool = False            # english-style: one deficit-balanced window per paragraph, honouring `quota`
+    ref_lang: str = ""              # parallel sources: language of the aligned side that becomes `response`
+    lid_ref_only: bool = False      # check language ID on the aligned side only (the source side was checked elsewhere)
 
 
 # ----------------------------------------------------------------------------------------------------------------
@@ -257,4 +261,6 @@ SOURCES: dict[str, list[Source]] = {
 
 LANGUAGE_ORDER = ["pcm", "yor", "hau", "ibo", "fon", "ewe", "twi", "efi", "ibb", "eng"]
 # Languages the AfriCOMET-1.1 encoder (Davlan/afro-xlmr-large-76L) lists. Ibibio is NOT among them.
-AFRICOMET_SUPPORTED = {"eng", "pcm", "yor", "hau", "ibo", "fon", "ewe", "twi", "efi"}
+# masakhane/africomet-stl-1.1 model card language list, restricted to the languages this project handles.
+AFRICOMET_SUPPORTED = {"eng", "pcm", "yor", "hau", "ibo", "fon", "ewe", "twi", "efi",
+                       "afr", "zul", "sna", "nya", "xho", "sot", "kin", "tsn", "orm", "wol", "som", "swh"}

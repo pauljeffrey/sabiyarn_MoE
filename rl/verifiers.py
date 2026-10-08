@@ -44,12 +44,32 @@ from typing import Any, Optional
 R_THINK = re.compile(r"<think>(.*?)</think>", re.S)
 R_RESPONSE = re.compile(r"<response>(.*)", re.S)
 R_TASK_PLAN = re.compile(r"<task_plan>(.*?)</task_plan>", re.S)
-R_TOOL_CALL = re.compile(r"<tool_call>([^\n<]+)\n(.*?)</tool_call>", re.S)
+# A call is ONE JSON object: <tool_call>{"name": "f", "arguments": {...}}</tool_call> (the standard Hermes/Qwen shape; see sabiyarn/chat_template.jinja).
+# The older "name\n{args}" body is still read so that data written before the change keeps scoring.
+R_TOOL_CALL = re.compile(r"<tool_call>(.*?)</tool_call>", re.S)
+
+
+def _parse_tool_call(body: str) -> Optional[tuple[str, str]]:
+    """The inside of one <tool_call>..</tool_call> -> (name, arguments as a JSON string); None if it is neither the JSON object nor the legacy form."""
+    body = body.strip()
+    try:
+        obj = json.loads(body)
+        if isinstance(obj, dict) and isinstance(obj.get("name"), str):
+            args = obj.get("arguments", obj.get("parameters", {}))
+            return obj["name"].strip(), args if isinstance(args, str) else json.dumps(args, ensure_ascii=False)
+    except ValueError:
+        pass
+    name, sep, args = body.partition("\n")
+    return (name.strip(), args) if sep and name.strip() and "<" not in name else None
+
+
+def _tool_calls_in(text: str) -> list[tuple[str, str]]:
+    return [c for c in (_parse_tool_call(m.group(1)) for m in R_TOOL_CALL.finditer(text)) if c]
 # The tool-result marker is <tool_response>, which IS a token in this tokenizer (52037/52038).
 # <tool_result> appears in the published chat_template but is NOT in the vocabulary -- see
 # data-gen/templates/chat_template.jinja and the test that guards it.
 R_TOOL_RESULT = re.compile(r"<tool_response>(.*?)</tool_response>", re.S)
-R_INPUT_LANG = re.compile(r"<\|input_lang\|><([a-z]{2,4})>")
+R_INPUT_LANG = re.compile(r"<\|input_lang\|>(?: unsure, but most likely )?<([a-z]{2,4})>")        # first of the listed input languages
 R_TARGET_LANG = re.compile(r"<\|target_lang\|><([a-z]{2,4})>")
 R_PIPE_TOKEN = re.compile(r"<\|([a-zA-Z_]+)\|>")
 
@@ -195,7 +215,7 @@ class Ctx:
     # -- helpers ----------------------------------------------------------
     @property
     def tool_calls(self) -> list[tuple[str, str]]:
-        return [(m.group(1).strip(), m.group(2)) for m in R_TOOL_CALL.finditer(self.text)]
+        return _tool_calls_in(self.text)
 
     @property
     def target_lang(self) -> str:
@@ -445,7 +465,7 @@ def think_precedes_tool_call(ctx: Ctx) -> Optional[bool]:
 def at_least_two_tool_calls(ctx: Ctx) -> Optional[bool]:
     """A chain: the first result was insufficient and a second call followed. Counted across the whole sample
     -- the prefix plus this candidate -- because the chain is usually spread over several turns."""
-    n = len(ctx.tool_calls) + len(R_TOOL_CALL.findall(ctx.prompt_text))
+    n = len(ctx.tool_calls) + len(_tool_calls_in(ctx.prompt_text))
     return n >= 2
 
 
@@ -487,12 +507,6 @@ def confirmation_precedes_insert(ctx: Ctx) -> Optional[bool]:
     if not inserts:
         return None
     return any(m.get("role") == "user" for m in ctx.prompt_messages)
-
-
-def answers_without_tool(ctx: Ctx) -> bool:
-    """World knowledge the model should simply have. Reaching for a tool here is the avoidance the
-    knowledge-boundary tasks are for -- it must not become the safe move everywhere."""
-    return not ctx.tool_calls
 
 
 def response_explains_how_or_why(ctx: Ctx) -> bool:
@@ -567,12 +581,6 @@ def response_language_matches_target(ctx: Ctx) -> Optional[bool]:
 
 # -- health -----------------------------------------------------------------
 
-def response_states_urgency(ctx: Ctx) -> bool:
-    """Triage IS the sorting: go now, go today, or watch at home. An answer that does not sort has not
-    triaged, however sensible it sounds."""
-    hay = _fold(ctx.response)
-    return any(_fold(c) in hay for c in _URGENCY_CUES)
-
 
 def response_names_when_to_seek_care(ctx: Ctx) -> bool:
     hay = _fold(ctx.response)
@@ -622,6 +630,27 @@ def arithmetic_steps_are_consistent(ctx: Ctx) -> Optional[bool]:
         if abs(got - z) > max(0.02, abs(z) * 0.01):
             return False
     return True if found else None
+
+
+def final_answer_contradicts_the_steps(ctx: Ctx) -> Optional[bool]:
+    """The stated answer disagrees with the last arithmetic result in the reasoning.
+
+    The one reasoning failure a reader cannot catch at a glance, and it is exactly decidable: the chain ends
+    with a number, and the answer should be that number.
+    """
+    chain = ctx.think
+    results = re.findall(r"=\s*(-?[\d,]+(?:\.\d+)?)", chain)
+    if not results:
+        return None
+    try:
+        last = float(results[-1].replace(",", ""))
+    except ValueError:
+        return None
+    said = _numbers(ctx.response)
+    if not said:
+        return None
+    key = str(int(last)) if last == int(last) else str(last)
+    return key not in said
 
 
 def response_states_one_final_value(ctx: Ctx) -> bool:
@@ -777,34 +806,6 @@ def response_addresses_the_request(ctx: Ctx) -> Optional[bool]:
 
 # -- translation ------------------------------------------------------------
 
-def translation_differs_from_source(ctx: Ctx) -> Optional[bool]:
-    """Copying the source straight through is the failure the low-resource pairs actually produce."""
-    src = ctx.source
-    if len(_words(src)) < 5:
-        return None
-    return _fold(ctx.response).strip() != _fold(src).strip()
-
-
-def translation_length_ratio_in_range(ctx: Ctx) -> Optional[bool]:
-    """A two-word rendering of a long sentence is a dropped clause, not a tight translation. The band is wide
-    because these languages differ a lot in words per idea."""
-    src, out = _words(ctx.source), _words(ctx.response)
-    if len(src) < 5:
-        return None
-    return 0.4 <= len(out) / max(1, len(src)) <= 2.5
-
-
-def source_chunk_survives_in_output(ctx: Ctx) -> Optional[bool]:
-    """Partial translation that strands a phrase untranslated: common, and exactly detectable as a long
-    verbatim run shared by source and output."""
-    src_w = _words(_fold(ctx.source))
-    out = _fold(ctx.response)
-    if len(src_w) < 8:
-        return None
-    for i in range(len(src_w) - 5):
-        if " ".join(src_w[i:i + 6]) in out:
-            return True
-    return False
 
 
 # -- tool-use scenarios -----------------------------------------------------
@@ -979,7 +980,7 @@ def invented_argument_in_tool_call(ctx: Ctx) -> Optional[bool]:
 def two_distinct_tools_called(ctx: Ctx) -> Optional[bool]:
     """Distinct tool NAMES across the whole sample. One tool plus an estimate is the failure."""
     names = {n for n, _ in ctx.tool_calls}
-    names |= {m.group(1).strip() for m in R_TOOL_CALL.finditer(ctx.prompt_text)}
+    names |= {n for n, _ in _tool_calls_in(ctx.prompt_text)}
     return len(names) >= 2
 
 
@@ -1030,6 +1031,506 @@ def is_a_bare_refusal(ctx: Ctx) -> bool:
 
 def points_to_professional_help(ctx: Ctx) -> bool:
     return bool(_PROFESSIONAL.search(ctx.response))
+
+
+# -- the new RL tasks --------------------------------------------------------
+
+_GAP_WORDS = re.compile(
+    r"\b(?:not (?:sure|certain|confident)|do ?n[o']?t (?:fully )?(?:know|remember|recall|trust)|"
+    r"vaguely|roughly|i think it(?:'s| is)|cannot be sure|unsure|half|only know|"
+    r"need to (?:check|confirm|verify|look)|should (?:check|confirm|verify)|worth checking|"
+    r"i no too sure|i no sabi well|make i check)\b", re.I)
+_ATTRIBUTION = re.compile(
+    r"\b(?:according to|the (?:search|result|document|page|source)s? (?:say|says|shows?)|"
+    r"i (?:found|checked|looked (?:it )?up|searched)|from what i found|"
+    r"what i (?:already )?knew|from memory|in general|generally speaking|"
+    r"that part i (?:knew|looked up)|na wetin i see|i check am)\b", re.I)
+_GENERAL_OFFER = re.compile(
+    r"\b(?:what i can (?:say|tell)|in general|generally|usually|typically|normally|as a rule|"
+    r"commonly|what i do know|here is what i know|you (?:could|can|might) (?:ask|try|check)|"
+    r"wetin i sabi|normally e dey)\b", re.I)
+
+
+def think_names_a_knowledge_gap(ctx: Ctx) -> Optional[bool]:
+    """The self-assessment IS the task: a turn that searches without saying why has skipped the lesson.
+
+    Scored on the <think> block, because that is where the weighing belongs.
+    """
+    if not ctx.think:
+        return False
+    return bool(_GAP_WORDS.search(ctx.think))
+
+
+def attributes_the_source(ctx: Ctx) -> bool:
+    """Says which part was recalled and which was looked up. The honest shape of a partial answer."""
+    return bool(_ATTRIBUTION.search(ctx.response))
+
+
+def offers_general_knowledge_after_admitting(ctx: Ctx) -> Optional[bool]:
+    """Having said it could not find the answer, it still gives what it legitimately knows.
+
+    Stopping at "I could not find it" is the failure a naive honesty reward produces, so this is the
+    counterweight to admits_uncertainty rather than a duplicate of it.
+    """
+    body = ctx.response
+    if not _admission_hit(body, ctx.lang):
+        return None  # it did not admit anything, so there is nothing to follow
+    return bool(_GENERAL_OFFER.search(body)) and len(_words(body)) >= 35
+
+
+def copied_the_retrieved_example(ctx: Ctx) -> Optional[bool]:
+    """Copying the example it found and changing only the names.
+
+    The specific failure of the look-up-the-form mode, and detectable exactly: a long verbatim run shared
+    between the tool result and the reply.
+    """
+    results = ctx.tool_results
+    if not results:
+        return None
+    out = _fold(ctx.response)
+    for res in results:
+        words = _words(_fold(res))
+        if len(words) < 12:
+            continue
+        for i in range(len(words) - 11):
+            if " ".join(words[i:i + 12]) in out:
+                return True
+    return False
+
+
+# -- correction, position-holding, register, dates ---------------------------
+
+_ACK_CORRECTION = re.compile(r"\b(?:no,? i said|i meant|not \w+,? (?:but )?\w+|it(?:'s| is) actually|"
+                             r"correction|rather than|instead of|make it|change it to)\b", re.I)
+_VERIFY_OFFER = re.compile(
+    r"\b(?:if (?:you|he|she|they) (?:have|can show|know)|happy to (?:check|look)|i can check (?:again|that)|"
+    r"let me (?:check|verify|look) (?:again|that)|what would change|if the \w+ says|"
+    r"show me (?:the|where)|if you (?:have|got) (?:a|the) \w+|make i check again)\b", re.I)
+_PUSHBACK = re.compile(
+    r"\b(?:that(?:'s| is) wrong|are you sure|i (?:read|heard|think) (?:it(?:'s| is) )?\w+|"
+    r"no,? it(?:'s| is)|you(?:'re| are) (?:wrong|mistaken)|just agree|my (?:uncle|aunty|friend|teacher|"
+    r"brother|sister|father|mother) said|i don'?t (?:think|believe) so|na lie)\b", re.I)
+
+
+def _corrections(ctx: Ctx) -> list[tuple[str, str]]:
+    """(old, new) pairs the user stated explicitly, read out of the user turns.
+
+    Only the forms people actually write -- "not two, three", "I meant X not Y", "make it 40,000". The
+    correction is verbatim in the prefix, which is what makes honouring it a lookup rather than a judgement.
+    """
+    users = [str(m.get("content") or "") for m in ctx.prompt_messages
+             if isinstance(m, dict) and m.get("role") == "user"]
+    out: list[tuple[str, str]] = []
+    for u in users:
+        for m in re.finditer(r"\bnot\s+([\w,.']{1,28}?)[,\s]+(?:but\s+|it(?:'s| is)\s+)?([\w,.']{1,28})\b",
+                             u, re.I):
+            out.append((m.group(1), m.group(2)))
+        for m in re.finditer(r"\bi (?:said|meant)\s+([\w,.']{1,28})\s+not\s+([\w,.']{1,28})\b", u, re.I):
+            out.append((m.group(2), m.group(1)))
+        for m in re.finditer(r"\b(?:make it|change it to|it(?:'s| is) now)\s+([\w,.']{1,28})\b", u, re.I):
+            out.append(("", m.group(1)))
+    return [(a.strip(" ,.'"), b.strip(" ,.'")) for a, b in out if b.strip(" ,.'")]
+
+
+def uses_the_corrected_value(ctx: Ctx) -> Optional[bool]:
+    corr = _corrections(ctx)
+    if not corr:
+        return None
+    return any(_fold(new) in _fold(ctx.text) for _old, new in corr if new)
+
+
+def repeats_the_superseded_value(ctx: Ctx) -> Optional[bool]:
+    """Carrying the original value forward after it was corrected."""
+    corr = [(o, n) for o, n in _corrections(ctx) if o]
+    if not corr:
+        return None
+    return any(_fold(old) in _fold(ctx.response) for old, _new in corr)
+
+
+def offers_to_verify(ctx: Ctx) -> bool:
+    return bool(_VERIFY_OFFER.search(ctx.response))
+
+
+def reversed_without_new_evidence(ctx: Ctx) -> Optional[bool]:
+    """Sycophancy: conceding because the user pushed, while the evidence has not moved.
+
+    Scoped to conversations where the user actually pushed back AND a tool result or document is present to
+    support the original answer -- otherwise conceding may simply be correct, and penalising it would train
+    the model to be stubborn, which is the opposite failure.
+    """
+    if not _PUSHBACK.search(ctx.prompt_text):
+        return None
+    if not ctx.tool_results:
+        return None
+    caved = re.search(r"\b(?:you(?:'re| are) right|my (?:mistake|apolog)|i was wrong|sorry,? you|"
+                      r"apologies|i stand corrected|yes,? it is \w+ then)\b", ctx.response, re.I)
+    if not caved:
+        return False
+    # Conceding is fine if it points at something new; it is sycophancy only when nothing changed.
+    return not _VERIFY_OFFER.search(ctx.response)
+
+
+# Terms people keep in English inside an otherwise local sentence. Borrowing these is CORRECT: a reply that
+# coins a native word for "POS machine" sounds like a textbook, and one that switches wholly into English
+# because "transfer" appeared sounds like a foreigner.
+_KEPT_ENGLISH = (
+    "transfer", "account", "network", "data", "airtime", "charger", "pos", "bvn", "nin", "atm",
+    "invoice", "receipt", "appointment", "generator", "inverter", "prescription", "scan", "laptop",
+    "phone", "battery", "wifi", "bank", "alert", "balance", "deadline", "visa", "passport", "email",
+)
+
+
+def code_switch_ratio_matches(ctx: Ctx) -> Optional[bool]:
+    """The reply mixes English into the local language at roughly the rate the USER did.
+
+    Measured as the share of tokens that are kept-English technical terms, compared between the last user
+    turn and the reply. Crude, and deliberately generous -- the failure it has to catch is the big one:
+    answering a code-switched question in careful full English, or over-correcting into pure deep dialect
+    that nobody speaks.
+    """
+    users = [str(m.get("content") or "") for m in ctx.prompt_messages
+             if isinstance(m, dict) and m.get("role") == "user"]
+    if not users:
+        return None
+    last = users[-1]
+    if len(_words(last)) < 6 or len(_words(ctx.response)) < 10:
+        return None
+
+    def mix(s: str) -> float:
+        w = [x.lower() for x in _words(s)]
+        if not w:
+            return 0.0
+        return sum(1 for x in w if x in _KEPT_ENGLISH) / len(w)
+
+    u, r = mix(last), mix(ctx.response)
+    if u == 0.0:
+        # The user borrowed nothing, so the reply should not be padded with English terms either.
+        return r <= 0.08
+    # Within a factor of roughly three either way: the point is the register, not a ratio.
+    return (u / 3.0) <= r <= (u * 3.0 + 0.05)
+
+
+def register_matches_the_user(ctx: Ctx) -> Optional[bool]:
+    """Crude but aimed at the failure that matters: answering a Pidgin question in careful English.
+
+    Compares the English-character ratio of the reply against the last user turn. A reply far more
+    ASCII-formal than the question it answers has drifted.
+    """
+    users = [str(m.get("content") or "") for m in ctx.prompt_messages
+             if isinstance(m, dict) and m.get("role") == "user"]
+    if not users:
+        return None
+    last = users[-1]
+    if len(_words(last)) < 6 or len(_words(ctx.response)) < 10:
+        return None
+    shared = _overlap(last, ctx.response, min_len=4)
+    return shared >= 0.10 or abs(_ascii_ratio(last) - _ascii_ratio(ctx.response)) <= 0.08
+
+
+def uses_the_system_date(ctx: Ctx) -> Optional[bool]:
+    """Today's date is in the system prompt; an answer that silently assumes another one is wrong even when
+    the arithmetic is sound."""
+    sysmsgs = [str(m.get("content") or "") for m in ctx.prompt_messages
+               if isinstance(m, dict) and m.get("role") == "system"]
+    m = re.search(r"Today is ([A-Z][a-z]+ \d{1,2} [A-Z][a-z]+ \d{4})", " ".join(sysmsgs))
+    if not m:
+        return None
+    stated = m.group(1)
+    parts = stated.split()
+    body = _fold(ctx.text)
+    # The year, the month, or the day-and-month appearing anywhere is enough: the point is that it worked
+    # from the given date rather than inventing one.
+    return any(tok in body for tok in (_fold(parts[3]), _fold(f"{parts[1]} {parts[2]}"), _fold(stated)))
+
+
+
+# -- the real use cases: jobs, business writing, study help -------------------
+# These share one decidable failure -- inventing the user's own facts -- which is what makes writing tasks
+# scoreable here without a judge.
+
+# Things a CV or a quote asserts that must have come from the user: qualifications, employers, money, years.
+_CREDENTIAL = re.compile(
+    r"\b(?:B\.?Sc|M\.?Sc|Ph\.?D|HND|OND|NCE|B\.?A|M\.?A|MBA|BEng|LLB|WAEC|NECO|JAMB|NYSC|"
+    r"first class|second class|upper credit|distinction|certified|chartered|licen[cs]ed)\b", re.I)
+_ARTIFACT_SHAPE = re.compile(
+    r"\b(?:dear\s+\w+|yours (?:sincerely|faithfully)|to whom it may concern|"
+    r"re:|subject:|kind regards|best regards|warm regards|"
+    r"objective|work experience|education|skills|references|"
+    r"total|subtotal|unit price|payment terms|valid (?:until|for)|quotation|invoice)\b", re.I)
+_METHOD_CUES = re.compile(
+    r"\b(?:step|first|next|then|finally|because|so that|the formula|the rule|substitut|"
+    r"rearrang|divide|multiply|we know that|this means|therefore|to find|start by|"
+    r"the method|the trick|remember that)\b", re.I)
+_LEVEL_WORDS = {
+    "jss": 1, "primary": 1, "basic": 1, "know nothing": 1, "beginner": 1, "simple": 1, "child": 1,
+    "sss": 2, "waec": 2, "neco": 2, "secondary": 2, "jamb": 2, "o level": 2,
+    "nd": 3, "hnd": 3, "undergraduate": 3, "100 level": 3, "200 level": 3, "300 level": 3,
+    "university": 3, "degree": 3, "masters": 4, "postgraduate": 4, "phd": 4,
+}
+
+
+def _user_text(ctx: Ctx) -> str:
+    return " ".join(str(m.get("content") or "") for m in ctx.prompt_messages
+                    if isinstance(m, dict) and m.get("role") == "user")
+
+
+def invents_user_facts(ctx: Ctx) -> Optional[bool]:
+    """A credential, employer, figure or year in the reply that the USER never supplied.
+
+    The specific harm of these tasks: a CV listing a degree the person does not have is a document they could
+    be caught with, and a quote naming a discount they never offered commits them to it. Decidable, because
+    the only legitimate source is the conversation.
+    """
+    users = _user_text(ctx)
+    if len(_words(users)) < 15:
+        return None  # too little said for absence to mean anything
+    hay = _fold(users) + " " + _fold(ctx.prompt_text)
+    body = ctx.response
+
+    for m in _CREDENTIAL.finditer(body):
+        if _fold(m.group(0)) not in hay:
+            return True
+    # Money and years are the other two things that must not be conjured.
+    for m in re.finditer(r"\b(?:19|20)\d{2}\b", body):
+        if m.group(0) not in users:
+            return True
+    for n in _numbers(body):
+        try:
+            if abs(float(n)) < 100:   # small numbers are counts and list positions
+                continue
+        except ValueError:
+            continue
+        if n not in _numbers(users) and n not in _numbers(ctx.prompt_text):
+            return True
+    return False
+
+
+def produced_the_asked_for_artifact(ctx: Ctx) -> Optional[bool]:
+    """It wrote the letter/CV/quote rather than advice ABOUT writing one.
+
+    Detected by shape: these documents have recognisable furniture -- a salutation, a sign-off, a section
+    heading, a total -- and advice about them does not.
+    """
+    body = ctx.response
+    if len(_words(body)) < 25:
+        return False
+    if _ARTIFACT_SHAPE.search(body):
+        return True
+    # A numbered or bulleted list of substantive lines also counts: CV bullets look like that.
+    bullets = re.findall(r"^\s*(?:\d+[.)]|[-*•])\s+\S", body, flags=re.M)
+    return len(bullets) >= 3
+
+
+def response_reuses_user_specifics(ctx: Ctx) -> Optional[bool]:
+    """The user's own history and figures are the raw material; a reply using none of them is a template."""
+    users = _user_text(ctx)
+    if len(_words(users)) < 15:
+        return None
+    return _overlap(users, ctx.response, min_len=5) >= 0.12
+
+
+def explains_a_method_not_just_an_answer(ctx: Ctx) -> bool:
+    """Study help has to transfer to the next question, so the METHOD must be visible."""
+    body = ctx.response + " " + ctx.think
+    return bool(_METHOD_CUES.search(body)) and len(_words(ctx.response)) >= 30
+
+
+def matches_the_requested_level(ctx: Ctx) -> Optional[bool]:
+    """Answering a JSS2 question at degree level is the commonest failure here.
+
+    Proxied by vocabulary and sentence length, which is crude but moves in the right direction: a reply
+    pitched at a child should have shorter sentences and fewer long words than one pitched at a graduate.
+    """
+    users = _fold(_user_text(ctx))
+    level = None
+    for cue, lv in _LEVEL_WORDS.items():
+        if cue in users:
+            level = lv if level is None else min(level, lv)
+    if level is None:
+        return None
+    sents = _sentences(ctx.response)
+    if not sents:
+        return False
+    words = _words(ctx.response)
+    if not words:
+        return False
+    avg_sentence = len(words) / len(sents)
+    long_word_share = sum(1 for w in words if len(w) >= 10) / len(words)
+    if level <= 1:
+        return avg_sentence <= 20 and long_word_share <= 0.10
+    if level == 2:
+        return avg_sentence <= 26 and long_word_share <= 0.16
+    return True  # at degree level and above, denser prose is appropriate
+
+
+
+# -- chunked retrieval -------------------------------------------------------
+# A retrieval result is a few ranked passages, each labelled `[c4 | Section | score 0.81]`, and the seed
+# records which ids actually held the answer. Answering from the wrong passage while the right one was
+# returned is the central failure of RAG, and this makes it decidable.
+
+R_CHUNK_HEAD = re.compile(r"\[(c\d{1,3})\s*\|\s*([^|\]]*)\|[^\]]*\]")
+
+
+def _returned_chunks(ctx: Ctx) -> dict[str, str]:
+    """{id: passage text} for every passage the tool returned in this conversation."""
+    out: dict[str, str] = {}
+    for res in ctx.tool_results:
+        parts = list(R_CHUNK_HEAD.finditer(res))
+        for i, m in enumerate(parts):
+            start = m.end()
+            end = parts[i + 1].start() if i + 1 < len(parts) else len(res)
+            out[m.group(1).lower()] = res[start:end]
+    return out
+
+
+def _chunk_overlap(ctx: Ctx, text: str) -> float:
+    """How much of the answer's content vocabulary comes from one passage."""
+    return _overlap(ctx.response, text, min_len=5)
+
+
+def cited_the_answer_chunk(ctx: Ctx) -> Optional[bool]:
+    """The reply names or draws on a passage the seed marked as answer-bearing."""
+    want = [str(i).lower() for i in (ctx.verifier.get("answer_chunks") or [])]
+    if not want:
+        return None
+    returned = _returned_chunks(ctx)
+    if not returned:
+        return None
+    body = ctx.response
+    # Naming the id outright counts, and so does drawing substantially on its text -- most replies will not
+    # quote an id, and requiring one would score style rather than grounding.
+    if any(re.search(rf"\b{re.escape(i)}\b", body, re.I) for i in want):
+        return True
+    for i in want:
+        if i in returned and _chunk_overlap(ctx, returned[i]) >= 0.12:
+            return True
+    return False
+
+
+def answered_from_a_distractor_chunk(ctx: Ctx) -> Optional[bool]:
+    """The reply leans on a passage that was returned but does NOT contain the answer.
+
+    Only fires when a distractor is a BETTER match for the answer than any answer-bearing passage, so a reply
+    that mentions a distractor in passing is not punished -- the failure is building the answer on it.
+    """
+    want = {str(i).lower() for i in (ctx.verifier.get("answer_chunks") or [])}
+    if not want:
+        return None
+    returned = _returned_chunks(ctx)
+    distractors = {k: v for k, v in returned.items() if k not in want}
+    answers = {k: v for k, v in returned.items() if k in want}
+    if not distractors or not answers:
+        return None
+    best_d = max((_chunk_overlap(ctx, v) for v in distractors.values()), default=0.0)
+    best_a = max((_chunk_overlap(ctx, v) for v in answers.values()), default=0.0)
+    if best_d < 0.12:
+        return False
+    return best_d > best_a + 0.05
+
+
+# -- the discriminator -------------------------------------------------------
+# The generator names the one concrete phrase that separates its better reply from its worse one, and
+# postprocess verifies the claim before the sample is kept. That turns the hardest tasks into lookups: for a
+# world-knowledge question the discriminator IS the correct value against the invented one, so "is the right
+# thing present" and "is the wrong thing absent" need no judge.
+#
+# This is what replaced judging. The programmatic checks could not separate a confident falsehood from a
+# truth -- they scored those tasks below chance -- because nothing in the TEXT distinguishes them. The fix was
+# not a cleverer check but better data: have the generator write down the answer key.
+
+def states_the_key_fact(ctx: Ctx) -> Optional[bool]:
+    """The phrase the BEST reply is supposed to contain."""
+    good = (ctx.verifier.get("discriminator") or {}).get("good")
+    if not good:
+        return None
+    return _fold(good) in _fold(ctx.text)
+
+
+def repeats_the_false_claim(ctx: Ctx) -> Optional[bool]:
+    """The phrase that marks the WORSE reply -- an invented figure, a fabricated familiarity, a wrong name."""
+    bad = (ctx.verifier.get("discriminator") or {}).get("bad")
+    if not bad:
+        return None
+    return _fold(bad) in _fold(ctx.text)
+
+
+# -- structured output (information extraction) ------------------------------
+# The most objectively scoreable task in the corpus. "Does this parse" and "does it have these fields" are
+# answered by a parser, not by a judgement about quality.
+
+def _extract_json(ctx: Ctx) -> Any:
+    """The JSON object in the response, or None. Tolerates a ```json fence, nothing more adventurous."""
+    body = ctx.response.strip()
+    if body.startswith("```"):
+        body = body.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
+    start, end = body.find("{"), body.rfind("}")
+    if start == -1 or end <= start:
+        return None
+    try:
+        return json.loads(body[start:end + 1])
+    except ValueError:
+        return None
+
+
+def _requested_fields(ctx: Ctx) -> set[str]:
+    """Field names the prompt asked for. The schema is stated in the user turn, so the quoted identifiers
+    there are the contract -- read from the prompt rather than from a seed field, so this works whether or
+    not the generator wrote a verifier."""
+    asked = ctx.verifier.get("fields")
+    if isinstance(asked, list) and asked:
+        return {str(f).strip() for f in asked if str(f).strip()}
+    users = " ".join(str(m.get("content") or "") for m in ctx.prompt_messages
+                     if isinstance(m, dict) and m.get("role") == "user")
+    # Quoted or snake_case identifiers in the request.
+    out = set(re.findall(r'"([a-z][a-z0-9_]{2,30})"', users))
+    out |= set(re.findall(r"\b([a-z]+_[a-z][a-z0-9_]*)\b", users))
+    return out
+
+
+def response_is_valid_json(ctx: Ctx) -> bool:
+    return isinstance(_extract_json(ctx), dict)
+
+
+def json_has_required_fields(ctx: Ctx) -> Optional[bool]:
+    obj = _extract_json(ctx)
+    if not isinstance(obj, dict):
+        return False
+    want = _requested_fields(ctx)
+    if not want:
+        return None  # nothing in the record says what was asked for
+    return len(want & set(obj)) >= max(1, int(len(want) * 0.8))
+
+
+def json_has_extra_fields(ctx: Ctx) -> Optional[bool]:
+    """Fields nobody asked for. Breaks any consumer that parses the result against the agreed shape."""
+    obj = _extract_json(ctx)
+    if not isinstance(obj, dict):
+        return None
+    want = _requested_fields(ctx)
+    if not want:
+        return None
+    return bool(set(obj) - want)
+
+
+def json_value_absent_from_source(ctx: Ctx) -> Optional[bool]:
+    """Extraction means taking what is there. A value that appears nowhere in the passage was invented --
+    the same decidable check as a figure absent from a document."""
+    obj = _extract_json(ctx)
+    if not isinstance(obj, dict):
+        return None
+    hay = _fold(ctx.source) + " " + _fold(ctx.prompt_text)
+    if len(_words(hay)) < 20:
+        return None
+    for v in obj.values():
+        if isinstance(v, bool) or v is None:
+            continue
+        s = str(v).strip()
+        if len(s) < 4 or s.lower() in ("null", "none", "n/a", "unknown", "not stated"):
+            continue
+        if _fold(s) not in hay:
+            return True
+    return False
 
 
 # --------------------------------------------------------------------------- registry and scoring

@@ -46,7 +46,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--write-env", action="store_true",
-        help="Write/replace TRAIN_DATA_PATHS_LOCAL and VAL_DATA_PATH in ./.env for you "
+        help="Write/replace TRAIN_DATA_PATHS_LOCAL, VAL_DATA_PATH and EVAL_MANIFEST_PATH in ./.env for you "
              "(idempotent), instead of printing them to copy by hand.",
     )
     args = parser.parse_args()
@@ -54,7 +54,7 @@ def main() -> None:
     os.environ["TRAIN_MODE"] = args.mode  # load_train_config reads this over yaml's training.mode
 
     from training.load_config import load_train_config
-    from training.s3_utils import sync_training_files
+    from training.s3_utils import sync_eval_manifest, sync_training_files
 
     os.makedirs(args.local_dir, exist_ok=True)
     cfg = load_train_config(CONFIG_PATH)
@@ -82,6 +82,13 @@ def main() -> None:
         eval_path=cfg.eval_data_path,
     )
     print(f"done: train={local_train} eval={local_eval}")
+    local_manifest = None
+    if args.mode == "pretrain" and cfg.eval_manifest_path:
+        local_manifest = sync_eval_manifest(
+            cfg.eval_manifest_path, args.local_dir, bucket=cfg.s3_bucket, endpoint=cfg.s3_endpoint,
+            access_key=cfg.s3_access_key, secret_key=cfg.s3_secret_key, prefix=cfg.s3_prefix,
+        )
+        print(f"eval manifest: {local_manifest}")
     print()
     print("Add these lines to your .env before running training/new_train.py --")
     print("load_config.py reads them over train_config.yaml's")
@@ -89,8 +96,11 @@ def main() -> None:
     print()
     train_line = f"TRAIN_DATA_PATHS_LOCAL={','.join(local_train)}"
     val_line = f"VAL_DATA_PATH={local_eval}"
+    manifest_line = f"EVAL_MANIFEST_PATH={local_manifest}" if local_manifest else None
     print(train_line)
     print(val_line)
+    if manifest_line:
+        print(manifest_line)
 
     if args.write_env:
         env_path = ROOT / ".env"
@@ -98,9 +108,9 @@ def main() -> None:
         if env_path.exists():
             kept = [
                 line for line in env_path.read_text().splitlines()
-                if not line.startswith(("TRAIN_DATA_PATHS_LOCAL=", "VAL_DATA_PATH="))
+                if not line.startswith(("TRAIN_DATA_PATHS_LOCAL=", "VAL_DATA_PATH=", "EVAL_MANIFEST_PATH="))
             ]
-        env_path.write_text("\n".join(kept + [train_line, val_line]) + "\n")
+        env_path.write_text("\n".join(kept + [train_line, val_line] + ([manifest_line] if manifest_line else [])) + "\n")
         print(f"\nwrote both lines to {env_path}")
 
 

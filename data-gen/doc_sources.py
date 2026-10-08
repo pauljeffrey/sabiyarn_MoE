@@ -55,6 +55,170 @@ API = "https://en.wikipedia.org/w/api.php"
 UA = "SabiYarn-datagen/0.1 (West African LM research; https://huggingface.co/BeardedMonster)"
 LICENCE = "CC BY-SA 4.0"
 
+# WHICH WIKIPEDIAS CAN ACTUALLY SUPPLY A LONG DOCUMENT. Measured, not assumed, by sampling each site's search
+# results for articles of 1,200+ words:
+#
+#   fra 176/200   hau 68/200   ibo 53/200   som 23/200   twi 14/200   yor 13/200
+#   orm 8/120     swh 6/200    kin 4/120    sna 2/120    zul 1/120    ewe 1/120    aka 0 (no wiki)
+#
+# This corrected an earlier conclusion of mine. I had sampled the Hugging Face wikipedia dump from a fixed
+# offset, which is stub-heavy, and concluded the African Wikipedias were unusable across the board. Sampling
+# through each site's own search tells a different story: Hausa and Igbo are genuinely viable, Yoruba is
+# marginal, and Swahili is poor DESPITE having 130,000 articles -- most of them short.
+#
+# Languages not listed fall through to generation, which is the only option when there is nothing to harvest.
+NATIVE_WIKIS = {
+    "fra": "fr",   # 2.8M articles; effectively unlimited
+    "hau": "ha",   # the best of the West African wikis
+    "ibo": "ig",
+    "som": "so",
+    "twi": "tw",   # thin, but enough to be worth trying before falling back
+    "yor": "yo",   # marginal: expect a low yield and a generation fallback
+}
+# Below this many usable documents for a language, do not bother: the harvest costs more attention than the
+# handful of documents is worth, and generation covers it.
+NATIVE_MIN_VIABLE = 25
+
+# NATIVE DOCUMENTS MAY BE SHORTER THAN ENGLISH ONES, and chunked retrieval is what makes that fine.
+#
+# The English band (1,600-6,400 words) was set when a tool result was a WHOLE document. Now that a result is
+# three to five passages, a 500-word article yields two or three of them -- which is exactly what a retriever
+# returns. Insisting on 1,600+ words in Hausa or Yoruba would reject the entire available corpus for no gain:
+# measured medians are 282 (hau), 310 (yor), 292 (ibo), 490 (som), 544 (swa).
+#
+# The long band still applies to SUMMARISATION, where the document genuinely is the subject.
+NATIVE_RAG_MIN_WORDS = 350
+NATIVE_RAG_MAX_WORDS = 6_400
+
+# MASAKHANEWS WAS TRIED AND DROPPED. Recording why, so it is not re-litigated.
+#
+# BBC-sourced news in exactly these languages looked like the obvious fix for the thin native wikis, and 2,820
+# documents were harvested across hau, yor, ibo, pcm, som, swh and fra. Measured side by side against the
+# wikis, it lost on BOTH axes everywhere the two overlap -- median words and median technicality:
+#
+#   hau  wiki 856w / 0.25   news 602w / 0.16
+#   ibo  wiki 690w / 0.20   news 546w / 0.14
+#   yor  wiki 622w / 0.21   news 540w / 0.11
+#   som  wiki 650w / 0.20   news 556w / 0.15
+#   fra  wiki 4,672w / 0.33 news 976w / 0.17
+#
+# Filtering by category did not rescue it either: across all seven MasakhaNEWS categories the technicality
+# medians sit between 0.10 and 0.20, and the highest is sport -- numbers of the wrong kind. News prose simply
+# carries few figures with units, which is what the score is mostly measuring.
+#
+# Only pcm and swh had no wiki alternative, and for those an ENGLISH document is the designed default anyway:
+# a retrieved passage is English by construction (see longdocs.plan_document), and english_to_native is one of
+# the standard directions. Dropping news also removes a second licence from the corpus -- AFL-3.0 over
+# BBC-sourced text -- which is one fewer question to answer before publishing, and removes a news-domain skew
+# towards politics, sport and entertainment that does not match the corpus's own domains.
+
+
+_NATIVE_PROBES = {
+    "fra": ("de", "la", "le", "et", "pour", "dans", "avec", "sur", "est", "une", "par", "plus",
+            "entre", "sous", "selon", "pendant", "chaque", "ainsi"),
+    "hau": ("da", "na", "a", "ta", "ya", "wannan", "kuma", "ba", "cikin", "wanda", "sun", "za",
+            "shi", "ne", "ko", "amma", "yana", "bayan"),
+    "ibo": ("na", "ya", "nke", "maka", "ihe", "ndi", "otu", "ka", "bu", "ego", "obodo", "oge",
+            "ike", "ala", "ulo", "mmiri", "afo", "ozo"),
+    # yor (168) and som (222) were the thinnest languages in the pool, and the probe list is what limits how
+    # far into a wiki the search reaches, so these two get a much longer one.
+    "som": ("ka", "oo", "la", "iyo", "waa", "ah", "uu", "si", "in", "ay", "dhan", "badan",
+            "waxa", "dalka", "sanadka", "qof", "biyo", "caafimaad", "magaalada", "dadka",
+            "soomaaliya", "wax", "kale", "markii", "sidoo", "hadda", "awood", "shaqo",
+            "dugsi", "beer", "xoolo", "suuq", "lacag", "dawo", "cudur", "roob",
+            "dhul", "guri", "waddo", "gaadhi", "tacliin", "diin", "taariikh", "dhaqan"),
+    "twi": ("ne", "no", "wo", "na", "se", "nti", "yi", "mu", "ho", "bi", "nso", "ara",
+            "nnipa", "asase", "nsuo", "sika", "afe", "aduane"),
+    "yor": ("ni", "ti", "ati", "awon", "fun", "lati", "pelu", "ko", "won", "ile", "omi", "owo",
+            "odun", "ounje", "ise", "oro", "eniyan", "ilu", "orile", "ede", "iwe", "oko",
+            "aye", "nkan", "ara", "okan", "ojo", "oorun", "igi", "eja", "eran", "aso",
+            "ilera", "egbogi", "arun", "iwosan", "ijoba", "oja", "ona", "ayika",
+            "itan", "esin", "asa", "orin", "eko", "agbara", "ina"),
+}
+
+
+def harvest_native(lang: str, *, min_words: int, max_words: int, want: int = 0,
+                   per_probe: int = 120, verbose: bool = True) -> Iterator[dict]:
+    """Long articles from `lang`'s own Wikipedia, selected on length and coherence.
+
+    No topic filter and no query-relevance gate -- see the note above. What IS checked:
+      - length, inside the band the samples ask for;
+      - that the text is prose rather than a list or a table dump, which is the one thing that would make a
+        document unusable as a passage to answer from;
+      - that it is not a disambiguation page or a bare stub with an infobox.
+    """
+    wiki_code = NATIVE_WIKIS.get(lang)
+    if not wiki_code:
+        return
+    wiki = Wikipedia(lang=wiki_code)
+    seen: set[str] = set()
+    produced = 0
+    for probe in _NATIVE_PROBES.get(lang, ("a",)):
+        try:
+            hits = wiki.search(probe, limit=per_probe)
+        except RuntimeError:
+            continue
+        # Length filter on the search result, before anything is downloaded.
+        cands = [h for h in hits
+                 if h.get("title") not in seen and int(h.get("wordcount") or 0) >= min_words * 0.9]
+        for h in cands:
+            title = h["title"]
+            seen.add(title)
+            try:
+                pg = wiki.plaintext(title)
+            except RuntimeError:
+                continue
+            if not pg:
+                continue
+            body = clean(pg["text"])
+            n = len(body.split())
+            if not (min_words <= n <= max_words):
+                continue
+            if not _is_prose(body):
+                continue
+            produced += 1
+            if verbose:
+                print(f"  [{lang}] {title[:48]:<50} {n:>6,}w")
+            yield {"title": pg["title"], "pageid": pg["pageid"], "url": pg["url"],
+                   "text": body, "words": n, "doc_lang": lang,
+                   # Scored for the record but not gated on: topic is not the selection criterion here.
+                   "technicality": round(technicality(body, title), 3),
+                   "relevance": 1.0, "query": f"native:{probe}",
+                   "domain": "native_general", "source": "wikipedia", "licence": LICENCE}
+            if want and produced >= want:
+                return
+
+
+def _is_prose(text: str) -> bool:
+    """Enough running prose to answer questions from.
+
+    The failure this excludes is a page that is mostly a table, a list of names, or an infobox with two
+    sentences round it -- common in the smaller wikis, and useless as a passage because there is nothing to
+    read off. Measured as: most lines are long enough to be sentences, and the text has sentence punctuation.
+    """
+    body = "\n".join(ln for ln in text.splitlines() if not ln.strip().startswith("="))
+    words = body.split()
+    # 150, not 200: a native-language news article of 350 words is a legitimate retrieval source now that a
+    # tool result is a few passages rather than a whole document.
+    if len(words) < 150:
+        return False
+    # Sentences, not lines: a document is prose if it is made of sentences, however it happens to be wrapped.
+    # Keying this on line count alone rejected a legitimate single-paragraph article.
+    sentences = [s for s in re.split(r"[.!?]+(?:\s|$)", body) if len(s.split()) >= 6]
+    if len(sentences) < 5:
+        return False
+    # And the average sentence has to be sentence-length. A table of names parses as many 2-word "sentences".
+    if len(words) / max(1, len(sentences)) < 8:
+        return False
+    # Finally, if the text IS broken into many lines, most of them should be long -- this is what catches a
+    # page that is mostly a list or an infobox.
+    lines = [ln.strip() for ln in body.splitlines() if ln.strip()]
+    if len(lines) >= 8:
+        longish = sum(1 for ln in lines if len(ln.split()) >= 12)
+        if longish / len(lines) < 0.40:
+            return False
+    return True
+
 # Search seeds, grouped by the corpus's own domains (prompts.DOMAINS). Each is phrased to surface REFERENCE
 # pages rather than overviews: the words are the ones a specification uses.
 TOPIC_SEEDS: dict[str, tuple[str, ...]] = {
@@ -213,6 +377,27 @@ TOPIC_SEEDS: dict[str, tuple[str, ...]] = {
 # the right response to something it already knows is to go and search. Those domains still appear
 # throughout the corpus; they appear in the tasks that answer WITHOUT a tool.
 
+GENERAL_SEEDS: dict[str, tuple[str, ...]] = {
+    "history": ("precolonial west african kingdom", "trans saharan trade history",
+                "independence movement nigeria", "ghana empire history"),
+    "festivals_customs": ("naming ceremony tradition", "masquerade festival yoruba",
+                          "harvest festival west africa", "traditional marriage rites"),
+    "arts_literature": ("oral storytelling tradition", "african novel postcolonial",
+                        "textile weaving tradition", "proverb oral literature"),
+    "music": ("highlife music history", "afrobeat origins", "talking drum tradition",
+              "juju music nigeria"),
+    "geography_places": ("niger river basin", "sahel region geography", "lagos lagoon",
+                         "volta river"),
+    "rural_life": ("village farming community life", "pastoralist migration seasonal",
+                   "market day rural trade"),
+    "sports": ("african cup of nations", "wrestling traditional sport", "athletics west africa"),
+    "religion_ethics": ("islam in west africa history", "christianity in nigeria history",
+                        "traditional religion orisha"),
+    "family_relationships": ("extended family kinship", "naming practices west africa"),
+    "food_cooking": ("staple foods west africa", "fermented foods tradition", "palm oil cooking"),
+}
+
+
 # --- technicality scoring -------------------------------------------------------------------------------
 # A number WITH a unit. The heart of the score: a figure carrying a unit is a fact that has to be looked
 # up, which is exactly the content the tool-using behaviour is for.
@@ -239,28 +424,43 @@ _GENERAL_WORDS = (
 )
 
 
-def technicality(text: str, title: str = "") -> float:
+def technicality(text: str, title: str = "", lang: str = "eng") -> float:
     """0..1. How much of this document is specific, checkable, looked-up fact.
 
     A proxy, and a deliberately crude one -- it is a filter on a free corpus, not a measurement. It only
     has to be good enough to prefer a page about emitter discharge rates over one about a footballer.
+
+    LANGUAGE MATTERS HERE, and getting it wrong misled me. _SPEC_WORDS and _GENERAL_WORDS are English
+    ("dosage", "tolerance", "per hectare", "discography"), so on a Hausa or Yoruba document they can never
+    match: a quarter of the score is structurally unavailable and the penalty never fires. Native documents
+    were therefore scoring low partly because the scorer is blind to them, not because the text is
+    unspecific -- and I nearly concluded from those numbers that native news is inherently untechnical.
+
+    For a non-English document the score is built from the LANGUAGE-NEUTRAL evidence only -- figures with
+    units, ranges, numeric density, all of which survive translation -- and renormalised, so the number means
+    the same thing in both cases.
     """
     words = text.split()
     n = len(words)
-    if n < 200:
+    if n < 150:
         return 0.0
     low = text.lower()
     per_1k = 1000.0 / n
     units = len(R_NUM_UNIT.findall(text)) * per_1k      # figures with units, per 1k words
     ranges = len(R_RANGE.findall(text)) * per_1k
     nums = len(R_NUMBER.findall(text)) * per_1k
+
+    u, r, d = min(units / 12.0, 1.0), min(ranges / 4.0, 1.0), min(nums / 35.0, 1.0)
+    if lang != "eng":
+        # Weights renormalised over the neutral components (0.40 + 0.15 + 0.10 = 0.65), plus the same floor.
+        return max(0.0, min(1.0, (u * 0.40 + r * 0.15 + d * 0.10) / 0.65 * 0.90 + 0.10))
+
     spec = sum(low.count(w) for w in _SPEC_WORDS) * per_1k
     general = sum(low.count(w) for w in _GENERAL_WORDS) * per_1k
-
-    score = (min(units / 12.0, 1.0) * 0.40
+    score = (u * 0.40
              + min(spec / 14.0, 1.0) * 0.25
-             + min(ranges / 4.0, 1.0) * 0.15
-             + min(nums / 35.0, 1.0) * 0.10
+             + r * 0.15
+             + d * 0.10
              + 0.10)  # a floor, so a sound reference page with few numbers is not excluded outright
     score -= min(general / 6.0, 1.0) * 0.45
     tl = title.lower()
@@ -327,7 +527,7 @@ def _content_terms(q: str) -> set[str]:
     return {w for w in re.findall(r"[a-z]+", q.lower()) if len(w) > 3 and w not in stop}
 
 
-def relevance(text: str, title: str, query: str) -> float:
+def relevance(text: str, title: str, query: str, lang: str = "eng") -> float:
     """0..1. Is this document about what the query asked for, and is it usable for this corpus?
 
     Deliberately a gate rather than a ranking: the pool is drawn from a free corpus, so it costs nothing to
@@ -351,7 +551,9 @@ def relevance(text: str, title: str, query: str) -> float:
     # for a query about identity enrolment and still the wrong answer: a document question answered from
     # another country's procedure is worse than one answered with "I could not find it". A penalty left it
     # at 0.50, above the gate.
-    if R_FOREIGN.search(title):
+    # The jurisdiction rule is written against English titles and would misfire on a Hausa or French page,
+    # whose place names are spelled differently. Applied only to the English pool, where it was calibrated.
+    if lang == "eng" and R_FOREIGN.search(title):
         return 0.0
     # Likewise a specific product or model year. "Toyota Prius (XW20)" matches a query about battery
     # charging perfectly and is still never a document a SabiYarn user retrieves. A penalty left it at 0.55.
@@ -455,23 +657,39 @@ def clean(text: str) -> str:
 
 # --- pool building ---------------------------------------------------------------------------------------
 
-# Calibrated against known pages rather than picked: general-interest articles score 0.00 (Fela Kuti,
-# Nigeria national football team) to 0.30 (Lagos), reference pages 0.41 (Drip irrigation) to 0.68 (Oral
-# rehydration therapy). 0.36 sits in the gap with room on both sides. A threshold of 0.42 -- my first guess
-# -- excluded Drip irrigation, which is exactly the kind of page this pool exists for.
-MIN_TECHNICALITY = 0.36
+# RELAXED, deliberately, from 0.36 to 0.15.
+#
+# The original idea was that a retrieved document should be something a 306M model cannot hold, so that
+# looking things up is reserved for genuinely technical questions. That reasoning does not survive contact
+# with how people actually work: nobody knows who a musician is until they encounter them, and nobody knows
+# the Rule of 72 until the day they look it up. An unnecessary search costs a second; a confident wrong
+# answer costs trust. Excluding general-interest documents from the pool meant the model could never learn
+# that looking THOSE up is available to it either.
+#
+# What the score is still used for: a mild PREFERENCE, so the pool leans towards pages with checkable
+# specifics (a discharge rate, a dosage, a fee) rather than consisting entirely of them. The floor now only
+# rejects documents with nothing retrievable in them at all.
+#
+# The calibration that produced 0.36 is kept for reference: general-interest pages score 0.00 (Fela Kuti) to
+# 0.30 (Lagos), reference pages 0.41 (Drip irrigation) to 0.68 (Oral rehydration therapy). Relevance --
+# whether the document matches the question asked of it -- is now the gate that does the real work.
+MIN_TECHNICALITY = 0.15
+# Above this a document counts as "specific"; the pool aims for a majority of these without requiring it.
+TECHNICAL_PREFERENCE = 0.36
 
 
 def harvest(*, min_words: int, max_words: int, min_technicality: float = MIN_TECHNICALITY,
             per_seed: int = 40, domains: Optional[Iterable[str]] = None,
-            want: int = 0, verbose: bool = True) -> Iterator[dict]:
+            want: int = 0, verbose: bool = True, lang: str = "eng",
+            queries: Optional[dict[str, tuple[str, ...]]] = None) -> Iterator[dict]:
     """Yield cleaned, length-filtered, technicality-scored documents.
 
     Length is filtered on the SEARCH result (`wordcount`), so a page is only downloaded once it is already
     known to be the right size -- that is the difference between a few hundred requests and a few thousand.
     """
-    wiki = Wikipedia()
-    seeds = TOPIC_SEEDS if domains is None else {k: v for k, v in TOPIC_SEEDS.items() if k in set(domains)}
+    wiki = Wikipedia(lang=NATIVE_WIKIS.get(lang, "en"))
+    base = queries if queries is not None else TOPIC_SEEDS
+    seeds = base if domains is None else {k: v for k, v in base.items() if k in set(domains)}
     seen_titles: set[str] = set()
     produced = 0
     for domain, queries in seeds.items():
@@ -503,7 +721,7 @@ def harvest(*, min_words: int, max_words: int, min_technicality: float = MIN_TEC
                 score = technicality(body, title)
                 if score < min_technicality:
                     continue
-                rel = relevance(body, title, q)
+                rel = relevance(body, title, q, lang=lang)
                 if rel < MIN_RELEVANCE:
                     continue
                 produced += 1
@@ -511,7 +729,7 @@ def harvest(*, min_words: int, max_words: int, min_technicality: float = MIN_TEC
                     print(f"  [{domain}] {title[:46]:<46} {n:>6,}w  tech {score:.2f} rel {rel:.2f}")
                 yield {"title": pg["title"], "pageid": pg["pageid"], "url": pg["url"],
                        "text": body, "words": n, "technicality": round(score, 3),
-                       "relevance": round(rel, 3), "query": q,
+                       "relevance": round(rel, 3), "query": q, "doc_lang": lang,
                        "domain": domain, "source": "wikipedia", "licence": LICENCE}
                 if want and produced >= want:
                     return
@@ -548,13 +766,26 @@ class DocumentPool:
                 added += 1
         return added
 
-    def take(self, *, words: int, domain: str = "", key: str = "") -> Optional[dict]:
+    def count(self, lang: str = "eng") -> int:
+        return sum(1 for d in self.docs if (d.get("doc_lang") or "eng") == lang)
+
+    def take(self, *, words: int, domain: str = "", key: str = "",
+             lang: str = "eng", technicality: Optional[tuple[float, float]] = None) -> Optional[dict]:
         """The unused document closest to `words`, preferring the requested domain.
 
         `key` makes the choice deterministic for a given caller, so a re-run picks the same document for the
         same sample and the corpus is reproducible.
         """
-        pool = [(i, d) for i, d in enumerate(self.docs) if i not in self._used]
+        # Language first and without compromise: handing a Hausa sample an English document would silently
+        # change what the sample teaches.
+        pool = [(i, d) for i, d in enumerate(self.docs)
+                if i not in self._used and (d.get("doc_lang") or "eng") == lang]
+        if technicality is not None:
+            lo, hi = technicality
+            band = [(i, d) for i, d in pool if lo <= float(d.get("technicality") or 0.0) <= hi]
+            # Falling back to the whole pool rather than failing: a missing band is a thinner spread, not a
+            # reason to generate a document we already have one for.
+            pool = band or pool
         if not pool:
             return None
         same = [(i, d) for i, d in pool if d.get("domain") == domain]
@@ -587,10 +818,10 @@ def fill_store(specs: Iterable[Any], store: Any, pool: "DocumentPool") -> int:
         cid = getattr(spec, "custom_id", None)
         if not cid or cid in store:
             continue
-        if getattr(spec, "doc_lang", None) != "eng":
-            continue  # nothing to source: see above
+        want_lang = getattr(spec, "doc_lang", None) or "eng"
         picked = pool.take(words=int(getattr(spec, "words", 0) or 0),
-                           domain=getattr(spec, "domain", "") or "", key=cid)
+                           domain=getattr(spec, "domain", "") or "", key=cid, lang=want_lang,
+                           technicality=getattr(spec, "technicality_band", None))
         if picked is None:
             continue
         store.put({
@@ -599,8 +830,8 @@ def fill_store(specs: Iterable[Any], store: Any, pool: "DocumentPool") -> int:
             "text": picked["text"],
             "words": picked["words"],
             "lang": getattr(spec, "lang", "eng"),
-            "doc_lang": "eng",
-            "doc_lang_mode": "eng",
+            "doc_lang": want_lang,
+            "doc_lang_mode": getattr(spec, "doc_lang_mode", None) or want_lang,
             # The form is what it is -- an encyclopaedia article -- rather than one of the generated forms.
             # Stage 2 reads this only to describe the document to the generator, so saying so is honest and
             # also tells the generator not to expect a report's section structure.
@@ -619,3 +850,136 @@ def fill_store(specs: Iterable[Any], store: Any, pool: "DocumentPool") -> int:
         })
         filled += 1
     return filled
+
+
+# --- chunking --------------------------------------------------------------------------------------------
+# A real retriever returns PASSAGES, not whole documents. Handing the model a 3,000-word article in one tool
+# result teaches it to read an article; handing it four labelled passages, two of which are from the wrong
+# section, teaches it to retrieve -- which is the behaviour this corpus exists for.
+#
+# Four things become possible that whole-document retrieval cannot express at all:
+#
+#   1. DISTRACTOR passages from the SAME document -- plausible, adjacent, and wrong. Much harder than an
+#      unrelated document, and much closer to what a real index returns.
+#   2. Honest insufficiency: return passages that genuinely do not contain the answer, instead of hiding the
+#      answer inside a document that does contain it. retrieval_insufficient stops being a fiction.
+#   3. Multi-hop: the answer needs passage 4 AND passage 9.
+#   4. A follow-up call for the NEIGHBOURING passage when one is cut off mid-point.
+#
+# It is also cheaper: ~800 words of passages in the prompt instead of ~3,000.
+
+CHUNK_WORDS = 190          # ~250 tokens: large enough to carry a fact with its qualifier
+CHUNK_MIN_WORDS = 60       # below this a passage is a heading with nothing under it
+
+
+def chunk_document(text: str, *, target_words: int = CHUNK_WORDS) -> list[dict]:
+    """Split a document into labelled passages, respecting its own section headings.
+
+    Returns [{"id", "section", "text", "words"}]. The id is stable and sequential so a sample can record
+    WHICH passages it was shown and which actually held the answer -- that is what makes looking in the wrong
+    place scoreable rather than invisible.
+    """
+    sections: list[tuple[str, list[str]]] = [("", [])]
+    for line in (text or "").splitlines():
+        s = line.strip()
+        m = re.fullmatch(r"=+\s*(.+?)\s*=+", s)
+        if m:
+            sections.append((m.group(1).strip(), []))
+        elif s:
+            sections[-1][1].append(s)
+
+    def _split_long(para: str, limit: int) -> list[str]:
+        """Break a paragraph that is itself longer than a passage.
+
+        Splits on BLANK-LINE paragraph boundaries first, because a paragraph is a unit of meaning and a
+        passage cut mid-argument is unanswerable from either half. Only a single paragraph that is still too
+        long falls back to sentences, and then to a hard word count for text with no terminal punctuation at
+        all (table dumps and run-on prose would otherwise become one enormous "passage").
+        """
+        if len(para.split()) <= limit * 1.4:
+            return [para]
+        blocks = [b.strip() for b in re.split(r"\n\s*\n", para) if b.strip()]
+        if len(blocks) > 1:
+            return [piece for b in blocks for piece in _split_long(b, limit)]
+        out, buf, n = [], [], 0
+        for sent in re.split(r"(?<=[.!?])\s+", para):
+            w = len(sent.split())
+            if n and n + w > limit:
+                out.append(" ".join(buf))
+                buf, n = [], 0
+            buf.append(sent)
+            n += w
+        if buf:
+            out.append(" ".join(buf))
+        # A "sentence" can still be longer than a passage -- table dumps and run-on text have no terminal
+        # punctuation at all. Fall back to a hard word split so passage size is bounded whatever the input.
+        bounded: list[str] = []
+        for piece in out:
+            words = piece.split()
+            if len(words) <= limit * 1.4:
+                bounded.append(piece)
+                continue
+            for i in range(0, len(words), limit):
+                bounded.append(" ".join(words[i:i + limit]))
+        return bounded
+
+    chunks: list[dict] = []
+    for heading, paras in sections:
+        paras = [piece for para in paras for piece in _split_long(para, target_words)]
+        buf: list[str] = []
+        n = 0
+        for para in paras:
+            w = len(para.split())
+            # Keep paragraphs whole where possible: a fact split across a boundary is unanswerable from
+            # either half, which would make the sample unfair rather than hard.
+            if n and n + w > target_words * 1.4:
+                chunks.append({"section": heading, "text": "\n".join(buf), "words": n})
+                buf, n = [], 0
+            buf.append(para)
+            n += w
+            if n >= target_words:
+                chunks.append({"section": heading, "text": "\n".join(buf), "words": n})
+                buf, n = [], 0
+        if buf and n >= CHUNK_MIN_WORDS:
+            chunks.append({"section": heading, "text": "\n".join(buf), "words": n})
+        elif buf and chunks:
+            chunks[-1]["text"] += "\n" + "\n".join(buf)
+            chunks[-1]["words"] += n
+    for i, c in enumerate(chunks, start=1):
+        c["id"] = f"c{i}"
+    return [c for c in chunks if c["words"] >= CHUNK_MIN_WORDS]
+
+
+def chunks_containing(chunks: list[dict], phrases: Iterable[str]) -> list[str]:
+    """Which passage ids contain any of `phrases`. Used to record the ANSWER-BEARING passages, so a reply
+    that cites the wrong one can be scored down."""
+    want = [_norm(p) for p in phrases if p and str(p).strip()]
+    if not want:
+        return []
+    out = []
+    for c in chunks:
+        hay = _norm(c["text"])
+        if any(w in hay for w in want):
+            out.append(c["id"])
+    return out
+
+
+def _norm(s: str) -> str:
+    import unicodedata
+    s = unicodedata.normalize("NFD", (s or "").casefold())
+    s = "".join(ch for ch in s if unicodedata.category(ch) != "Mn")
+    return re.sub(r"\s+", " ", s).strip()
+
+
+def render_retrieval(chunks: list[dict], *, scores: Optional[list[float]] = None) -> str:
+    """Format passages as a retriever would return them: id, section, a score, then the text.
+
+    The score is cosmetic but load-bearing for the lesson -- a real result is ranked, and the top hit is
+    often not the one that answers the question.
+    """
+    out = []
+    for i, c in enumerate(chunks):
+        sc = scores[i] if scores and i < len(scores) else max(0.30, 0.92 - 0.11 * i)
+        head = f"[{c['id']} | {c['section'] or 'untitled'} | score {sc:.2f}]"
+        out.append(f"{head}\n{c['text']}")
+    return "\n\n".join(out)

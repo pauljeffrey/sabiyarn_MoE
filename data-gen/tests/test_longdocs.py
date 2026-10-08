@@ -273,18 +273,24 @@ def test_a_rag_document_arrives_through_the_tool_result_not_the_user():
     """The point of a RAG sample is that the assistant composes a query and answers from what comes back. A
     document handed over in the user turn teaches context-stuffing, which is the opposite behaviour."""
     doc = {**_doc(3000), "rag": True}
+    # A RAG result is a few ranked PASSAGES, not the whole document -- that is what a retriever returns, and
+    # it is what lets a sample contain a plausible-but-wrong passage from the same document.
     turns = [{"role": "user", "content": "Wetin the guideline talk about cold chain?"},
              {"role": "assistant", "input_lang": "pcm", "task_plan": ["<|RAG|>"],
               "tool_call": {"name": "search_documents", "arguments": {"query": "cold chain"}}},
-             {"role": "tool", "name": "search_documents", "content": L.PLACEHOLDER},
+             {"role": "tool", "name": "search_documents", "content": f"{L.CHUNK_PLACEHOLDER}: c2, c1"},
              {"role": "assistant", "input_lang": "eng", "target_lang": "pcm", "task_plan": ["<|RAG|>"],
               "response": "Di guideline talk say..."}]
     out, err = L.splice(turns, doc)
-    assert err is None
-    assert L.PLACEHOLDER not in out[2]["content"] and out[2]["content"].startswith("A Report")
-    # and the same document in a user turn is now the error
-    bad = [{"role": "user", "content": f"here {L.PLACEHOLDER}"}]
-    assert L.splice(bad, doc)[1] == "placeholder_in_user_turn_wanted_tool"
+    assert err is None, err
+    assert L.CHUNK_PLACEHOLDER not in out[2]["content"]
+    # rendered as a ranked result, with the ids the generator asked for
+    assert "[c2 |" in out[2]["content"] and "score" in out[2]["content"]
+    # and the passages must be a SUBSET, not the whole document
+    assert len(out[2]["content"].split()) < doc["words"]
+    # and the same placeholder in a user turn is still the error
+    bad = [{"role": "user", "content": f"here {L.CHUNK_PLACEHOLDER}: c1"}]
+    assert L.splice(bad, doc)[1] == "chunk_placeholder_in_user_turn"
 
 
 # --------------------------------------------------------------------------- stage 2

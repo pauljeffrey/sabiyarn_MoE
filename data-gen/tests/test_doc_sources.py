@@ -252,3 +252,249 @@ def test_live_search_and_fetch():
     pg = w.plaintext("Drip irrigation")
     assert pg and len(pg["text"].split()) > 1000
     assert technicality(clean(pg["text"]), pg["title"]) >= MIN_TECHNICALITY
+
+
+# --------------------------------------------------------------------------- chunking
+# A real retriever returns PASSAGES. Whole-document retrieval cannot express a distractor from the same
+# document, honest insufficiency, multi-hop, or a follow-up call for the neighbouring passage.
+
+def test_chunking_respects_section_headings():
+    from doc_sources import chunk_document
+    text = ("== Design ==\n" + "design word " * 150 + "\n== Dosage ==\n" + "dosage word " * 150)
+    cs = chunk_document(text)
+    assert cs, "nothing chunked"
+    assert {c["section"] for c in cs} == {"Design", "Dosage"}
+    assert all(c["id"].startswith("c") for c in cs)
+    assert [c["id"] for c in cs] == [f"c{i}" for i in range(1, len(cs) + 1)], "ids must be sequential"
+
+
+def test_chunks_are_a_usable_size():
+    from doc_sources import CHUNK_MIN_WORDS, chunk_document
+    cs = chunk_document("== S ==\n" + " ".join(f"w{i}" for i in range(2000)))
+    assert cs
+    assert all(c["words"] >= CHUNK_MIN_WORDS for c in cs), "a heading with nothing under it is not a passage"
+    assert max(c["words"] for c in cs) < 400, "a passage this long defeats the point of retrieving one"
+
+
+def test_a_tiny_trailing_passage_is_merged_not_emitted():
+    """A fact split across a boundary is unanswerable from either half, which makes a sample unfair rather
+    than hard."""
+    from doc_sources import CHUNK_MIN_WORDS, chunk_document
+    cs = chunk_document("== S ==\n" + "word " * 200 + "\nshort tail here")
+    assert all(c["words"] >= CHUNK_MIN_WORDS for c in cs)
+    assert "short tail here" in " ".join(c["text"] for c in cs), "the tail must not be lost"
+
+
+def test_chunks_containing_finds_the_answer_bearing_passage():
+    """This is what makes looking in the WRONG passage scoreable rather than invisible."""
+    from doc_sources import chunk_document, chunks_containing
+    text = ("== A ==\n" + "filler " * 200 + "\n== B ==\n" + "filler " * 100
+            + " the discharge rate is 4 l/h " + "filler " * 100)
+    cs = chunk_document(text)
+    hits = chunks_containing(cs, ["discharge rate is 4 l/h"])
+    assert len(hits) == 1
+    assert chunks_containing(cs, ["a phrase that is not present anywhere"]) == []
+    assert chunks_containing(cs, []) == [], "no phrases means no claim, not every chunk"
+
+
+def test_chunks_containing_ignores_accents_and_case():
+    from doc_sources import chunks_containing
+    cs = [{"id": "c1", "text": "Ọ̀pọ̀lọpọ̀ NAIRA were spent", "section": "", "words": 4}]
+    assert chunks_containing(cs, ["opolopo naira"]) == ["c1"]
+
+
+def test_render_retrieval_looks_like_a_ranked_result():
+    from doc_sources import render_retrieval
+    out = render_retrieval([{"id": "c1", "section": "Dosage", "text": "body one", "words": 2},
+                            {"id": "c2", "section": "", "text": "body two", "words": 2}])
+    assert "[c1 | Dosage | score" in out
+    assert "untitled" in out, "a passage with no heading still needs a label"
+    assert "body one" in out and "body two" in out
+    first = float(out.split("score ")[1].split("]")[0])
+    second = float(out.split("score ")[2].split("]")[0])
+    assert first > second, "a real result is ranked, and the top hit is often not the answer"
+
+
+def test_chunking_a_real_pooled_document():
+    import json
+    from pathlib import Path
+    from doc_sources import chunk_document
+    pool = Path(__file__).resolve().parent.parent / "data" / "document_pool.jsonl"
+    if not pool.exists():
+        pytest.skip("no document pool on disk")
+    doc = json.loads(pool.read_text(encoding="utf-8").splitlines()[0])
+    cs = chunk_document(doc["text"])
+    assert len(cs) >= 5, f"a {doc['words']}-word document should yield several passages, got {len(cs)}"
+    # Chunking must not lose content.
+    assert sum(c["words"] for c in cs) >= doc["words"] * 0.7
+
+
+# --------------------------------------------------------------------------- native-language documents
+
+def test_only_measured_wikis_are_harvestable():
+    """NATIVE_WIKIS is a measurement, not a wish list: each entry was checked for articles long enough to
+    serve as a passage. Languages not listed fall through to generation, which is the only option."""
+    from doc_sources import NATIVE_WIKIS
+    assert NATIVE_WIKIS["fra"] == "fr"
+    assert "hau" in NATIVE_WIKIS and "ibo" in NATIVE_WIKIS
+    # Measured as unusable: a median article of 24 words (zul) or 53 (ewe) cannot be a retrieval passage.
+    for unusable in ("zul", "ewe", "sna", "kin", "aka"):
+        assert unusable not in NATIVE_WIKIS, f"{unusable} has no long articles to harvest"
+
+
+def test_is_prose_rejects_tables_and_lists():
+    """The one thing that makes a native document unusable as a passage: nothing to read off. Common in the
+    smaller wikis, where many long pages are tables of names."""
+    from doc_sources import _is_prose
+    table = "\n".join(f"| {i} | Name {i} | 1999 |" for i in range(40))
+    assert not _is_prose(table)
+    listing = "\n".join(f"* Item {i}" for i in range(40))
+    assert not _is_prose(listing)
+    prose = ("Wannan rubutu yana bayanin yadda ake sarrafa shara a cikin birane da kuma matsalolin da ke "
+             "tattare da shi a yankunan karkara. " * 14)
+    assert _is_prose(prose), "a single long paragraph is still prose"
+    assert _is_prose("\n\n".join([prose] * 3)), "and so is the same text in paragraphs"
+    assert not _is_prose("Short. Text. Only."), "too little to answer anything from"
+
+
+def test_pool_keeps_languages_separate():
+    """Handing a Hausa sample an English document would silently change what the sample teaches."""
+    import json
+    from pathlib import Path
+    from doc_sources import DocumentPool
+    import tempfile
+    with tempfile.TemporaryDirectory() as d:
+        p = DocumentPool(Path(d) / "pool.jsonl")
+        p.extend([{"title": "E", "pageid": 1, "url": "u", "text": "x " * 3000, "words": 3000,
+                   "doc_lang": "eng", "domain": "x", "source": "wikipedia", "licence": "CC BY-SA 4.0"},
+                  {"title": "H", "pageid": 2, "url": "u", "text": "y " * 3000, "words": 3000,
+                   "doc_lang": "hau", "domain": "x", "source": "wikipedia", "licence": "CC BY-SA 4.0"}])
+        assert p.count("eng") == 1 and p.count("hau") == 1
+        assert p.take(words=3000, lang="hau")["title"] == "H"
+        assert p.take(words=3000, lang="hau") is None, "must not fall back to another language"
+        assert p.take(words=3000, lang="eng")["title"] == "E"
+
+
+def test_fill_store_sources_a_native_document_for_a_native_spec():
+    from pathlib import Path
+    import tempfile
+    from doc_sources import DocumentPool, fill_store
+
+    class _Spec:
+        custom_id, doc_lang, words, domain, rag, lang, tokens = "doc__h", "hau", 3000, "x", True, "hau", 4000
+
+    class _Store:
+        def __init__(self): self.docs = {}
+        def __contains__(self, k): return k in self.docs
+        def put(self, d): self.docs[d["doc_id"]] = d
+
+    with tempfile.TemporaryDirectory() as d:
+        pool = DocumentPool(Path(d) / "p.jsonl")
+        pool.extend([{"title": "H", "pageid": 2, "url": "u", "text": "y " * 3000, "words": 3000,
+                      "doc_lang": "hau", "domain": "x", "source": "wikipedia", "licence": "CC BY-SA 4.0"}])
+        store = _Store()
+        assert fill_store([_Spec()], store, pool) == 1
+        assert store.docs["doc__h"]["doc_lang"] == "hau"
+
+
+# --------------------------------------------------------------------------- news as a native source
+# The native wikis are thin and skewed for most of these languages. MasakhaNEWS is BBC-sourced news in
+# exactly the languages this corpus serves -- edited prose, current, locally relevant -- and measured medians
+# (hau 282, yor 310, ibo 292, som 490, swa 544 words) are usable now that a tool result is a few passages
+# rather than a whole document.
+
+
+def test_the_native_band_is_shorter_than_the_english_one():
+    """Chunked retrieval is what makes this correct: a 400-word article yields two or three passages, which
+    is what a retriever returns. Insisting on 1,600+ words would reject the whole available corpus."""
+    from doc_sources import NATIVE_RAG_MIN_WORDS, NATIVE_RAG_MAX_WORDS
+    assert NATIVE_RAG_MIN_WORDS < 1_600
+    assert NATIVE_RAG_MIN_WORDS >= 300, "below this there is not enough to form a passage"
+    assert NATIVE_RAG_MAX_WORDS >= 6_000, "the long band still has to fit for summarisation"
+
+
+
+def test_a_short_native_article_counts_as_prose():
+    from doc_sources import _is_prose
+    article = ("Gwamnatin jihar Kano ta ce za ta fara aikin gina sabbin makarantu a shekara mai zuwa. "
+               "Kwamishinan ilimi ya bayyana cewa aikin zai kai ga kananan hukumomi arba'in da hudu. "
+               "Ya kara da cewa kudaden za su fito daga kasafin kudin shekarar. " * 7)
+    assert _is_prose(article), "a 350-word native article is a legitimate retrieval source"
+
+
+def test_technicality_is_language_aware():
+    """_SPEC_WORDS and _GENERAL_WORDS are English, so on a Hausa document a quarter of the score is
+    structurally unavailable and the penalty never fires. Native documents were scoring low partly because
+    the scorer is blind to them -- I nearly concluded from those numbers that native news is inherently
+    unspecific. The neutral evidence (figures with units, ranges, numeric density) is renormalised instead."""
+    from doc_sources import technicality
+    # Identical numeric evidence, one in English prose and one with no English spec vocabulary at all.
+    numeric = ("Ana amfani da 120 kg/ha na nitrogen a kowace shekara, kuma ruwan sama ya kai 850 mm. "
+               "Zafin ya tsaya tsakanin 22 °C da 34 °C, kuma pH ya kai 6.5. " * 10)
+    as_native = technicality(numeric, "Noma", lang="hau")
+    as_english = technicality(numeric, "Farming", lang="eng")
+    assert as_native > as_english, (
+        f"the native score ({as_native:.2f}) must not be penalised for lacking English spec words "
+        f"({as_english:.2f})")
+    assert as_native >= 0.45, "dense figures-with-units should score well in any language"
+
+
+def test_english_scoring_is_unchanged_by_the_language_split():
+    """The English path must still behave as calibrated: general-interest prose below the old threshold,
+    reference prose above it."""
+    from doc_sources import technicality
+    general = ("He was born in Abeokuta and began his career as a singer, recording his first album with "
+               "the band. His discography spans four decades and his filmography includes two films. " * 8)
+    technical = ("Emitters are rated at 2 l/h to 8 l/h at 100 kPa. The recommended application rate is "
+                 "120 kg/ha of nitrogen in two doses. Moisture must fall below 13% at 25 °C. " * 8)
+    assert technicality(general, "A Musician") < 0.36
+    assert technicality(technical, "Drip irrigation") >= 0.36
+
+
+def test_a_summary_source_draws_a_spread_of_specificity():
+    """A dense reference page and a plain narrative are different summarisation problems: the first is about
+    keeping the numbers right, the second about finding the point. Training on one teaches one."""
+    import sys
+    from pathlib import Path as _P
+    sys.path.insert(0, str(_P(__file__).resolve().parent.parent))
+    from schemas.seed import Seed
+    from longdocs import doc_group_index, plan_document
+    seed = Seed.load(str(_P(__file__).resolve().parent.parent / "seeds" / "rl.json"))
+    bands = []
+    for i in range(0, 24, 4):
+        row = {"custom_id": f"rl__eng__long_document_summarization__{i:06d}", "lang": "eng",
+               "task": "long_document_summarization", "index": i}
+        bands.append(plan_document(seed, row, domain="health_medicine", subtopic="x").technicality_band)
+    assert len(set(bands)) == 3, f"summary sources must span the range, got {set(bands)}"
+    # a RAG spec takes whatever matches its length: the spread is a summarisation concern
+    rag = {"custom_id": "rl__eng__rag_document_qa__000000", "lang": "eng",
+           "task": "rag_document_qa", "index": 0}
+    assert plan_document(seed, rag, domain="health_medicine", subtopic="x").technicality_band is None
+
+
+def test_the_pool_honours_a_technicality_band_and_falls_back(tmp_path):
+    """Falling back to the whole language rather than failing: a thin band is a narrower spread, not a reason
+    to generate a document we already have one for."""
+    from doc_sources import DocumentPool
+    p = DocumentPool(tmp_path / "pool.jsonl")
+    p.extend([{"title": "dense", "pageid": 1, "url": "u", "text": "x " * 3000, "words": 3000,
+               "technicality": 0.80, "doc_lang": "eng", "domain": "d", "source": "wikipedia",
+               "licence": "CC BY-SA 4.0"},
+              {"title": "plain", "pageid": 2, "url": "u", "text": "y " * 3000, "words": 3000,
+               "technicality": 0.10, "doc_lang": "eng", "domain": "d", "source": "wikipedia",
+               "licence": "CC BY-SA 4.0"}])
+    assert p.take(words=3000, lang="eng", technicality=(0.45, 1.0))["title"] == "dense"
+    assert p.take(words=3000, lang="eng", technicality=(0.0, 0.25))["title"] == "plain"
+    # both used; a band with nothing left falls back rather than returning None
+    p2 = DocumentPool(tmp_path / "pool.jsonl")
+    p2.take(words=3000, lang="eng", technicality=(0.45, 1.0))
+    assert p2.take(words=3000, lang="eng", technicality=(0.45, 1.0)) is not None, "must fall back"
+
+
+def test_general_seeds_cover_the_plain_domains():
+    """The topic seeds were written to surface reference pages and produced ZERO documents below 0.25. These
+    supply the half of the mix that was missing."""
+    from doc_sources import GENERAL_SEEDS, TOPIC_SEEDS
+    assert not (set(GENERAL_SEEDS) & set(TOPIC_SEEDS)), "the two seed sets should not overlap"
+    assert {"history", "festivals_customs", "music", "geography_places"} <= set(GENERAL_SEEDS)
+    assert all(v for v in GENERAL_SEEDS.values())

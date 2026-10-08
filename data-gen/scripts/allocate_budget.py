@@ -76,7 +76,13 @@ _GEMMA_PENALTY = {
 #
 # The earlier 82/62/44 came from the PRETRAIN path, where one document is generated and checked; an RL sample
 # is a prefix plus a ranked pair and every part can fail independently.
-_YIELD = {"high": 0.80, "medium": 0.47, "low": 0.38}
+# RE-MEASURED after the contract A/B. Five 80-request arms over identical rows put the shipped
+# configuration (simple contract + closing reminder + discriminator) at 45%, against 35% for the verbose
+# contract -- so the earlier 0.80/0.47/0.38 was optimistic by roughly a third once the richer contract went in.
+#
+# These are scaled to a 45% overall mix on pcm/eng/hau/yor rather than read off per language, because 80
+# requests do not split four ways with any precision.
+_YIELD = {"high": 0.55, "medium": 0.38, "low": 0.30}
 _TIER = {
     "pcm": "high", "eng": "high", "yor": "high", "hau": "high", "ibo": "high",
     "twi": "medium", "aka": "medium", "swh": "medium", "fra": "medium",

@@ -55,6 +55,12 @@ DOCUMENT_TASKS = SUMMARY_DOCUMENT_TASKS | RAG_DOCUMENT_TASKS
 
 # What the generator writes instead of the document, and what splice() replaces.
 PLACEHOLDER = "__DOCUMENT__"
+# A RAG tool result is a LIST OF PASSAGES, not a whole document: that is what a retriever returns, and it is
+# what lets a sample contain a plausible-but-wrong passage from the same document. The generator writes
+# `__CHUNKS__: c4, c9, c2` -- the ids it wants returned, in rank order -- and the passages are substituted
+# afterwards, exactly as __DOCUMENT__ is.
+CHUNK_PLACEHOLDER = "__CHUNKS__"
+R_CHUNK_REQUEST = re.compile(re.escape(CHUNK_PLACEHOLDER) + r"\s*:?\s*([cC]\d+(?:\s*,\s*[cC]\d+)*)")
 
 # Document size in TOKENS, derived from the phase's context budget (budgets.py) rather than hardcoded, so
 # "what context is the model being trained at" is set in one place. Weighted towards the short end: a document
@@ -178,7 +184,7 @@ class DocSpec:
 
     __slots__ = ("custom_id", "lang", "doc_lang", "doc_lang_mode", "form", "form_desc", "stages",
                  "tokens", "words", "n_sections", "section_words", "min_words", "register", "domain",
-                 "subtopic", "parts", "rag")
+                 "subtopic", "parts", "rag", "technicality_band")
 
     def __init__(self, **kw: Any) -> None:
         for k in self.__slots__:
@@ -271,8 +277,19 @@ def plan_document(seed: Any, row: dict, *, domain: str, subtopic: str) -> DocSpe
     key = mode if mode != "native" else ("native_low" if tier == "low" else "native")
     n_sections = min(MAX_SECTIONS, max(len(stages), -(-words // _SECTION_WORDS[key])))
     section_words = min(_MAX_SECTION_WORDS, max(_SECTION_WORDS[key], -(-words // n_sections)))
+    # SUMMARISATION DRAWS A DELIBERATE SPREAD OF SPECIFICITY. A dense reference page -- figures, rates,
+    # thresholds -- and a plain narrative are different summarisation problems: the first is about keeping the
+    # numbers right, the second about finding the point. Training on only one teaches only one, so the band
+    # alternates across groups rather than taking whatever the pool hands over.
+    #
+    # Three bands on a 3-cycle: dense, middling, plain. The pool falls back to the whole language when a band
+    # is thin, so this biases the draw without ever failing it.
+    band = None
+    if row.get("task") in SUMMARY_DOCUMENT_TASKS:
+        band = ((0.45, 1.00), (0.25, 0.45), (0.00, 0.25))[gi % 3]
     # Keyed by the GROUP, not the row: this is the whole reuse mechanism.
-    return DocSpec(custom_id=f"doc__{lang}__{row.get('task')}__{gi:06d}",
+    return DocSpec(technicality_band=band,
+                   custom_id=f"doc__{lang}__{row.get('task')}__{gi:06d}",
                    lang=lang, doc_lang=doc_lang, doc_lang_mode=mode,
                    form=form, form_desc=form_desc, stages=stages, tokens=tokens, words=words,
                    n_sections=n_sections, section_words=section_words, min_words=_MIN_WORDS[key],
@@ -716,6 +733,9 @@ def splice(turns: Any, document: dict) -> tuple[Any, Optional[str]]:
     if not isinstance(turns, list):
         return turns, "turns_not_a_list"
     body = (f"{document['title']}\n\n{document['text']}" if document.get("title") else document["text"])
+    # A RAG document is now retrieved as PASSAGES, so its placeholder is the chunk list.
+    if document.get("rag"):
+        return splice_chunks(turns, document)
     want_role = "tool" if document.get("rag") else "user"
     found = False
     for t in turns:
@@ -735,6 +755,57 @@ def splice(turns: Any, document: dict) -> tuple[Any, Optional[str]]:
     return turns, None
 
 
+
+def document_chunks(document: dict) -> list[dict]:
+    """The document's passages, computed once and cached on the document dict."""
+    cached = document.get("_chunks")
+    if cached:
+        return cached
+    from doc_sources import chunk_document
+    chunks = chunk_document(document.get("text") or "")
+    document["_chunks"] = chunks
+    return chunks
+
+
+def _chunk_index(document: dict) -> str:
+    """The document rendered as labelled passages, for the generator to choose from."""
+    chunks = document_chunks(document)
+    return "\n\n".join(f"[{c['id']} | {c['section'] or 'untitled'}]\n{c['text']}" for c in chunks)
+
+
+def splice_chunks(turns: list[dict], document: dict) -> tuple[list[dict], Optional[str]]:
+    """Replace `__CHUNKS__: c4, c9` in a tool result with those passages, rendered as a ranked result.
+
+    Returns (turns, error). The error is a drop reason, so a malformed request is a counted failure rather
+    than a sample with a placeholder left in it.
+    """
+    from doc_sources import render_retrieval
+    chunks = {c["id"]: c for c in document_chunks(document)}
+    if not chunks:
+        return turns, "document_has_no_chunks"
+    found = 0
+    for turn in turns:
+        content = turn.get("content")
+        if not isinstance(content, str) or CHUNK_PLACEHOLDER not in content:
+            continue
+        if turn.get("role") != "tool":
+            return turns, f"chunk_placeholder_in_{turn.get('role')}_turn"
+        m = R_CHUNK_REQUEST.search(content)
+        if not m:
+            return turns, "chunk_placeholder_without_ids"
+        ids = [i.strip().lower() for i in m.group(1).split(",")]
+        picked = [chunks[i] for i in ids if i in chunks]
+        if not picked:
+            return turns, "chunk_ids_not_in_document"
+        turn["content"] = R_CHUNK_REQUEST.sub(lambda _: render_retrieval(picked), content, count=1)
+        found += 1
+    if found == 0:
+        return turns, "no_chunk_placeholder"
+    if found > 1:
+        return turns, "chunk_placeholder_repeated"
+    return turns, None
+
+
 def document_brief(document: dict) -> str:
     """The stage-2 instruction block: the document is given, and must be referenced, never repeated."""
     words = document.get("words") or 0
@@ -743,26 +814,40 @@ def document_brief(document: dict) -> str:
 assistant does NOT have it in front of it and the user does NOT paste it. The assistant reaches it only by
 calling search_documents, and what comes back is a role='tool' result.
 
-In the FIRST search_documents tool result, write exactly the placeholder
+It is indexed as the numbered PASSAGES below. A search returns a FEW RANKED PASSAGES, never the whole
+document -- that is what a real retriever does.
 
-    {PLACEHOLDER}
+In the FIRST search_documents tool result, write exactly
 
-and nothing else. The real text is substituted for it afterwards. Use the placeholder EXACTLY ONCE, in a
-role='tool' result, and nowhere else -- not in the user turn, not in an assistant response. Any LATER tool
-result is an ordinary short passage you write yourself.
+    {CHUNK_PLACEHOLDER}: c4, c9, c2
+
+listing 3 to 5 passage ids in the order the retriever would rank them, and nothing else. The passages are
+substituted for that line afterwards. Choose them deliberately:
+  - the one or two that actually answer the question, and
+  - one or two PLAUSIBLE BUT WRONG ones from the same document -- an adjacent section, a passage about the
+    same subject at a different time or place. A real top hit is often not the one that answers.
+Do NOT put the answer-bearing passage first every time.
+
+Then declare, in the verifier object, "answer_chunks": the ids that genuinely contain the answer. This is
+checked, so it must be true of the passages you listed.
+
+Use the placeholder EXACTLY ONCE, in a role='tool' result. Any LATER tool result is a short passage you write
+yourself.
 
 What this sample has to teach:
 - the assistant composes its own English search query from what the user asked;
-- it reads the returned passages and answers from THEM, saying where the answer came from;
-- asked something the document does not cover, it says the document does not cover it rather than falling
-  back on general knowledge. That refusal is the most valuable turn in the sample.
+- it reads the returned passages, uses the RIGHT one, and says which it used -- naming the passage or quoting
+  from it. Answering from the wrong passage while the right one was returned is the failure this shape exists
+  to expose;
+- asked something no returned passage covers, it says so rather than falling back on general knowledge, and
+  may ask for a different search. That turn is the most valuable one in the sample.
 The answer goes in whatever language the io_direction calls for, even though the passages are English.
 
---- THE KNOWLEDGE BASE (the assistant retrieves from this; do not reproduce it) ---
+--- THE INDEX (the assistant retrieves from this; do not reproduce it) ---
 {document.get('title') or ''}
 
-{document.get('text') or ''}
---- END OF KNOWLEDGE BASE ---"""
+{_chunk_index(document)}
+--- END OF INDEX ---"""
     return f"""THE DOCUMENT IS ALREADY WRITTEN -- it is below, {words:,} words of it, and it is what the user
 pastes in. You must NOT retype it, shorten it, or paraphrase it into the user turn. In the user turn where the
 user pastes it, write exactly the placeholder

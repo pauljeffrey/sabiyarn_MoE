@@ -33,6 +33,7 @@ def _spec_checks() -> dict[str, list[dict]]:
     import rewards_spec as R
     out = {t: [vars(c) for c in cs] for t, cs in R.CHECKS.items()}
     out["UNIVERSAL"] = [vars(c) for c in R.UNIVERSAL]
+    out["DISCRIMINATOR"] = [vars(c) for c in R.DISCRIMINATOR]
     return out
 
 
@@ -103,10 +104,14 @@ def test_tool_calls_are_visible_to_the_scorer():
     into text. Measured: 0 of 108 candidates contained <tool_call>, so every tool check was unscoreable and
     a tool-call candidate looked like an empty answer."""
     text = ('<|input_lang|><eng><think>need the weather</think><task_plan><|plan|></task_plan>'
-            '<tool_call>get_weather\n{"location": "Ibi"}</tool_call>')
+            '<tool_call>{"name": "get_weather", "arguments": {"location": "Ibi"}}</tool_call>')
     ctx = Ctx(text, {"lang": "pcm"})
     assert ctx.tool_calls == [("get_weather", '{"location": "Ibi"}')]
-    assert REGISTRY["answers_without_tool"](ctx) is False
+    # the older "name\\n{args}" body is still understood
+    assert Ctx('<tool_call>get_weather\n{"location": "Ibi"}</tool_call>', {"lang": "pcm"}).tool_calls == [("get_weather", '{"location": "Ibi"}')]
+    # Any check that depends on seeing the call now sees it.
+    assert REGISTRY["two_distinct_tools_called"](ctx) is False, "one call is one call"
+    assert REGISTRY["think_precedes_tool_call"](ctx) is True
 
 
 def test_target_language_check_uses_expect_markers():
@@ -283,17 +288,38 @@ def test_reward_prefers_the_best_candidate():
         f"of {n} ({accuracy:.0%} of decided pairs). A reward below chance trains the policy backwards.")
 
 
-def test_judge_only_tasks_are_not_scored_by_the_verifier():
-    """The exclusion must be real at training time, not just documented. Measured at 40% accuracy on these
-    -- below chance -- so a confident wrong signal is worse than no signal."""
+def test_nothing_is_judge_only_because_there_is_no_judge():
+    """There is no judge model in this pipeline, so a task that cannot be scored programmatically cannot be
+    trained on at all. Four tasks used to be excluded because the procedural checks scored them below chance;
+    the discriminator fixed that at the DATA level -- the generator writes down the phrase that separates its
+    two replies, postprocess verifies the claim holds, and scoring becomes a substring lookup."""
     import rewards_spec as R
-    from rl.rewards import VerifierReward
-    rw = VerifierReward()
-    item = {"id": "x", "lang": "eng", "judge_required": True, "tasks": ["world_knowledge_qa"],
-            "checks": R.for_task("world_knowledge_qa")}
-    out = rw([item, item], ["<|input_lang|><eng><response>a", "<|input_lang|><eng><response>b"])
-    assert out == [rw.neutral, rw.neutral], "a judge-only task must defer, not score"
-    assert "world_knowledge_qa" in R.JUDGE_ONLY_TASKS
+    assert R.JUDGE_ONLY_TASKS == frozenset(), (
+        f"these tasks would be untrainable without a judge: {sorted(R.JUDGE_ONLY_TASKS)}")
+    # and the discriminator is actually present on every task's checks
+    for task in R.CHECKS:
+        names = {c["name"] for c in R.for_task(task)}
+        assert "states_the_key_fact" in names, f"{task} has no answer key"
+        assert "avoids_the_false_claim" in names
+
+
+def test_discriminator_checks_score_the_right_candidate():
+    """The sharpest signal available, and it applies to every task."""
+    item = {"lang": "pcm", "verifier": {"discriminator": {"good": "4,500 naira", "bad": "about 6,000"}}}
+    checks = [{"name": "key", "weight": 0.6, "expect": True, "fn": "states_the_key_fact"},
+              {"name": "false", "weight": 0.4, "expect": False, "fn": "repeats_the_false_claim"}]
+    best = "<|input_lang|><pcm><|target_lang|><pcm><response>Na 4,500 naira you go pay."
+    worst = "<|input_lang|><pcm><|target_lang|><pcm><response>E be about 6,000 naira."
+    (rb, rw), _ = score_group([best, worst], item, checks)
+    assert rb == 1.0 and rw == 0.0
+
+
+def test_discriminator_is_unknown_when_the_record_has_none():
+    """Older records carry no discriminator; those checks must drop out rather than fail everything."""
+    item = {"lang": "pcm", "verifier": {}}
+    checks = [{"name": "key", "weight": 1.0, "expect": True, "fn": "states_the_key_fact"}]
+    r, detail = score("<|input_lang|><pcm><response>anything", item, checks)
+    assert detail["key"] == "unknown"
 
 
 def test_behaviour_tasks_are_not_quietly_excluded():
@@ -318,8 +344,8 @@ def test_group_scoring_does_not_reward_being_unscoreable():
         {"name": "brief", "weight": 0.4, "expect": True, "fn": "response_under_120_words"},
     ]
     acted = ('<|input_lang|><eng><task_plan><|plan|></task_plan>'
-             '<tool_call>get_market_prices\n{"commodity":"maize"}</tool_call>'
-             '<tool_call>get_exchange_rate\n{"base":"NGN"}</tool_call>')
+             '<tool_call>{"name": "get_market_prices", "arguments": {"commodity": "maize"}}</tool_call>'
+             '<tool_call>{"name": "get_exchange_rate", "arguments": {"base": "NGN"}}</tool_call>')
     did_nothing = "<|input_lang|><eng><|target_lang|><eng><response>It is about 2000.</response>"
 
     (r_acted, r_idle), _ = score_group([acted, did_nothing], item, checks)
@@ -347,3 +373,26 @@ def test_a_failed_gate_zeroes_only_that_candidate():
     fine = "<|input_lang|><eng><response>The market opens at six and shuts when the yams are gone."
     (r_loop, r_fine), _ = score_group([loop, fine], item, checks)
     assert r_loop == 0.0 and r_fine > 0.0
+
+
+def test_study_help_is_scored_on_grounding_not_recall():
+    """A study answer from the weights is one the student cannot check, and this is the task where a confident
+    wrong answer gets memorised and written in an exam. So retrieval carries more weight than pedagogy."""
+    import rewards_spec as R
+    checks = {c["name"]: c["weight"] for c in R.for_task("exam_and_study_help") if not c.get("gate")}
+    grounding = (checks["retrieved_before_answering"] + checks["answer_rests_on_what_came_back"]
+                 + checks["no_fact_absent_from_the_source"] + checks["says_where_it_came_from"])
+    pedagogy = checks["shows_a_reusable_method"] + checks["pitched_at_the_level_asked"]
+    assert grounding > pedagogy, (
+        f"grounding carries {grounding:.2f} against pedagogy {pedagogy:.2f} -- recall is the failure here")
+
+
+def test_study_help_is_rl_only():
+    """"Retrieved it" against "recalled it" is a preference between two replies, which a single SFT target
+    cannot express."""
+    import sys
+    from pathlib import Path as _P
+    sys.path.insert(0, str(_P(__file__).resolve().parent.parent / "data-gen" / "seeds"))
+    from build_seeds import BEHAVIOUR_TASKS, SFT_TASKS
+    assert "exam_and_study_help" in BEHAVIOUR_TASKS
+    assert "exam_and_study_help" not in {t.name for t in SFT_TASKS}

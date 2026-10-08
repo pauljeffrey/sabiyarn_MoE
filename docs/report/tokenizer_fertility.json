@@ -1,0 +1,462 @@
+{
+ "afr": {
+  "docs": 600,
+  "words": 275237,
+  "sabiyarn-32k": {
+   "tokens_per_word": 1.924,
+   "bytes_per_token": 2.725
+  },
+  "sabiyarn-81920": {
+   "tokens_per_word": 2.136,
+   "bytes_per_token": 2.455
+  },
+  "gpt2": {
+   "tokens_per_word": 2.025,
+   "bytes_per_token": 2.589
+  },
+  "llama3": {
+   "tokens_per_word": 1.695,
+   "bytes_per_token": 3.093
+  }
+ },
+ "efi": {
+  "docs": 600,
+  "words": 259663,
+  "sabiyarn-32k": {
+   "tokens_per_word": 2.291,
+   "bytes_per_token": 2.546
+  },
+  "sabiyarn-81920": {
+   "tokens_per_word": 2.877,
+   "bytes_per_token": 2.027
+  },
+  "gpt2": {
+   "tokens_per_word": 3.0,
+   "bytes_per_token": 1.945
+  },
+  "llama3": {
+   "tokens_per_word": 2.761,
+   "bytes_per_token": 2.113
+  }
+ },
+ "ewe": {
+  "docs": 600,
+  "words": 350962,
+  "sabiyarn-32k": {
+   "tokens_per_word": 2.472,
+   "bytes_per_token": 2.27
+  },
+  "sabiyarn-81920": {
+   "tokens_per_word": 2.701,
+   "bytes_per_token": 2.078
+  },
+  "gpt2": {
+   "tokens_per_word": 3.077,
+   "bytes_per_token": 1.824
+  },
+  "llama3": {
+   "tokens_per_word": 2.824,
+   "bytes_per_token": 1.988
+  }
+ },
+ "fon": {
+  "docs": 600,
+  "words": 250871,
+  "sabiyarn-32k": {
+   "tokens_per_word": 2.394,
+   "bytes_per_token": 2.184
+  },
+  "sabiyarn-81920": {
+   "tokens_per_word": 2.704,
+   "bytes_per_token": 1.934
+  },
+  "gpt2": {
+   "tokens_per_word": 3.334,
+   "bytes_per_token": 1.568
+  },
+  "llama3": {
+   "tokens_per_word": 3.066,
+   "bytes_per_token": 1.706
+  }
+ },
+ "hau": {
+  "docs": 600,
+  "words": 278520,
+  "sabiyarn-32k": {
+   "tokens_per_word": 1.406,
+   "bytes_per_token": 3.793
+  },
+  "sabiyarn-81920": {
+   "tokens_per_word": 2.35,
+   "bytes_per_token": 2.269
+  },
+  "gpt2": {
+   "tokens_per_word": 2.331,
+   "bytes_per_token": 2.288
+  },
+  "llama3": {
+   "tokens_per_word": 2.124,
+   "bytes_per_token": 2.511
+  }
+ },
+ "ibb": {
+  "docs": 600,
+  "words": 259057,
+  "sabiyarn-32k": {
+   "tokens_per_word": 2.352,
+   "bytes_per_token": 2.762
+  },
+  "sabiyarn-81920": {
+   "tokens_per_word": 3.034,
+   "bytes_per_token": 2.142
+  },
+  "gpt2": {
+   "tokens_per_word": 3.601,
+   "bytes_per_token": 1.804
+  },
+  "llama3": {
+   "tokens_per_word": 2.729,
+   "bytes_per_token": 2.38
+  }
+ },
+ "ibo": {
+  "docs": 600,
+  "words": 298706,
+  "sabiyarn-32k": {
+   "tokens_per_word": 1.469,
+   "bytes_per_token": 4.157
+  },
+  "sabiyarn-81920": {
+   "tokens_per_word": 2.814,
+   "bytes_per_token": 2.17
+  },
+  "gpt2": {
+   "tokens_per_word": 3.71,
+   "bytes_per_token": 1.646
+  },
+  "llama3": {
+   "tokens_per_word": 2.55,
+   "bytes_per_token": 2.394
+  }
+ },
+ "kin": {
+  "docs": 600,
+  "words": 197967,
+  "sabiyarn-32k": {
+   "tokens_per_word": 2.826,
+   "bytes_per_token": 2.561
+  },
+  "sabiyarn-81920": {
+   "tokens_per_word": 3.287,
+   "bytes_per_token": 2.202
+  },
+  "gpt2": {
+   "tokens_per_word": 3.242,
+   "bytes_per_token": 2.233
+  },
+  "llama3": {
+   "tokens_per_word": 2.944,
+   "bytes_per_token": 2.459
+  }
+ },
+ "nya": {
+  "docs": 600,
+  "words": 211686,
+  "sabiyarn-32k": {
+   "tokens_per_word": 2.606,
+   "bytes_per_token": 2.675
+  },
+  "sabiyarn-81920": {
+   "tokens_per_word": 3.047,
+   "bytes_per_token": 2.288
+  },
+  "gpt2": {
+   "tokens_per_word": 3.097,
+   "bytes_per_token": 2.251
+  },
+  "llama3": {
+   "tokens_per_word": 2.769,
+   "bytes_per_token": 2.518
+  }
+ },
+ "orm": {
+  "docs": 600,
+  "words": 237829,
+  "sabiyarn-32k": {
+   "tokens_per_word": 2.916,
+   "bytes_per_token": 2.623
+  },
+  "sabiyarn-81920": {
+   "tokens_per_word": 3.318,
+   "bytes_per_token": 2.305
+  },
+  "gpt2": {
+   "tokens_per_word": 3.252,
+   "bytes_per_token": 2.352
+  },
+  "llama3": {
+   "tokens_per_word": 3.009,
+   "bytes_per_token": 2.542
+  }
+ },
+ "pcm": {
+  "docs": 600,
+  "words": 147433,
+  "sabiyarn-32k": {
+   "tokens_per_word": 1.835,
+   "bytes_per_token": 2.938
+  },
+  "sabiyarn-81920": {
+   "tokens_per_word": 2.184,
+   "bytes_per_token": 2.467
+  },
+  "gpt2": {
+   "tokens_per_word": 1.804,
+   "bytes_per_token": 2.987
+  },
+  "llama3": {
+   "tokens_per_word": 1.69,
+   "bytes_per_token": 3.189
+  }
+ },
+ "sna": {
+  "docs": 600,
+  "words": 178983,
+  "sabiyarn-32k": {
+   "tokens_per_word": 4.031,
+   "bytes_per_token": 2.181
+  },
+  "sabiyarn-81920": {
+   "tokens_per_word": 4.005,
+   "bytes_per_token": 2.195
+  },
+  "gpt2": {
+   "tokens_per_word": 4.668,
+   "bytes_per_token": 1.883
+  },
+  "llama3": {
+   "tokens_per_word": 4.371,
+   "bytes_per_token": 2.012
+  }
+ },
+ "som": {
+  "docs": 600,
+  "words": 235731,
+  "sabiyarn-32k": {
+   "tokens_per_word": 2.603,
+   "bytes_per_token": 2.498
+  },
+  "sabiyarn-81920": {
+   "tokens_per_word": 2.968,
+   "bytes_per_token": 2.191
+  },
+  "gpt2": {
+   "tokens_per_word": 2.921,
+   "bytes_per_token": 2.226
+  },
+  "llama3": {
+   "tokens_per_word": 2.677,
+   "bytes_per_token": 2.429
+  }
+ },
+ "sot": {
+  "docs": 600,
+  "words": 285866,
+  "sabiyarn-32k": {
+   "tokens_per_word": 1.954,
+   "bytes_per_token": 2.615
+  },
+  "sabiyarn-81920": {
+   "tokens_per_word": 2.216,
+   "bytes_per_token": 2.305
+  },
+  "gpt2": {
+   "tokens_per_word": 2.154,
+   "bytes_per_token": 2.372
+  },
+  "llama3": {
+   "tokens_per_word": 1.991,
+   "bytes_per_token": 2.566
+  }
+ },
+ "swh": {
+  "docs": 600,
+  "words": 227711,
+  "sabiyarn-32k": {
+   "tokens_per_word": 2.414,
+   "bytes_per_token": 2.703
+  },
+  "sabiyarn-81920": {
+   "tokens_per_word": 2.851,
+   "bytes_per_token": 2.288
+  },
+  "gpt2": {
+   "tokens_per_word": 2.819,
+   "bytes_per_token": 2.314
+  },
+  "llama3": {
+   "tokens_per_word": 2.562,
+   "bytes_per_token": 2.546
+  }
+ },
+ "tsn": {
+  "docs": 600,
+  "words": 350690,
+  "sabiyarn-32k": {
+   "tokens_per_word": 1.895,
+   "bytes_per_token": 2.72
+  },
+  "sabiyarn-81920": {
+   "tokens_per_word": 2.174,
+   "bytes_per_token": 2.371
+  },
+  "gpt2": {
+   "tokens_per_word": 2.054,
+   "bytes_per_token": 2.51
+  },
+  "llama3": {
+   "tokens_per_word": 1.948,
+   "bytes_per_token": 2.646
+  }
+ },
+ "twi": {
+  "docs": 600,
+  "words": 335385,
+  "sabiyarn-32k": {
+   "tokens_per_word": 2.133,
+   "bytes_per_token": 2.539
+  },
+  "sabiyarn-81920": {
+   "tokens_per_word": 2.51,
+   "bytes_per_token": 2.158
+  },
+  "gpt2": {
+   "tokens_per_word": 2.863,
+   "bytes_per_token": 1.892
+  },
+  "llama3": {
+   "tokens_per_word": 2.745,
+   "bytes_per_token": 1.973
+  }
+ },
+ "urh": {
+  "docs": 600,
+  "words": 303959,
+  "sabiyarn-32k": {
+   "tokens_per_word": 1.735,
+   "bytes_per_token": 3.31
+  },
+  "sabiyarn-81920": {
+   "tokens_per_word": 2.651,
+   "bytes_per_token": 2.166
+  },
+  "gpt2": {
+   "tokens_per_word": 3.482,
+   "bytes_per_token": 1.649
+  },
+  "llama3": {
+   "tokens_per_word": 2.353,
+   "bytes_per_token": 2.44
+  }
+ },
+ "wol": {
+  "docs": 600,
+  "words": 327854,
+  "sabiyarn-32k": {
+   "tokens_per_word": 2.064,
+   "bytes_per_token": 2.56
+  },
+  "sabiyarn-81920": {
+   "tokens_per_word": 2.464,
+   "bytes_per_token": 2.145
+  },
+  "gpt2": {
+   "tokens_per_word": 2.398,
+   "bytes_per_token": 2.204
+  },
+  "llama3": {
+   "tokens_per_word": 2.15,
+   "bytes_per_token": 2.458
+  }
+ },
+ "xho": {
+  "docs": 600,
+  "words": 171004,
+  "sabiyarn-32k": {
+   "tokens_per_word": 3.486,
+   "bytes_per_token": 2.487
+  },
+  "sabiyarn-81920": {
+   "tokens_per_word": 3.878,
+   "bytes_per_token": 2.236
+  },
+  "gpt2": {
+   "tokens_per_word": 3.98,
+   "bytes_per_token": 2.178
+  },
+  "llama3": {
+   "tokens_per_word": 3.584,
+   "bytes_per_token": 2.419
+  }
+ },
+ "yor": {
+  "docs": 600,
+  "words": 318458,
+  "sabiyarn-32k": {
+   "tokens_per_word": 1.311,
+   "bytes_per_token": 4.756
+  },
+  "sabiyarn-81920": {
+   "tokens_per_word": 3.089,
+   "bytes_per_token": 2.018
+  },
+  "gpt2": {
+   "tokens_per_word": 4.056,
+   "bytes_per_token": 1.537
+  },
+  "llama3": {
+   "tokens_per_word": 2.754,
+   "bytes_per_token": 2.263
+  }
+ },
+ "zul": {
+  "docs": 600,
+  "words": 161354,
+  "sabiyarn-32k": {
+   "tokens_per_word": 3.573,
+   "bytes_per_token": 2.512
+  },
+  "sabiyarn-81920": {
+   "tokens_per_word": 4.006,
+   "bytes_per_token": 2.241
+  },
+  "gpt2": {
+   "tokens_per_word": 4.083,
+   "bytes_per_token": 2.198
+  },
+  "llama3": {
+   "tokens_per_word": 3.652,
+   "bytes_per_token": 2.458
+  }
+ },
+ "eng": {
+  "docs": 600,
+  "words": 265572,
+  "sabiyarn-32k": {
+   "tokens_per_word": 1.312,
+   "bytes_per_token": 4.697
+  },
+  "sabiyarn-81920": {
+   "tokens_per_word": 1.945,
+   "bytes_per_token": 3.17
+  },
+  "gpt2": {
+   "tokens_per_word": 1.3,
+   "bytes_per_token": 4.743
+  },
+  "llama3": {
+   "tokens_per_word": 1.257,
+   "bytes_per_token": 4.904
+  }
+ }
+}

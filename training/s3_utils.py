@@ -381,3 +381,26 @@ def sync_training_files(
         prefix=prefix,
     )
     return train_local, eval_resolved
+
+
+def sync_eval_manifest(
+    remote_path: str,
+    local_dir: str,
+    *,
+    bucket: str,
+    endpoint: str,
+    access_key: str,
+    secret_key: str,
+    prefix: str = "",
+) -> str:
+    """Download the stratified-eval manifest (e.g. datasets/validation_v2_manifest.json) next to the
+    flattened bins in `local_dir`; returns the local path (training/eval_plan.py reads it)."""
+    return download_if_missing(
+        remote_path,
+        os.path.join(local_dir, os.path.basename(remote_path)),
+        bucket=bucket,
+        endpoint=endpoint,
+        access_key=access_key,
+        secret_key=secret_key,
+        prefix=prefix,
+    )

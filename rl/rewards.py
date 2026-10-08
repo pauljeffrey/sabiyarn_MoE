@@ -187,11 +187,133 @@ class BlendedReward:
         return [self.w * x + (1.0 - self.w) * y for x, y in zip(a, b)]
 
 
-def _africomet(cfg: RLConfig, device: str) -> RewardFn:
+class StructuredTranslationReward:
+    """Reward for a turn that is  SCAFFOLD + CONTENT  (see rl/structure.py).
+
+        R = w_f * R_format + (1 - w_f) * gate * R_content        (then, optionally, shaped: see below)
+
+    R_format  field-wise match of the scaffold against the sample's expected one (order-agnostic plan F1).
+    R_content the translation after <response>: reference-free AfriCOMET-QE on (source, translation), clipped to [0, 1]. No
+              reference is needed. (`use_reference=True` switches rows that carry one to reference-based AfriCOMET blended with
+              sentence chrF++, `chrf_anchor`, because a learned metric alone is what gets exploited -- Amrhein & Sennrich 2022; Gao
+              et al. 2023 on over-optimisation.) A length-ratio guard halves it for implausibly short/long output and a copy of
+              the source scores 0, which is the classic way to fool a QE metric.
+    shaping   shaping="threshold": R < threshold becomes a large negative number, R >= threshold a positive one (rl.structure.
+              shape_reward); order within a prompt's group is unchanged.
+    gate      content counts only when the target-language tag is right and the response is non-empty and clean. Without the
+              gate the policy could earn content reward in the wrong language; without the additive format term it would get no
+              gradient on the scaffold while the gate is closed.
+
+    `wants_raw` makes the trainer pass completions decoded WITH special tokens (the scaffold is made of them).
+    The group-mean baseline of rl/policy_gradient.py then turns R into advantages exactly as before (GRPO-style, Shao et al. 2024).
+    """
+
+    wants_raw = True
+
+    def __init__(self, reference_reward: Optional[RewardFn], qe_reward: Optional[RewardFn] = None, format_weight: float = 0.2,
+                 chrf_anchor: float = 0.2, length_guard: bool = True, weights: Optional[dict] = None, log_every: int = 0,
+                 use_reference: bool = False, shaping: str = "none", threshold: float = 0.46, negative_scale: float = 2.0,
+                 shaper=None, train_unusable: bool = False):
+        self.ref_reward, self.qe_reward = reference_reward, qe_reward
+        self.wf, self.alpha, self.length_guard, self.weights, self.log_every = format_weight, chrf_anchor, length_guard, weights, log_every
+        self.use_reference, self.shaping, self.threshold, self.negative_scale = use_reference, shaping, threshold, negative_scale
+        self.shaper = shaper                     # rl.shaping.ContentShaper for shaping in ("calibrated", "adaptive")
+        self.train_unusable = train_unusable
+        self._chrf = None
+        self._n = 0
+        self.last_stats: dict[str, float] = {}      # read by the trainer's logger: where the reward comes from
+        self.last_weights: Optional[list[float]] = None   # per-completion advantage weights (QE reliability of the pair), read by the trainer
+
+    def _sentence_chrf(self, hyp: str, ref: str) -> float:
+        if self._chrf is None:
+            from sacrebleu.metrics import CHRF
+            self._chrf = CHRF(word_order=2)
+        return self._chrf.sentence_score(hyp, [ref]).score / 100.0
+
+    @staticmethod
+    def _norm(t: str) -> str:
+        return " ".join(t.lower().split())
+
+    def __call__(self, items, completions):
+        from rl.structure import expected_translation_structure, format_score
+
+        fmt = []
+        for it, c in zip(items, completions):
+            exp = it.get("expected_structure") or expected_translation_structure(it.get("source_lang", ""), it.get("targ_lang", ""))
+            fmt.append(format_score(c, exp, self.weights))
+        # content, scored only for gated rows, in one batch per scorer
+        has_ref = [bool(self.use_reference and it.get("reference")) for it in items]
+        idx_ref = [i for i, f in enumerate(fmt) if f["gate"] and has_ref[i]]
+        idx_qe = [i for i, f in enumerate(fmt) if f["gate"] and not has_ref[i]]
+        content = [0.0] * len(items)
+        if idx_ref and self.ref_reward is not None:
+            sc = self.ref_reward([items[i] for i in idx_ref], [fmt[i]["response"] for i in idx_ref])
+            for i, s in zip(idx_ref, sc):
+                base = max(0.0, min(1.0, float(s)))
+                if self.alpha > 0:
+                    base = (1 - self.alpha) * base + self.alpha * self._sentence_chrf(fmt[i]["response"], items[i]["reference"])
+                content[i] = base
+        if idx_qe and self.qe_reward is not None:
+            qitems = [{**items[i], "reference": ""} for i in idx_qe]
+            for i, s in zip(idx_qe, self.qe_reward(qitems, [fmt[i]["response"] for i in idx_qe])):
+                content[i] = max(0.0, min(1.0, float(s)))
+        out = []
+        idx_gate_scores = {i: content[i] for i, f in enumerate(fmt) if f["gate"]}
+        n = max(1, len(items))
+        self.last_stats = {"fmt_score": sum(f["score"] for f in fmt) / n, "fmt_target_lang": sum(f["target_lang"] for f in fmt) / n,
+                           "fmt_input_lang": sum(f["input_lang"] for f in fmt) / n, "fmt_plan_f1": sum(f["plan"] for f in fmt) / n,
+                           "fmt_structure": sum(f["structure"] for f in fmt) / n, "gate_rate": sum(f["gate"] for f in fmt) / n,
+                           "content_mean_gated": (sum(content) / max(1, sum(f["gate"] for f in fmt)))}
+        self.last_weights = [1.0] * len(items)
+        for i, (it, f) in enumerate(zip(items, fmt)):
+            c = content[i]
+            if f["gate"]:
+                resp = f["response"]
+                if self._norm(resp) == self._norm(it.get("source", "")) and it.get("source"):
+                    c = 0.0                                   # copying the input is not translating it
+                elif self.length_guard:
+                    ref = (it.get("reference") if self.use_reference else "") or it.get("source") or ""
+                    ratio = len(resp) / max(1, len(ref))
+                    if ratio < 0.3 or ratio > 3.0:
+                        c *= 0.5
+            if self.shaper is not None and self.shaping in ("calibrated", "adaptive"):
+                # content curve (failures steeply negative, good -> great resolved) + scaffold on a -1..1 scale
+                key = f"{it.get('source_lang') or ''}>{it.get('targ_lang') or ''}"
+                scaffold = 4.0 * f["score"] - 2.0                                    # scaffold on the same -2 .. +2 scale
+                if not self.shaper.is_usable(key):
+                    # QE cannot tell real from mismatched translations for this pair (measured): train the scaffold only
+                    r, self.last_weights[i] = scaffold, 0.0 if not self.train_unusable else 1.0
+                    out.append(r)
+                    self._n += 1
+                    continue
+                if f["gate"] and idx_gate_scores.get(i) is not None:
+                    self.shaper.observe(key, [idx_gate_scores[i]])
+                cs = self.shaper(c, key) if f["gate"] else self.shaper(0.0, key)
+                # the content curve rides on the pair's measured reliability; the advantage is also down-weighted by it (trainer),
+                # because per-group standardisation would otherwise cancel any per-pair scale
+                self.last_weights[i] = self.shaper.reliability(key)
+                r = self.wf * scaffold + (1 - self.wf) * cs
+                out.append(r)
+                self._n += 1
+                continue
+            r = self.wf * f["score"] + (1 - self.wf) * (c if f["gate"] else 0.0)
+            if self.shaping == "threshold":
+                from rl.structure import shape_reward
+                r = shape_reward(r, self.threshold, self.negative_scale)
+            out.append(r)
+            self._n += 1
+            if self.log_every and self._n % self.log_every == 0:
+                LOG.info("structured_reward", reward=round(r, 3), fmt=round(f["score"], 3), content=round(c, 3), gate=f["gate"],
+                         plan=round(f["plan"], 2), target=f["target_lang"])
+        return out
+
+
+def _africomet(cfg: RLConfig, device: str, model_id: Optional[str] = None) -> RewardFn:
+    model_id = model_id or cfg.reward_id
     if cfg.reward_python:
-        return CometWorkerReward(cfg.reward_python, cfg.reward_id, cfg.reward_batch_size, cfg.reward_gpu)
+        return CometWorkerReward(cfg.reward_python, model_id, cfg.reward_batch_size, cfg.reward_gpu)
     try:
-        return CometInProcessReward(cfg.reward_id, cfg.reward_batch_size, device, cfg.reward_gpu)
+        return CometInProcessReward(model_id, cfg.reward_batch_size, device, cfg.reward_gpu)
     except ImportError as exc:
         raise SystemExit(
             "reward: africomet needs `unbabel-comet`, which requires transformers<5 and so cannot share this "
@@ -202,6 +324,25 @@ def _africomet(cfg: RLConfig, device: str) -> RewardFn:
 
 
 def build_reward(cfg: RLConfig, device: str = "cpu") -> Callable[[list[dict], list[str]], list[float]]:
+    if cfg.reward in ("structured_africomet", "structured_chrf"):
+        if cfg.reward == "structured_chrf":                        # no COMET install needed: wiring / smoke tests
+            ref, qe = ChrfReward(), None
+        else:
+            ref = _africomet(cfg, device) if cfg.reward_use_reference else None
+            qe = _africomet(cfg, device, cfg.reward_qe_id) if cfg.reward_qe_id else None
+            if not cfg.reward_use_reference and qe is None:
+                raise SystemExit("reward: structured_africomet without references needs reward_qe_id (a reference-free AfriCOMET)")
+        shaper = None
+        if cfg.reward_shaping in ("calibrated", "adaptive"):
+            from rl.shaping import ContentShaper
+            shaper = ContentShaper.from_file(cfg.reward_calibration_path, mode=cfg.reward_shaping, neg_scale=cfg.reward_negative_scale,
+                                             window=cfg.reward_adaptive_window, warmup=cfg.reward_adaptive_warmup,
+                                             default_anchors=tuple(float(x) for x in str(cfg.reward_default_anchors).split(",")))
+        return StructuredTranslationReward(ref, qe, cfg.reward_format_weight, cfg.reward_chrf_anchor, cfg.reward_length_guard,
+                                           shaper=shaper,
+                                           log_every=getattr(cfg, "reward_log_every", 0), use_reference=cfg.reward_use_reference,
+                                           shaping=cfg.reward_shaping, threshold=cfg.reward_threshold,
+                                           negative_scale=cfg.reward_negative_scale)
     if cfg.reward == "chrf":
         return ChrfReward()
     if cfg.reward == "verifier":
@@ -213,4 +354,4 @@ def build_reward(cfg: RLConfig, device: str = "cpu") -> Callable[[list[dict], li
     if cfg.reward == "africomet":
         return _africomet(cfg, device)
     raise ValueError(
-        f"unknown reward {cfg.reward!r} -- expected one of: chrf, africomet, verifier, verifier+africomet")
+        f"unknown reward {cfg.reward!r} -- expected one of: chrf, africomet, verifier, verifier+africomet, structured_africomet, structured_chrf")

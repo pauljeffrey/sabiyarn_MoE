@@ -55,9 +55,12 @@ SPECIAL_TOKENS = {
         "<|plan|>", "<|analyze|>", "<|recommend|>", "<|explain|>", "<|debug|>", "<|RAG|>",
         "<summarize>", "<translate>", "<classify>", "<NER>", "<identify>", "<qa>",
     ],
+    # The five tags the corpus actually emits. <|is_non_technical|> is a real token and the assembler still
+    # accepts it, but nothing generates it: a tag earns its token only where the KIND of question changes how
+    # it has to be answered, and "this is an ordinary question" is the default. 29 of 59 domains carry no tag
+    # at all rather than one that announces the absence of a specialism.
     "domain_flags": [
-        "<|is_technical|>", "<|is_legal|>", "<|is_medical|>", "<|is_scientific|>",
-        "<|is_non_technical|>", "<|is_financial|>",
+        "<|is_technical|>", "<|is_legal|>", "<|is_medical|>", "<|is_scientific|>", "<|is_financial|>",
     ],
     "label_tokens": {
         "sentiment": "<sentiment>", "topic": "<topic>", "intent": "<intent>", "toxic": "<toxic>",
@@ -77,7 +80,7 @@ ASSISTANT_FORMAT = {
     "plain": "<|input_lang|>{src}<task_plan>{verbs}</task_plan><|target_lang|>{tgt}<response>{text}",
     "with_think": ("<|input_lang|>{src}<think>{reasoning}</think>"
                    "<task_plan>{verbs}</task_plan><|target_lang|>{tgt}<response>{text}"),
-    "tool_call": "<|input_lang|>{src}<think>{reasoning}</think><tool_call>{name}\n{arguments_json}</tool_call>",
+    "tool_call": '<|input_lang|>{src}<think>{reasoning}</think><tool_call>{{"name": "{name}", "arguments": {arguments_json}}}</tool_call>',
     "notes": (
         "src/tgt are language tags like <yor>; for translation they differ and must match the real "
         "direction. A turn that calls a tool emits ONLY the tool_call form (no <response>); the tool result "
@@ -388,6 +391,9 @@ TOOLS = [
 # ---------------------------------------------------------------------------
 
 def _task(name, tags, share, description, plan=(), flags=(), tools=False, think=False, langs=None, notes=""):
+    # CANONICAL_PLANS wins where it names the task: the plan is the reference the model is scored against, so
+    # it belongs in one audited table rather than being restated at each call site and drifting.
+    plan = CANONICAL_PLANS.get(name, list(plan))
     return TaskSpec(name, list(tags), description, share=share, task_plan=list(plan),
                     domain_flags=list(flags), uses_tools=tools, requires_think=think,
                     languages=langs, notes=notes)
@@ -407,16 +413,139 @@ def _task(name, tags, share, description, plan=(), flags=(), tools=False, think=
 #
 # Every tag in schemas.seed.TAGS still gets a task somewhere, so each stays separately countable, auditable and
 # holdable-out.
+# Tasks whose replies are long enough that pairing several turns would put three long pieces in one
+# generation -- the regime that produced truncation and empty completions.
+LONG_REPLY_TASKS = {
+    "summarization", "long_document_summarization", "creative_from_knowledge", "creative_from_pattern",
+    "rag_document_qa", "structured_output",
+    "cv_and_job_application", "exam_and_study_help",
+}
+# Tasks whose replies are naturally a few sentences, where three pairs cost little.
+SHORT_REPLY_TASKS = {
+    "no_tool_admit_unknown", "clarifying_question", "search_found_nothing", "stale_data_awareness",
+    "date_and_time_reasoning", "code_switch_fidelity", "privacy_boundary", "multi_turn_consistency",
+    "instruction_following", "plan_then_tool_sequence",
+}
+
+
+# Tasks whose turn is about the INTERACTION rather than about the subject, and which therefore declare no
+# <|is_*|> tag at all.
+#
+# Measured, not guessed: with the tag applied to every turn, one live Yoruba conversation grounded in moon
+# phases stamped <|is_scientific|> onto "what time shall I set the reminder for", onto the set_reminder call
+# itself, and onto "the reminder service timed out, use your phone alarm". The tag is supposed to say what
+# kind of QUESTION the turn is holding, and none of those three holds a question about the subject at all --
+# so a tag there is not a judgement, it is a sticker. That is the same rote behaviour as pinning the tag per
+# task, just moved up to the conversation.
+#
+# The test is whether the turn's content is about the world or about the exchange: asking for a missing
+# detail, building tool arguments, reporting a failure, declining, reconciling sources, or reformatting to
+# instruction are all about the exchange. Answering, explaining, summarising, extracting and generating are
+# about the world, and those keep the tag.
+MECHANICAL_TASKS = {
+    "clarifying_question", "tool_error_recovery", "tool_structured_call", "tool_conflicting_results",
+    "tool_chain_insufficient", "search_found_nothing", "stale_data_awareness", "retrieval_insufficient",
+    "privacy_boundary", "instruction_following", "multi_turn_consistency",
+}
+
+
+# ---------------------------------------------------------------------------- canonical task plans
+# The task_plan is what the model says it is DOING, in the order it does it, and it is scored against this
+# as a set (rl/structure.plan_f1, recall-weighted) with the order measured separately. So the plans here are
+# the reference answer, not a hint -- which is why they are written out per task rather than left to whatever
+# verbs a task description happens to imply.
+#
+# The shape is: TECHNICALITY FIRST where the kind of question changes how to answer it, then the verbs in
+# solution order. Declaring <|is_medical|> before <|RAG|> is the model saying "this is a medical question, so
+# I am going to look it up rather than recall it" -- which is the division of labour the whole corpus is
+# built around, made explicit in the output instead of implied by it.
+#
+# THE <|is_*|> TAG IS NOT WRITTEN HERE, with three exceptions. It comes from the sample's DOMAIN
+# (sampling.taxonomy.DOMAIN_QUESTION_TAGS), because that is what decides what kind of question it is: a
+# tool_search_answer turn is technical when it is about diesel pumps and non-technical when it is about Fuji
+# music, and this table cannot know which. Eight tasks used to pin a tag here, which made it a per-task
+# constant -- a label the model learns to emit by rote rather than a judgement about the question in front of
+# it. Only the three tasks that NAME their own domain keep one: health_advice and safety_boundary are medical
+# whatever they are grounded in, and financial_analysis is financial. Everything else inherits the domain's.
+#
+# Two tags from the intended set cannot be used and both are documented in assemble._UNUSABLE_TAGS:
+# <|hate|> is token 52115, above vocab_size 52050, so hate-speech work uses <toxic>; <POS> is not in the
+# tokenizer in any casing, so part-of-speech uses <classify> with the <tag> label.
+CANONICAL_PLANS = {
+    # -- retrieval and the knowledge boundary. <qa> after <|RAG|> is the prescribed pairing: retrieve, then
+    # answer from what came back.
+    "tool_search_answer":        ["<|RAG|>", "<qa>"],
+    "rag_document_qa":           ["<|RAG|>", "<qa>"],
+    "retrieval_insufficient":    ["<|RAG|>", "<|analyze|>", "<|explain|>"],
+    "tool_chain_insufficient":   ["<|plan|>", "<|RAG|>", "<|analyze|>", "<|explain|>"],
+    "self_check_then_search":    ["<|analyze|>", "<|RAG|>", "<qa>"],
+    "search_found_nothing":      ["<|RAG|>", "<|analyze|>", "<|explain|>"],
+    "no_tool_admit_unknown":     ["<|analyze|>", "<|chat|>"],
+    "exam_and_study_help":       ["<|RAG|>", "<|explain|>"],
+
+    # -- tools with structured arguments, and the scenarios around them
+    "tool_structured_call":      ["<|plan|>", "<|math|>", "<|data_extract|>"],
+    "multi_tool_composition":    ["<|plan|>", "<|RAG|>", "<|math|>"],
+    "tool_error_recovery":       ["<|plan|>", "<|analyze|>", "<|explain|>"],
+    "tool_conflicting_results":  ["<|analyze|>", "<score>", "<|explain|>"],
+    "stale_data_awareness":      ["<|RAG|>", "<|analyze|>", "<|explain|>"],
+    "clarifying_question":       ["<|plan|>", "<|chat|>"],
+    "multi_turn_consistency":    ["<|plan|>", "<|analyze|>", "<|explain|>"],
+    "holds_a_grounded_position": ["<|analyze|>", "<score>", "<|explain|>"],
+    "date_and_time_reasoning":   ["<|math|>", "<|explain|>"],
+
+    # -- boundaries
+    "privacy_boundary":          ["<|analyze|>", "<|chat|>"],
+    "safety_boundary":           ["<|is_medical|>", "<|analyze|>", "<|recommend|>"],
+
+    # -- reasoning, generation, extraction
+    "multi_step_reasoning":      ["<|math|>", "<|analyze|>", "<|explain|>"],
+    "summarization":             ["<summarize>"],
+    "long_document_summarization": ["<summarize>"],
+    "structured_output":         ["<|JSON|>", "<|data_extract|>"],
+    "instruction_following":     ["<|edit|>", "<|chat|>"],
+    "creative_from_knowledge":   ["<|generate|>"],
+    "creative_from_pattern":     ["<|RAG|>", "<|analyze|>", "<|generate|>"],
+    "cv_and_job_application":    ["<|generate|>", "<|edit|>"],
+    # SHORT multi-step planning: two or three steps the assistant has to sequence itself, over the things
+    # this model is actually for -- look something up and summarise it, read a document and draft a reply,
+    # check a figure and then act on it. Deliberately not long-horizon agent planning: the point is that
+    # <|plan|> comes FIRST and the rest of the plan reflects the steps, not that the task is hard.
+    "short_multi_step_plan":     ["<|plan|>", "<|RAG|>", "<summarize>"],
+    "plan_then_tool_sequence":   ["<|plan|>", "<|RAG|>", "<|generate|>"],
+    "business_and_customer_writing": ["<|generate|>", "<|edit|>"],
+
+    # -- competence
+    "world_knowledge_qa":        ["<|explain|>"],
+    "health_advice":             ["<|is_medical|>", "<|recommend|>", "<|explain|>"],
+    "financial_analysis":        ["<|is_financial|>", "<|math|>", "<|analyze|>"],
+    "code_switch_fidelity":      ["<|chat|>"],
+}
+
 BEHAVIOUR_TASKS = {
     "tool_search_answer", "tool_chain_insufficient", "no_tool_admit_unknown", "retrieval_insufficient",
-    "rag_document_qa", "tool_compute", "tool_database", "action_tool_use",
+    "rag_document_qa",
     # The tool-use SCENARIOS belong here too, and for the same reason: in every one of them the lesson is
     # that one reply is WORSE than another -- report the failure or paper over it, surface the conflict or
     # pick silently, ask or guess, decline the part that crosses the line or refuse everything. A single SFT
     # target cannot express any of those, so they are RL-only and must not leak back into SFT.
     "tool_error_recovery", "tool_conflicting_results", "stale_data_awareness", "clarifying_question",
     "multi_tool_composition", "privacy_boundary", "safety_boundary",
+    # Short multi-step planning is a preference task: answering only the first step, or opening with a plan
+    # and never reaching the answer, are both things a single SFT target cannot express.
+    "short_multi_step_plan", "plan_then_tool_sequence",
+    # The merged structured-argument task, the grey-area self-check, the fruitless search, and the
+    # look-up-the-form-then-write mode: all four are preferences, so all four are RL-only.
+    "tool_structured_call", "self_check_then_search", "search_found_nothing", "creative_from_pattern",
+    "multi_turn_consistency", "holds_a_grounded_position", "date_and_time_reasoning",
+    "code_switch_fidelity",
+    # Study help is RL-only now that it must be grounded: "retrieved it" against "recalled it" is a
+    # preference between two replies, and a single SFT target cannot say which one it is.
+    "exam_and_study_help",
 }
+# tool_compute, tool_database and action_tool_use were merged into tool_structured_call and their task
+# definitions removed: left in place they would have been owned by no phase at all -- excluded from SFT for
+# being behaviour, and absent from RL.
 ALL_TASKS = [
     # ---- knowledge boundary: the reason this corpus exists
     _task("tool_search_answer", ["tool-calling", "knowledge-boundary", "qa"], 9.0,
@@ -456,23 +585,6 @@ ALL_TASKS = [
           "the io_direction calls for. Its search query is in English too.",
           plan=["<|RAG|>"], tools=True, think=True),
     # ---- tool families beyond retrieval
-    _task("tool_compute", ["tool-calling", "structured-output"], 4.0,
-          "Quantitative questions answered with run_statistics / calculate / convert_units rather than mental "
-          "arithmetic: average rainfall over a season, price change between two months, bags to tonnes, "
-          "spread of test scores. The assistant shows the numbers it passed in and interprets the result in "
-          "one sentence.",
-          plan=["<|math|>", "<|analyze|>"], tools=True, think=True),
-    _task("tool_database", ["tool-calling", "structured-output"], 4.0,
-          "Record keeping with search_db / db_get_record / db_insert_record: look up a customer's balance, "
-          "find stock below a threshold, save a new patient visit or sale. Before writing, the assistant "
-          "confirms the values in words; after writing, it echoes what was stored. Includes zero-result "
-          "searches and rejected writes.",
-          plan=["<|data_extract|>", "<|plan|>"], tools=True, think=True),
-    _task("action_tool_use", ["tool-calling"], 4.0,
-          "The user asks for an action: send a message, set a reminder, check a route or a forecast. The "
-          "assistant confirms any ambiguous parameter FIRST, then emits the call, then reports the result -- "
-          "including cases where the tool fails and it explains the failure plainly.",
-          plan=["<|plan|>"], tools=True, think=True),
     # ---- general understanding: the base the whole design rests on
     _task("world_knowledge_qa", ["qa", "multi-turn-chat"], 11.0,
           "Everyday how-and-why questions a curious 16-year-old could answer unaided: why bread rises, how a "
@@ -579,9 +691,12 @@ ALL_TASKS = [
           plan=["<|analyze|>", "<|explain|>"], tools=True, think=True),
     _task("stale_data_awareness", ["tool-calling", "insufficient-context"], 3.5,
           "The tool returns real data that is OLD -- a fuel price from last week, a schedule updated months "
-          "ago, a job posting from last year -- in a domain where that matters. The assistant gives the "
-          "figure WITH its date and says plainly that it may have moved. The wrong candidate quotes it as "
-          "current, which is the most common way a tool-using assistant misleads someone.",
+          "ago, a job posting from last year -- in a domain where that matters. TODAY'S DATE IS STATED IN "
+          "THE SYSTEM PROMPT, so the staleness is something the assistant can actually work out rather than "
+          "guess: it compares the result's date against today, gives the figure WITH its date, and says "
+          "plainly how old it is and that it may have moved. Where the gap matters it offers to check again "
+          "or says where a current figure is published. The wrong candidate quotes it as current, which is "
+          "the most common way a tool-using assistant misleads someone.",
           plan=["<|RAG|>", "<|explain|>"], tools=True, think=True),
     _task("clarifying_question", ["tool-calling", "insufficient-context"], 4.0,
           "The request is genuinely UNDERSPECIFIED in a way that changes the answer: which Ibadan, which "
@@ -597,12 +712,35 @@ ALL_TASKS = [
           "forward, and does not re-derive it from memory. The wrong candidate calls one tool and estimates "
           "the rest, or passes a made-up intermediate into the second call.",
           plan=["<|plan|>", "<|math|>"], tools=True, think=True),
+    _task("short_multi_step_plan", ["tool-calling", "qa", "summarization"], 4.0,
+          "A request with TWO OR THREE steps the user does not spell out, over the ordinary work this model "
+          "is for: 'find out what the new tax band is and summarise it for my staff'; 'read this letter and "
+          "tell me what I owe and by when'; 'check tomorrow's forecast and tell me if I should harvest'. The "
+          "assistant states the steps in ONE short line before doing them -- two or three clauses, not a "
+          "numbered project plan -- then carries them out in that order and answers. The wrong candidate "
+          "either answers only the first step and stops, or opens with a long plan and never gets to the "
+          "answer. Keep the whole thing short: the skill is sequencing two steps correctly, not planning at "
+          "length.",
+          plan=["<|plan|>"], tools=True, think=True),
+    _task("plan_then_tool_sequence", ["tool-calling", "content-writing"], 3.5,
+          "The user asks for ONE outcome that needs a look-up and then something done with what came back: "
+          "'get the fee for renewing my licence and draft the message to my brother asking him to pay it'; "
+          "'find the clinic's opening time and set me a reminder an hour before'. The assistant decides the "
+          "order, calls the tools in it, and uses the REAL value from the first call in the second step. The "
+          "wrong candidate does the steps in the wrong order, or writes the second step around a guessed "
+          "value instead of waiting for the first result.",
+          plan=["<|plan|>"], tools=True, think=True),
     _task("privacy_boundary", ["tool-calling", "knowledge-boundary"], 3.0,
-          "The user asks for something that crosses a personal-data line: look up someone else's exam "
-          "result or phone number, message a third party on their behalf without consent, read out an "
-          "account balance to someone else. The assistant declines THAT PART in one plain sentence without "
-          "lecturing, and still helps with whatever part is legitimate. The wrong candidate either complies "
-          "fully or refuses the whole request and leaves the user with nothing.",
+          "A request that crosses a personal-data line IN A WAY PEOPLE ACTUALLY ASK. Realistic shapes: 'my "
+          "brother sent me his BVN, check his balance for him'; 'find me the phone number of the landlord at "
+          "this address'; 'my wife's phone is with me, read out her messages'; 'save this customer's card "
+          "details for next time'; 'send this to my ex, here is her number'; 'my staff is sick, log into her "
+          "account and send the report'; 'tell me what my daughter has been searching'. Each has a real, "
+          "sympathetic motive -- that is what makes it hard. The assistant declines THAT PART in one plain "
+          "sentence, without lecturing and without implying bad intent, and still helps with what is "
+          "legitimate: it can draft the message for the user to send themselves, explain how the brother can "
+          "check his own balance, or tell them what the bank will accept. The wrong candidate either complies, "
+          "or refuses the whole request and leaves a person with a genuine need holding nothing.",
           plan=["<|plan|>", "<|chat|>"], tools=True),
     _task("safety_boundary", ["health-advice", "multi-turn-chat"], 3.0,
           "A request whose direct answer could hurt someone: a drug dose for a child, how much of a "
@@ -612,6 +750,143 @@ ALL_TASKS = [
           "harm. The wrong candidate either states a dose or a figure, or refuses so completely that the "
           "person is left with no help at all.",
           plan=["<|recommend|>", "<|explain|>"], flags=["health"], think=True),
+    # ---- merged tool task. tool_compute + tool_database + the mechanical half of action_tool_use were one
+    # lesson in three costumes: put the REAL values into the call, report exactly what came back, and do not
+    # fill in the part you did not get.
+    _task("tool_structured_call", ["tool-calling", "structured-output"], 5.0,
+          "A call with STRUCTURED ARGUMENTS where the arguments matter as much as the choice of tool: "
+          "calculate or run_statistics over figures from the conversation, convert_units, search_db or "
+          "db_get_record with field filters, db_insert_record after confirming the values in words, "
+          "set_reminder or send_message with a time and a recipient. The assistant passes the values the "
+          "user actually gave, shows them, and reports exactly what came back -- including an empty result, "
+          "a rejected write or a failure. The wrong candidate invents an argument the user never supplied, "
+          "or reports a number the tool did not return.",
+          plan=["<|plan|>", "<|math|>"], tools=True, think=True),
+
+    # ---- the grey area. Not "it plainly does not know" (tool_search_answer) but "it half-knows and has to
+    # decide whether that is enough". This is the behaviour a person shows with the Rule of 72: you have a
+    # vague sense of it for years, and one day you check.
+    _task("self_check_then_search", ["tool-calling", "knowledge-boundary", "qa"], 5.0,
+          "The assistant has PARTIAL knowledge of the thing asked -- it knows roughly what socialism is, "
+          "that there is a rule about doubling money, that a drug treats malaria -- and the <think> block "
+          "weighs that honestly: what it is sure of, what it is not, and whether the gap matters for this "
+          "question. Deciding the gap matters, it searches, then answers from what came back and says which "
+          "part it had and which part it looked up. The wrong candidate answers from the vague memory alone "
+          "and gets a specific detail subtly wrong -- the divisor, the date, the dose -- while sounding "
+          "entirely confident. Searching is NEVER the failure here; unearned confidence is.",
+          plan=["<|analyze|>", "<|RAG|>"], tools=True, think=True),
+
+    _task("search_found_nothing", ["tool-calling", "insufficient-context", "knowledge-boundary"], 4.0,
+          "The assistant searches, and the results genuinely do not answer the question -- a local bylaw "
+          "nobody has published, this week's price in one small market, a person or product with no "
+          "footprint. It says plainly that it could not find the answer, THEN gives what it does legitimately "
+          "know around the question (how such fees usually work, where this is normally published, who to "
+          "ask) and marks that clearly as general rather than looked-up. The wrong candidate either "
+          "fabricates a specific answer from the irrelevant results, or stops at 'I could not find it' and "
+          "leaves the person with nothing when it had something useful to offer.",
+          plan=["<|RAG|>", "<|explain|>"], tools=True, think=True),
+
+    # ---- the two creative modes, kept separate ON PURPOSE: the lesson is different in each. One is "write
+    # from what you have", the other is "go and look at how this is done, then do it". A model that only ever
+    # learns the first invents conventions; one that only learns the second cannot write without a crutch.
+    _task("creative_from_knowledge", ["content-writing", "multi-turn-chat"], 3.5,
+          "Write or solve something from the model's OWN knowledge, with no tool: a folktale with a given "
+          "animal and a moral, a condolence letter, a market trader's testimony, a song for a naming "
+          "ceremony, a way round a practical problem (no light for three days and food to keep). The brief "
+          "fixes two or three things -- who is in it, where, what must be true at the end -- and the piece "
+          "honours them while being locally specific. The wrong candidate is fluent and placeless: it ignores "
+          "a constraint or could have been written about anywhere.",
+          plan=["<|generate|>"]),
+    _task("creative_from_pattern", ["content-writing", "tool-calling", "rag"], 3.5,
+          "The user asks for something in a FORM the assistant does not already command: a formal petition to "
+          "a local government, a tender response, a cover letter in a particular style, a haiku, a will, a "
+          "cooperative constitution, a research abstract. It looks the form up first -- search_internet or "
+          "search_documents -- reads what the convention actually is, and then WRITES THE USER'S OWN "
+          "CONTENT in that form, naming where the pattern came from. The wrong candidate either guesses the "
+          "form and gets its conventions wrong, or copies the example it found and changes only the names.",
+          plan=["<|RAG|>", "<|generate|>"], tools=True, think=True),
+
+    _task("multi_turn_consistency", ["multi-turn-chat", "tool-calling"], 4.0,
+          "The user CORRECTS something mid-conversation -- 'no, I said Ibadan not Ibadan North', 'it is "
+          "three bags not two', 'I meant my sister, not my wife', 'the budget is 40,000 now' -- and "
+          "everything after that has to reflect the correction: the next tool call uses the new value, the "
+          "arithmetic is redone, the earlier answer is acknowledged as superseded rather than silently "
+          "dropped. The wrong candidate carries the ORIGINAL value forward, or re-states the old answer as "
+          "though the correction never happened. This is one of the commonest real failures and it is "
+          "exactly checkable: the corrected value must appear after the correction and the old one must not.",
+          plan=["<|plan|>", "<|analyze|>"], tools=True, think=True),
+    _task("holds_a_grounded_position", ["multi-turn-chat", "knowledge-boundary", "qa"], 4.0,
+          "The user PUSHES BACK on something the assistant got right -- 'that's wrong', 'my uncle is a nurse "
+          "and he says otherwise', 'are you sure? I read 90 days', 'just agree with me' -- and the "
+          "assistant neither caves nor digs in. It restates the claim WITH ITS GROUNDS: what the tool "
+          "returned, what the document says, the step in the arithmetic. Where the user might be right it "
+          "says what would change its mind or offers to check again. Where it was genuinely wrong it says so "
+          "plainly. The wrong candidate reverses itself to please the user while the evidence has not moved "
+          "-- sycophancy -- or repeats the same sentence louder with no grounds at all. Caving is scored as "
+          "the failure ONLY when the evidence in the conversation still supports the original answer.",
+          plan=["<|analyze|>", "<|explain|>"], think=True),
+    _task("code_switch_fidelity", ["multi-turn-chat", "text-rephrasing"], 0.6,
+          "The user writes the way people actually write -- Pidgin with English technical words, Yoruba with "
+          "English numbers, a formal opening then casual follow-ups -- and the assistant MATCHES that "
+          "register instead of drifting into textbook formality or textbook English. If the user switches "
+          "mid-conversation, it switches with them. The wrong candidate answers a Pidgin question in "
+          "careful English, or over-corrects a code-switched question into pure deep-dialect that no one "
+          "actually speaks. Deliberately a small block: this is a tone the whole corpus should carry rather "
+          "than a task to drill, and too much of it would crowd out the behaviours.",
+          plan=["<|chat|>"]),
+    _task("date_and_time_reasoning", ["tool-calling", "qa"], 3.0,
+          "An everyday question whose answer depends on WHEN IT IS: how many days until the deadline, is the "
+          "market on today, how long until the rains, how old will she be in September, has the deadline "
+          "passed, which day does the month start on, how many weeks of medicine are left. Today's date is "
+          "in the system prompt, so the assistant works from that -- calling get_current_datetime when it "
+          "needs more precision -- and shows the subtraction. The wrong candidate assumes a date, ignores "
+          "the one it was given, or answers 'soon' where a number was asked for. Ordinary life, not "
+          "appointment systems.",
+          plan=["<|math|>", "<|plan|>"], tools=True, think=True),
+
+    # ---- what people actually open an assistant for. The Google-Ipsos survey puts Nigerian adult AI use at
+    # 88%, the highest measured anywhere, with 93% using it to understand complex topics, 91% for work
+    # support and 80% for career exploration. The corpus had almost nothing for the last two.
+    _task("cv_and_job_application", ["content-writing", "text-rephrasing", "multi-turn-chat"], 5.0,
+          "The single largest gap against real use. Career work, in the forms it actually arrives: turn a "
+          "messy work history into CV bullets that lead with what was achieved; write a cover letter for a "
+          "named role; explain what a job advert is really asking for and whether the person qualifies; "
+          "answer 'tell me about yourself' or 'why should we hire you' for a specific job; rewrite a CV "
+          "summary for a different industry; decide what to leave off. The user's details are the ONLY "
+          "material -- qualifications, employers, years, grades come from what they said and nowhere else. "
+          "The wrong candidate invents a degree, a job title or a date the user never gave, or returns "
+          "generic careers advice instead of writing the thing that was asked for.",
+          plan=["<|generate|>", "<|edit|>"]),
+    _task("business_and_customer_writing", ["content-writing", "text-rephrasing"], 4.5,
+          "Small-business writing, which is most of what 'work support' means here: a reply to a customer "
+          "who is angry about a late delivery; a price quote with the terms spelled out; a polite chase for "
+          "an unpaid invoice; a product caption for WhatsApp Status or Instagram; a supplier negotiation "
+          "message; an apology that does not admit liability it should not; a short proposal. It keeps the "
+          "user's actual figures and dates, matches the register they asked for (firm, warm, formal), and is "
+          "short enough to send. The wrong candidate is a corporate template with brackets left in, invents "
+          "a discount or a delivery date the user never mentioned, or is three times longer than anyone "
+          "would read on a phone.",
+          plan=["<|generate|>", "<|edit|>"]),
+    _task("exam_and_study_help", ["qa", "rag", "tool-calling", "summarization"], 5.0,
+          "Students are the largest single group of users, and this is the task where a confident wrong "
+          "answer does the most damage -- it gets memorised and written in an exam.\n"
+          "SO THE ANSWER MUST BE GROUNDED, NEVER RECALLED. Every sample runs one of two ways:\n"
+          "  (a) RETRIEVED -- the student supplies or references the material (a chapter, a past paper, a "
+          "syllabus extract) and the assistant searches it with search_documents and answers from the "
+          "passages that come back; or\n"
+          "  (b) SEARCHED -- there is no material to hand, so the assistant searches the internet for the "
+          "syllabus requirement, the method, or the worked form of that question type, and answers from what "
+          "it finds.\n"
+          "Either way it says WHERE the answer came from, and where the retrieval does not settle it, it says "
+          "so rather than filling the gap from memory. Within that: explain AT THE STATED LEVEL (JSS2, WAEC, "
+          "200-level, 'explain like I know nothing') and stop there rather than showing off; work the "
+          "question so the METHOD is visible and reusable; turn retrieved material into revision notes; make "
+          "practice questions whose answers are traceable to the source.\n"
+          "The wrong candidate answers straight from its own knowledge with no retrieval -- fluent, "
+          "plausible, and exactly the thing a student cannot check -- or answers above the level asked for, "
+          "or gives an answer with no method so nothing transfers to the next question.",
+          plan=["<|RAG|>", "<|explain|>"], tools=True, think=True),
+
     # ---- generation and reasoning. Added because each has a GENUINE better/worse pair, which is what makes a
     # task worth putting in RL: a faithful summary against one that invents a figure, a story that follows its
     # brief against a generic one, a correct chain of reasoning against a plausible-but-wrong one. SFT can only
@@ -692,26 +967,45 @@ SFT_TASKS = [
 # why they moved here. A handful of non-behaviour tasks stay at low weight so the policy is not optimised
 # purely on refusal and forgets how to answer.
 _RL_WEIGHTS = {
-    # ---- the behaviour, ~60%. Still the largest block: these are the tasks SFT cannot express at all, because
-    # in each of them the lesson is that one reply is WORSE than another, not that one string is right.
+    # ---- the behaviour, ~56%. The tasks SFT cannot express, because in each the lesson is that one reply is
+    # WORSE than another rather than that one string is right.
+    #
+    # MERGED. tool_compute and tool_database folded into `tool_structured_call`: all three were the same
+    # lesson wearing different tool names -- pass the real values in, report what came back, do not invent
+    # the bit you did not get. Keeping them separate spent three task slots on one behaviour.
+    # action_tool_use folded into `clarifying_question` for the same reason: "confirm the ambiguous parameter
+    # before acting" IS the clarifying behaviour, just with a side effect attached.
     "tool_search_answer": 9.0, "retrieval_insufficient": 8.5, "no_tool_admit_unknown": 8.0,
-    "rag_document_qa": 8.0, "tool_chain_insufficient": 6.0, "action_tool_use": 2.5,
-    "tool_compute": 2.5, "tool_database": 2.5,
-    # ---- tool-use SCENARIOS, ~17%. What happens when the call does not go cleanly, which is most of real
-    # use: the tool errors, two sources disagree, the data is stale, the request is ambiguous, two tools must
-    # compose, or the ask crosses a privacy or safety line.
-    "tool_error_recovery": 4.0, "multi_tool_composition": 3.5, "clarifying_question": 3.5,
-    "tool_conflicting_results": 3.0, "stale_data_awareness": 2.5, "privacy_boundary": 2.0,
-    "safety_boundary": 2.0,
-    # ---- generation and reasoning, ~26%. These earn a place in RL for the same reason: each has a real
-    # better/worse pair rather than one correct answer. A faithful summary against one that invents a figure,
-    # a story that honours its brief against a fluent generic one, a correct chain against a plausible wrong
-    # one, an obeyed constraint against a quietly broken one. All four also score WITHOUT a judge.
-    "multi_step_reasoning": 8.0, "summarization": 6.0, "creative_writing": 6.0,
-    "instruction_following": 6.0,
-    # ---- competence held in, ~14%, so the policy does not learn that refusing is always safe
-    "world_knowledge_qa": 7.0, "health_advice": 2.0, "health_triage": 1.5, "financial_analysis": 1.5,
-    "translation_english": 1.5, "long_document_summarization": 1.5,
+    "rag_document_qa": 8.0, "tool_chain_insufficient": 6.0,
+    "tool_structured_call": 5.0,
+    "self_check_then_search": 5.0,
+    "search_found_nothing": 4.0,
+    "tool_error_recovery": 4.0, "clarifying_question": 4.5, "multi_tool_composition": 3.5,
+    # Short multi-step planning: sequencing two or three ordinary steps. Sized like the other tool-calling
+    # behaviours rather than large, because the model's job is qa / summarisation / rag / tool calls and this
+    # is the glue between them, not a separate competence.
+    "short_multi_step_plan": 4.0, "plan_then_tool_sequence": 3.5,
+    "tool_conflicting_results": 3.0, "stale_data_awareness": 2.5,
+    "privacy_boundary": 2.0,
+    "multi_turn_consistency": 4.0, "holds_a_grounded_position": 4.0,
+    "date_and_time_reasoning": 3.0,
+    # ~0.6 of 122 lands around 160 samples: present as a tone, not drilled as a task.
+    "code_switch_fidelity": 0.6,
+    # Raised from 2.0: the cost of getting this wrong is a person hurt, and it was the smallest block in the
+    # corpus. Still modest, because over-refusal is its own failure and more volume invites it.
+    "safety_boundary": 3.5,
+    # ---- generation, reasoning and extraction, ~31%
+    "multi_step_reasoning": 8.0, "summarization": 6.0,
+    "cv_and_job_application": 5.0, "business_and_customer_writing": 4.5, "exam_and_study_help": 5.0,
+    "creative_from_knowledge": 3.5, "creative_from_pattern": 3.5,
+    "instruction_following": 6.0, "structured_output": 5.0,
+    "long_document_summarization": 2.0,
+    # ---- competence held in, ~13%, so the policy is not optimised purely on procedure
+    "world_knowledge_qa": 7.0, "health_advice": 2.5, "financial_analysis": 2.0,
+    # REMOVED: health_triage -- sorting urgency is advice this system should not be trusted to give, and a
+    # wrong sort is the most harmful output in the corpus.
+    # REMOVED: translation_english -- covered by the africomet_translation pipeline, which uses a learned
+    # translation metric rather than these procedural checks.
 }
 # Each RL task carries the checks that SCORE its candidates -- regexes and named functions that judge procedure
 # and form with no model in the loop (rewards_spec.py). Most of what this phase teaches is checkable that way:
@@ -749,7 +1043,12 @@ IDENTITIES = [
 # is the wrong output for this audience.
 PERSONA = """\
 VOICE: talk like a knowledgeable friend (a paddy), not a manual.
-- Code-switching, local slang and idiom are WANTED, not merely allowed: "no wahala", "e go better", "abeg",
+- CODE-SWITCHING IS CORRECT, not sloppy. Keep the English word where that is the word people use -- transfer,
+  account, network, data, POS, BVN, charger, appointment, invoice, generator, prescription -- and put the rest
+  in the local language. Inventing a native coinage for a borrowed technical term makes the model sound like
+  a textbook; sliding into full English because one technical word appeared makes it sound like a foreigner.
+  Match the user's own ratio.
+- Local slang and idiom are WANTED, not merely allowed: "no wahala", "e go better", "abeg",
   "omo", proverbs, the way people actually speak. Match the user's register -- formal if they are formal.
 - Friendly, respectful, direct. Never sycophantic ("Great question!"), never padded, never lecturing.
 - Helpful unless you genuinely do not know, and then say so plainly and briefly.
@@ -774,6 +1073,26 @@ IO_DIRECTIONS = [
      "brief": "The material and instruction are in {lang}, and the user asks for the answer in ENGLISH. "
               "<|input_lang|> is <{code}> and <|target_lang|> is <eng>. The assistant's <response> must be "
               "English."},
+    {"key": "code_switched", "weight": 2.0,
+     "brief": "The user writes {lang} MIXED WITH ENGLISH the way people actually type -- the local language "
+              "for the sentence and English for the technical nouns ('my POS machine no dey work since "
+              "morning', 'mo fẹ́ transfer owó sí account mi'). The assistant answers IN THE SAME MIX, at the "
+              "same ratio: it keeps the English terms that have no everyday equivalent -- transfer, account, "
+              "network, data, charger, POS, BVN, invoice, appointment -- and says everything else in {lang}. "
+              "It does NOT translate those terms into coined vocabulary nobody uses, and it does NOT slide "
+              "into full English because a technical word appeared. <|input_lang|> and <|target_lang|> are "
+              "both <{code}>: a code-switched reply is {lang} with borrowings, not two languages.\n"
+              "This is the register most of these languages are genuinely spoken in, so it is weighted "
+              "double -- getting it wrong makes the model sound like a textbook rather than a person."},
+    {"key": "three_way", "weight": 1.0,
+     "brief": "THREE languages, which is the case no public corpus covers and the one people actually hit. "
+              "The user WRITES in {lang}, the material they are asking about is in a THIRD language "
+              "({other_name}) -- often but not always English -- and they ask for the answer in a language "
+              "that is not the one they wrote in. State all three explicitly in the user turn ('this "
+              "{other_name} document -- explain it to me in Twi'). <|input_lang|> is the language the USER "
+              "WROTE IN ({code}); <|target_lang|> is the language they asked the ANSWER in, which is "
+              "different. The material's language is neither marker's business -- markers describe the "
+              "conversation, not the source."},
     {"key": "crosslingual", "weight": 1.0,
      "brief": "The material is in {other_name} and the user asks for the answer in {lang} -- neither is "
               "English. <|input_lang|> is <{other_code}> and <|target_lang|> is <{code}>. This is the "
@@ -890,6 +1209,31 @@ def build(kind: str) -> Seed:
         # Two candidates, not three: the judge only needs a better/worse pair, and a third
         # response is ~40% more output tokens for a ranking it does not use.
         conv["responses_per_prompt"] = 2
+        # HOW MANY TURNS GET A RANKED PAIR.
+        #
+        # Public preference data almost always pairs only the FINAL turn -- HH-RLHF, UltraFeedback, Nectar --
+        # and treats the prefix as shared context. Pairing more turns multiplies the training pairs for one
+        # generation, because the prefix is written once either way, but it also multiplies the OUTPUT the
+        # generator has to produce in a single response, and long single responses are what produced the
+        # empty-completion and truncation failures measured earlier.
+        #
+        # So: two turns by default (the final one and the one before it), three for tasks whose replies are
+        # naturally short, and ONE for the tasks whose replies are long -- a summary or a story paired three
+        # ways is three long pieces in one response, which is exactly the regime that breaks.
+        #
+        # At training time each pair becomes its own (prefix, chosen, rejected) with the prefix fixed to the
+        # CHOSEN path, which is the standard way multi-turn DPO is done.
+        # ONE PAIRED TURN BY DEFAULT, measured rather than assumed. Asking for two or three ranked turns
+        # produced ZERO usable extra pairs on a live 44-request probe while the overall yield fell from 69%
+        # to 36% -- the extra instruction and the extra output cost samples and returned nothing. The
+        # machinery stays (paired_turns > 1 still works, and _pair_record is tested) because it is worth
+        # retrying on a stronger generator, but it is not worth paying for on this one.
+        conv["paired_turns"] = 1
+        conv["paired_turns_short_tasks"] = 1
+        conv["paired_turns_long_tasks"] = 1
+        conv["long_reply_tasks"] = sorted(LONG_REPLY_TASKS)
+        conv["short_reply_tasks"] = sorted(SHORT_REPLY_TASKS)
+        conv["mechanical_tasks"] = sorted(MECHANICAL_TASKS)
         # An RL sample is a PREFIX plus one judgeable pair, so it wants a shorter conversation than SFT.
         # Measured on the first live RL run: asking for 3-6 user turns and 2-4 tasks to set up a single
         # preference pair cost a 14.5k-token prompt, and `user_turns:1` was the second-largest drop class
@@ -923,7 +1267,11 @@ def build(kind: str) -> Seed:
             "that. Follow the exact turn count the request asks for."
         )
         columns = ["id", "lang", "tags", "tasks", "prompt_messages", "prompt_text",
-                   "response_1", "response_2", "ranking", "rationale", "verifier",
+                   "response_1", "response_2", "ranking", "scores", "rationale", "verifier",
+                   # `expected_structure` is the chosen reply's scaffold with the prose stripped -- the
+                   # column rl/rewards.py's StructuredTranslationReward already reads. `text` is the whole
+                   # sample as the chat template renders it.
+                   "expected_structure", "text",
                    "instruction", "input", "context"]
     conv = {**conv, "io_directions": IO_DIRECTIONS, "identities": IDENTITIES, "persona": PERSONA}
     return Seed(kind=kind, details=SFT_DETAILS if kind == "sft" else RL_DETAILS,

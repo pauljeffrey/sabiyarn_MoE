@@ -19,10 +19,12 @@ from typing import Any, Optional
 
 import os
 
-from assemble import MAX_RESPONSE_TOKENS, VALID_LANGS, VALID_VERBS
+import assemble  # for the LIVE response budget; see _format_brief
+from budgets import budget_for  # max_tokens comes from the phase budget, not a literal
+from assemble import VALID_LANGS, VALID_VERBS
 from longdocs import DOCUMENT_TASKS, document_brief
 from providers.base import Request
-from sampling.taxonomy import DOMAINS, GENRES, all_pairs
+from sampling.taxonomy import DOMAINS, GENRES, all_pairs, question_tag_of
 from schemas.output import schema_for
 from schemas.seed import Seed
 
@@ -110,6 +112,57 @@ def _fewshot_block() -> str:
 _PAIRS = all_pairs()
 _GENRES = sorted(GENRES)
 # Implied current date/time, cycled so time-dependent behaviour is not learned against one anchor.
+from datetime import date as _date  # noqa: E402  (local to the date helper below)
+
+_MONTHS = ("January", "February", "March", "April", "May", "June",
+           "July", "August", "September", "October", "November", "December")
+_WEEKDAYS = ("Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday")
+# Spread across several years so the corpus is not anchored to one, and nothing in it implies a cutoff.
+_YEARS = (2024, 2025, 2026, 2027)
+
+
+def _concrete_date(when: str, index: int, lang_code: str) -> str:
+    """A real date, deterministic per row, and agreeing with `when` when `when` names a month or weekday.
+
+    Deterministic so a re-run produces the same corpus; varied so no single date is over-represented.
+    """
+    i = index * 7 + _lang_offset(lang_code)
+    low = (when or "").lower()
+    month = next((m for m in _MONTHS if m.lower() in low), "")
+    if not month:
+        # The seasonal phrases name a time of year without naming a month, and getting these wrong is
+        # noticeable to a reader: harmattan is not September and Christmas is not March.
+        for cue, months in (("harmattan", ("December", "January", "February")),
+                            ("christmas", ("December",)),
+                            ("ramadan", ("March", "April")),
+                            ("rainy season", ("June", "July", "August", "September")),
+                            ("dry season", ("November", "December", "January", "February")),
+                            ("new year", ("January",)),
+                            ("planting", ("April", "May")),
+                            ("harvest", ("September", "October", "November"))):
+            if cue in low:
+                month = months[i % len(months)]
+                break
+    month = month or _MONTHS[i % 12]
+    year = _YEARS[i % len(_YEARS)]
+    want_weekday = next((d for d in _WEEKDAYS if d.lower() in low), "")
+    if "week before christmas" in low:
+        day = 15 + (i % 5)          # actually before Christmas, not on it
+    else:
+        day = 1 + (i * 3) % 28      # 1-28 is valid in every month, so no February bookkeeping
+    base = _date(year, _MONTHS.index(month) + 1, day)
+    # The weekday must be the REAL one for that date. Deriving it (rather than taking it from `when`) stops
+    # the corpus asserting that 4 January 2025 was a Monday, which it was not -- a small wrong fact, but one
+    # repeated across thousands of samples and trivially avoidable.
+    if want_weekday:
+        target = _WEEKDAYS.index(want_weekday)
+        shift = (target - base.weekday()) % 7
+        if day + shift > 28:
+            shift -= 7
+        base = _date(year, base.month, max(1, day + shift))
+    return f"{_WEEKDAYS[base.weekday()]} {base.day} {_MONTHS[base.month - 1]} {base.year}"
+
+
 _WHENS = [
     "a Monday morning in January", "a Wednesday afternoon in March", "a Friday evening in May",
     "a Saturday morning in July", "a Sunday afternoon in August", "a Tuesday night in October",
@@ -128,16 +181,309 @@ def _lang_offset(lang: str) -> int:
     return int(hashlib.sha256(lang.encode()).hexdigest()[:8], 16)
 
 
+# The domain/genre odometer laps every 17,808 rows, and 17,808 = 2^4 x 3 x 7 x 53. The direction cycle's
+# LENGTH has to be coprime with that or a given (domain, genre) sees the same direction for ever.
+#
+# This bit me: five directions worked (17,808 mod 5 = 3), and adding a sixth broke it silently -- 17,808 mod
+# 6 = 0, and a sampled run showed every row of one domain landing on `crosslingual` alone. 6 can never work,
+# and nor can 7. So the cycle is built from the directions' WEIGHTS to a length that is coprime, which also
+# gives the weights something to do.
+_DOMAIN_GENRE_LAP = 17_808
+
+
+def _io_cycle(dirs: list[dict]) -> list[int]:
+    """Indices into `dirs`, repeated by weight, to a length coprime with the domain/genre lap.
+
+    Weights are relative: a direction weighted 2.0 appears twice as often as one weighted 1.0. The total is
+    then nudged up until it is coprime, by lengthening the highest-weighted direction -- which changes the
+    distribution by at most one slot and keeps the guarantee that matters.
+    """
+    from math import gcd
+    weights = [max(1, round(float(d.get("weight") or 1.0) * 2)) for d in dirs]
+    cycle = [i for i, w in enumerate(weights) for _ in range(w)]
+    if not cycle:
+        return [0]
+    # Lengthen the LOWEST-weighted direction, not the highest. Nudging the highest amplifies a direction
+    # that is already boosted -- code_switched at weight 2.0 went from 4 slots to 5 -- so the declared weights
+    # stop being the weights. Padding the lowest costs the least distortion.
+    guard = 0
+    while gcd(len(cycle), _DOMAIN_GENRE_LAP) != 1 and guard < 12:
+        cycle.append(min(range(len(dirs)), key=lambda i: weights[i]))
+        guard += 1
+    return cycle
+
+
+
+# The verifier spec, per FIELD, so a request carries only the fields its task can actually supply. Listing all
+# six every time cost 2,700 characters -- the largest single block in the prompt -- and most tasks need one or
+# two. It also read as a menu, which invites the generator to fill in fields that do not apply, and a wrong
+# verifier is worse than none: it scores the GOOD answer as bad.
+_VERIFIER_FIELDS = {
+    "expected_answer":
+        '  - "expected_answer": the ONE correct value, as a bare string -- "4500", "12", "1960".',
+    "constraint":
+        '  - "constraint": the checkable rule the user imposed, as {"kind": ..., "value": ...} with kind one\n'
+        '    of max_words | exactly_sentences | list_items | forbidden_word | required_word. Omit if none.',
+    "brief_elements":
+        '  - "brief_elements": what the piece MUST contain -- names, places, the required ending -- as short\n'
+        '    strings.',
+    "max_words":
+        '  - "max_words": the length the user asked for, in words. Omit if they did not ask.',
+    "answer_chunks":
+        '  - "answer_chunks": REQUIRED here. The ids -- ["c4"] or ["c4","c9"] -- of the returned passages that\n'
+        '    genuinely contain the answer; the rest are distractors. Checked, so it must be true.',
+    "fields":
+        '  - "fields": the field names the user asked for in the schema, as a list of strings.',
+}
+
+# Which fields each task can supply. A task not listed gets the discriminator alone.
+_VERIFIER_BY_TASK = {
+    "multi_step_reasoning": ("expected_answer",),
+    "date_and_time_reasoning": ("expected_answer",),
+    "exam_and_study_help": ("expected_answer", "answer_chunks"),
+    "instruction_following": ("constraint", "max_words"),
+    "creative_from_knowledge": ("brief_elements", "max_words"),
+    "creative_from_pattern": ("brief_elements",),
+    "cv_and_job_application": ("brief_elements", "max_words"),
+    "business_and_customer_writing": ("max_words",),
+    "structured_output": ("fields",),
+    "rag_document_qa": ("answer_chunks",),
+    "retrieval_insufficient": ("answer_chunks",),
+    "summarization": ("max_words",),
+    "long_document_summarization": ("answer_chunks", "max_words"),
+    "tool_structured_call": ("expected_answer",),
+}
+
+_DISCRIMINATOR_SPEC = (
+    '  - "discriminator": OPTIONAL. {"good": "<short exact phrase the BEST reply contains and the worst does\n'
+    '    NOT>", "bad": "<short exact phrase the WORST contains and the best does not>"} -- under 12 words\n'
+    '    each, quoted EXACTLY as written, matched literally. Usually the correct value against the invented\n'
+    '    one. OMIT when the difference is spread over the whole reply; the scores below carry the ranking.')
+
+
+def _verifier_block(task_names: list[str]) -> str:
+    """Only the verifier fields these tasks can supply, plus the discriminator."""
+    fields: list[str] = []
+    for name in task_names:
+        for f in _VERIFIER_BY_TASK.get(name, ()):
+            if f not in fields:
+                fields.append(f)
+    lines = [_VERIFIER_FIELDS[f] for f in fields] + [_DISCRIMINATOR_SPEC]
+    return ('Also return a "verifier" object -- the GROUND TRUTH a program uses to score the replies without\n'
+            "reading them. It must describe the prefix you actually wrote, and a WRONG verifier is worse than\n"
+            "none because it marks the good reply bad. Omit any field you are unsure of.\n"
+            + "\n".join(lines) + "\n")
+
+
+
+# ---------------------------------------------------------------------------- output schemas
+# NOT USED AT THE PROVIDER. Kept because it belongs in vllm_gen.py, where a schema constrains DECODING
+# token-by-token instead of being reinterpreted by a provider -- see the finding below.
+#
+# gemma-4 does honour `response_format` with a JSON schema on Doubleword; the problem is what it then does.
+# Both ways of writing the schema fail, and they fail differently:
+#
+#   PERMISSIVE (one turn type, every field optional): the provider satisfies the schema literally and PADS
+#   the optional keys. Measured: `tool_call` on 9 user turns, `think` on 9, `task_plan` on 4. An earlier pilot
+#   saw messages_malformed 11/24 against 1/24 with plain json_object. Valid JSON, not a conversation.
+#
+#   ROLE-DISCRIMINATED (anyOf over user/assistant-answer/assistant-call/tool, additionalProperties false):
+#   padding becomes impossible -- and the model COLLAPSES TO THE CHEAPEST BRANCH. Measured: every turn came
+#   back role="user", thirteen of them in a row on one sample, with no assistant turn anywhere. Structurally
+#   valid and semantically empty.
+#
+# The lesson is that a provider-side schema constrains the SHAPE while leaving the model free to pick the
+# easiest shape that fits, which is not what we want enforced. Grammar-constrained decoding does not have that
+# escape, because the grammar is applied to every token rather than chosen once -- so the place for this is
+# the self-hosted path.
+#
+# Measured on a 120-request probe without it: 34% yield, and of the 79 failures, 51 were shape failures the
+# schema can simply prevent -- too_few_responses 29, candidate_not_an_assembled_turn 11, json_invalid 6,
+# prompt_messages_malformed 3, no_best_or_worst 3 (the enum), each-turn-must-be-an-object 1,
+# prompt_turns_unusable 1.
+#
+# What a schema CANNOT express, and so still has to be validated our side: that the prefix ends with a user
+# or tool turn, that the two candidates differ in substance, and that the markers are right. The markers were
+# never the generator's job anyway -- assemble.py builds them from the fields, so the chat template is already
+# guaranteed by construction rather than by instruction.
+#
+# `strict` is deliberately NOT set: strict mode requires every property to be required and forbids
+# additionalProperties throughout, which cannot describe a turn where `response` and `tool_call` are
+# alternatives and `think` is optional.
+
+# ROLE-DISCRIMINATED, and additionalProperties is false on every branch. That is the whole point.
+#
+# A permissive schema -- one object type with every field optional -- is actively WORSE than no schema, and
+# this was measured twice. An earlier pilot saw messages_malformed 11/24 against 1/24 without it, and my own
+# test of the permissive version put `tool_call` on 9 user turns, `think` on 9 and `task_plan` on 4. The
+# provider satisfies the schema literally and pads the optional keys, producing valid JSON that is not a
+# well-formed conversation.
+#
+# Discriminating on `role` with additionalProperties false makes that impossible rather than discouraged: a
+# user turn has no `tool_call` property to fill, so nothing can put one there. An assistant turn still needs
+# both shapes -- answering and calling -- so it is two branches, which is also how the "a turn either answers
+# or calls a tool" rule stops being an instruction and becomes a constraint.
+
+_USER_TURN = {
+    "type": "object", "additionalProperties": False,
+    "properties": {"role": {"type": "string", "const": "user"}, "content": {"type": "string"}},
+    "required": ["role", "content"],
+}
+_TOOL_TURN = {
+    "type": "object", "additionalProperties": False,
+    "properties": {"role": {"type": "string", "const": "tool"},
+                   "name": {"type": "string"}, "content": {"type": "string"}},
+    "required": ["role", "name", "content"],
+}
+_ASSISTANT_ANSWER = {
+    "type": "object", "additionalProperties": False,
+    "properties": {
+        "role": {"type": "string", "const": "assistant"},
+        "think": {"type": "string"},
+        "task_plan": {"type": "array", "items": {"type": "string"}, "minItems": 1},
+        "input_lang": {"type": "string"},
+        "target_lang": {"type": "string"},
+        "response": {"type": "string"},
+        "label_token": {"type": "string"},
+    },
+    "required": ["role", "task_plan", "input_lang", "target_lang", "response"],
+}
+_ASSISTANT_CALL = {
+    "type": "object", "additionalProperties": False,
+    "properties": {
+        "role": {"type": "string", "const": "assistant"},
+        "think": {"type": "string"},
+        "task_plan": {"type": "array", "items": {"type": "string"}, "minItems": 1},
+        "input_lang": {"type": "string"},
+        "tool_call": {
+            "type": "object", "additionalProperties": False,
+            "properties": {"name": {"type": "string"}, "arguments": {"type": "object"}},
+            "required": ["name", "arguments"],
+        },
+    },
+    "required": ["role", "task_plan", "input_lang", "tool_call"],
+}
+_TURN_SCHEMA = {"anyOf": [_USER_TURN, _ASSISTANT_ANSWER, _ASSISTANT_CALL, _TOOL_TURN]}
+
+# A candidate is one assistant turn, in either shape, with no role key.
+_CANDIDATE_ANSWER = {k: v for k, v in _ASSISTANT_ANSWER.items() if k != "required"}
+_CANDIDATE_ANSWER = {**_CANDIDATE_ANSWER,
+                     "properties": {k: v for k, v in _ASSISTANT_ANSWER["properties"].items() if k != "role"},
+                     "required": ["task_plan", "input_lang", "target_lang", "response"]}
+_CANDIDATE_CALL = {**{k: v for k, v in _ASSISTANT_CALL.items() if k != "required"},
+                   "properties": {k: v for k, v in _ASSISTANT_CALL["properties"].items() if k != "role"},
+                   "required": ["task_plan", "input_lang", "tool_call"]}
+_CANDIDATE_CONTENT_SCHEMA = {"anyOf": [_CANDIDATE_ANSWER, _CANDIDATE_CALL]}
+
+
+def _rl_schema(n_resp: int = 2) -> dict:
+    """The RL output contract as a schema, matching the named-pair shape the prompt asks for.
+
+    Nothing calls this: provider-side `response_format` was measured to make the DATA worse in two distinct
+    ways (a permissive schema invites key padding, a role-discriminated anyOf collapses the branches), so the
+    contract is carried in the prompt instead. It is kept in step with that prompt anyway -- a schema that
+    disagrees with the instructions is worse than no schema, and the next person to try this should start
+    from one that is at least correct.
+    """
+    turn = _CANDIDATE_CONTENT_SCHEMA
+    return {
+        "type": "object",
+        "properties": {
+            "prompt_turns": {"type": "array", "items": _TURN_SCHEMA, "minItems": 2},
+            "best_reply": turn,
+            "worst_reply": turn,
+            "why_best": {"type": "string"},
+            "gap": {"type": "number", "minimum": 1, "maximum": 10},
+            "verifier": {"type": "object"},
+            "tasks": {"type": "array", "items": {"type": "string"}},
+            "tags": {"type": "array", "items": {"type": "string"}},
+            "confidence": {"type": "number"},
+        },
+        "required": ["prompt_turns", "best_reply", "worst_reply", "tasks"],
+    }
+
+
+def _sft_schema() -> dict:
+    """The SFT contract: one conversation, no candidates."""
+    return {
+        "type": "object",
+        "properties": {
+            "turns": {"type": "array", "items": _TURN_SCHEMA, "minItems": 2},
+            "tasks": {"type": "array", "items": {"type": "string"}},
+            "tags": {"type": "array", "items": {"type": "string"}},
+            "confidence": {"type": "number"},
+        },
+        "required": ["turns", "tasks"],
+    }
+
+
+def response_format_for(kind: str, n_resp: int = 2) -> dict:
+    """An OpenAI-shaped response_format for this phase, or {} for pretrain (free prose, no structure)."""
+    if kind == "rl":
+        schema = _rl_schema(n_resp)
+    elif kind == "sft":
+        schema = _sft_schema()
+    else:
+        return {}
+    return {"type": "json_schema", "json_schema": {"name": f"{kind}_sample", "schema": schema}}
+
+
+
+# ---------------------------------------------------------------------------- contract complexity
+# Yield fell from 69% to 34% across the run of additions that followed the 69% measurement: the verifier
+# object, the discriminator, the chunk-id declaration, the full-article instruction, the concise-think
+# paragraph, the explicit language rule and twelve more tasks. Every one of them earns its place on paper;
+# the question is what they cost together on THIS generator, and the only way to know is to measure.
+#
+# DATA_GEN_SIMPLE_CONTRACT=1 strips the request back to what it asked for at 69% -- a prefix, two scored
+# candidates, tasks and tags -- while leaving the tasks, the languages and the documents untouched, so an A/B
+# at the same n on the same rows isolates the contract.
+#
+# What is dropped in simple mode, and what that costs if it wins:
+#   - the verifier object. expected_answer, constraint, brief_elements, max_words and answer_chunks go, so the
+#     objective checks that depend on them become "unknown" and drop out of the reward. The procedural checks
+#     are unaffected.
+#   - the discriminator, which is what retired JUDGE_ONLY_TASKS. Without it the factual tasks lose their answer
+#     key and are scored on procedure alone -- which measured BELOW CHANCE. So if simple mode wins, those four
+#     tasks need either the discriminator kept for them specifically, or dropping from the corpus.
+#   - the full-article and concise-think paragraphs, which are instructions about length rather than structure.
+
+def simple_contract() -> bool:
+    """ON by default. Measured on five 80-request arms over identical rows:
+
+        A  full contract                          35%   discriminator on 28/28
+        B  simple                                 42%   none
+        C  simple + closing reminder              48%   none
+        D  full + closing reminder                38%   discriminator on 29/30
+        E  simple + reminder + discriminator      45%   discriminator on 36/36   <- shipped
+
+    Both levers work independently and the mechanisms are legible: the reminder targets the single biggest
+    failure (the generator omitting `responses` and spilling one turn at the top level), and the slimmer
+    contract removes demands that compete with it. E gives up three points against C to keep the one verifier
+    field that cannot be reconstructed afterwards -- the discriminator is the answer key that let
+    JUDGE_ONLY_TASKS be retired, and without it the factual tasks are scored on procedure alone, which
+    measured below chance.
+
+    Every kept sample was clean in all five arms, so this is a yield difference and not a quality one.
+
+    DATA_GEN_FULL_CONTRACT=1 restores the verbose contract: the full task-conditional verifier block, the
+    full-article instruction and the long think rule. Worth trying on a stronger generator, where the extra
+    ground truth may come free.
+    """
+    import os
+    return os.environ.get("DATA_GEN_FULL_CONTRACT") != "1"
+
+
 def _io_direction(seed: Seed, lang: str, index: int, rng: random.Random) -> dict:
     """Pick the input/output language pattern on its own odometer.
 
-    `index` advances by 1 per row for a fixed (lang, task), so stepping through a 5-element list gives an
-    EXACTLY even distribution rather than an approximately even one. It also stays independent of the
-    domain/genre odometer: that one laps every 17,808 rows and 17,808 mod 5 = 3, which is coprime with 5, so
-    a given (domain, genre) still sees all five directions.
+    `index` advances by 1 per row for a fixed (lang, task), so stepping through a fixed cycle gives an
+    EXACTLY even distribution rather than an approximately even one -- and the cycle length is kept coprime
+    with the domain/genre lap (see _io_cycle) so the two odometers stay independent.
     """
     dirs = seed.conversation.get("io_directions") or [{"key": "native_native", "brief": "Everything in {lang}."}]
-    d = dict(dirs[(index + _lang_offset(lang)) % len(dirs)])
+    cycle = _io_cycle(dirs)
+    d = dict(dirs[cycle[(index + _lang_offset(lang)) % len(cycle)]])
     others = [l for l in seed.languages if l.code not in (lang, "eng")]
     other = rng.choice(others) if others else None
     me = _lang_spec(seed, lang)
@@ -148,7 +494,12 @@ def _io_direction(seed: Seed, lang: str, index: int, rng: random.Random) -> dict
     # the language tags the assistant's markers must carry, so compliance can be measured
     expect = {"native_native": (me.code, me.code), "english_english": ("eng", "eng"),
               "english_to_native": ("eng", me.code), "native_to_english": (me.code, "eng"),
-              "crosslingual": (d["other"] or "hau", me.code)}
+              "crosslingual": (d["other"] or "hau", me.code),
+              # three_way: the user WROTE in their own language and asked for the answer in a THIRD one. The
+              # markers describe the conversation -- what came in, what goes out -- so the material's
+              # language does not appear in them at all. That is the whole point of the direction: input and
+              # target differ, and neither is the source's language.
+              "three_way": (me.code, d["other"] or "eng")}
     d["expect_markers"] = list(expect.get(d["key"], (me.code, me.code)))
     return d
 
@@ -378,7 +729,11 @@ RULES THAT FOLLOW FROM THIS
 def _format_brief(lang_code: str, language_name: str, verbs_allowed: str) -> str:
     """A pure function of (language): anything row-specific belongs in the user message, because this is the
     shared prefix that prefix caching reuses across a whole (kind, lang) group."""
-    return (_FORMAT_BRIEF.replace("__MAX_TOK__", str(MAX_RESPONSE_TOKENS))
+    # The LIVE budget, not the value bound at import. generate.py calls assemble.set_response_budget() per
+    # phase -- 4,096 for SFT, 2,048 for RL where two candidates share the window -- and reading the imported
+    # name instead told every RL request it had twice the room the assembler would actually accept. Responses
+    # written to that figure were then rejected for length, which is a discarded sample per occurrence.
+    return (_FORMAT_BRIEF.replace("__MAX_TOK__", str(assemble.MAX_RESPONSE_TOKENS))
             .replace("__VERBS_ALLOWED__", verbs_allowed)
             .replace("__LANGS_ALLOWED__", " ".join(sorted(VALID_LANGS)))
             .replace("__LANGUAGE_NAME__", language_name).replace("__LANG__", lang_code))
@@ -485,17 +840,29 @@ def _sft_like_request(seed: Seed, row: dict, *, rl: bool, document: Optional[dic
     # Stride must be COPRIME with len(_WHENS) or most values are unreachable: *3 mod 12 reached only 4 of 12,
     # the same arithmetic trap that once locked every sub-topic to one genre. 5 is coprime with 12.
     when = _WHENS[(row["index"] * 5 + _lang_offset(lang.code)) % len(_WHENS)]
+    # A CONCRETE date for the system prompt, consistent with `when` where `when` names a month.
+    # `when` sets the scene for the generator -- register, season, festival -- but "a Wednesday afternoon in
+    # March" is not something a model can compare a tool result's date against. stale_data_awareness needs a
+    # real date to subtract from, and every "today"/"this week" in the corpus is better grounded with one.
+    today = _concrete_date(when, row["index"], lang.code)
 
     needs_tools = any(t.uses_tools for t in tasks)
     if needs_tools:
-        # Which tools a task genuinely needs. Tag hints alone left generic tool-calling tasks
-        # (action_tool_use) with an EMPTY set once distractors stopped padding the list -- a tool-calling
-        # task with no tools. Task names are explicit here; tags stay as a fallback for new tasks.
+        # Which tools a task genuinely needs. Tag hints alone left generic tool-calling tasks with an EMPTY
+        # set once distractors stopped padding the list -- a tool-calling task with no tools. Task names are
+        # explicit here; tags stay as a fallback for new tasks.
         BY_TASK = {
-            "action_tool_use": ["send_message", "set_reminder", "get_transport_route",
-                                "get_weather_forecast", "get_current_datetime"],
-            "tool_compute": ["run_statistics", "calculate", "convert_units"],
-            "tool_database": ["search_db", "db_get_record", "db_insert_record"],
+            # The merged structured-argument task inherits all three former catalogues: compute, database
+            # and the side-effecting actions.
+            "tool_structured_call": ["run_statistics", "calculate", "convert_units",
+                                     "search_db", "db_get_record", "db_insert_record",
+                                     "send_message", "set_reminder", "get_current_datetime"],
+            "self_check_then_search": ["search_internet", "fetch_page", "search_documents"],
+            "search_found_nothing": ["search_internet", "fetch_page", "search_documents"],
+            "creative_from_pattern": ["search_internet", "fetch_page", "search_documents"],
+            "exam_and_study_help": ["search_documents", "search_internet", "fetch_page", "calculate"],
+            "clarifying_question": ["send_message", "set_reminder", "get_transport_route",
+                                    "get_weather_forecast", "search_db"],
             "rag_document_qa": ["search_documents", "search_internet"],
             # search_internet returns LINKS, so fetch_page must be in scope or the second stage of the
             # search can never happen -- measured: fetch_page was called 0 times without this.
@@ -565,7 +932,39 @@ def _sft_like_request(seed: Seed, row: dict, *, rl: bool, document: Optional[dic
         # More than that and the document stops being the subject of the conversation.
         _lo, _hi = 1, 3
     n_user = rng.randint(min(_lo, _hi), _hi)
-    verbs = sorted({v for t in tasks for v in t.task_plan}) or ["<|chat|>"]
+    # CANONICAL ORDER, not alphabetical. `sorted()` here was actively teaching the wrong order: the verbs
+    # were handed over under the heading "use them in the order each turn carries them out" while sorted by
+    # codepoint, which puts <qa> before <|RAG|> and <|RAG|> before <|is_technical|> -- the exact reverse of
+    # the designed plan. CANONICAL_PLANS already lists them in solution order, so preserve it and dedupe
+    # without reordering. This matters more now that plan_order carries reward weight: rewarding an order the
+    # prompt scrambles would punish the generator for obeying us.
+    # THE DOMAIN'S QUESTION TAG, prepended to any task plan that does not name one itself. The <|is_*|> tag
+    # says what KIND of question the turn is holding, and that is a property of the subject matter, not of
+    # the task: the same tool_search_answer is technical about diesel pumps and ordinary about music.
+    # CANONICAL_PLANS keeps a tag only for the three tasks that name their own domain; the rest inherit this.
+    #
+    # AND IT IS OFTEN EMPTY: 29 of 59 domains carry no tag at all, because a tag is worth a token only where
+    # the kind of question changes how it must be answered -- looked up, hedged or worked out rather than
+    # recalled. Everyday subjects carry no such obligation, so they get no tag rather than a tag that says
+    # "ordinary". An empty _qtag prepends nothing and the plan simply opens with its first verb.
+    # A MECHANICAL task declares no tag: asking for a missing detail, reporting a failure or declining holds
+    # no question about the subject, so a tag there is a sticker rather than a judgement. One live
+    # conversation grounded in moon phases stamped <|is_scientific|> onto "what time shall I set the reminder
+    # for" and onto "the reminder service timed out" before this exclusion existed.
+    #
+    # The exclusion is by TASK, not by turn shape, and in particular a TOOL-CALL turn of a subject task does
+    # carry the tag. That is the single most meaningful place for it: <|is_medical|> before <|RAG|> is the
+    # model saying "this is a medical question, so I will look it up rather than recall it", which is the
+    # division of labour the whole corpus is built around. An earlier draft of this rule told the generator
+    # that any turn calling a tool holds no question to classify, which contradicted the table above it.
+    _qtag = question_tag_of(domain)
+    _mech = set(seed.conversation.get("mechanical_tasks") or ())
+    _plan_of = {t.name: (list(t.task_plan)
+                         if (not _qtag or t.name in _mech
+                             or any(v.startswith("<|is_") for v in (t.task_plan or [])))
+                         else [_qtag] + list(t.task_plan))
+                for t in tasks}
+    verbs = list(dict.fromkeys(v for t in tasks for v in _plan_of[t.name])) or ["<|chat|>"]
     fmt = _format_brief(lang.code, lang.name, " ".join(sorted(VALID_VERBS)))
 
     task_lines = "\n".join(f"  * {t.name} [{', '.join(t.tags)}]: {t.description}" for t in tasks)
@@ -576,8 +975,10 @@ def _sft_like_request(seed: Seed, row: dict, *, rl: bool, document: Optional[dic
                    if needs_tools else
                    "This conversation uses no tools, so it should stay compact: one assistant reply per user "
                    "message and nothing else.")
-    verbs_line = ("task_plan verbs for this conversation (use them in the order each turn carries them out): "
-                  + "".join(verbs))
+    # The VOCABULARY for this conversation, not an ordering: with two or three tasks drawn, this is a union
+    # across turns, and "the order each turn carries them out" was a claim it could not support. Per-turn
+    # ordering is `plan_rule`, which states it task by task.
+    verbs_line = ("task_plan verbs available to this conversation, across all of its turns: " + "".join(verbs))
     # Exemplars are attached for the low-resource tier, where structure collapses, and can be forced
     # everywhere with DATA_GEN_FEWSHOT=1. They live in the SYSTEM prompt, so they stay part of the shared
     # prefix: constant per (kind, language) and free under vLLM prefix caching.
@@ -592,7 +993,19 @@ def _sft_like_request(seed: Seed, row: dict, *, rl: bool, document: Optional[dic
     if tool_names:
         tools_section = (
             f"\nTOOLS available in this conversation (put this exact JSON in the system message):\n"
-            f"{_tool_block(seed, tool_names)}\n\nHow these tools behave when called:\n"
+            f"{_tool_block(seed, tool_names)}\n"
+            # A search_internet or fetch_page result has no document behind it -- the point of those samples
+            # is reading what a live search returns, clutter and all -- so the generator writes it, and the
+            # 16k output ceiling exists for exactly this.
+            + ("" if simple_contract() else
+               "\nA WEB result is YOURS TO WRITE: no document sits behind it, because the point of those "
+               "samples is reading what a live search actually returns. Write it at realistic length -- a "
+               "fetched page is a WHOLE ARTICLE, a thousand words or more, with the navigation, cookie "
+               "notice and citation clutter left in. A tidy three-line summary is not a page, and reading "
+               "past the clutter is half of what the sample teaches.\n"
+               if {"search_internet", "fetch_page"} & set(tool_names) else "")
+            + 
+            f"\nHow these tools behave when called:\n"
             f"{_tool_behaviour(seed, tool_names)}\n"
             f"\nEvery tool listed above is applicable to this conversation. Use the ones the tasks call for.\n")
     else:
@@ -600,6 +1013,93 @@ def _sft_like_request(seed: Seed, row: dict, *, rl: bool, document: Optional[dic
                          "the assistant does not know, the correct behaviour is to say so plainly.\n")
 
     lang_name = lang.name
+    # THE CANONICAL PLAN. The task_plan is scored against this (rl/structure.plan_f1), so the generator has
+    # to be told what it is -- it was not, and the plans it invented were consistently shorter than the
+    # designed ones: <|math|> alone where the reference is <|math|><|analyze|><|explain|>. A reference the
+    # data never exhibits is not a reference, it is a wish.
+    #
+    # Stated PER TASK, not as one sequence. A conversation draws two or three tasks, and concatenating their
+    # plans produced a single ordering claim over verbs that belong to different turns -- including three
+    # different <|is_*|> tags in one list, which is exactly the six-way menu this rule exists to remove. A
+    # turn carries out one task, so a turn's plan is that task's plan, and the rule says so.
+    _canon = [(tk.name, list(dict.fromkeys(_plan_of[tk.name]))) for tk in tasks]
+    _canon = [(n, p) for n, p in _canon if p]
+    plan_rule = ""
+    if _canon:
+        _lines = "\n".join(
+            "  * {}: task_plan: [{}]".format(n, ", ".join('"%s"' % v for v in p)) for n, p in _canon)
+        plan_rule = (
+            f"\nTASK_PLAN, PER TURN. A turn's plan is the plan of the task that turn carries out, in this "
+            f"order:\n{_lines}\n"
+            f"A turn that does only part of its task uses a SUBSET of those verbs in the same relative "
+            f"order. Put them inside <task_plan></task_plan> as FIELDS (task_plan: [...]), never as a "
+            f"string.\n")
+        # The DOMAIN TAG, as its own rule with the exact value filled in. Asking for "a tag from
+        # <|is_technical|>, <|is_medical|>, ..." produced one on 2 of 22 live turns: a six-way choice set
+        # mid-paragraph is a question, and the generator answered it by skipping. Naming the tag each task
+        # takes, in position, turns the choice into a transcription.
+        _flagged = [(n, p[0]) for n, p in _canon if p[0].startswith("<|is_")]
+        if _flagged:
+            _distinct = list(dict.fromkeys(f for _, f in _flagged))
+            # "the tag for EVERY turn" only where every task in this conversation takes the same one.
+            # Overstating it contradicts the table directly above -- and the plan the turn is scored against,
+            # which for an unflagged task does not contain a tag at all.
+            if len(_distinct) == 1 and len(_flagged) == len(_canon):
+                _rule = (f"EVERY assistant turn that produces a <response> OPENS its task_plan with "
+                         f"{_distinct[0]} -- there is nothing to choose, it is the tag for every turn here")
+            elif len(_distinct) == 1 and len(_flagged) > 1:
+                # one tag, several tasks: naming it once beats repeating it per task
+                _rule = (f"EVERY {', '.join(n for n, _ in _flagged)} turn that produces a <response> OPENS "
+                         f"its task_plan with {_distinct[0]}, before the verbs that act on the question")
+            elif len(_flagged) == 1:
+                _rule = (f"EVERY {_flagged[0][0]} turn that produces a <response> OPENS its task_plan with "
+                         f"{_flagged[0][1]}, before the verbs that act on the question")
+            else:
+                _rule = ("A turn that produces a <response> OPENS its task_plan with the tag its own task "
+                         "takes above -- " + ", ".join(f"{f} for {n}" for n, f in _flagged))
+            plan_rule += (
+                f"- {_rule}. It is not optional, and a turn that does only part of its task still opens "
+                f"with it. Declaring what KIND of question is being held, before acting on it, is a "
+                f"behaviour this data exists to teach: a turn without it is an incomplete sample.\n")
+            # And the converse, stated explicitly. Without it the generator generalises the tag to every
+            # turn in the conversation -- it stamped <|is_scientific|> on "what time shall I set the
+            # reminder for" -- which is the rote labelling the per-task table exists to prevent.
+            _plain = [n for n, p in _canon if not p[0].startswith("<|is_")]
+            if _plain:
+                plan_rule += (
+                    f"- NO OTHER TURN declares an <|is_*|> tag. A turn that asks for a missing detail, "
+                    f"reports that a tool failed or declines something is about the exchange, not about the "
+                    f"subject, so it holds no question to classify: "
+                    f"{', '.join(_plain)} "
+                    f"{'opens' if len(_plain) == 1 else 'open'} with the first verb listed above and no "
+                    f"tag. Carrying the tag across every turn of the conversation is wrong.\n")
+        else:
+            # Every task here is about the exchange rather than the subject, so NO turn declares a tag.
+            # Saying so costs one line and is cheaper than the generator deciding to add one anyway.
+            plan_rule += ("- NO TURN in this conversation declares an <|is_*|> tag: every task here is about "
+                          "the exchange -- asking for a detail, reporting a failure, declining -- not about "
+                          "a subject that could be classified. Each plan opens with its first verb above.\n")
+
+    # These appear in the SHARED user message, so both the SFT and RL paths must define them. The closing
+    # reminder is RL-only: it exists to stop the generator omitting `responses`, and SFT has none to omit.
+    closing_reminder = ""
+    # `plan_rule` is NOT defaulted here: it is computed above for both paths, and a blank default at this
+    # point silently clobbered it, so the canonical-plan rule never reached a single prompt. The only reason
+    # plans matched at all was `verbs_line`, which carries the verbs but not the ordering or tag rules.
+    verifier_json_line = ""
+    verifier_block = ""
+    # <think> IS FOR A DECISION, NOT A RECAP. Measured on live kept records: 14 of 21 think blocks opened by
+    # restating the question ("The user wants to know...") and those leading clauses were 39% of all think
+    # text in the corpus. The question is already on screen, so that is pure spend -- at 32,768 tokens the
+    # context budget is real. The old 120-word trim never fired once (median 22 words, max 41): the waste was
+    # never length, it was structure, so the rule names the opener instead of capping the count.
+    think_rule = ("<think> IS FOR A DECISION, NOT A RECAP. Start at the decision: which tool, which of two "
+                  "readings, what is missing, what the figure works out to. NEVER open with \"The user wants\" "
+                  "or \"The user is asking\" -- measured on live output, that restatement was 39% of all "
+                  "think text and the question is already on screen. One or two short sentences. Omit "
+                  "<think> entirely where nothing needs deciding, which is most turns.\n"
+                  "Bad:  <think>The user wants to know the renewal fee for a licence. I should look it up.</think>\n"
+                  "Good: <think>The fee changed in 2025, so recall is unsafe -- look it up.</think>")
     if not rl:
         _msg = "message" if n_user == 1 else "messages"
         shape = f"""Produce ONE conversation with EXACTLY {n_user} {_msg} of role "user" -- no more, no
@@ -614,49 +1114,104 @@ Return JSON:
   "confidence": <float 0-1: your honest estimate that this conversation is correct AND fluent {lang_name}>}}"""
     else:
         n_resp = int(seed.conversation['responses_per_prompt'])
+        # How many assistant turns get a ranked pair (see build_seeds, kind == "rl"). A long-reply task gets
+        # one, a wholly short-reply conversation three, everything else two. Pairing more turns multiplies
+        # the training pairs for one generation -- the prefix is written once either way -- but it also
+        # multiplies the OUTPUT in a single response, and long single responses are what produced the
+        # empty-completion and truncation failures measured earlier.
+        _names = {x.name for x in tasks}
+        if _names & set(seed.conversation.get("long_reply_tasks") or ()):
+            n_pairs = int(seed.conversation.get("paired_turns_long_tasks", 1))
+        elif _names <= set(seed.conversation.get("short_reply_tasks") or ()):
+            n_pairs = int(seed.conversation.get("paired_turns_short_tasks", 3))
+        else:
+            n_pairs = int(seed.conversation.get("paired_turns", 2))
+        n_pairs = max(1, min(n_pairs, n_user))
+        verifier_block = "" if simple_contract() else _verifier_block([x.name for x in tasks])
+        # THE LAST THING IT READS. The dominant failure was the generator omitting `responses` entirely --
+        # writing the prefix and then spilling ONE assistant turn at the top level, i.e. producing
+        # "conversation + next turn" instead of "conversation + two ranked candidates". Every captured case
+        # had no `responses` key at all, and it was roughly 30% of all requests.
+        #
+        # The requirement is already stated once in the JSON shape above; by the time a long prefix has been
+        # written it has drifted out of view. Restating it as the final line costs ~40 tokens and is the
+        # cheapest intervention available against the single biggest loss.
+        # The discriminator rides along HERE in simple mode rather than in a block of its own further up.
+        # Measured: the full verifier block costs about 10 points of yield (48% -> 38%), and the discriminator
+        # is the one field of it that cannot be reconstructed later -- it is the answer key that let
+        # JUDGE_ONLY_TASKS be retired. One line at the point of maximum recency is the cheapest way to keep it.
+        # A plain string, not an f-string: doubled braces would survive literally into the prompt.
+        _disc = ('\nAlso add: "verifier": {"discriminator": {"good": "<exact short phrase only the BEST reply '
+                 'contains>", "bad": "<exact short phrase only the WORST contains>"}} -- omit it if no single '
+                 'phrase separates them.' if simple_contract() else "")
+        # THE LAST THING IT READS, and it names the two keys literally. The previous version asked for "a
+        # top-level responses array with EXACTLY 2 items, each scored" -- an array of wrapper objects, three
+        # levels deep -- and 7 of 11 drops on a 24-sample diagnostic were requests that wrote prompt_turns
+        # and then spilled ONE assistant turn at the top level with no `responses` key at all: 29% of every
+        # request paid for. Two named sibling keys are a shape that cannot half-exist the way an array can.
+        closing_reminder = (
+            f"\nBEFORE YOU STOP, check your JSON has BOTH of these keys at the top level, as siblings of "
+            f"\"prompt_turns\":\n  \"best_reply\":  {{...}}\n  \"worst_reply\": {{...}}\n"
+            f"A reply with only one of them, or with the assistant turn's fields written directly at the top "
+            f"level, is discarded.{_disc}")
+        # The RL path uses the SAME think rule as SFT. It used to drop to a bare "Keep <think> to 1-3
+        # sentences." under the simple contract, and that one-liner is what let the restatement opener
+        # through: it capped the length of the padding instead of forbidding it.
+        verifier_json_line = ("" if simple_contract()
+                              else '  "verifier": {{ ...only the fields that apply, omit the rest... }},\n')
+        if n_pairs > 1:
+            multi_turn_block = (
+                f"RANK {n_pairs} TURNS, NOT ONE. The LAST {n_pairs} assistant turns each get a pair of "
+                f"candidate replies, returned in \"turn_responses\" as {n_pairs} entries of the form\n"
+                f'  {{"after_user_turn": <the 1-based number of the user turn it answers>, '
+                f'"best_reply": {{...}}, "worst_reply": {{...}}}}\n'
+                "Earlier assistant turns in \"prompt_turns\" stay single. Each pair must answer the "
+                "conversation AS IT STANDS AT THAT POINT -- the prefix up to that user turn, with the BEST "
+                "reply assumed for every earlier paired turn. Keep every reply the length it would naturally "
+                "be; do not pad to fill the extra slots.\n\n")
+            turn_responses_line = (
+                '\n  "turn_responses": [{"after_user_turn": <n>, "best_reply": {...}, '
+                '"worst_reply": {...}}, ...],')
+        else:
+            multi_turn_block = ""
+            turn_responses_line = ""
         shape = f"""Produce ONE conversation PREFIX with EXACTLY {n_user} messages of role "user", the LAST
 of which ends the prefix (tool turns are extra and do not count), then EXACTLY {n_resp} alternative
 assistant replies to that final user message.
 
-Do NOT write the final assistant reply inside "prompt_turns". The prefix STOPS at the last user message (or
-at a tool result, if the assistant called a tool and the reply must read off the result). The replies go in
-"responses" and nowhere else.
+Do NOT write the final assistant reply inside "prompt_turns". The two replies go in "best_reply"
+and "worst_reply" at the TOP LEVEL, and nowhere else.
 
-"responses" must be a list of EXACTLY {n_resp} items -- one labelled "best" and one labelled "worst". Both
-are required; a single reply is not a sample, because there is nothing to rank. Do not use any other label.
-  - best:  honest, correctly grounded, uses the right tool or correctly admits it cannot;
-  - worst: confidently wrong -- invents a fact, answers from an irrelevant tool result, claims to recognise
-    something it was never told, or refuses when the answer WAS actually available.
+THE PREFIX MUST END WITH A role="user" MESSAGE OR A role="tool" RESULT. Never with an assistant turn, and in
+particular NEVER WITH A TOOL CALL: a call with no result after it is a question the candidates cannot answer,
+and the sample is discarded. If the assistant calls a tool, the prefix carries the call AND the result it got
+back, and the candidates are what it says having read that result.
+
+{multi_turn_block}BOTH "best_reply" AND "worst_reply" are required. A single reply is not a sample, because there is nothing
+to rank.
+  - best_reply:  honest, correctly grounded, uses the right tool or correctly admits it cannot;
+  - worst_reply: confidently wrong -- invents a fact, answers from an irrelevant tool result, claims to
+    recognise something it was never told, or refuses when the answer WAS actually available.
 They must differ in SUBSTANCE, not wording: two paraphrases of the same answer are useless.
+
+Give "gap" a number from 1 to 10 for how much better best_reply is. This is cheap for you -- you already know
+which is better and why -- and it is what the training uses to weight the pair. A gap below 3 means the two
+replies are too close together, so make the worse one genuinely worse instead of lowering the gap.
 
 Each reply's "content" is an OBJECT with THE SAME FIELDS as an assistant turn in the OUTPUT CONTRACT --
 think, task_plan, input_lang, target_lang, response (or tool_call). Write the FIELDS. Do NOT write the
 special tokens or the marker string yourself, and do NOT put a JSON string there: the markers are assembled
 for you, exactly as they are for the turns in "prompt_turns".
 
-Also return a "verifier" object: the GROUND TRUTH a program needs to score an answer without reading it.
-This is what makes the sample checkable, so it must describe the prefix you actually wrote:
-  - "expected_answer": for a question with ONE correct value (arithmetic, a count, a date), that value as a
-    bare string -- "4500", "12", "1960". Omit when the task has no single correct value.
-  - "constraint": when the user imposed a checkable rule, as {{"kind": ..., "value": ...}} where kind is one
-    of "max_words" | "exactly_sentences" | "list_items" | "forbidden_word" | "required_word", e.g.
-    {{"kind": "exactly_sentences", "value": 3}} or {{"kind": "forbidden_word", "value": "money"}}. Omit if
-    the user imposed none.
-  - "brief_elements": for a writing brief, the things the piece MUST contain -- names, places, the required
-    ending -- as a list of short strings. Omit when there was no brief.
-  - "max_words": when the user asked for a length, the number of words. Omit otherwise.
-These must be EXACT: "expected_answer" has to be the value the best reply states, and a "forbidden_word" has
-to be a word the best reply genuinely avoids. A wrong verifier is worse than no verifier -- it would score
-the good answer as bad -- so omit a field you are unsure of rather than guessing it.
-
+{verifier_block}
 Return JSON:
 {{"prompt_turns": [ ...turn objects exactly as the OUTPUT CONTRACT describes... ],
-  "responses": [
-    {{"content": {{ ...assistant turn FIELDS... }}, "quality": "best",  "why": "<one line, English>"}},
-    {{"content": {{ ...assistant turn FIELDS... }}, "quality": "worst", "why": "<one line, English>"}}
-  ],
-  "verifier": {{ ...only the fields that apply, omit the rest... }},
-  "tasks": [...], "tags": [...],
+  "best_reply":  {{ ...assistant turn FIELDS... }},
+  "worst_reply": {{ ...assistant turn FIELDS... }},
+  "why_best": "<one line, English: what makes the first better>",
+  "gap": <1-10: how much better the best reply is>,
+{verifier_json_line}
+  "tasks": [...], "tags": [...],{turn_responses_line}
   "confidence": <float 0-1: your honest estimate that the ranking is right and the text is fluent {lang_name}>}}"""
 
     # A long-document sample covers ONE task, so "change subject at least once" would be self-contradictory.
@@ -675,7 +1230,13 @@ Return JSON:
                 f"{doc_angle(row)}.\nSeveral separate conversations are built from this same document, so "
                 f"ask about THIS facet and not the document in general.\n")
 
-    user = f"""LANGUAGE DIRECTION for this conversation -- {io['key']}:
+    user = f"""THE LANGUAGE RULE, which the direction below is an instance of: the USER may write in ANY supported
+language, and the ANSWER goes in whatever language the user ASKS FOR -- which is often not the one they wrote
+in, and need not be the language of the material either. Where the answer language is not the obvious one, the
+user has to SAY so in their own words ("...explain it to me in Twi"), because that is the only way the request
+is well formed. <|input_lang|> is what came in; <|target_lang|> is what was asked for.
+
+LANGUAGE DIRECTION for this conversation -- {io['key']}:
 {io['brief']}
 Set <|input_lang|> to <{io['expect_markers'][0]}> and <|target_lang|> to <{io['expect_markers'][1]}> on every
 assistant turn that produces a <response>. Where the two differ, that difference is the point of the sample:
@@ -689,6 +1250,11 @@ the user asks in one language for an answer in another, and the assistant compli
 
 Ground the content in: {DOMAINS[domain].name} / {subtopic}.
 It is {when}; anything time-dependent (a reminder, a forecast, a rate, "today") must fit that.
+Today's date is {today} and it is stated in the assistant's system prompt, so anything the assistant works
+out from "today" -- days remaining, whether a deadline has passed, how stale a result is -- must agree with
+that date.
+
+{think_rule}
 The assistant's identity in the system message will be: "{identity}" -- keep its self-references consistent
 with that, and do not assume any other name.
 {tools_section}
@@ -699,7 +1265,8 @@ Hard requirements:
 - When a tool result does not answer the question, the assistant says that instead of forcing an answer.
 - Tool arguments must be valid against the tool's JSON schema.
 - Tool results must be realistic: concrete snippets, sometimes partial, sometimes unhelpful.
-- No sycophancy ("Great question!"), no padding, no restating the question before answering."""
+- No sycophancy ("Great question!"), no padding, no restating the question before answering.
+{plan_rule}{closing_reminder}"""
 
     return Request(
         custom_id=row["custom_id"],
@@ -708,7 +1275,15 @@ Hard requirements:
         # mid-string, which showed up as json_invalid on ~17% of a pilot. Headroom is far cheaper than a retry.
         # A long-document sample needs LESS, not more: the document arrives as input and is referred to by a
         # placeholder, so this completion holds only the summary and its follow-ups.
-        max_tokens=4096 if document else 6144,
+        # FROM THE BUDGET, not hardcoded. budgets._rl was raised to 16,384 so an internet-search sample can
+        # carry a full article, and this line quietly capped every request at 6,144 regardless -- the raise
+        # had no effect on anything. A document-backed sample still needs LESS: the document arrives as input
+        # and is referred to by a placeholder, so the completion holds only the conversation.
+        # A DOCUMENT-backed sample keeps the smaller ceiling on purpose: the document arrives as input and is
+        # referred to by a placeholder, so no budget should be available for re-emitting it. Everything else
+        # takes the phase budget, which is 16,384 for RL so an internet-search sample can carry a full
+        # article -- this line previously hardcoded 6,144 and silently discarded that raise.
+        max_tokens=4096 if document else budget_for(seed.kind).max_output_tokens,
         temperature=0.9,
         # Deliberately json_object, NOT json_schema. A pilot with the schema attached produced *more*
         # rejects (messages_malformed 11/24 vs 1/24): providers coerce the output to satisfy the schema
@@ -727,7 +1302,7 @@ Hard requirements:
                   "distractor_definitions": _tool_defs(seed, distractors),
                   "domain": domain, "subtopic": subtopic, "n_user_turns": n_user,
                   "io_direction": io["key"], "io_other_lang": io["other"],
-                  "identity": identity, "when": when,
+                  "identity": identity, "when": when, "today": today,
                   # The turn bounds this row was actually asked for, so the validator checks the request that
                   # was made rather than the seed-wide floor -- a long-document sample legitimately has one
                   # user turn, which the global min_user_turns=3 would reject.
@@ -739,6 +1314,8 @@ Hard requirements:
                   # samples that are themselves realistic, since plenty of real tool use is a one-shot
                   # question. For SFT the floor stays as asked: there the conversation IS the sample.
                   "min_user_turns": 1 if seed.kind == "rl" else _lo, "max_user_turns": _hi,
+                  "n_pairs": n_pairs if seed.kind == "rl" else 1,
+                  "schema_enforced": True,
                   "document": document, "expect_markers": io["expect_markers"]},
     )
 

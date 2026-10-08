@@ -42,11 +42,22 @@ rl:
   kl_coef: 0.05                                    # raise it if the reward climbs while chrF++/BLEU (eval_suite) fall
   advantage_std_norm: true
   rl_micro_batch: 16
-  reward: africomet                                # africomet | chrf
+  reward: africomet                                # africomet | chrf | structured_africomet | structured_chrf (scaffold + content, see HOW_TO_RUN.md)
   reward_id: masakhane/africomet-stl
   reward_python: null                              # e.g. .venv-comet/bin/python  (unbabel-comet needs transformers<5)
   reward_batch_size: 16
   reward_gpu: true
+  # structured_africomet only:
+  reward_format_weight: 0.2                        # R = w*scaffold + (1-w)*gate*content (content = reference-free AfriCOMET-QE)
+  reward_qe_id: masakhane/africomet-qe-stl-1.1
+  reward_use_reference: false                      # true: rows with a reference use the reference model + chrF++ anchor
+  reward_chrf_anchor: 0.2
+  reward_length_guard: true
+  reward_shaping: calibrated                        # calibrated (default; needs reward_calibration_path from rlhf/scripts/calibrate_shaping.py) -> adaptive once it plateaus; threshold|none for comparison
+  reward_calibration_path: outputs/shaping.json
+  reward_threshold: 0.46
+  reward_negative_scale: 2.0
+  # rejection sampling instead of RL: algo=rs (rs_mode, rs_input, rs_n, rs_keep_top, rs_min_reward, rs_filter_keep_frac)
 
 output:
   out_dir: outputs/rlhf

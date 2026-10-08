@@ -1,8 +1,7 @@
 # Tool-call format (chat template v2) — contract for data, rewards and serving
 
 Source of truth: `sabiyarn/chat_template.jinja` (byte-identical copy in `data-gen/templates/`). Everything below is what that template renders; if this note and the
-template disagree, the template wins. Status: implemented in the repo, **not yet pushed to the Hub tokenizer** (`BeardedMonster/SabiYarn-32k` still carries the previous
-version), and `<tools>`/`</tools>` are **not yet tokens** (see "Pending").
+template disagree, the template wins. Status: implemented in the repo and **pushed to both tokenizer repos** (`BeardedMonster/SabiYarn-32k` commit e2cfaf1, `Aletheia-ng/SabiYarn_MoE-280M` commit 3030760; both carry identical `tokenizer.json`, `tokenizer_config.json` (with the `chat_template` key), `special_tokens_map.json`, `chat_template.jinja`; `generation_config.json` has `eos_token_id: [2, 52030]`). See §7 for the tool vocabulary (`<tools>`, `</tools>` and 16 quoted JSON keys).
 
 ## 1. What a tool-using turn looks like
 
@@ -61,7 +60,19 @@ Rendered text (one line in reality; line breaks added here):
 * `data-gen/assemble.py::output_structure` still reduces a call to `<tool_call>NAME</tool_call>` (name only) for the *expected structure* column; it reads the name out of the JSON object.
 * `data-gen/agents/loop.py` and the `agent/` framework were not touched here: they must (a) stop on `</tool_call>`, (b) keep the whole turn as one assistant text, (c) pass `tools=` to the template, (d) not append function names to tool results.
 
-## 6. Pending (needs the owner's decision)
-* Push the template to the Hub tokenizer; the `Aletheia-ng/SabiYarn_MoE-280M` tokenizer still has an older template (`<tool_result>`) and must be synced before it is used for serving or rollouts.
-* Add `<tools>` (52117) and `</tools>` (52118) as special tokens: `python scripts/add_tool_tokens.py --out DIR` (dry run, verified) then `--push`. This must happen **before** `sft.bin` is tokenised; the vocabulary growth to 52,160 rows already covers them. `data-gen/tests/test_chat_template.py::test_every_marker_the_template_emits_is_a_real_token` fails until then, on purpose.
-* Add `</tool_call>` to `generation_config.eos_token_id` of the served model.
+## 6. Done / still open
+* Done: template, tokens and `generation_config.json` (`eos_token_id: [2, 52030]` = `</s>` and `</tool_call>`, so `generate()` stops after a call) are on both repos; the Aletheia tokenizer was brought level with the reference one (it also gained `<POS>` 52116 and the renamed `<zul> <xho> <wol> <sna>`). `apply_chat_template(tools=...)` from the Hub equals the data build's rendering byte for byte.
+* The model weights still have 52,050 embedding rows; every id >= 52,050 (new language tags, `<POS>`, `<tools>`, `</tools>`, the 16 JSON keys) only works after the SFT-time growth to 52,160 (`sft_resize_vocab_size`). Do not use those tokens against the current checkpoint.
+* `sft.bin` can be tokenised now with the current tokenizer. Continued-pretraining text must NOT be (see §7, "pretraining pin").
+* Still open: parallel calls in one message (needs a dedicated end-of-calls token), and the Hub copies of `tokenizer_config.json` carry `transformers_version` metadata from older writes (harmless).
+
+## 7. The tool vocabulary
+| tokens | ids | kind | why |
+|---|---|---|---|
+| `<tools>`, `</tools>` | 52117, 52118 | **special** | delimit the function block in the system turn |
+| `"name"` `"arguments"` `"description"` `"parameters"` `"properties"` `"required"` `"type"` `"function"` `"string"` `"object"` `"integer"` `"number"` `"boolean"` `"array"` `"enum"` `"query"` | 52119 … 52134 (in that order) | **ordinary added tokens, quotes included** | these keys were 37% of the tokens of a typical `<tools>` block (`"arguments"` = 5 pieces); each is now one token. On a real sample (search tool + 3 device tools + one call) the whole text goes from 637 to 534 tokens |
+* They are ordinary, not special, on purpose: `decode(..., skip_special_tokens=True)` drops special tokens, which would delete the keys from a decoded tool call and break `json.loads`. An ordinary added token decodes to exactly its text (checked for all 16, with and without `skip_special_tokens`).
+* The match is on the quoted string, so `"type"` becomes the token wherever that exact string appears (also in ordinary JSON in user text). Argument names that differ per tool (`city`, `expression`, ...) stay plain text.
+* **Pretraining pin.** Ordinary web/JSON text contains these strings, so text tokenised with the current tokenizer gets ids up to 52,134, which the 52,050-row checkpoint cannot embed. `data/prepare.py` (pretrain mode) and `data/prepare_unimax.py` therefore load the tokenizer at revision `0c711cb2f7af669b2782c90c1d0d4d097df21422` (override: env `PRETRAIN_TOKENIZER_REVISION`). SFT and RL tokenisation use the current tokenizer (`mode` sft/rl). The bins already built are unaffected.
+* **Initialisation at SFT.** `sabiyarn/model/resize.py` starts each of the 16 keys (and `<tools>`/`</tools>`) as the mean of the embedding rows of the pieces the old tokenizer splits it into (`"arguments"` ≈ mean of `"`, `ar`, `g`, `uments`, `"`); the language tags and `<POS>` keep mean + noise. `Trainer._resize_for_sft` does this on a fresh SFT start (falls back to mean + noise, with a warning, if the Hub is unreachable).
+* Adding more tokens: `scripts/add_tool_tokens.py` (edit `KEY_NAMES`, dry run, then `--push-to` both repos). 25 of the 52,160 SFT rows are still free (ids 52,135–52,159).

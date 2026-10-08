@@ -20,11 +20,12 @@ import os
 import random
 import re
 import traceback
+import unicodedata
 from pathlib import Path
 from typing import Any, Optional
 
 from providers.base import Response
-from assemble import LABEL_TOKENS, AssemblyError, build_messages
+from assemble import LABEL_TOKENS, AssemblyError, build_messages, structure_of
 from disassemble import looks_pre_assembled, turn_from_assistant
 from longdocs import _text_from
 from longdocs import splice as splice_document
@@ -53,6 +54,14 @@ _RESP = re.compile(r"<response>(.*)", re.S)
 
 STATS: dict[str, int] = {}
 
+# The restatement opener a reasoning block wastes its first clause on: "The user wants to know X, so ...".
+# Anchored and limited to one leading clause so it can only ever remove the recap, never the decision.
+_RESTATEMENT_OPENER = re.compile(
+    r"^(?:the\s+user|the\s+question|they|user)\s+"
+    r"(?:is\s+asking|is\s+requesting|has\s+asked|asked|asks|wants?\s+to\s+know|wants?|needs?|"
+    r"would\s+like|is\s+looking\s+for)\b[^.!?]*[.!?]",
+    re.IGNORECASE)
+
 
 # Set DATA_GEN_DEBUG_DIR to capture the raw response behind every drop. The counters tell you how often a
 # thing goes wrong; only the raw text tells you why, and without it a reason like `prompt_messages_malformed`
@@ -78,6 +87,92 @@ def _drop(reason: str, raw: str = "", custom_id: str = "") -> None:
                                           encoding="utf-8")
     except OSError:
         pass  # diagnostics must never break a run
+
+
+def _pair_from(d: dict) -> list:
+    """The ranked pair out of a generated object, in either shape it can arrive in.
+
+    PREFERRED (current contract): two named sibling keys, "best_reply" and "worst_reply", each holding the
+    assistant turn's fields directly, with one optional top-level "gap" scoring the margin.
+
+    LEGACY: a "responses" array of {"content": ..., "quality": "best"|"worst", "score": n} wrappers. Still
+    read, because shards already generated under it must keep parsing and because a generator that reaches
+    for the old shape anyway should not cost a sample.
+
+    The named shape exists because the array one was the single largest source of waste: 7 of 11 drops on a
+    24-sample diagnostic were objects that held "prompt_turns" and then spilled ONE assistant turn at the top
+    level with no "responses" key -- 29% of every request paid for. An array of wrappers can half-exist; two
+    named slots either are there or are not.
+    """
+    best, worst = d.get("best_reply"), d.get("worst_reply")
+    if isinstance(best, dict) and isinstance(worst, dict):
+        try:
+            gap = float(d.get("gap"))
+        except (TypeError, ValueError):
+            gap = None
+        # Scores are synthesised from the gap so the downstream margin logic is unchanged. Where the
+        # generator gave no gap, the pair is still ordered -- it just carries no magnitude.
+        hi, lo = (10.0, max(0.0, 10.0 - gap)) if gap is not None else (None, None)
+        out = [{"content": best, "quality": "best", "why": d.get("why_best") or ""},
+               {"content": worst, "quality": "worst", "why": ""}]
+        if hi is not None:
+            out[0]["score"], out[1]["score"] = hi, lo
+        STATS["shape:named_pair"] = STATS.get("shape:named_pair", 0) + 1
+        return out
+    legacy = d.get("responses")
+    if isinstance(legacy, list) and legacy:
+        STATS["shape:responses_array"] = STATS.get("shape:responses_array", 0) + 1
+        return legacy
+    return []
+
+
+def _score_of(r: dict) -> Optional[float]:
+    v = r.get("score")
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return None
+    return f if 0.0 <= f <= 10.0 else None
+
+
+def _fold(s: str) -> str:
+    """Casefold and strip diacritics for a SUBSTRING test only.
+
+    These languages are written with inconsistent accenting, so a discriminator phrase quoted by the
+    generator will often differ from the reply by a diacritic or two. Matching loosely here makes the check
+    about the words rather than the keystrokes; it is never used to produce output.
+    """
+    s = unicodedata.normalize("NFD", (s or "").casefold())
+    s = "".join(c for c in s if unicodedata.category(c) != "Mn")
+    return re.sub(r"\s+", " ", s).strip()
+
+
+def _phrase_present(phrase: str, text: str, *, min_tokens: int = 4, ratio: float = 0.7) -> bool:
+    """Is `phrase` present in `text`, allowing for the generator misspelling its own quotation?
+
+    Fast path is the folded substring test. The fallback exists because _fold cannot see through every way a
+    diacritic gets mangled: it strips COMBINING marks, so it folds the dot under Yoruba e-dot away, but a
+    generator that re-types the phrase from memory also substitutes whole glyphs -- a measured case quoted
+    "mi o le oeayewo owo ti wa ninu account celomiran" for a reply that actually read "mi o le sayewo owo ti o
+    wa ninu account elomiran". The ligature and the cedilla are different LETTERS, not marks, so no amount of
+    normalising joins them, and a perfect privacy_boundary sample (best declines to check a third party's
+    balance, worst invents one) was being discarded because the generator misspelled its own citation.
+
+    So a phrase of at least `min_tokens` words also passes if `ratio` of its words appear in the text. The
+    floor is what keeps this honest: a two-word phrase like "LGA office" cannot pass loosely, and that case
+    -- a discriminator naming something the generator never wrote -- is still correctly rejected.
+    """
+    if not phrase:
+        return False
+    fp, ft = _fold(phrase), _fold(text)
+    if fp in ft:
+        return True
+    words = [w for w in re.split(r"[^0-9a-z\u00c0-\u024f]+", fp) if len(w) > 1]
+    if len(words) < min_tokens:
+        return False
+    have = set(w for w in re.split(r"[^0-9a-z\u00c0-\u024f]+", ft) if len(w) > 1)
+    hit = sum(1 for w in words if w in have)
+    return hit / len(words) >= ratio
 
 
 def _capture(resp, tag: str) -> None:
@@ -200,7 +295,7 @@ def _candidate_text(content: Any, md: dict) -> str:
                 continue
             if not isinstance(args, str):
                 args = json.dumps(args, ensure_ascii=False)
-            body += f"<tool_call>{name}\n{args}</tool_call>"
+            body += f'<tool_call>{{"name": {json.dumps(name, ensure_ascii=False)}, "arguments": {args}}}</tool_call>'          # as chat_template.jinja renders it
         return body.strip()
     return ""
 
@@ -260,7 +355,31 @@ def _fill_turn_defaults(turns: Any, md: dict) -> Any:
                 for w in wrappers:
                     v = v.replace(w, "")
                 t[key] = v.strip()
-        # A label token written INLINE instead of in the `label_token` field. The token is legal, the
+            # <think> MUST NOT OUTGROW THE ANSWER. A reasoning block longer than the response it precedes is
+        # spending the context window on narration, and at 32,768 tokens that budget is real. Trimmed rather
+        # than dropped: the turn is otherwise sound, and the generator reaches for padding here more than
+        # anywhere else. 120 words is roughly three full sentences of genuine deliberation.
+        th, rp = t.get("think"), t.get("response")
+        # A LEADING RESTATEMENT is dropped. Measured on live kept records: 14 of 21 think blocks opened with
+        # "The user wants..." and those clauses were 39% of all think text. The question is in the user turn
+        # directly above, so removing the clause is information-preserving -- unlike trimming the tail, which
+        # is where the actual decision lives. Only ever strips when something substantive remains.
+        if isinstance(th, str) and th:
+            stripped = _RESTATEMENT_OPENER.sub("", th.strip(), count=1).lstrip()
+            if stripped and stripped != th.strip() and len(stripped.split()) >= 4:
+                t["think"] = th = stripped
+                STATS["repair:stripped_think_restatement"] = \
+                    STATS.get("repair:stripped_think_restatement", 0) + 1
+        if isinstance(th, str) and th:
+            tw = len(th.split())
+            # 60 words, not 120. The old ceiling never fired once across a live run (median 22, max 41), so
+            # it protected nothing; 60 is still twice the observed median and leaves real deliberation alone.
+            too_long = tw > 60 or (isinstance(rp, str) and rp and tw > max(40, len(rp.split())))
+            if too_long:
+                keep = " ".join(th.split()[:60])
+                t["think"] = keep.rsplit(".", 1)[0] + "." if "." in keep else keep
+                STATS["repair:trimmed_long_think"] = STATS.get("repair:trimmed_long_think", 0) + 1
+    # A label token written INLINE instead of in the `label_token` field. The token is legal, the
         # position is not, and the assembler emits it in exactly the right place from the field -- so moving
         # it is information-preserving, unlike stripping it. 10 of 31 drops on the same pilot.
         resp = t.get("response")
@@ -379,6 +498,23 @@ def _clean_verifier(raw: Any, msgs: list[dict]) -> dict:
         keep = [e for e in keep if len(e) <= 60][:8]
         if keep:
             out["brief_elements"] = keep
+
+    ac = raw.get("answer_chunks")
+    if isinstance(ac, (list, tuple)):
+        ids = [str(x).strip().lower() for x in ac]
+        ids = [i for i in ids if re.fullmatch(r"c\d{1,3}", i)]
+        if ids:
+            out["answer_chunks"] = ids[:6]
+
+    disc = raw.get("discriminator")
+    if isinstance(disc, dict):
+        keep = {}
+        for side in ("good", "bad"):
+            v = disc.get(side)
+            if isinstance(v, str) and 2 <= len(v.strip()) <= 120:
+                keep[side] = v.strip()
+        if keep:
+            out["discriminator"] = keep
 
     mw = raw.get("max_words")
     try:
@@ -629,6 +765,101 @@ IDENTITIES = [
 ]
 
 
+
+def _pair_record(base: dict, md: dict, seed: Seed, msgs: list[dict], entry: Any,
+                 verifier: dict, want: int) -> Optional[dict]:
+    """One extra ranked pair, at an EARLIER turn, as its own training record.
+
+    The prefix is truncated to the user turn this pair answers, so the record is a complete
+    (prefix, chosen, rejected) triple on its own -- which is how multi-turn DPO is normally done. The
+    generator was told to write each pair against the prefix as it stands at that point with the BEST earlier
+    reply assumed, so the truncation matches what it was asked for.
+
+    Returns None rather than raising: an unusable extra pair must not cost the main record.
+    """
+    if not isinstance(entry, dict):
+        return None
+    try:
+        after = int(entry.get("after_user_turn"))
+    except (TypeError, ValueError):
+        return None
+    responses = _pair_from(entry)
+    if not isinstance(responses, list) or len(responses) < 2:
+        return None
+
+    # Truncate the prefix to just after the `after`-th user turn.
+    seen, cut = 0, None
+    for i, m in enumerate(msgs):
+        if m.get("role") == "user":
+            seen += 1
+            if seen == after:
+                cut = i + 1
+                break
+    if cut is None or cut < 1:
+        return None
+    prefix = msgs[:cut]
+    # The same shape rules as the final pair: fields assembled, both sides present and different.
+    cands = []
+    for r in responses:
+        if isinstance(r, str) and r.strip():
+            r = {"content": r}
+        if not isinstance(r, dict):
+            continue
+        content = r.get("content")
+        if content is None and (r.get("response") is not None or r.get("tool_call") is not None):
+            content = {k: v for k, v in r.items() if k not in ("quality", "why", "role", "score")}
+        txt = _candidate_text(content, md)
+        if txt and "<|input_lang|>" in txt:
+            cands.append({**r, "_text": txt})
+    if len(cands) < 2:
+        return None
+    quals = [(c.get("quality") or "").strip().lower() for c in cands]
+    if "best" not in quals or "worst" not in quals:
+        # Same recovery as the final pair: the scores carry the ranking, so a missing label is not fatal.
+        have = [(i, _score_of(c)) for i, c in enumerate(cands)]
+        have = [(i, s) for i, s in have if s is not None]
+        if len(have) < 2:
+            return None
+        have.sort(key=lambda it: -it[1])
+        if have[0][1] <= have[-1][1]:
+            return None
+        quals = ["partial"] * len(cands)
+        quals[have[0][0]], quals[have[-1][0]] = "best", "worst"
+    texts = [c["_text"] for c in cands]
+    if len(set(texts)) < len(texts):
+        return None
+    order = sorted(range(len(cands)), key=lambda i: {"best": 0, "partial": 1, "worst": 2}.get(quals[i], 1))
+    sc = [_score_of(cands[i]) for i in order]
+    if sc[0] is not None and sc[-1] is not None and (sc[0] - sc[-1]) < 2.0:
+        return None
+
+    rec = {**base,
+           "id": f"{base.get('id', '')}__t{after}",
+           "tags": base.get("tags") or [], "tasks": base.get("tasks") or [],
+           "tools": md.get("tools", []), "verifier": verifier,
+           "prompt_messages": prefix,
+           "prompt_text": render_messages(prefix, add_generation_prompt=True),
+           "ranking": [quals[i] for i in order],
+           "scores": sc,
+           "rationale": [cands[i].get("why", "") for i in order],
+           "paired_turn": after,
+           **_flatten(prefix)}
+    for n in range(want):
+        rec[f"response_{n + 1}"] = texts[order[n]] if n < len(order) else None
+    chosen = rec.get("response_1") or ""
+    # structure_of comes from assemble, which OWNS these markers -- not from rl/, which is not on data-gen's
+    # path. A cross-package import here failed silently behind a broad except and left this column EMPTY on
+    # every record of a live run while every unit test passed.
+    rec["expected_structure"] = structure_of(chosen) if chosen else ""
+    try:
+        rec["text"] = render_messages(prefix + [{"role": "assistant", "content": chosen}]) if chosen else ""
+    except Exception as exc:  # noqa: BLE001 -- must not cost the sample, but must be VISIBLE
+        rec["text"] = ""
+        STATS["text_render_failed:" + type(exc).__name__] = \
+            STATS.get("text_render_failed:" + type(exc).__name__, 0) + 1
+    return rec
+
+
 def _rebuild_system_message(md: dict, rng_seed: str) -> Optional[str]:
     """Canonical system message: the preamble plus the applicable tools AND the injected distractors.
 
@@ -648,9 +879,15 @@ def _rebuild_system_message(md: dict, rng_seed: str) -> Optional[str]:
     # Deterministic shuffle so distractors are not always last -- position must not be a tell.
     rng.shuffle(catalogue)
     identity = md.get("identity") or rng.choice(IDENTITIES)
+    # TODAY'S DATE. Without it the model cannot tell that a tool result from "12 March" is stale, which makes
+    # stale_data_awareness unlearnable -- it would have to guess the gap instead of working it out. It also
+    # grounds every "today", "this week" and "last month" in the corpus, and it is what a real deployment
+    # puts in the system prompt anyway. Costs about 12 tokens.
+    today = md.get("today")
+    date_line = f" Today is {today}." if today else ""
     # Compact JSON: indent=2 cost ~40% more tokens for no benefit to the model.
-    return f"{identity} You have these tools:\n" + json.dumps(catalogue, ensure_ascii=False,
-                                                              separators=(",", ":"))
+    return (f"{identity}{date_line} You have these tools:\n"
+            + json.dumps(catalogue, ensure_ascii=False, separators=(",", ":")))
 
 
 def _tags(raw: Any, fallback: list[str]) -> list[str]:
@@ -782,7 +1019,7 @@ def _to_record(seed: Seed, resp: Response) -> Optional[dict]:
     if not _validate_conversation(msgs, seed, ends_with=("user", "tool"), md=md):
         _capture(resp, "validate_conversation")
         return None
-    responses = data.get("responses") or []
+    responses = _pair_from(data)
     want = int(seed.conversation["responses_per_prompt"])
     # Assemble first, then filter on what came out: a candidate whose fields will not assemble is as
     # useless as an empty one, and deciding that here keeps the two checks from disagreeing.
@@ -793,8 +1030,13 @@ def _to_record(seed: Seed, resp: Response) -> Optional[dict]:
         if r.get("content") is not None:
             return r["content"]
         if r.get("response") is not None or r.get("tool_call") is not None:
-            return {k: v for k, v in r.items() if k not in ("quality", "why", "role")}
+            return {k: v for k, v in r.items() if k not in ("quality", "why", "role", "score")}
         return None
+
+    # A candidate can arrive as a bare STRING rather than an object -- measured one per pair on a live run,
+    # alongside a well-formed sibling. Wrapping it costs nothing and recovers a sample that is otherwise
+    # thrown away for having "too few" candidates when it had two.
+    responses = [{"content": r} if isinstance(r, str) and r.strip() else r for r in responses]
 
     responses = [{**r, "_text": _candidate_text(_content_of(r), md)}
                  for r in responses if isinstance(r, dict)]
@@ -821,6 +1063,21 @@ def _to_record(seed: Seed, resp: Response) -> Optional[dict]:
              "partial": "partial", "best": "best", "worst": "worst"}
     quals = [_QUAL.get((r.get("quality") or "").strip().lower(), (r.get("quality") or "").strip().lower())
              for r in responses]
+    # QUALITY IS OPTIONAL WHERE SCORES EXIST. Measured on a live run: the generator supplied `score` and
+    # dropped `quality`, having read the two as alternatives once scores were added to the contract -- and
+    # they ARE alternatives, because a numeric ranking says everything a best/worst label says. Deriving the
+    # labels from the scores recovers those samples instead of discarding them for a missing field whose
+    # information we already have.
+    if not ({"best", "worst"} <= set(quals)):
+        scored = [(i, _score_of(r)) for i, r in enumerate(responses)]
+        have = [(i, s) for i, s in scored if s is not None]
+        if len(have) >= 2:
+            have.sort(key=lambda it: -it[1])
+            if have[0][1] > have[-1][1]:   # a tie is not a preference
+                quals = ["partial"] * len(responses)
+                quals[have[0][0]] = "best"
+                quals[have[-1][0]] = "worst"
+                STATS["repair:quality_from_scores"] = STATS.get("repair:quality_from_scores", 0) + 1
     if "best" not in quals or "worst" not in quals:
         _drop("no_best_or_worst")
         return None
@@ -829,18 +1086,104 @@ def _to_record(seed: Seed, resp: Response) -> Optional[dict]:
         _drop("duplicate_responses")
         return None
     order = sorted(range(len(responses)), key=lambda i: {"best": 0, "partial": 1, "worst": 2}.get(quals[i], 1))
+
+    # VERIFY THE DISCRIMINATOR. The generator was asked to name the one concrete phrase that makes the worse
+    # reply worse; this checks the claim against the replies it actually wrote. It is the cheapest quality
+    # gate available -- a substring test, no tokens -- and it catches the failure that matters most: two
+    # replies that differ in wording but not in substance, which teach the policy nothing and which no
+    # programmatic reward can separate afterwards.
+    #
+    # Without a judge in the loop this is also what makes the factual tasks scoreable at all: the phrase is
+    # the ground truth, so "is the right value present" and "is the invented one absent" become lookups.
+    verifier = rec_verifier = _clean_verifier(data.get("verifier"), msgs)
+    disc = (rec_verifier or {}).get("discriminator") or {}
+    if disc:
+        best_t = texts[order[0]]
+        worst_t = texts[order[-1]]
+        # ASYMMETRIC. The `good` phrase holding -- present in the best reply, absent from the worst -- is
+        # what the gate is actually for: it proves the two replies differ in SUBSTANCE and it is the answer
+        # key the factual tasks are scored against. The `bad` phrase is a bonus, and when it fails the
+        # generator has usually mis-transcribed its own criticism rather than written a bad pair: measured on
+        # a 30-sample run, 2 of 3 discriminator drops had `good` holding perfectly. Dropping the sample for
+        # the half we do not need threw away pairs that were sound. Now only `good` is load-bearing; a
+        # failing `bad` is removed from the verifier and counted, so the answer key never contains a claim
+        # that was not checked.
+        bad_sides = []
+        g, b = disc.get("good"), disc.get("bad")
+        if g and not (_phrase_present(g, best_t) and not _phrase_present(g, worst_t)):
+            bad_sides.append("good")
+        if b and not (_phrase_present(b, worst_t) and not _phrase_present(b, best_t)):
+            disc.pop("bad", None)
+            STATS["repair:dropped_unverified_bad_phrase"] = \
+                STATS.get("repair:dropped_unverified_bad_phrase", 0) + 1
+        if bad_sides:
+            _drop(f"discriminator_does_not_hold:{'+'.join(bad_sides)}", resp.text or "", resp.custom_id)
+            return None
+    # A pair whose two sides scored nearly the same is a pair that teaches almost nothing, and the generator
+    # has already told us so. Dropping it here costs no tokens and keeps the margin honest.
+    sc = [_score_of(responses[i]) for i in order]
+    if sc[0] is not None and sc[-1] is not None and (sc[0] - sc[-1]) < 2.0:
+        _drop(f"score_margin_too_small:{sc[0]:.0f}v{sc[-1]:.0f}")
+        return None
+
     rec = {**base, "tags": _tags(data.get("tags"), md.get("tags", [])),
            "tasks": data.get("tasks") or md.get("tasks", []), "tools": md.get("tools", []),
            # The ground truth the programmatic scorers need (rl/verifiers.py). Kept even when empty so the
            # column exists for every row, and sanitised: a verifier the generator invented wrongly would
            # score the GOOD answer as bad, which is worse than having none.
-           "verifier": _clean_verifier(data.get("verifier"), msgs),
+           "verifier": verifier,
            "prompt_messages": msgs, "prompt_text": render_messages(msgs, add_generation_prompt=True),
            "ranking": [quals[i] for i in order],
+           # The generator's own 0-10 scores, in the same order as the responses. DPO needs only the
+           # ordering, which `ranking` carries; the scores give a MARGIN, which is what lets a pair whose
+           # two sides are nearly as good as each other be filtered out later rather than trained on.
+           "scores": [_score_of(responses[i]) for i in order],
            "rationale": [responses[i].get("why", "") for i in order],
            **_flatten(msgs)}
     for n in range(want):
         rec[f"response_{n + 1}"] = texts[order[n]] if n < len(order) else None
+
+    # THE SCAFFOLD AND THE FULL TEXT, as their own columns.
+    #
+    # `expected_structure` is the structured part of the CHOSEN reply -- the markers, the task_plan verbs, the language
+    # tags -- with the prose stripped. It is what the model is expected to produce structurally, and it is
+    # scored separately at training time (rl/scaffold.py) because mixed in with a few hundred tokens of prose
+    # the structure is a rounding error, while being the part that makes the output machine-readable.
+    #
+    # It is named for the column StructuredTranslationReward ALREADY reads (rl/rewards.py), so the reward
+    # gets a per-sample reference for EVERY task instead of falling back to its translation-shaped default.
+    #
+    # `text` is the whole sample as the chat template renders it: prompt plus the chosen reply. Training can
+    # regex the structure back out of it, so the two columns are consistent by construction rather than by
+    # agreement -- and a mismatch between them is a bug worth catching, which a test does.
+    chosen = rec.get("response_1") or ""
+    # structure_of comes from assemble, which OWNS these markers -- not from rl/, which is not on data-gen's
+    # path. A cross-package import here failed silently behind a broad except and left this column EMPTY on
+    # every record of a live run while every unit test passed.
+    rec["expected_structure"] = structure_of(chosen) if chosen else ""
+    try:
+        rec["text"] = render_messages(msgs + [{"role": "assistant", "content": chosen}]) if chosen else ""
+    except Exception as exc:  # noqa: BLE001 -- must not cost the sample, but must be VISIBLE
+        rec["text"] = ""
+        STATS["text_render_failed:" + type(exc).__name__] = \
+            STATS.get("text_render_failed:" + type(exc).__name__, 0) + 1
+
+    # EXTRA PAIRS at earlier turns. Each becomes its own (prefix, chosen, rejected) record, which is where
+    # the extra data comes from: the prefix was written once, so a second ranked turn is close to free.
+    extra = []
+    for entry in (data.get("turn_responses") or []):
+        er = _pair_record(base, md, seed, msgs, entry, verifier, want)
+        if er is not None:
+            extra.append(er)
+        else:
+            STATS["extra_pair_unusable"] = STATS.get("extra_pair_unusable", 0) + 1
+    if extra:
+        # Deduplicate against the final pair: a generator that repeats the last turn here adds nothing.
+        final_key = rec.get("response_1")
+        extra = [e for e in extra if e.get("response_1") != final_key]
+        if extra:
+            rec["_extra_pairs"] = extra
+            STATS["repair:extra_pairs_kept"] = STATS.get("repair:extra_pairs_kept", 0) + len(extra)
     return rec
 
 
@@ -849,7 +1192,9 @@ def to_records(seed: Seed, resp: Response) -> list[dict]:
     md = resp.metadata or {}
     if not md.get("packed"):
         r = to_record(seed, resp)
-        return [r] if r else []
+        if not r:
+            return []
+        return [r] + r.pop("_extra_pairs", [])
     data = _json(resp.text)
     if data is None:
         _drop("json_invalid")

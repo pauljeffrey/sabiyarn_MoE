@@ -352,3 +352,42 @@ def test_quality_label_synonyms_are_accepted():
     assert '"chosen": "best"' in body and '"rejected": "worst"' in body
     # and the mapping must not invent a label for something unlabelled
     assert '"": "best"' not in body
+
+
+def test_a_misspelled_discriminator_quotation_still_matches():
+    """The generator re-types its own citation and mangles the diacritics; the sample is still good.
+
+    Measured case: a privacy_boundary pair where the best reply correctly declined to check a third party's
+    balance and the worst invented one -- exactly the behaviour the task exists to teach -- was discarded
+    because the discriminator quoted "oeayewo"/"celomiran" for text that read "sayewo"/"elomiran". _fold
+    strips COMBINING marks, so it cannot join a ligature or a cedilla to the letter the writer meant.
+    """
+    from postprocess_gen import _phrase_present
+    best = ("Sùgbọ́n nípa account ọmọ rẹ, mi ò le ṣàyẹ̀wò owó tí ó wà nínú account ẹlòmíràn pẹ̀lú BVN wọn. "
+            "Ó yẹ kí ọmọ rẹ fúnra rẹ̀ lọ sí banki.")
+    assert _phrase_present("mi ò le œàyèwò owó tí wà nínu account çlòmíràn", best)
+    # an exact quotation still matches, and a phrase the generator never wrote still does not
+    assert _phrase_present("mi ò le ṣàyẹ̀wò owó", best)
+    assert not _phrase_present("LGA office", best)
+    # the word floor keeps the loose path honest: a short phrase must match as a substring or not at all
+    assert not _phrase_present("account ṣàyẹ̀wò", "owó account tí ṣàyẹ̀wò nínú")
+
+
+def test_an_unverified_bad_phrase_costs_the_phrase_not_the_sample():
+    """`good` holding is what proves the two replies differ in substance; `bad` is a bonus.
+
+    On a 30-sample run, 2 of 3 discriminator drops had `good` holding perfectly -- the pair was sound and the
+    generator had merely mis-transcribed its own criticism. The unverifiable half is now removed from the
+    answer key and counted, rather than costing the sample.
+    """
+    import postprocess_gen as P
+    disc = {"good": "mo ti ṣàyẹ̀wò", "bad": "a phrase that appears nowhere at all in either reply"}
+    best, worst = "mo ti ṣàyẹ̀wò owó náà", "owó rẹ̀ jẹ́ ₦25,000"
+    bad_sides = []
+    if not (P._phrase_present(disc["good"], best) and not P._phrase_present(disc["good"], worst)):
+        bad_sides.append("good")
+    if not (P._phrase_present(disc["bad"], worst) and not P._phrase_present(disc["bad"], best)):
+        disc.pop("bad", None)
+    assert bad_sides == [], "the good side holds, so the sample survives"
+    assert "bad" not in disc, "the unverified claim must not stay in the answer key"
+    assert disc["good"]

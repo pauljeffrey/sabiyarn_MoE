@@ -74,9 +74,22 @@ def test_for_task_includes_the_universal_gates():
     assert all(isinstance(c, dict) for c in out), "for_task must be JSON-serialisable for the seed"
 
 
-def test_unknown_task_still_gets_the_gates():
-    """So a task added to the seed before its scorers are written is malformed-checked, not unchecked."""
-    assert {c["name"] for c in R.for_task("no_such_task")} == {c.name for c in R.UNIVERSAL}
+def test_unknown_task_still_gets_the_gates_and_the_answer_key():
+    """A task added to the seed before its own scorers are written is still gated for malformedness AND
+    scored on the discriminator, which applies to every task regardless."""
+    names = {c["name"] for c in R.for_task("no_such_task")}
+    assert {c.name for c in R.UNIVERSAL} <= names
+    assert {c.name for c in R.DISCRIMINATOR} <= names
+
+
+def test_the_discriminator_does_not_crowd_out_procedure():
+    """The discriminator is one phrase -- the sharpest signal, but not the whole story. Procedure must keep
+    the majority, or "called a tool before answering" stops being worth doing."""
+    for task in R.CHECKS:
+        checks = [c for c in R.for_task(task) if not c.get("gate")]
+        disc = sum(c["weight"] for c in checks if c["name"] in {x.name for x in R.DISCRIMINATOR})
+        assert 0.0 < disc < 0.5, f"{task}: discriminator carries {disc:.0%} of the score"
+        assert abs(sum(c["weight"] for c in checks) - 1.0) < 1e-6, f"{task} weights do not sum to 1"
 
 
 def test_admission_phrases_cover_the_generated_languages():

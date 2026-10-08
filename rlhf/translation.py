@@ -22,17 +22,46 @@ def translation_messages(instruction: str, source: str) -> list[dict]:
 
 
 def to_record(row: dict) -> Optional[dict]:
+    """tds-sft style rows (instruction, input, response) and the AfriCOMET RL dataset (+ source_lang, targ_lang, output_structure).
+
+    With `output_structure` (or source_lang/targ_lang) the record carries the scaffold the policy must emit before the translation,
+    `<|input_lang|><src><task_plan><translate></task_plan><|target_lang|><tgt><response>`, and its prompt has NO system turn so it
+    renders exactly like the `text` column the SFT data was tokenized from. `reference` is empty for rows without an aligned
+    translation (those are scored reference-free). `response` (used by the SFT warm-start) is scaffold + reference.
+    """
     src, ref = (row.get("input") or "").strip(), (row.get("response") or "").strip()
-    if not src or not ref:
+    if not src:
         return None
-    return {"prompt_messages": translation_messages(row.get("instruction", ""), src), "source": src,
-            "reference": ref, "response": ref, "language": row.get("language")}
+    struct = (row.get("output_structure") or "").strip()
+    if not struct and row.get("source_lang") and row.get("targ_lang"):
+        from rl.structure import expected_translation_structure
+        struct = expected_translation_structure(row["source_lang"], row["targ_lang"], row.get("instruction_language"),
+                                                row.get("instruction_position") or "prepend")
+    if not struct:
+        if not ref:
+            return None
+        return {"prompt_messages": translation_messages(row.get("instruction", ""), src), "source": src,
+                "reference": ref, "response": ref, "language": row.get("language")}
+    user = (row.get("prompt") or "").strip() or f"{(row.get('instruction') or '').strip()}\n\n{src}".strip()     # `prompt` keeps the instruction before/after the text as sampled
+    return {"prompt_messages": [{"role": "user", "content": user}], "source": src, "reference": ref,
+            "response": (struct + ref) if ref else "", "expected_structure": struct,
+            "source_lang": row.get("source_lang"), "targ_lang": row.get("targ_lang"), "language": row.get("language")}
 
 
 def load_translation_records(cfg: RLConfig) -> list[dict]:
     """Hub dataset (cfg.dataset_id) or jsonl (cfg.data_path) with instruction/input/response columns."""
     rows: Iterable[dict] = _load_generic(cfg)
-    return [r for r in (to_record(x) for x in rows) if r is not None]
+    recs = [r for r in (to_record(x) for x in rows) if r is not None]
+    if getattr(cfg, "reward_shaping", "none") in ("calibrated", "adaptive") and getattr(cfg, "reward_calibration_path", None):
+        from rl.shaping import ContentShaper
+
+        bad = ContentShaper.from_file(cfg.reward_calibration_path).unusable
+        kept = [r for r in recs if f"{r.get('source_lang')}>{r.get('targ_lang')}" not in bad]
+        if len(kept) != len(recs):
+            import structlog
+            structlog.get_logger().info("translation_pairs_dropped", unusable_pairs=sorted(bad), dropped=len(recs) - len(kept))
+        recs = kept
+    return recs
 
 
 def translate(instruction: str, source: str, model_path: str, cfg: RLConfig, max_new_tokens: int = 128) -> str:

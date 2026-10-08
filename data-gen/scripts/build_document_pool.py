@@ -26,7 +26,10 @@ ROOT = HERE.parent
 sys.path.insert(0, str(ROOT))
 
 from budgets import budget_for  # noqa: E402
-from doc_sources import MIN_TECHNICALITY, TOPIC_SEEDS, DocumentPool, harvest  # noqa: E402
+from doc_sources import (  # noqa: E402
+    MIN_TECHNICALITY, NATIVE_RAG_MAX_WORDS, NATIVE_RAG_MIN_WORDS, NATIVE_WIKIS,
+    GENERAL_SEEDS, TOPIC_SEEDS, DocumentPool, harvest, harvest_native,
+)
 
 DEFAULT_POOL = ROOT / "data" / "document_pool.jsonl"
 
@@ -38,11 +41,16 @@ def report(pool: DocumentPool) -> None:
     words = [int(d.get("words") or 0) for d in pool.docs]
     tech = [float(d.get("technicality") or 0) for d in pool.docs]
     by_dom = collections.Counter(d.get("domain") for d in pool.docs)
+    by_lang = collections.Counter(d.get("doc_lang") or "eng" for d in pool.docs)
     print(f"{len(pool):,} documents in {pool.path}")
     print(f"  words      : median {statistics.median(words):,.0f}  "
           f"min {min(words):,}  max {max(words):,}")
     print(f"  technicality: median {statistics.median(tech):.2f}  min {min(tech):.2f}  max {max(tech):.2f}")
-    print(f"  licence    : {pool.docs[0].get('licence')} -- attribution required if the corpus is published")
+    lic = collections.Counter(d.get("licence") or "unknown" for d in pool.docs)
+    print("  licences   : (all apply if the corpus is published)")
+    for name, cnt in lic.most_common():
+        print(f"     {cnt:>5}  {name}")
+    print(f"  languages  : {dict(by_lang.most_common())}")
     print("  domains    :")
     for dom, n in by_dom.most_common():
         print(f"     {dom:<28} {n:>5}")
@@ -57,6 +65,14 @@ def main() -> int:
     ap.add_argument("--min-technicality", type=float, default=MIN_TECHNICALITY)
     ap.add_argument("--kind", default="rl", choices=["rl", "sft"],
                     help="whose document band to target")
+    ap.add_argument("--lang", default="eng",
+                    help="document language. Only the languages in doc_sources.NATIVE_WIKIS can be "
+                         "harvested; everything else falls through to generation, which is the only option "
+                         "when the Wikipedia has nothing long enough to take.")
+    ap.add_argument("--general", action="store_true",
+                    help="harvest PLAIN-language documents (history, festivals, music, places) instead of "
+                         "reference pages. Summarising a narrative is a different problem from summarising a "
+                         "specification, and the topic seeds produced no plain documents at all.")
     ap.add_argument("--report", action="store_true", help="describe the existing pool and exit")
     a = ap.parse_args()
 
@@ -78,12 +94,31 @@ def main() -> int:
             print(f"unknown domain(s): {unknown}\nknown: {sorted(TOPIC_SEEDS)}", file=sys.stderr)
             return 1
 
-    print(f"harvesting into {pool.path}  (have {len(pool):,})")
-    print(f"  band: {min_words:,}-{max_words:,} words  ({lo_tok:,}-{hi_tok:,} tokens, {a.kind})")
+    if a.lang != "eng" and a.lang not in NATIVE_WIKIS:
+        print(f"{a.lang} has no harvestable Wikipedia (measured: too few long articles), and MasakhaNEWS was\n"
+              f"tried and dropped -- see the note in doc_sources. Its documents come from the ENGLISH pool,\n"
+              f"which is the default for a retrieved passage anyway.\n"
+              f"Harvestable natively: {sorted(NATIVE_WIKIS)}", file=sys.stderr)
+        return 1
+    print(f"harvesting into {pool.path}  (have {len(pool):,}; {pool.count(a.lang):,} in {a.lang})")
+    if a.lang == "eng":
+        print(f"  band: {min_words:,}-{max_words:,} words  ({lo_tok:,}-{hi_tok:,} tokens, {a.kind})")
+    else:
+        print(f"  band: {NATIVE_RAG_MIN_WORDS:,}-{NATIVE_RAG_MAX_WORDS:,} words  (native; a tool result "
+              f"is a few passages, so shorter documents are usable)")
     print(f"  technicality >= {a.min_technicality}")
-    added = pool.extend(harvest(min_words=min_words, max_words=max_words,
-                                min_technicality=a.min_technicality, per_seed=a.per_seed,
-                                domains=domains, want=a.want))
+    if a.lang == "eng":
+        stream = harvest(min_words=min_words, max_words=max_words,
+                         min_technicality=0.0 if a.general else a.min_technicality,
+                         per_seed=a.per_seed, domains=domains, want=a.want,
+                         queries=GENERAL_SEEDS if a.general else None)
+    else:
+        # Native documents may be SHORTER: a tool result is a few passages now, so a 400-word article is a
+        # legitimate source and insisting on 1,600+ would reject the whole available corpus.
+        min_words, max_words = NATIVE_RAG_MIN_WORDS, NATIVE_RAG_MAX_WORDS
+        # Selected on length and coherence rather than topic: see doc_sources.harvest_native.
+        stream = harvest_native(a.lang, min_words=min_words, max_words=max_words, want=a.want)
+    added = pool.extend(stream)
     print(f"\nadded {added:,}; pool now {len(pool):,}")
     report(pool)
     return 0

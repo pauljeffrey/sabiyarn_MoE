@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Entry point:  python -m rl.run [--config rl/config.yaml] [--algo dpo|rl|sft] [key=value ...]
+"""Entry point:  python -m rl.run [--config rl/config.yaml] [--algo dpo|rl|sft|rs] [key=value ...]
 
     python -m rl.run                                              # DPO with rl/config.yaml
     torchrun --standalone --nproc_per_node=2 -m rl.run --config rlhf/configs/default.yaml
@@ -27,7 +27,7 @@ def main(argv: list[str] | None = None) -> str:
     load_dotenv()
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--config", default=None, help="YAML config (default: RL_CONFIG_PATH or rl/config.yaml)")
-    ap.add_argument("--algo", choices=["sft", "dpo", "rl"], default=None)
+    ap.add_argument("--algo", choices=["sft", "dpo", "rl", "rs"], default=None)
     ap.add_argument("overrides", nargs="*", help="RLConfig fields as key=value")
     args = ap.parse_args(argv)
 
@@ -44,6 +44,10 @@ def main(argv: list[str] | None = None) -> str:
         from rl.sft import train_sft
 
         return train_sft(cfg)
+    if cfg.algo == "rs":
+        from rl.rejection_sampling import run_rs
+
+        return run_rs(cfg)
     from rl.policy_gradient import train_rl
 
     return train_rl(cfg)

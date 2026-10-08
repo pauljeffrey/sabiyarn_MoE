@@ -370,6 +370,133 @@ DOMAINS: dict[str, Domain] = {d.key: d for d in _DOMAIN_LIST}
 DOMAIN_KEYS: list[str] = [d.key for d in _DOMAIN_LIST]
 DOMAIN_GROUPS: list[str] = sorted({d.group for d in _DOMAIN_LIST})
 
+# ---------------------------------------------------------------------------
+# What KIND of question a domain produces: the <|is_*|> tag the assistant declares before answering
+# ---------------------------------------------------------------------------
+# The tokenizer has six of these and they are the first thing a task_plan carries, so the model says what
+# kind of question it is holding before it says how it will answer it.
+#
+# The tag belongs to the DOMAIN, not to the task. Hanging it off the task -- as CANONICAL_PLANS originally
+# did for eight tasks -- trains it as a per-task constant: every tool_search_answer turn would declare
+# <|is_technical|> whether the question was about diesel pumps or about Fuji music. That is the opposite of a
+# judgement about the question, and a wrong tag is worse than an absent one because it is the reference the
+# model is trained to reproduce. Only a task that NAMES its domain (health_advice, safety_boundary,
+# financial_analysis) keeps a tag of its own; every other task takes the tag of the domain it is grounded in.
+#
+# The coarse `tags` and `group` above cannot stand in for this. They overlap (law_governance is
+# "academic civic risk") and group is too blunt -- `society` holds both law_governance and gender_society,
+# `knowledge` holds both mathematics and music criticism. So each domain is assigned deliberately, and
+# `_assert_every_domain_is_tagged` below makes a new domain a hard error rather than a silent default.
+#
+# HALF THE DOMAINS GET NO TAG, and that is the point. A tag is worth emitting where the KIND of question
+# changes how it must be answered -- a medical, legal, financial, technical or scientific question has to be
+# looked up, hedged or worked out rather than recalled. Everyday life carries no such obligation, so there is
+# nothing for a tag to say about it. Marking it <|is_non_technical|> would add a token to roughly half the
+# corpus to convey "this is ordinary", which is the default and needs no announcement; it would also make the
+# tag a thing the model emits on every turn, which is exactly the rote labelling the per-domain mapping
+# exists to prevent. An empty string here means NO TAG for that domain.
+DOMAIN_QUESTION_TAGS: dict[str, str] = {
+    # -- livelihoods: the practical trades are technical, the money-facing ones financial
+    "agriculture_crops": "<|is_technical|>",
+    "livestock_fisheries": "<|is_technical|>",
+    "extractives_mining": "<|is_technical|>",
+    "trade_markets": "<|is_financial|>",
+    "entrepreneurship": "<|is_financial|>",
+    "careers_work": "",
+    "crafts_artisans": "",
+
+    # -- health. disability_inclusion is deliberately NOT medical: it is a question about rights, access and
+    # attitudes, and answering it as a clinical one is itself the failure mode.
+    "health_medicine": "<|is_medical|>",
+    "public_health": "<|is_medical|>",
+    "maternal_child_health": "<|is_medical|>",
+    "nutrition_fitness": "<|is_medical|>",
+    "psychology_wellbeing": "<|is_medical|>",
+    "disability_inclusion": "",
+
+    # -- society. Legal where the real question is a rule, a document or an entitlement -- which is what
+    # people actually ask about migration, land and official paperwork.
+    "law_governance": "<|is_legal|>",
+    "public_services_documents": "<|is_legal|>",
+    "migration_diaspora": "<|is_legal|>",
+    "traditional_authority": "<|is_legal|>",
+    "education": "",
+    "civic_life": "",
+    "security_safety": "",
+    "disasters_emergencies": "",
+    "gender_society": "",
+
+    # -- economy
+    "economics_business": "<|is_financial|>",
+    "finance_mobile_money": "<|is_financial|>",
+    "consumer_life": "<|is_financial|>",
+    "housing_land": "<|is_legal|>",          # tenancy, titles and boundaries, not arithmetic
+    "tourism_hospitality": "",
+
+    # -- infrastructure and technology: technical throughout
+    "technology_digital": "<|is_technical|>",
+    "ai_data": "<|is_technical|>",
+    "telecom_phones": "<|is_technical|>",
+    "energy_power": "<|is_technical|>",
+    "transport_mobility": "<|is_technical|>",
+    "engineering_construction": "<|is_technical|>",
+    "water_sanitation": "<|is_technical|>",
+
+    # -- the natural world and the formal subjects
+    "environment_climate": "<|is_scientific|>",
+    "weather_seasons": "<|is_scientific|>",
+    "animals_wildlife": "<|is_scientific|>",
+    "natural_science": "<|is_scientific|>",
+    "mathematics": "<|is_scientific|>",
+
+    # -- the humanities are not sciences, and labelling them as such would be a lie the model repeats
+    "language_linguistics": "",
+    "history": "",
+    "geography_places": "",
+    "media_journalism": "",
+
+    # -- culture, arts and everyday life
+    "religion_ethics": "",
+    "arts_literature": "",
+    "music": "",
+    "film_nollywood": "",
+    "sports": "",
+    "games_pastimes": "",
+    "food_cooking": "",
+    "fashion_textiles": "",
+    "festivals_customs": "",
+    "proverbs_oral_tradition": "",
+    "family_relationships": "",
+    "childhood_parenting": "",
+    "youth_life": "",
+    "elders_ageing": "",
+    "urban_life": "",
+    "rural_life": "",
+}
+
+QUESTION_TAGS: frozenset[str] = frozenset(v for v in DOMAIN_QUESTION_TAGS.values() if v)
+
+
+def _assert_every_domain_is_tagged() -> None:
+    """A domain with no question tag would silently emit a plan with no tag at all, on every sample it
+    touches, and nothing downstream would notice. Fail at import instead."""
+    missing = [k for k in DOMAIN_KEYS if k not in DOMAIN_QUESTION_TAGS]
+    extra = [k for k in DOMAIN_QUESTION_TAGS if k not in DOMAINS]
+    if missing or extra:
+        raise AssertionError(
+            f"DOMAIN_QUESTION_TAGS is out of step with DOMAINS -- untagged: {missing}, unknown: {extra}")
+
+
+_assert_every_domain_is_tagged()
+
+
+def question_tag_of(domain_key: str) -> str:
+    """The <|is_*|> tag for a domain, or "" where the domain needs none.
+
+    KeyError on an unknown domain, on purpose: a missing domain is a bug, an untagged one is a decision.
+    """
+    return DOMAIN_QUESTION_TAGS[domain_key]
+
 
 def all_pairs() -> list[tuple[str, str]]:
     """Every (domain key, sub-topic) pair, in stable declaration order."""

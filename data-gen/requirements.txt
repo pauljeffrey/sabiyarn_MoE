@@ -6,3 +6,4 @@ tqdm>=4.66.0
 rich>=13.7.0
 python-dotenv>=1.0.0
 pytest>=8.0.0  # only needed to run tests/
+pinecone>=5.0.0  # agents/retrieval.py -- optional, only for the Pinecone retrieval path

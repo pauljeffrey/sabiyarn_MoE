@@ -136,11 +136,17 @@ def dedup_dataset_streaming(
             keep_idx.append(idx)
     return dataset.select(keep_idx)
 
-def get_tokenizer_and_eot(tokenizer_name):
+# Text for CONTINUED PRETRAINING must be tokenised with the tokenizer as it was before the tool-calling vocabulary was added: the model has 52,050
+# embedding rows until the SFT-time growth, and ordinary web text contains strings such as "name" or "type" that the current tokenizer turns into ids
+# >= 52,119. Override with PRETRAIN_TOKENIZER_REVISION=<commit or 'main'> only for SFT/RL text.
+PRETRAIN_TOKENIZER_REVISION = os.environ.get("PRETRAIN_TOKENIZER_REVISION", "0c711cb2f7af669b2782c90c1d0d4d097df21422")
+
+
+def get_tokenizer_and_eot(tokenizer_name, mode: str = "pretrain"):
     """Initializes and returns the tokenizer and its eos_token_id -- the
     actual document-boundary token the data is tokenized with, always
     directly from the tokenizer itself, not a fallback/alternative token."""
-    enc = AutoTokenizer.from_pretrained(tokenizer_name, use_fast=True)
+    enc = AutoTokenizer.from_pretrained(tokenizer_name, use_fast=True, revision=PRETRAIN_TOKENIZER_REVISION if (mode == "pretrain" and tokenizer_name == "BeardedMonster/SabiYarn-32k") else None)    # sft / rl use the current tokenizer
     return enc, enc.eos_token_id
 
 def calculate_test_size(dataset_length):
@@ -187,7 +193,7 @@ def process_example(example, tokenizer, eot_token):
     """Tokenizes a single example from the pre-rendered text column."""
     ids = tokenizer.encode(example["text"])
     ids = _strip_leading_bos(ids)
-    ids.extend([eot_token, eot_token])
+    ids.append(eot_token)  # ONE end-of-text token per document (was two): fewer wasted tokens at training time
     return {"ids": ids, "len": len(ids)}
 
 def write_to_memmap(dset, filename, dtype, log_prefix="",):
@@ -377,7 +383,7 @@ def run(
                 files_processed = json.load(t)
 
     tokenizer_name = _tokenizer_cfg.get("name", "BeardedMonster/SabiYarn-32k")
-    tokenizer, eot = get_tokenizer_and_eot(tokenizer_name)
+    tokenizer, eot = get_tokenizer_and_eot(tokenizer_name, mode)
     process_fn = lambda example: process_example(example, tokenizer, eot)
 
     LOG.info("prepare_start", mode=mode, tokenizer=tokenizer_name)

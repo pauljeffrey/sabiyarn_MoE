@@ -9,7 +9,8 @@ def test_load_train_config_reads_yaml_sections():
     # model_name (model.repo_name) and the data paths below are under active
     # tuning -- assert structure, not literal values.
     assert cfg.model_name.startswith('Aletheia-ng/SabiYarn_MoE')
-    assert len(cfg.train_data_paths) == 2
+    assert len(cfg.train_data_paths) == 3  # [eng, afr, other_afr]
+    assert cfg.train_data_paths[2].endswith('other_african_pretrain.bin')
     assert all(p.startswith('datasets/') and p.endswith('.bin') for p in cfg.train_data_paths)
     assert cfg.process_one_file_at_a_time is True
 
@@ -114,3 +115,22 @@ def test_yaml_default_is_ddp_bf16(monkeypatch):
     monkeypatch.delenv("DISTRIBUTED", raising=False)
     cfg = load_train_config("training/train_config.yaml")
     assert cfg.distributed == "ddp" and cfg.mixed_precision in ("bf16", "bfloat16")
+
+
+def test_sft_phase_resizes_model_pretrain_does_not(monkeypatch):
+    monkeypatch.delenv("TRAIN_MODE", raising=False)
+    pre = load_train_config(Path('training/train_config.yaml'))
+    assert (pre.resize_vocab_size, pre.resize_block_size, pre.fill_positions_from) == (0, 0, 0)       # continuous pretraining never grows the model
+    assert pre.block_size == 4096
+    monkeypatch.setenv("TRAIN_MODE", "sft")
+    sft = load_train_config(Path('training/train_config.yaml'))
+    assert sft.resize_vocab_size == 52160 and sft.resize_vocab_size % 64 == 0 and sft.resize_vocab_size >= 52117
+    assert sft.resize_block_size == 0 and sft.block_size == 32768                                    # no position-table growth unless asked for
+    assert sft.train_batch_size * sft.gradient_accumulation_steps * sft.block_size == 786_432
+
+
+def test_sft_masks_the_loss_even_though_pretraining_does_not(monkeypatch):
+    monkeypatch.delenv("TRAIN_MODE", raising=False)
+    assert load_train_config(Path('training/train_config.yaml')).use_loss_mask is False
+    monkeypatch.setenv("TRAIN_MODE", "sft")
+    assert load_train_config(Path('training/train_config.yaml')).use_loss_mask is True

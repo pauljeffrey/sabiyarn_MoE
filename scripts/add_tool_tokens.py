@@ -1,8 +1,13 @@
-"""Add `<tools>` and `</tools>` to the SabiYarn tokenizer as special tokens (ids 52117 and 52118).
+"""Add the tool-calling vocabulary to the SabiYarn tokenizer.
 
-The chat template renders function definitions as `<tools>\n{json}\n{json}\n</tools>` in the system turn. Without these tokens the tags cost several byte-pair
-pieces each, on every tool-using sample. The two ids sit inside the SFT embedding growth already planned (52,160 rows hold ids up to 52,159), so the model
-needs no further resize.
+* SPECIAL tokens `<tools>` and `</tools>` (ids 52117, 52118): the chat template renders function definitions as `<tools>\n{json}\n{json}\n</tools>`.
+* ORDINARY (non-special) added tokens, each INCLUDING its quotes, for the JSON-schema / tool-call keys that fill every tool block (ids 52119-52134):
+  "name" "arguments" "description" "parameters" "properties" "required" "type" "function" "string" "object" "integer" "number" "boolean" "array" "enum" "query".
+  Ordinary, not special, on purpose: a special token is dropped by `decode(skip_special_tokens=True)`, which would delete the keys from a decoded tool call and
+  break `json.loads`. An ordinary added token decodes to exactly its text. On a typical tool block these keys were 37% of all tokens (5 for `"arguments"`).
+
+All ids sit inside the 52,160 SFT embedding rows, so the model needs no further resize. The ids are >= 52,050: the current checkpoint cannot embed them, and
+text for CONTINUED PRETRAINING must be tokenised with the tokenizer revision before these keys existed (see PRETRAIN_TOKENIZER_REVISION in data/prepare*.py).
 
     python scripts/add_tool_tokens.py --out DIR            # DRY RUN: writes the patched tokenizer files to DIR and checks them. Pushes nothing.
     python scripts/add_tool_tokens.py --out DIR --push-to BeardedMonster/SabiYarn-32k Aletheia-ng/SabiYarn_MoE-280M
@@ -19,11 +24,15 @@ import os
 import sys
 from pathlib import Path
 
-NEW_TOKENS = ["<tools>", "</tools>"]
+SPECIAL_TOKENS = ["<tools>", "</tools>"]
+KEY_NAMES = ["name", "arguments", "description", "parameters", "properties", "required", "type", "function",
+             "string", "object", "integer", "number", "boolean", "array", "enum", "query"]
+KEY_TOKENS = [f'"{k}"' for k in KEY_NAMES]
+NEW_TOKENS = SPECIAL_TOKENS + KEY_TOKENS
 
 
 def entry(i: int, content: str) -> dict:
-    return {"id": i, "content": content, "single_word": False, "lstrip": False, "rstrip": False, "normalized": False, "special": True}
+    return {"id": i, "content": content, "single_word": False, "lstrip": False, "rstrip": False, "normalized": False, "special": content in SPECIAL_TOKENS}
 
 
 def main():
@@ -54,23 +63,31 @@ def main():
     template = (Path(__file__).resolve().parents[1] / "sabiyarn" / "chat_template.jinja").read_text(encoding="utf-8")
     cfg["chat_template"] = template
     (a.out / "chat_template.jinja").write_text(template, encoding="utf-8")
+    todo_special = [t for t in todo if t in SPECIAL_TOKENS]                # the quoted keys are NOT special tokens
     extra = sm.get("additional_special_tokens")
     if isinstance(extra, list):
-        sm["additional_special_tokens"] = extra + todo
+        sm["additional_special_tokens"] = extra + todo_special
     cfg_extra = cfg.get("additional_special_tokens")
     if isinstance(cfg_extra, list):
-        cfg["additional_special_tokens"] = cfg_extra + todo
+        cfg["additional_special_tokens"] = cfg_extra + todo_special
     for name, obj in (("tokenizer.json", tj), ("tokenizer_config.json", cfg), ("special_tokens_map.json", sm)):
         (a.out / name).write_text(json.dumps(obj, ensure_ascii=False, indent=2), encoding="utf-8")
-    # check: the patched files load, the new tags are single tokens, and nothing else moved
+    # check: the patched files load, the new entries are single tokens that decode back to exactly their text, and nothing unrelated moved
     from transformers import AutoTokenizer
     tok = AutoTokenizer.from_pretrained(str(a.out))
     ids = tok("<tools>\n{}\n</tools>", add_special_tokens=False)["input_ids"]
     assert ids[0] == tok.convert_tokens_to_ids("<tools>") and ids[-1] == tok.convert_tokens_to_ids("</tools>"), ids
+    for t in KEY_TOKENS:
+        enc = tok(t, add_special_tokens=False)["input_ids"]
+        assert enc == [tok.convert_tokens_to_ids(t)] and len(enc) == 1, (t, enc)
+        assert tok.decode(enc, skip_special_tokens=True) == t and tok.decode(enc) == t, f"{t} does not decode back to itself"
+    block = '<tools>\n{"type": "function", "function": {"name": "f", "description": "d", "parameters": {"type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"]}}}\n</tools>'
+    assert tok.decode(tok(block, add_special_tokens=False)["input_ids"], skip_special_tokens=True).replace("<tools>", "").replace("</tools>", "").strip() == block[len("<tools>"):-len("</tools>")].strip(), "a tools block does not survive decode(skip_special_tokens=True)"
     ref = AutoTokenizer.from_pretrained(a.repo, token=token)
-    probe = "<|user|>Tani Biyi Bandele?</s><|assistant|><tool_call>{\"name\": \"f\"}</tool_call>"
+    probe = "<|user|>Tani Biyi Bandele? Ẹ kú àárọ̀.</s><|assistant|><tool_call>f</tool_call><tools></tools>"
     assert tok(probe)["input_ids"] == ref(probe)["input_ids"], "existing ids changed"
-    print("checked: new tags are single tokens; existing encodings unchanged; vocabulary size", len(tok))
+    n_block = (len(tok(block, add_special_tokens=False)["input_ids"]), len(ref(block, add_special_tokens=False)["input_ids"]))
+    print(f"checked: new entries are single tokens and decode back exactly; unrelated text unchanged; vocabulary size {len(tok)}; sample tools block {n_block[1]} -> {n_block[0]} tokens")
     # the template as transformers renders it must equal the template as our data build renders it (tools block, tool call, single turn)
     msgs = [{"role": "system", "content": "S"}, {"role": "user", "content": "Tani Biyi Bandele?"},
             {"role": "assistant", "content": "<|input_lang|><yor><task_plan><|RAG|></task_plan>", "tool_calls": [{"function": {"name": "f", "arguments": {"q": "Ẹ̀gbọ́n 'x'"}}}]},

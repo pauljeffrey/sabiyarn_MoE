@@ -2,7 +2,8 @@
 
 Inputs are data-gen's records (data-gen/data/processed/{sft,dpo}.jsonl) or any Hub dataset with the same columns:
 
-  dpo : prompt_messages (list of {role, content}), chosen, rejected
+  dpo : prompt_messages (list of {role, content}), and EITHER chosen/rejected
+        OR data-gen's own response_1/response_2 + ranking (see preference_pair)
   sft : messages (full conversation ending in the assistant turn)   -- or prompt_messages + response
   rl  : prompt_messages (+ whatever the reward needs: `reference`, `source`, ...)
 
@@ -97,10 +98,65 @@ def encode_answer(tok, rec: dict, answer: str, cfg: RLConfig) -> Optional[Encode
     return Encoded(prompt, ans)
 
 
+def preference_pair(rec: dict) -> Optional[tuple[str, str]]:
+    """(chosen, rejected) from a record, in either of the two shapes this project produces.
+
+    `chosen`/`rejected` is what a judged or public DPO set looks like. data-gen writes `response_1` and
+    `response_2` plus a `ranking` -- and reading only the first shape meant the trainer KeyError'd on every
+    record data-gen has ever produced. The only bridge was judge_gen.py, a second paid pass that reduces the
+    candidates to chosen/rejected; with no judge model in the pipeline that bridge does not exist, so the
+    ordering the generator already gave us is used directly.
+
+    `ranking` is authoritative where present, because postprocess_gen sorts the responses by quality and
+    writes the order it used. Falling back to response_1-is-better matches that sort.
+    """
+    if rec.get("chosen") is not None and rec.get("rejected") is not None:
+        return str(rec["chosen"]), str(rec["rejected"])
+
+    a, b = rec.get("response_1"), rec.get("response_2")
+    if not a or not b:
+        return None
+    ranking = rec.get("ranking") or []
+    if len(ranking) >= 2:
+        order = {"best": 0, "partial": 1, "worst": 2}
+        ra, rb = order.get(str(ranking[0]).lower(), 1), order.get(str(ranking[1]).lower(), 1)
+        if ra == rb:
+            return None  # same quality on both sides is not a preference
+        return (str(a), str(b)) if ra < rb else (str(b), str(a))
+    return str(a), str(b)
+
+
+def score_margin(rec: dict) -> Optional[float]:
+    """The generator's own 0-10 gap between the two replies, where it recorded one.
+
+    Used to drop pairs that are nearly as good as each other: those teach almost nothing and their gradient is
+    noise. postprocess_gen already drops anything under 2.0 at generation time, so this is a second filter for
+    corpora built before that existed.
+    """
+    sc = rec.get("scores")
+    if not isinstance(sc, (list, tuple)) or len(sc) < 2:
+        return None
+    try:
+        lo, hi = float(sc[0]), float(sc[-1])
+    except (TypeError, ValueError):
+        return None
+    return abs(lo - hi)
+
+
 def encode_dpo(tok, records: Iterable[dict], cfg: RLConfig) -> list[tuple[Encoded, Encoded]]:
-    out, dropped = [], 0
+    out, dropped, unusable, narrow = [], 0, 0, 0
+    min_margin = float(getattr(cfg, "min_score_margin", 0.0) or 0.0)
     for rec in records:
-        c, r = encode_answer(tok, rec, rec["chosen"], cfg), encode_answer(tok, rec, rec["rejected"], cfg)
+        pair = preference_pair(rec)
+        if pair is None:
+            unusable += 1
+            continue
+        if min_margin:
+            m = score_margin(rec)
+            if m is not None and m < min_margin:
+                narrow += 1
+                continue
+        c, r = encode_answer(tok, rec, pair[0], cfg), encode_answer(tok, rec, pair[1], cfg)
         if c is None or r is None:
             dropped += 1
             continue
@@ -108,6 +164,11 @@ def encode_dpo(tok, records: Iterable[dict], cfg: RLConfig) -> list[tuple[Encode
     if dropped:
         LOG.warning("dpo_examples_dropped_too_long", dropped=dropped, kept=len(out),
                     max_prompt_len=cfg.max_prompt_len, max_seq_len=cfg.max_seq_len)
+    if unusable:
+        LOG.warning("dpo_examples_without_a_preference", dropped=unusable,
+                    hint="need chosen/rejected, or response_1/response_2 with a ranking that differs")
+    if narrow:
+        LOG.info("dpo_examples_dropped_narrow_margin", dropped=narrow, min_margin=min_margin)
     return out
 
 

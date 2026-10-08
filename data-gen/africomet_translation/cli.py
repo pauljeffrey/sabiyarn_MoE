@@ -43,9 +43,10 @@ def cmd_extract(a) -> int:
     out.mkdir(parents=True, exist_ok=True)
     cache.mkdir(parents=True, exist_ok=True)
     _env(str(cache))
-    from .registry import build_registry, slug
+    from .registry import slug
+    from .registry_v4 import build_registry_v4
     reg_args = _registry_args(a)
-    registry = build_registry(**reg_args)
+    registry = build_registry_v4(**reg_args)
     langs = a.languages.split(",") if a.languages else list(registry)
     tasks = []
     for lang in langs:
@@ -60,7 +61,7 @@ def cmd_extract(a) -> int:
     if not tasks:
         return 0
     from .extract import run_task
-    cfg = {"cache": str(cache), "out": str(out), "seed": a.seed, "cap": a.max_src_tokens, "registry_args": reg_args}
+    cfg = {"cache": str(cache), "out": str(out), "seed": a.seed, "cap": a.max_src_tokens, "registry_args": reg_args, "max_docs": a.max_docs}
     ctx = mp.get_context("spawn")
     t0, finished, errors = time.time(), 0, 0
     with ProcessPoolExecutor(a.lid_workers, mp_context=ctx) as lid_pool, ProcessPoolExecutor(a.workers, mp_context=ctx) as pool:
@@ -104,7 +105,7 @@ def cmd_clean(a) -> int:
     cache.mkdir(parents=True, exist_ok=True)
     _env(str(cache))
     from .clean import THRESHOLD, train_model
-    langs = a.languages.split(",") if a.languages else ["pcm", "yor", "hau", "ibo", "fon", "ewe", "twi", "efi", "ibb", "eng"]
+    langs = a.languages.split(",") if a.languages else ["pcm", "yor", "hau", "ibo", "fon", "ewe", "twi", "efi", "eng"]
     (out / "clean_models").mkdir(exist_ok=True)
     for lang in langs:
         p = out / "clean_models" / f"{lang}.pkl"
@@ -156,71 +157,77 @@ def cmd_clean(a) -> int:
 def build_card_v2(stats: dict, tag: str, max_src_tokens: int) -> str:
     from .instructions import CONFIDENCE
     total = sum(stats["rows"].values())
+    with_resp = sum(stats["with_response"].values())
+
     def table(counter, h1, h2="rows", top=None):
         items = sorted(counter.items(), key=lambda kv: -kv[1])[: top or None]
         return ["| %s | %s |" % (h1, h2), "|---|---|", *[f"| {k} | {v:,} |" for k, v in items], ""]
-    lic = {}
-    for src, n in stats["source"].items():
-        lic[src] = n
+
     lines = [
         "---", "license: other", "license_name: mixed-per-record-see-card",
-        "language:", *[f"- {c}" for c in ("en", "yo", "ha", "ig", "pcm", "ee", "fon", "tw", "efi", "ibb")],
+        "language:", *[f"- {c}" for c in ("en", "yo", "ha", "ig", "pcm", "ee", "fon", "tw", "efi", "ibb", "urh")],
         "pretty_name: AfriCOMET translation prompts", "size_categories:", f"- {'10M<n<100M' if total >= 10_000_000 else '1M<n<10M'}",
         "task_categories:", "- translation", "- text-generation",
         "tags:", "- rlhf", "- africomet", "- translation", "- african-languages", "- prompts",
         "configs:", "- config_name: default", "  data_files:", "  - split: train", "    path: data/*/*.parquet",
         "---", "",
         "# AfriCOMET translation prompts", "",
-        f"{total:,} translation prompts for RLHF with [AfriCOMET](https://huggingface.co/masakhane/africomet-qe-stl-1.1) "
-        "(reference-free QE) as the reward. Each row is a passage of 1-5 consecutive sentences from one document in a "
-        "source language plus an instruction asking for a translation into a different target language. There is no "
-        "reference translation: the policy translates and AfriCOMET scores the translation against `input`.", "",
+        f"{total:,} translation prompts for RLHF with [AfriCOMET](https://huggingface.co/masakhane/africomet-qe-stl-1.1) as the "
+        f"reward. Each row is a passage of 1-5 consecutive sentences in `source_lang` plus an instruction asking for a translation "
+        f"into `targ_lang`. **{with_resp:,} rows ({with_resp / total:.1%}) also carry `response`**, an aligned human reference "
+        "translation (so reference-based AfriCOMET can be used on them); for the rest `response` is empty and the "
+        "reference-free (QE) variant scores the policy's output against `input`.", "",
         "No language model wrote any text here. Passages come from the public corpora listed below; instructions come "
         "from hand-written template banks.", "",
         "## Fields", "", "| field | meaning |", "|---|---|",
-        "| `instruction`, `input` | the request (in `instruction_language`) and the source passage |",
-        "| `source_language`, `target_language` | `eng pcm yor hau ibo fon ewe twi efi ibb` |",
+        "| `instruction` | the request, written in `instruction_language`, naming the target language |",
+        "| `input` | the source passage |",
+        "| `response` | aligned reference translation in `targ_lang` (empty when the source has no aligned text in one of our languages) |",
+        "| `source_lang`, `targ_lang` | `eng pcm yor hau ibo fon ewe twi efi ibb urh`. When `response` is set, `targ_lang` is the language of that reference |",
         "| `prompt` | `instruction` and `input` joined in the order given by `instruction_position` (`prepend` / `append`) |",
-        "| `template_confidence` | reliability of the instruction wording: `high` (English), `medium` (pcm/yor/hau/ibo), `low` (twi/ewe) |",
-        "| `n_sentences`, `src_tokens` | sentences in `input`; length in `Davlan/afro-xlmr-large-76L` tokens (capped at "
-        f"{max_src_tokens}; AfriCOMET truncates each segment at 512) |",
-        "| `source_dataset`, `source_license`, `source_kind` | provenance. kind: `curated` `news` `encyclopedia` `web` `bible` |",
-        "| `africomet_supported` | both languages are in AfriCOMET-1.1's encoder language list (Ibibio is not) |", "",
+        "| `instruction_language`, `template_confidence` | language of the instruction (`eng pcm yor hau ibo twi ewe`) and how reliable that wording is (`high`/`medium`/`low`) |",
+        f"| `n_sentences`, `src_tokens` | sentences in `input`; length in `Davlan/afro-xlmr-large-76L` tokens (capped at {max_src_tokens}; `response` at 480; AfriCOMET truncates each segment at 512) |",
+        "| `source_dataset`, `source_license`, `source_kind` | provenance. kind: `curated` `news` `encyclopedia` `web` `bible` `jw` `mined` `speech_text` |",
+        "| `africomet_supported` | both languages are in AfriCOMET-1.1's encoder language list (Ibibio and Urhobo are not) |", "",
         "## How it was built", "",
-        "* **Web text is only used after sentence-level language ID** (GlotLID v3). Measured on HPLT 'Yoruba', only ~46% of "
-        "lines the corpus labels Yoruba were Yoruba. Sentences with e-mail/phone/URL, spam-like repetition, markup or "
-        "non-prose shapes are dropped; sentences are de-duplicated across all sources.",
-        "* **Cleaned, then filtered.** Each sentence is cleaned (verse / section numbers, scripture references, footnote "
-        "marks, bullets and spacing removed), then windows are dropped for mojibake, symbols/emoji, too few letters, digits "
-        "or punctuation, repetition, Title-Case spam, mixed letter-digit corruption, and English function- or content-word "
-        "leakage (threshold calibrated per language on its own clean news). Web Yoruba, Igbo and English are additionally "
-        "scored by a per-language classifier trained to separate hand-translated/edited prose from random web text; "
-        "windows below 0.5 are dropped. This removed most machine-translated web text: **only 13% of raw Yoruba, 24% of "
-        "Igbo and 67% of English windows survived**. The classifier is deliberately NOT used for Hausa, Twi and the smaller "
-        "languages, where it rejected genuine news and religious prose, so those rely on the rules alone and are noisier.",
-        "* **English is the augmenter.** Non-English source text is limited by what exists, so English passages fill the "
-        "rest and are routed to the other nine languages so each *target* language gets about the same number of rows.",
-        "* **Targets** for non-English sources cycle evenly over the nine other languages, with English as target weighted double.",
-        "* Window sizes are drawn uniformly from 1-5 sentences, limited by paragraph length.", "",
+        "* **Wide sweep of Hugging Face.** Every dataset tagged with, or named after, Pidgin, Efik, Ibibio, Urhobo, Fon, Twi/Akan or "
+        "Ewe was inspected without downloading it: the first rows were read through the dataset-server and every text column "
+        "was language-identified (GlotLID), so the right column is found by content, not by the dataset card. Parallel "
+        "datasets contribute our language's column as the source; the aligned column becomes `response` when it is English or "
+        "another of our languages, and is dropped otherwise (e.g. Ewe-French gives Ewe text only).",
+        "* **Excluded after checking provenance:** LLM-generated sets (e.g. `pristine-twi`, `ghok-parallel-en-twi`, "
+        "`pidgin-corpus-synth`), a Twi set whose Twi side is NLLB output, translated task data (QA, sentiment, Alpaca), "
+        "speech/TTS snippets, Cameroonian Pidgin, FLORES-only collections (xP3x), and FineWeb-2's 23 GB 'Pidgin' (misidentified English).",
+        "* **Mined pair sets are only read near the top.** Their NLLB similarity score is sorted descending and quality collapses "
+        "past rank ~200k (mojibake, random names), so only rows above a score floor, capped per set, are used, and both sides "
+        "are language-identified.",
+        "* **Two cleaning profiles.** Hausa, Yoruba, Igbo and English: strict (numbers and scripture references stripped, rule "
+        "filters, plus a per-language prose classifier for Yoruba, Igbo and English that removed most machine-translated web "
+        "text; only 13% of raw Yoruba and 24% of raw Igbo survived). Pidgin, Efik, Ibibio, Urhobo, Fon, Twi and Ewe: "
+        "**lenient** (Bible verse numbers and references are kept; only mojibake, near-empty text, runaway repetition and "
+        "mostly-English text are dropped), because their clean data is scarce.",
+        "* **English is the augmenter.** English passages without a reference fill the dataset and are routed to the other "
+        "languages so each *target* language gets a similar number of rows.", "",
         "## Rows by source language", ""] + table(stats["rows"], "language") + [
-        "## Rows by target language", ""] + table(stats["target"], "target") + [
+        "## Rows with a reference (`response`) by source language", ""] + table(stats["with_response"], "language") + [
+        "## Rows by target language", ""] + table(stats["target"], "targ_lang") + [
         "## Rows by source kind", ""] + table(stats["kind"], "kind") + [
         "## Sources", "", "Licenses differ per row; the dataset as a whole is only as permissive as its most restrictive rows.", "",
-        "| source | rows |", "|---|---|", *[f"| `{k}` | {v:,} |" for k, v in sorted(stats["source"].items(), key=lambda kv: -kv[1])[:60]], "",
+        "| source | rows |", "|---|---|", *[f"| `{k}` | {v:,} |" for k, v in sorted(stats["source"].items(), key=lambda kv: -kv[1])[:80]], "",
         "## Licenses", ""] + table(stats["license"], "license") + [
         "## Limitations", "",
-        "* **Licenses are mixed and some are restrictive:** `howard-nlp/ibom-mt` is CC-BY-NC-4.0; Wikipedia/FLORES/SIB-200/"
-        "wikianc content is share-alike; **Bible rows (`source_kind=bible`) come from translations whose Bible-society "
-        "copyright was not verified**; web rows are Common Crawl derivatives whose copyright is not cleared by the "
-        "corpora's CC0 label. Filter on `source_license` / `source_kind` for a stricter release.",
-        "* **Ibibio is not in AfriCOMET-1.1's language list**; rows involving it have `africomet_supported=false`.",
-        "* **Instruction templates are not native-reviewed** and **Fon, Efik and Ibibio have none** (never an instruction "
-        "language). Confidence: " + ", ".join(f"`{l}` {c}" for l, c in CONFIDENCE.items()) + ".",
-        "* The scarce languages (Fon, Efik, Ibibio, Ewe, Twi, Pidgin) are dominated by Bible text; English rows carry "
-        "most of the volume. Web text for these languages may include machine-translated pages that passed language ID.",
+        "* **Licenses are mixed and several are restrictive.** CC-BY-NC rows (`ghananlpcommunity/*`, `goldfish-models/fish-food`, "
+        "`howard-nlp/ibom-mt`, ...), share-alike rows, **Bible and jw.org rows whose copyright is not cleared**, and web rows that "
+        "are Common Crawl derivatives. Filter on `source_license` / `source_kind` for a stricter release.",
+        "* **Mined pair rows (`source_kind=mined`) have noisy alignment** even above the score floor, so their `response` is a "
+        "weaker reference than the Bible/curated ones. Most pair text is itself Bible/JW-style.",
+        "* **Ibibio and Urhobo are not in AfriCOMET-1.1's language list**; rows involving them have `africomet_supported=false`.",
+        "* **Instruction templates are not native-reviewed** and **Fon, Efik, Ibibio and Urhobo have none** (never an "
+        "instruction language). Confidence: " + ", ".join(f"`{l}` {c}" for l, c in CONFIDENCE.items()) + ".",
+        "* Windows are 1-5 sentences but parallel/mined rows are single units, so `n_sentences` skews low there.",
         "* FLORES-200 / SIB-200 sentences are standard evaluation sets: do not evaluate on FLORES after training on this.",
         "* Efik and Ibibio sources mix `n̄` and `ñ`; text is NFC-normalised only. No toxicity filtering was applied.", "",
-        "## Reproduction", "", "`data-gen/africomet_translation/` in the SabiYarn repository: `cli extract`, then `cli assemble`.", "",
+        "## Reproduction", "", "`data-gen/africomet_translation/` in the SabiYarn repository: `cli extract`, `cli clean`, `cli assemble`.", "",
     ]
     return "\n".join(lines)
 
@@ -228,10 +235,12 @@ def build_card_v2(stats: dict, tag: str, max_src_tokens: int) -> str:
 def cmd_assemble(a) -> int:
     out = Path(a.out).resolve()
     token = _env(str(Path(a.cache).resolve())) if a.cache else _env(str(out / ".hfcache"))
-    from .assemble import assemble
+    from .assemble import LANGS, NEW_LANGS, assemble
     from .build import REPO_ID, _api, push_files
+    from .clean import LENIENT
     api = _api(token) if a.push else None
     langs = a.languages.split(",") if a.languages else None
+    src_dirs = {l: ("windows" if (l in LENIENT or l in NEW_LANGS) else a.clean_dir) for l in LANGS}
 
     def on_done(lang, files):
         if not api:
@@ -241,7 +250,7 @@ def cmd_assemble(a) -> int:
             n = push_files(api, REPO_ID, batch, f"Add {lang} prompts {a.tag} ({len(batch)} shard(s))", private=not a.public)
             print(f"[hub] {lang}: pushed {n} shard(s)", flush=True)
 
-    stats = assemble(out, a.total, a.seed, a.tag, langs, a.limit_per_lang, on_done, a.max_non_eng_per_lang, a.windows_dir)
+    stats = assemble(out, a.total, a.seed, a.tag, src_dirs, langs, a.limit_per_lang, on_done, a.max_non_eng_per_lang)
     card = build_card_v2(stats, a.tag, a.max_src_tokens)
     (out / "final" / "README.md").write_text(card)
     if api:
@@ -249,7 +258,6 @@ def cmd_assemble(a) -> int:
         print(f"[hub] card updated -> https://huggingface.co/datasets/{REPO_ID}", flush=True)
     print(f"done: {sum(stats['rows'].values()):,} rows", flush=True)
     return 0
-
 
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -264,6 +272,7 @@ def main(argv=None) -> int:
     e.add_argument("--workers", type=int, default=5)
     e.add_argument("--lid-workers", type=int, default=3)
     e.add_argument("--force", action="store_true")
+    e.add_argument("--max-docs", type=int, default=0, help="debug: stop each source after N documents")
     e.add_argument("--include-nc", action="store_true", help="also use CC-BY-NC sources that are not needed for coverage")
     e.add_argument("--eng-c4", type=int, default=0)
     e.add_argument("--eng-wiki", type=int, default=0)
@@ -279,7 +288,7 @@ def main(argv=None) -> int:
     m.add_argument("--languages", default="")
     m.add_argument("--limit-per-lang", type=int, default=0)
     m.add_argument("--max-non-eng-per-lang", type=int, default=0)
-    m.add_argument("--windows-dir", default="windows", help="'clean' to assemble from the cleaned windows")
+    m.add_argument("--clean-dir", default="clean", help="directory of strictly cleaned windows (yor/hau/ibo/eng)")
     m.add_argument("--push", action="store_true")
     m.add_argument("--public", action="store_true")
     c = sub.add_parser("clean")

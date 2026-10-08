@@ -62,7 +62,7 @@ def prefetch(mode: str = "pretrain") -> dict:
     os.environ["TRAIN_MODE"] = mode  # load_train_config reads this over yaml's training.mode
 
     from training.load_config import load_train_config
-    from training.s3_utils import sync_training_files
+    from training.s3_utils import sync_eval_manifest, sync_training_files
 
     os.makedirs(DATA_DIR, exist_ok=True)
     cfg = load_train_config(CONFIG_PATH)
@@ -90,8 +90,13 @@ def prefetch(mode: str = "pretrain") -> dict:
         prefix=cfg.s3_prefix,
         eval_path=cfg.eval_data_path,
     )
-    volume.commit()
     result = {"mode": mode, "train_data_paths": local_train, "eval_data_path": local_eval}
+    if mode == "pretrain" and cfg.eval_manifest_path:
+        result["eval_manifest_path"] = sync_eval_manifest(
+            cfg.eval_manifest_path, DATA_DIR, bucket=cfg.s3_bucket, endpoint=cfg.s3_endpoint,
+            access_key=cfg.s3_access_key, secret_key=cfg.s3_secret_key, prefix=cfg.s3_prefix,
+        )
+    volume.commit()
     print(f"done: {result}")
     return result
 

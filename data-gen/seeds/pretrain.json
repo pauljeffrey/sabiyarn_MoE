@@ -233,7 +233,6 @@
         "<|is_legal|>",
         "<|is_medical|>",
         "<|is_scientific|>",
-        "<|is_non_technical|>",
         "<|is_financial|>"
       ],
       "label_tokens": {

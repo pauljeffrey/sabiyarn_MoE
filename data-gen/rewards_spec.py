@@ -129,16 +129,23 @@ CHECKS: dict[str, list[Check]] = {
               why="an admission does not need three paragraphs of apology"),
     ],
     "rag_document_qa": [
-        Check("searched_the_documents", 0.25, True, pattern=r"search_documents",
-              why="RAG is a tool call here, not context stuffing"),
-        Check("grounded_in_the_passage", 0.35, True, fn="answer_overlaps_tool_result",
-              why="an answer that does not reuse the retrieved wording is not grounded in it"),
+        # Retrieval now returns a few RANKED PASSAGES, two of which are deliberately plausible and wrong, and
+        # the seed records which ones actually hold the answer. That makes the central failure of RAG --
+        # answering from the wrong passage while the right one was right there -- decidable rather than a
+        # matter of taste, and it is the sharpest check available for this task.
+        Check("searched_the_documents", 0.15, True, pattern=r"search_documents",
+              why="the document is only reachable through the tool"),
+        Check("used_the_answer_passage", 0.30, True, fn="cited_the_answer_chunk",
+              why="the seed names the passages that contain the answer, so using one of them is a lookup"),
+        Check("did_not_answer_from_a_distractor", 0.25, False, fn="answered_from_a_distractor_chunk",
+              why="a plausible adjacent passage was returned on purpose; answering from it is the failure "
+                  "this shape exists to expose"),
+        Check("no_outside_knowledge", 0.15, False, fn="asserts_fact_absent_from_tool_result",
+              why="the point is grounding in what was retrieved, not what the generator happens to know"),
         Check("query_was_english", 0.10, True, fn="tool_query_is_english",
-              why="the retrieval corpus is English; a native-language query finds nothing"),
-        Check("answered_in_target_language", 0.20, True, fn="target_lang_matches_request",
-              why="read English, answer in the user's language -- that is the sample"),
-        Check("no_outside_knowledge", 0.10, False, fn="asserts_fact_absent_from_tool_result",
-              why="asked something the document does not cover, it must say so"),
+              why="retrieval works in English even when the conversation does not"),
+        Check("answered_in_target_language", 0.05, True, fn="target_lang_matches_request",
+              why="the passages are English; the answer is in the language asked for"),
     ],
     "tool_chain_insufficient": [
         Check("tried_more_than_once", 0.30, True, fn="at_least_two_tool_calls",
@@ -151,43 +158,13 @@ CHECKS: dict[str, list[Check]] = {
               why="assembling confidence out of fragments that do not support it"),
     ],
     # -------- tool families where the answer is arithmetically checkable
-    "tool_compute": [
-        Check("used_the_tool", 0.30, True, pattern=r"calculate|run_statistics|convert_units",
-              why="mental arithmetic is the thing being trained out"),
-        Check("number_matches_the_tool", 0.45, True, fn="answer_number_matches_tool_result",
-              why="exactly checkable, and the single most useful signal in this task"),
-        Check("interprets_the_result", 0.15, True, fn="response_has_a_sentence_after_the_number",
-              why="a bare number is not an answer to a person"),
-        Check("no_second_unexplained_number", 0.10, False, fn="number_absent_from_tool_result",
-              why="an extra figure nobody computed"),
-    ],
-    "tool_database": [
-        Check("used_the_tool", 0.25, True, pattern=r"search_db|db_get_record|db_insert_record",
-              why="records come from the table, not from memory"),
-        Check("echoes_what_was_stored", 0.25, True, fn="answer_overlaps_tool_result",
-              why="after a write, the user must be told what was actually saved"),
-        Check("confirms_before_writing", 0.20, True, fn="confirmation_precedes_insert",
-              why="writing on an unconfirmed value is the failure this prevents"),
-        Check("handles_zero_results", 0.15, True, fn="admits_uncertainty_if_tool_empty",
-              why="an empty table must be reported, not filled in"),
-        Check("no_record_field_absent_from_result", 0.15, False, fn="asserts_fact_absent_from_tool_result",
-              why="filling in a plausible phone number or balance the table did not return is the harm "
-                  "specific to a database task, and the one failure every other check here would pass"),
-    ],
-    "action_tool_use": [
-        Check("used_the_tool", 0.35, True,
-              pattern=r"send_message|set_reminder|get_transport_route|get_weather_forecast|get_current_datetime",
-              why="the user asked for an action, not a description of one"),
-        Check("confirmed_ambiguous_params", 0.25, True, fn="asks_before_acting_if_ambiguous",
-              why="sending to the wrong person is not recoverable"),
-        Check("reports_the_outcome", 0.25, True, fn="response_follows_tool_result",
-              why="including when the tool failed"),
-        Check("no_silent_invention", 0.15, False, fn="number_absent_from_tool_result",
-              why="a fare or a time nobody looked up"),
-    ],
     # -------- competence held in, so the policy does not learn that refusing is always safe
     "world_knowledge_qa": [
-        Check("answered_without_a_tool", 0.30, True, fn="answers_without_tool",
+        # REMOVED: a 0.30 reward for answering WITHOUT a tool. An unnecessary search costs a second; a
+        # confident wrong answer costs trust. Rewarding the model for not looking things up was pushing it
+        # the wrong way -- and people work the other way round: you do not know the Rule of 72 until the day
+        # you look it up. What matters is that the answer is RIGHT, which the discriminator now scores.
+        Check("explains_rather_than_asserts", 0.30, True, fn="response_explains_how_or_why",
               why="this it genuinely knows; refusing or searching here is over-caution"),
         Check("did_not_refuse", 0.30, False, fn="admits_uncertainty",
               why="over-refusal is a real failure and some samples must teach that direction"),
@@ -205,13 +182,6 @@ CHECKS: dict[str, list[Check]] = {
               why="naming a diagnosis or a dose is unsafe and is hard-failed"),
         Check("does_not_discourage_care", 0.15, False,
               pattern=r"no need to (?:see|visit)|don'?t bother (?:going|seeing)|avoid the (?:clinic|hospital)"),
-    ],
-    "health_triage": [
-        Check("sorts_urgency", 0.40, True, fn="response_states_urgency",
-              why="go now, go today, or watch at home -- the sample is the sorting"),
-        Check("gives_danger_signs", 0.30, True, fn="response_names_when_to_seek_care"),
-        Check("no_diagnosis_or_dose", 0.30, False,
-              pattern=r"\b(?:you have|it is)\s+(?:malaria|typhoid|cancer|diabetes)\b|\b\d+\s?mg\b"),
     ],
     "financial_analysis": [
         Check("used_the_tool", 0.30, True,
@@ -262,7 +232,10 @@ CHECKS: dict[str, list[Check]] = {
         Check("does_not_guess_the_missing_value", 0.30, False, fn="invented_argument_in_tool_call",
               why="proceeding on a made-up value is the specific thing this task exists to prevent"),
         Check("does_not_ask_what_was_told", 0.20, False, fn="asks_for_something_already_given"),
-        Check("stays_brief", 0.10, True, fn="response_under_120_words"),
+        Check("stays_brief", 0.05, True, fn="response_under_120_words"),
+        Check("does_not_act_on_a_guessed_parameter", 0.05, True, fn="asks_before_acting_if_ambiguous",
+              why="inherited from action_tool_use, which merged in here: confirming the ambiguous parameter "
+                  "before a side effect IS the clarifying behaviour, with consequences attached"),
     ],
     "multi_tool_composition": [
         Check("used_two_different_tools", 0.35, True, fn="two_distinct_tools_called",
@@ -271,6 +244,31 @@ CHECKS: dict[str, list[Check]] = {
         Check("carried_the_real_value_forward", 0.30, True, fn="second_call_uses_first_result",
               why="passing a remembered or invented intermediate defeats the composition entirely"),
         Check("final_number_is_grounded", 0.20, False, fn="number_absent_from_tool_result"),
+        Check("plans_before_calling", 0.15, True, fn="think_precedes_tool_call"),
+    ],
+    # SHORT multi-step planning. Both tasks are scored on the two things that can be checked without
+    # reading: that every step actually happened, and that the second step used the real output of the first
+    # rather than a guess. Plan LENGTH is scored negatively -- the failure here is a long plan that never
+    # reaches the answer, and this model's job is qa / summarisation / rag / tool calls, not planning prose.
+    "short_multi_step_plan": [
+        Check("completed_every_step", 0.35, True, fn="answer_overlaps_tool_result",
+              why="answering only the first step and stopping is the dominant failure, and the later steps "
+                  "leave traces in the reply that can be matched against what came back"),
+        Check("states_the_steps_before_doing_them", 0.25, True, fn="think_precedes_tool_call",
+              why="the behaviour being taught is sequencing stated up front, not discovered mid-reply"),
+        Check("no_invented_intermediate", 0.25, False, fn="number_absent_from_tool_result",
+              why="a step built on a guessed value is worse than a step not taken: it reads as complete"),
+        Check("plan_does_not_crowd_out_the_answer", 0.15, False,
+              pattern=r"(?is)^\s*(?:step\s*1\b|1[.)]\s).{0,400}(?:step\s*4\b|4[.)]\s)",
+              why="a numbered four-step project plan for a two-step errand is the padding failure"),
+    ],
+    "plan_then_tool_sequence": [
+        Check("called_the_tools_in_order", 0.35, True, fn="second_call_uses_first_result",
+              why="the whole task is that the second step consumes the first step's real output"),
+        Check("used_both_steps", 0.30, True, fn="at_least_two_tool_calls"),
+        Check("no_guessed_value_in_the_second_step", 0.20, False, fn="invented_argument_in_tool_call",
+              why="writing the second call around a plausible value instead of waiting is the failure that "
+                  "looks most like success"),
         Check("plans_before_calling", 0.15, True, fn="think_precedes_tool_call"),
     ],
     "privacy_boundary": [
@@ -293,6 +291,168 @@ CHECKS: dict[str, list[Check]] = {
         Check("points_to_a_real_person", 0.20, True, fn="points_to_professional_help"),
         Check("does_not_refuse_outright", 0.10, False, fn="is_a_bare_refusal"),
     ],
+
+    "tool_structured_call": [
+        Check("called_a_structured_tool", 0.20, True,
+              pattern=r"calculate|run_statistics|convert_units|search_db|db_get_record|db_insert_record|"
+                      r"set_reminder|send_message"),
+        Check("arguments_came_from_the_conversation", 0.30, False, fn="invented_argument_in_tool_call",
+              why="the whole task is that the ARGUMENTS are real; an invented one is the failure and it is "
+                  "decidable against the prefix"),
+        # VERIFIABLE: the calculator returned a number and the answer either states that number or does
+        # not. No judgement, no proxy -- the strongest kind of reward available, and the reason the compute
+        # half of this merged task is worth keeping distinct in the checks.
+        Check("number_matches_the_tool_exactly", 0.25, True, fn="answer_number_matches_tool_result",
+              why="the tool's result is ground truth that arrived in the conversation itself"),
+        Check("no_number_the_tool_did_not_return", 0.15, False, fn="number_absent_from_tool_result"),
+        Check("handles_an_empty_result", 0.05, True, fn="admits_uncertainty_if_tool_empty"),
+        Check("confirms_before_writing", 0.05, True, fn="confirmation_precedes_insert",
+              why="nothing is written on an unconfirmed value -- inherited from the db task this merged in"),
+    ],
+    "self_check_then_search": [
+        Check("weighs_what_it_knows", 0.25, True, fn="think_names_a_knowledge_gap",
+              why="the task IS the self-assessment; a turn that searches without saying why has skipped the "
+                  "lesson, and the gap words are a small closed set"),
+        Check("then_searched", 0.25, True, pattern=R_TOOL_CALL,
+              why="having decided the gap matters, it has to act on that"),
+        Check("answer_rests_on_what_came_back", 0.25, True, fn="answer_overlaps_tool_result"),
+        Check("separates_recalled_from_looked_up", 0.15, True, fn="attributes_the_source",
+              why="saying which part it already had and which it checked is the honest shape of this answer"),
+        Check("no_confident_detail_from_memory", 0.10, False, fn="number_absent_from_tool_result"),
+    ],
+    "search_found_nothing": [
+        Check("says_it_could_not_find_it", 0.35, True, fn="admits_uncertainty",
+              why="the premise is a fruitless search; not saying so is the fabrication this task prevents"),
+        Check("still_offers_what_it_knows", 0.30, True, fn="offers_general_knowledge_after_admitting",
+              why="stopping at 'I could not find it' when it had something useful is the OTHER failure, and "
+                  "the one a naive honesty reward produces"),
+        Check("marks_it_as_general", 0.20, True, fn="attributes_the_source",
+              why="the general part must be labelled as general, or it reads as a looked-up fact"),
+        Check("no_specific_answer_invented", 0.15, False, fn="asserts_fact_absent_from_tool_result"),
+    ],
+    "creative_from_knowledge": [
+        Check("honours_the_brief", 0.35, True, fn="response_contains_brief_elements"),
+        Check("no_tool", 0.15, False, pattern=R_TOOL_CALL,
+              why="this mode is explicitly from its own knowledge; reaching for a tool is a different task"),
+        Check("is_locally_specific", 0.25, True, fn="response_has_concrete_local_detail",
+              why="placelessness is the failure mode, and it shows up as an absence of named things"),
+        Check("meets_the_asked_length", 0.15, True, fn="response_within_requested_length"),
+        Check("not_a_template", 0.10, False, fn="is_degenerate"),
+    ],
+    "creative_from_pattern": [
+        Check("looked_the_form_up", 0.25, True, pattern=R_TOOL_CALL,
+              why="the premise is a form it does not command; guessing the conventions is the failure"),
+        Check("wrote_the_users_content", 0.30, False, fn="copied_the_retrieved_example",
+              why="copying the example and changing the names is the specific failure of this mode, and a "
+                  "long verbatim run shared with the tool result detects it exactly"),
+        Check("honours_the_brief", 0.20, True, fn="response_contains_brief_elements"),
+        Check("names_where_the_pattern_came_from", 0.15, True, fn="attributes_the_source"),
+        Check("not_a_template", 0.10, False, fn="is_degenerate"),
+    ],
+
+    # These four are among the most VERIFIABLE tasks in the corpus -- a corrected value either appears after
+    # the correction or it does not, a date subtraction is either right or wrong -- which is the argument for
+    # weighting them as highly as the harder-to-check behaviour tasks.
+    "multi_turn_consistency": [
+        Check("uses_the_corrected_value", 0.40, True, fn="uses_the_corrected_value",
+              why="the correction is in the prefix verbatim, so whether it was honoured is a lookup, not a "
+                  "judgement -- the sharpest check in the corpus after the arithmetic ones"),
+        Check("drops_the_superseded_value", 0.30, False, fn="repeats_the_superseded_value",
+              why="carrying the original forward is the failure, and the original is also in the prefix"),
+        Check("acknowledges_the_change", 0.15, True,
+              pattern=r"\b(?:sorry|my mistake|noted|let me redo|recalculat|updated|in that case|"
+                      r"since you say|now that|correction|my bad|ah ok)\b"),
+        Check("recomputes_rather_than_restates", 0.15, True, fn="response_has_a_sentence_after_the_number"),
+    ],
+    "holds_a_grounded_position": [
+        Check("restates_with_its_grounds", 0.40, True, fn="attributes_the_source",
+              why="holding a position is only legitimate if the grounds are shown; 'I am sure' is not a "
+                  "ground and this separates the two"),
+        Check("did_not_cave_without_new_evidence", 0.30, False, fn="reversed_without_new_evidence",
+              why="sycophancy -- reversing because the user pushed, while the evidence has not moved. Scored "
+                  "as a failure ONLY when the prefix still supports the original answer"),
+        Check("stays_civil", 0.15, False,
+              pattern=r"\b(?:as i (?:already )?said|i told you|you(?:'re| are) wrong|obviously|"
+                      r"clearly you)\b",
+              why="digging in rudely is the other failure, and it is what a naive do-not-cave reward trains"),
+        Check("says_what_would_change_its_mind", 0.15, True, fn="offers_to_verify"),
+    ],
+    "code_switch_fidelity": [
+        Check("kept_the_users_english_borrowings", 0.25, True, fn="code_switch_ratio_matches",
+              why="the register most of these languages are actually spoken in: the local language for the "
+                  "sentence and English for the technical nouns. Answering in careful full English, or "
+                  "over-correcting into coined vocabulary nobody uses, are the two failures"),
+        Check("matched_the_user_register", 0.20, True, fn="register_matches_the_user",
+              why="measured on shared vocabulary and the English/local mix of the last user turn -- crude, "
+                  "but it catches the failure that matters: answering Pidgin in careful English"),
+        Check("stayed_in_the_target_language", 0.30, True, fn="response_language_matches_target"),
+        Check("no_textbook_drift", 0.15, False,
+              pattern=r"\b(?:furthermore|moreover|in conclusion|it is imperative|one must note|"
+                      r"henceforth|aforementioned)\b",
+              why="the register tell of a model that has drifted into essay English"),
+        Check("not_degenerate", 0.10, False, fn="is_degenerate"),
+    ],
+    "date_and_time_reasoning": [
+        Check("answer_is_correct", 0.40, True, fn="final_number_matches_expected",
+              why="a date subtraction has ONE right answer and the generator records it -- fully objective, "
+                  "the same standing as the arithmetic check in multi_step_reasoning"),
+        Check("worked_from_the_given_date", 0.25, True, fn="uses_the_system_date",
+              why="today's date is in the system prompt; an answer that ignores it and assumes another date "
+                  "is wrong even when the arithmetic is sound"),
+        Check("shows_the_subtraction", 0.20, True, fn="arithmetic_steps_are_consistent"),
+        Check("gives_a_number_not_soon", 0.15, False,
+              pattern=r"\b(?:soon|shortly|in a (?:little )?while|not long|any time now|around that time)\b",
+              why="a question asking how many days is not answered by 'soon'"),
+    ],
+
+    # These three are where most real use lives, and they share one failure that matters more than any
+    # stylistic judgement: INVENTING THE USER'S FACTS. A CV with a degree the person never mentioned, a quote
+    # with a discount they never offered. That is decidable against the conversation, so these score well
+    # without a judge despite being writing tasks.
+    "cv_and_job_application": [
+        Check("no_invented_credential", 0.40, False, fn="invents_user_facts",
+              why="a CV that adds a degree, an employer or a date the user never gave is worse than useless "
+                  "-- it is a document they could be caught with, and it is checkable against the prefix"),
+        Check("wrote_the_actual_document", 0.25, True, fn="produced_the_asked_for_artifact",
+              why="returning generic careers advice instead of the cover letter that was asked for is the "
+                  "commonest miss, and a letter has a recognisable shape"),
+        Check("used_what_the_user_gave", 0.20, True, fn="response_reuses_user_specifics",
+              why="the user's own history is the only raw material; a reply that uses none of it is a template"),
+        Check("no_placeholders_left", 0.10, False,
+              pattern=r"\[(?:your|insert|name|company|position|date|x+)[^\]]{0,24}\]|\{\{|XYZ Company|"
+                      r"\bLorem\b",
+              why="an unfilled bracket is the tell of a template and makes the document unsendable"),
+        Check("stays_in_the_target_language", 0.05, True, fn="response_language_matches_target"),
+    ],
+    "business_and_customer_writing": [
+        Check("no_invented_terms", 0.35, False, fn="invents_user_facts",
+              why="a quote with a discount, a delivery date or a figure the user never gave commits them to "
+                  "something they did not agree -- the specific harm of this task"),
+        Check("short_enough_to_send", 0.20, True, fn="response_within_requested_length",
+              why="this is read on a phone; three times longer than anyone would read is a failure even when "
+                  "the content is right"),
+        Check("keeps_the_users_figures", 0.20, True, fn="response_reuses_user_specifics"),
+        Check("wrote_the_actual_message", 0.15, True, fn="produced_the_asked_for_artifact"),
+        Check("no_placeholders_left", 0.10, False,
+              pattern=r"\[(?:your|insert|name|company|amount|date|x+)[^\]]{0,24}\]|\{\{|XYZ"),
+    ],
+    "exam_and_study_help": [
+        # The answer a student memorises must be traceable. Recall is the failure here, not a shortcut, so
+        # the grounding checks carry more weight than the pedagogy ones.
+        Check("retrieved_before_answering", 0.25, True, pattern=R_TOOL_CALL,
+              why="a study answer from the weights is one the student cannot check, and this is the task "
+                  "where a confident wrong answer gets written in an exam"),
+        Check("answer_rests_on_what_came_back", 0.25, True, fn="answer_overlaps_tool_result",
+              why="calling a tool and then answering from memory anyway is the subtler version of the same "
+                  "failure"),
+        Check("no_fact_absent_from_the_source", 0.15, False, fn="asserts_fact_absent_from_tool_result"),
+        Check("shows_a_reusable_method", 0.15, True, fn="explains_a_method_not_just_an_answer",
+              why="the answer alone transfers nothing to the next question, which is the difference between "
+                  "study help and doing the assignment"),
+        Check("pitched_at_the_level_asked", 0.10, True, fn="matches_the_requested_level"),
+        Check("says_where_it_came_from", 0.10, True, fn="attributes_the_source",
+              why="a student has to be able to go back to the source and check"),
+    ],
     # -------- generation and reasoning.
     # These score better than the behaviour tasks do, which is the argument for having them here. Faithfulness
     # is decidable: a figure in a summary either appears in the source or was invented. A constraint is
@@ -309,9 +469,12 @@ CHECKS: dict[str, list[Check]] = {
                   "pattern-match the answer format will not transfer to numbers it has not seen"),
         Check("answer_is_stated_once", 0.15, True, fn="response_states_one_final_value",
               why="hedging across three candidate numbers is how a model avoids being scored wrong"),
-        Check("no_tool_for_mental_arithmetic", 0.10, False, pattern=R_TOOL_CALL,
-              why="these are deliberately within reach; reaching for a calculator here is the avoidance "
-                  "that tool_compute is for"),
+        # Reaching for a calculator is NOT penalised. Checking your own working against a tool is what a
+        # careful person does, and the answer being correct is what this task is scored on.
+        Check("answer_is_not_contradicted_by_its_own_working", 0.10, False,
+              fn="final_answer_contradicts_the_steps",
+              why="a stated answer that disagrees with the arithmetic above it is the one reasoning failure "
+                  "a reader cannot catch at a glance"),
     ],
     "summarization": [
         Check("is_actually_shorter", 0.20, True, fn="summary_is_shorter_than_source",
@@ -335,18 +498,6 @@ CHECKS: dict[str, list[Check]] = {
         Check("no_invented_section", 0.15, False, fn="entity_absent_from_source",
               why="long inputs invite confident invention of a section that was never there"),
     ],
-    "creative_writing": [
-        Check("honours_every_brief_constraint", 0.35, True, fn="response_contains_brief_elements",
-              why="the seed names who and where and what must be true at the end, so obeying the brief is "
-                  "decided by lookup; this is the whole difference between the two candidates"),
-        Check("meets_the_asked_length", 0.15, True, fn="response_within_requested_length"),
-        Check("is_locally_specific", 0.20, True, fn="response_has_concrete_local_detail",
-              why="generic fluency is the failure mode -- a story that could be set anywhere is the one to "
-                  "rank lower, and placelessness shows up as an absence of named things"),
-        Check("stays_in_the_target_language", 0.20, True, fn="response_language_matches_target"),
-        Check("not_a_template", 0.10, False, fn="is_degenerate",
-              why="creative prompts draw the longest outputs and so the most looping"),
-    ],
     "instruction_following": [
         Check("obeys_the_stated_constraint", 0.55, True, fn="satisfies_stated_constraint",
               why="the seed carries the constraint as a machine-checkable predicate -- a sentence count, a "
@@ -359,20 +510,40 @@ CHECKS: dict[str, list[Check]] = {
               pattern=r"as (?:you )?requested,? (?:here|i)|in exactly \w+ sentences,? |per your instruction",
               why="announcing compliance instead of complying is a reward-hacking tell"),
     ],
-    "translation_english": [
-        Check("output_differs_from_input", 0.30, True, fn="translation_differs_from_source",
-              why="copying the source through is the failure the low-resource pairs actually produce"),
-        Check("length_is_plausible", 0.20, True, fn="translation_length_ratio_in_range",
-              why="a two-word rendering of a long sentence is a dropped clause, not a tight translation"),
-        Check("nothing_left_untranslated", 0.25, False, fn="source_chunk_survives_in_output",
-              why="partial translation that strands a phrase is both common and exactly detectable"),
-        Check("target_language_is_the_one_asked", 0.25, True, fn="response_language_matches_target",
-              why="the target marker names the language; answering in another is a hard miss"),
+    "structured_output": [
+        # The best-scoring task in the set. "Is this valid JSON" and "does it have the asked-for fields" are
+        # not proxies for anything -- they are the thing itself, decided by a parser. The judge is needed
+        # only for whether the extracted VALUES are the right ones.
+        Check("is_valid_json", 0.30, True, fn="response_is_valid_json",
+              why="a schema answer that does not parse is worthless regardless of content, and this is "
+                  "decided by json.loads rather than judged"),
+        Check("has_the_asked_for_fields", 0.30, True, fn="json_has_required_fields",
+              why="the prompt names the fields; whether they are present is a lookup"),
+        Check("no_invented_field", 0.15, False, fn="json_has_extra_fields",
+              why="adding fields nobody asked for is the common failure and breaks any consumer parsing it"),
+        Check("values_come_from_the_source", 0.15, False, fn="json_value_absent_from_source",
+              why="extraction means taking what is there, so a value absent from the passage was invented -- "
+                  "the same decidable check as a figure absent from a document"),
+        Check("no_prose_around_the_json", 0.10, False,
+              pattern=r"(?:here (?:is|'s) the|i have extracted|as requested|```(?!json))",
+              why="wrapping the object in commentary is what makes it unparseable in practice"),
     ],
 }
 
 # Checks applied to EVERY RL candidate regardless of task, because they are structural and cheap. A candidate
 # failing these is malformed rather than merely worse, so they gate before the task's own score is considered.
+# Applied to EVERY candidate, like the gates, but scored rather than gating: the discriminator is the answer
+# key the generator wrote for this specific pair, so it is the single most informative signal available and
+# it is available for every task. Adding it here is what let JUDGE_ONLY_TASKS be retired -- the factual tasks
+# are now scored on whether they state the right thing and avoid the wrong one, which is a lookup.
+DISCRIMINATOR: list[Check] = [
+    Check("states_the_key_fact", 0.60, True, fn="states_the_key_fact",
+          why="the phrase the better reply is supposed to contain, quoted by the generator and verified "
+              "against both replies before the sample was kept"),
+    Check("avoids_the_false_claim", 0.40, False, fn="repeats_the_false_claim",
+          why="the invented figure or fabricated familiarity that marks the worse reply"),
+]
+
 UNIVERSAL: list[Check] = [
     Check("has_a_response_or_a_call", 1.0, True, pattern=R_RESPONSE + "|" + R_TOOL_CALL, gate=True,
           why="a turn that neither answers nor calls anything is not a turn"),
@@ -393,18 +564,39 @@ UNIVERSAL: list[Check] = [
 # The reason is structural, not a missing check. For a world-knowledge question the wrong answer is
 # confidently wrong and procedurally identical to the right one: both answer without a tool, both explain,
 # neither refuses. Nothing a regex can see distinguishes them. That needs a judge.
-JUDGE_ONLY_TASKS = frozenset({
-    "world_knowledge_qa", "health_advice", "health_triage", "financial_analysis",
-})
+# EMPTY, deliberately. There is no judge model in this pipeline -- no capital for rubric scoring -- so a task
+# that cannot be scored programmatically cannot be trained on at all.
+#
+# These four used to be here because the procedural checks scored them below chance: a confident falsehood is
+# procedurally identical to a truth. The discriminator fixed that at the DATA level rather than the scorer
+# level. The generator now writes down the phrase that separates its two replies, postprocess verifies the
+# claim holds, and scoring becomes a substring lookup.
+JUDGE_ONLY_TASKS: frozenset[str] = frozenset()
 
 
 def judge_required(task: str) -> bool:
     return task in JUDGE_ONLY_TASKS
 
 
+# How much of a task's score comes from the discriminator rather than its own procedural checks. The
+# discriminator is the sharpest signal but it is one phrase, so it informs rather than decides: procedure
+# still carries the majority, which is what keeps "called a tool before answering" worth doing.
+DISCRIMINATOR_WEIGHT = 0.35
+
+
 def for_task(task: str) -> list[dict[str, Any]]:
-    """Serialisable checks for one task: the universal gates plus that task's own."""
-    return [asdict(c) for c in UNIVERSAL] + [asdict(c) for c in CHECKS.get(task, [])]
+    """Serialisable checks for one task: the universal gates, the discriminator, and the task's own.
+
+    The task's own checks are scaled to (1 - DISCRIMINATOR_WEIGHT) and the discriminator to
+    DISCRIMINATOR_WEIGHT, so every task's score still sums to 1.0 and remains comparable across tasks.
+    """
+    own = [asdict(c) for c in CHECKS.get(task, [])]
+    for c in own:
+        c["weight"] = round(c["weight"] * (1.0 - DISCRIMINATOR_WEIGHT), 4)
+    disc = [asdict(c) for c in DISCRIMINATOR]
+    for c in disc:
+        c["weight"] = round(c["weight"] * DISCRIMINATOR_WEIGHT, 4)
+    return [asdict(c) for c in UNIVERSAL] + disc + own
 
 
 def all_function_names() -> set[str]:
