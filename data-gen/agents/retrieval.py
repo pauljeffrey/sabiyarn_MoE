@@ -1,0 +1,318 @@
+"""Retrieval for the agent loop: find passages, hand back a ranked result a model can read.
+
+TWO IMPLEMENTATIONS, one interface.
+
+`LocalRetriever` scores chunks with BM25 over the document pool already on disk. No service, no keys, no
+network, deterministic, and it is what the tests and the offline path use.
+
+`PineconeRetriever` queries a Pinecone index with integrated embedding (llama-text-embed-v2, which is
+multilingual -- the reason it is worth having, since half the queries are Yoruba or Hausa). What it buys over
+the local path is CROSS-DOCUMENT retrieval: the distractors come from other documents that are genuinely
+near in embedding space, instead of other sections of the same article. "The retrieved passage does not
+answer the question" is a lesson this corpus is built to teach, and it is only honest if the near-miss is a
+real near-miss.
+
+WHY THE RETRIEVED TEXT IS RECORDED SEPARATELY. During generation the passages are evicted from the agent's
+history after the turn that cited them -- that eviction is what keeps the loop cheap (a document left in
+context is a 2x cost swing, measured). But the published sample must still CONTAIN the context, or an SFT
+record teaches the model to answer from nowhere. So every turn records what it retrieved in `Turn.retrieved`,
+and the record builder writes those passages back into the published conversation as the tool result they
+were. Evicted from the generator's working memory, present in the data.
+"""
+
+from __future__ import annotations
+
+import json
+import math
+import os
+import re
+from collections import Counter
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Iterable, Optional, Protocol
+
+_HERE = Path(__file__).resolve().parent
+_POOL = _HERE.parent / "data" / "document_pool.jsonl"
+
+_WORD = re.compile(r"[0-9A-Za-zÀ-ɏĀ-ſ']+")
+
+
+def _tok(s: str) -> list[str]:
+    return [w.lower() for w in _WORD.findall(s or "")]
+
+
+@dataclass
+class Passage:
+    """One retrievable unit. `doc_id`/`section` are what a citation points at."""
+    id: str
+    doc_id: str
+    title: str
+    section: str
+    text: str
+    score: float = 0.0
+    lang: str = ""
+
+    def words(self) -> int:
+        return len(self.text.split())
+
+
+class Retriever(Protocol):
+    def search(self, query: str, *, k: int = 4, lang: str = "") -> list[Passage]: ...
+
+
+# ---------------------------------------------------------------------------- chunking
+
+
+def split_passages(text: str, *, target_words: int = 110, doc_id: str = "", title: str = "",
+                   lang: str = "") -> list[Passage]:
+    """Split on the document's own headings, then pack paragraphs up to `target_words`.
+
+    Paragraph-level, not sentence-level: a sentence ripped out of a paragraph loses the referent of every
+    pronoun in it, and a model asked to answer from it either invents the referent or refuses. 110 words is
+    about the size at which a passage still answers a question on its own.
+    """
+    out: list[Passage] = []
+    section = ""
+    buf: list[str] = []
+    n = 0
+
+    def flush() -> None:
+        nonlocal buf, n
+        if buf:
+            out.append(Passage(id=f"p{len(out) + 1}", doc_id=doc_id, title=title, section=section,
+                               text="\n".join(buf).strip(), lang=lang))
+        buf, n = [], 0
+
+    for block in re.split(r"\n\s*\n", text or ""):
+        b = block.strip()
+        if not b:
+            continue
+        # a short line with no terminal punctuation is a heading, not a paragraph
+        if len(b.split()) <= 12 and not b.endswith((".", "!", "?", ":", ";")) and "\n" not in b:
+            flush()
+            section = b
+            continue
+        w = len(b.split())
+        if n and n + w > target_words:
+            flush()
+        buf.append(b)
+        n += w
+    flush()
+    return out
+
+
+# ---------------------------------------------------------------------------- local BM25
+
+
+@dataclass
+class LocalRetriever:
+    """BM25 over the document pool. Deterministic, offline, and the fallback when Pinecone is unavailable."""
+
+    passages: list[Passage] = field(default_factory=list)
+    k1: float = 1.5
+    b: float = 0.75
+    _df: Counter = field(default_factory=Counter, repr=False)
+    _toks: list[list[str]] = field(default_factory=list, repr=False)
+    _avg: float = 0.0
+
+    @classmethod
+    def from_pool(cls, path: Path = _POOL, *, limit: int = 0, target_words: int = 110) -> "LocalRetriever":
+        passages: list[Passage] = []
+        if path.exists():
+            for i, line in enumerate(path.open(encoding="utf-8")):
+                if limit and i >= limit:
+                    break
+                try:
+                    d = json.loads(line)
+                except ValueError:
+                    continue
+                doc_id = str(d.get("pageid") or d.get("doc_id") or i)
+                for p in split_passages(d.get("text") or "", target_words=target_words, doc_id=doc_id,
+                                        title=str(d.get("title") or ""), lang=str(d.get("lang") or "")):
+                    p.id = f"{doc_id}#{p.id}"
+                    passages.append(p)
+        return cls.build(passages)
+
+    @classmethod
+    def build(cls, passages: list[Passage]) -> "LocalRetriever":
+        r = cls(passages=passages)
+        r._toks = [_tok(f"{p.title} {p.section} {p.text}") for p in passages]
+        for t in r._toks:
+            r._df.update(set(t))
+        r._avg = (sum(len(t) for t in r._toks) / len(r._toks)) if r._toks else 0.0
+        return r
+
+    def search(self, query: str, *, k: int = 4, lang: str = "") -> list[Passage]:
+        q = _tok(query)
+        if not q or not self.passages:
+            return []
+        n = len(self.passages)
+        scored: list[tuple[float, int]] = []
+        for i, toks in enumerate(self._toks):
+            if lang and self.passages[i].lang and self.passages[i].lang != lang:
+                continue
+            tf = Counter(toks)
+            dl = len(toks) or 1
+            s = 0.0
+            for w in q:
+                f = tf.get(w, 0)
+                if not f:
+                    continue
+                idf = math.log(1 + (n - self._df[w] + 0.5) / (self._df[w] + 0.5))
+                s += idf * (f * (self.k1 + 1)) / (f + self.k1 * (1 - self.b + self.b * dl / (self._avg or 1)))
+            if s > 0:
+                scored.append((s, i))
+        scored.sort(key=lambda x: -x[0])
+        hits = []
+        top = scored[0][0] if scored else 1.0
+        for s, i in scored[:k]:
+            p = self.passages[i]
+            hits.append(Passage(p.id, p.doc_id, p.title, p.section, p.text,
+                                score=round(s / (top or 1), 3), lang=p.lang))
+        return hits
+
+
+# ---------------------------------------------------------------------------- pinecone
+
+
+class PineconeRetriever:
+    """Pinecone with integrated embedding. Imported lazily so the module works without the SDK installed."""
+
+    def __init__(self, index: str = "", namespace: str = "docs", model: str = ""):
+        from pinecone import Pinecone  # noqa: PLC0415 -- optional dependency
+
+        key = os.environ.get("PINECONE_API_KEY")
+        if not key:
+            raise RuntimeError("PINECONE_API_KEY is not set")
+        self.model = model or os.environ.get("PINECONE_MODEL", "llama-text-embed-v2")
+        self.name = index or os.environ.get("PINECONE_INDEX", "hera")
+        self.namespace = namespace
+        self._pc = Pinecone(api_key=key)
+        self._index = self._pc.Index(self.name)
+
+    def search(self, query: str, *, k: int = 4, lang: str = "") -> list[Passage]:
+        flt = {"lang": {"$eq": lang}} if lang else None
+        res = self._index.search(
+            namespace=self.namespace,
+            query={"inputs": {"text": query}, "top_k": k, **({"filter": flt} if flt else {})},
+            fields=["text", "title", "section", "doc_id", "lang"],
+        )
+        out = []
+        for hit in (res.get("result", {}) or {}).get("hits", []) or []:
+            f = hit.get("fields", {}) or {}
+            out.append(Passage(id=str(hit.get("_id")), doc_id=str(f.get("doc_id") or ""),
+                               title=str(f.get("title") or ""), section=str(f.get("section") or ""),
+                               text=str(f.get("text") or ""), score=round(float(hit.get("_score") or 0), 3),
+                               lang=str(f.get("lang") or "")))
+        return out
+
+    # ---- ingest
+
+    def ensure_index(self, *, region: str = "") -> None:
+        from pinecone import ServerlessSpec  # noqa: PLC0415
+
+        region = region or os.environ.get("PINECONE_REGION", "us-east-1")
+        if self.name in [i["name"] for i in self._pc.list_indexes()]:
+            return
+        self._pc.create_index_for_model(
+            name=self.name,
+            cloud="aws", region=region,
+            embed={"model": self.model, "field_map": {"text": "text"}},
+            spec=ServerlessSpec(cloud="aws", region=region),
+        )
+
+    def upsert(self, passages: Iterable[Passage], *, batch: int = 90) -> int:
+        """Upsert with integrated embedding -- Pinecone does the embedding, so no embedding model here."""
+        buf, total = [], 0
+        for p in passages:
+            buf.append({"_id": p.id, "text": p.text, "title": p.title, "section": p.section,
+                        "doc_id": p.doc_id, "lang": p.lang})
+            if len(buf) >= batch:
+                self._index.upsert_records(self.namespace, buf)
+                total += len(buf)
+                buf = []
+        if buf:
+            self._index.upsert_records(self.namespace, buf)
+            total += len(buf)
+        return total
+
+
+def get_retriever(prefer_pinecone: bool = True, **kw) -> Retriever:
+    """Pinecone when it is configured AND reachable, otherwise the local index.
+
+    Falling back rather than failing is deliberate: retrieval quality changes how realistic the sample is,
+    but a missing service should not stop a run, and the local path is good enough to generate against.
+    """
+    if prefer_pinecone and os.environ.get("PINECONE_API_KEY"):
+        try:
+            return PineconeRetriever(**kw)
+        except Exception as exc:  # noqa: BLE001 -- any SDK/network/auth failure means "use local"
+            print(f"  [retrieval] pinecone unavailable ({type(exc).__name__}), using the local index")
+    return LocalRetriever.from_pool()
+
+
+def render(passages: list[Passage], *, note: str = "") -> str:
+    """Format passages the way a retriever returns them: ranked, labelled, scored.
+
+    The id is what a citation points at, and the score is what makes "the top hit is not always the answer"
+    visible to the model reading it.
+    """
+    if not passages:
+        return "No passages matched." + (f" {note}" if note else "")
+    out = []
+    for p in passages:
+        head = f"[{p.id}] score={p.score:.2f}"
+        if p.title:
+            head += f" | {p.title}"
+        if p.section:
+            head += f" > {p.section}"
+        out.append(f"{head}\n{p.text}")
+    return "\n\n".join(out)
+
+
+def _ingest_cli() -> None:
+    """python -m agents.retrieval --ingest [--limit N] [--dry-run]
+
+    Chunks the document pool and upserts it with integrated embedding. Pinecone embeds server-side, so there
+    is no embedding model or GPU on this side and no vector ever crosses the wire.
+    """
+    import argparse
+
+    ap = argparse.ArgumentParser(description="ingest the document pool into Pinecone")
+    ap.add_argument("--ingest", action="store_true")
+    ap.add_argument("--limit", type=int, default=0, help="documents to read (0 = all)")
+    ap.add_argument("--target-words", type=int, default=110)
+    ap.add_argument("--namespace", default="docs")
+    ap.add_argument("--dry-run", action="store_true", help="chunk and report, upsert nothing")
+    a = ap.parse_args()
+
+    rows = []
+    if _POOL.exists():
+        for i, line in enumerate(_POOL.open(encoding="utf-8")):
+            if a.limit and i >= a.limit:
+                break
+            try:
+                rows.append(json.loads(line))
+            except ValueError:
+                continue
+    passages: list[Passage] = []
+    for i, d in enumerate(rows):
+        doc_id = str(d.get("pageid") or d.get("doc_id") or i)
+        for p in split_passages(d.get("text") or "", target_words=a.target_words, doc_id=doc_id,
+                                title=str(d.get("title") or ""), lang=str(d.get("lang") or "")):
+            p.id = f"{doc_id}#{p.id}"
+            passages.append(p)
+    words = sum(p.words() for p in passages)
+    print(f"{len(rows):,} documents -> {len(passages):,} passages, {words:,} words "
+          f"(median {sorted(p.words() for p in passages)[len(passages) // 2] if passages else 0} per passage)")
+    if a.dry_run or not a.ingest:
+        print("dry run: nothing upserted")
+        return
+    r = PineconeRetriever(namespace=a.namespace)
+    r.ensure_index()
+    n = r.upsert(passages)
+    print(f"upserted {n:,} passages into {r.name}/{a.namespace} with {r.model}")
+
+
+if __name__ == "__main__":
+    _ingest_cli()
