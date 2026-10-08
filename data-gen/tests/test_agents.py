@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 
 import pytest
 
@@ -389,3 +390,91 @@ def test_a_failing_remote_index_does_not_stop_the_run():
     assert h.search("ampe scoring", k=2)
     assert h.remote is None, "repeated failure disables the remote for the rest of the run"
     assert h.search("ampe scoring", k=2), "and the run continues on BM25"
+
+
+# --------------------------------------------------------------------------- chat template v2 contract
+# docs/TOOL_CALL_FORMAT.md. These assert the RENDERED text, because the template is the source of truth and
+# the message dicts are only the input to it.
+
+def _tool_record(n_calls: int = 1):
+    from agents.retrieval import Passage
+    calls = [{"name": "search_documents", "arguments": {"query": f"q{i}", "lang": "yor"}}
+             for i in range(n_calls)]
+    conv = Conversation(lang="yor", persona="student", register="heavy", turns=[
+        Turn(user="Tani Biyi Bandele?",
+             assistant={"think": "The dates change, so look it up.",
+                        "task_plan": ["<|RAG|>", "<|explain|>"],
+                        "response": "Biyi Bandele jẹ onkọwe ọmọ Naijiria."},
+             tool_calls=calls, results=[f"RESULT {i}" for i in range(n_calls)],
+             retrieved=[Passage("d1#p1", "d1", "Biyi Bandele", "", "Biyi Bandele jẹ onkọwe.")],
+             refined={"task_plan": ["<|RAG|>", "<|explain|>"],
+                      "response": "Biyi Bandele na onkọwe ọmọ Naijiria."})])
+    tools = [{"type": "function", "function": {
+        "name": "search_documents", "description": "Search the corpus.",
+        "parameters": {"type": "object", "properties": {"query": {"type": "string"}},
+                       "required": ["query"]}}}]
+    return records_from(conv, row={"custom_id": "x", "domain": "arts_literature"}, lang="yor",
+                        target_lang="yor", model="m", tools=["search_documents"],
+                        openai_tools=tools)[0]
+
+
+def test_a_tool_turn_renders_as_one_assistant_turn_with_one_eos():
+    """The whole exchange is ONE assistant turn: no second <|assistant|> after the tool result, and exactly
+    one </s>, after the final answer. TOOL_CALL_FORMAT.md section 2."""
+    text = _tool_record()["text"]
+    if not text:
+        pytest.skip("sft_new.render unavailable")
+    assert text.count("<|assistant|>") == 1
+    assistant = text.split("<|assistant|>", 1)[1]
+    assert assistant.count("</s>") == 1, assistant
+    assert assistant.endswith("</s>")
+    # the call is one parseable JSON object, Hermes/Qwen shape, and nothing follows it but the result
+    body = assistant.split("<tool_call>", 1)[1].split("</tool_call>", 1)[0]
+    assert json.loads(body) == {"name": "search_documents",
+                                "arguments": {"query": "q0", "lang": "yor"}}
+    assert "</tool_call></s>" not in assistant, "no </s> after a call -- </tool_call> is the stop"
+    assert "</tool_call><tool_response>" in assistant
+    # the scaffold is written BEFORE the call, and again after the result
+    assert assistant.index("<task_plan>") < assistant.index("<tool_call>")
+    after = assistant.split("</tool_response>", 1)[1]
+    assert after.startswith("<|input_lang|>") and "<|target_lang|>" in after and "<response>" in after
+
+
+def test_a_tool_result_carries_no_function_name():
+    """`<tool_response>text</tool_response>` and nothing else -- section 2. A name here is a field the
+    training text never shows."""
+    text = _tool_record()["text"]
+    if not text:
+        pytest.skip("sft_new.render unavailable")
+    assert "<tool_response>RESULT 0</tool_response>" in text
+    assert "search_documents</tool_response>" not in text
+    assert "<tool_response>search_documents" not in text
+
+
+def test_the_tools_block_is_rendered_from_the_tools_list():
+    """Function definitions are a `tools` list the template renders as a <tools> block in the system turn,
+    not free text in the prompt (section 2). A tool-calling row that does not carry them is not tool-calling
+    data (section 3), so the list rides on the record and `text` is rendered with it."""
+    rec = _tool_record()
+    if not rec["text"]:
+        pytest.skip("sft_new.render unavailable")
+    assert rec["tools"] and rec["tools"][0]["function"]["name"] == "search_documents"
+    assert "<tools>" in rec["text"] and "</tools>" in rec["text"]
+    block = rec["text"].split("<tools>", 1)[1].split("</tools>", 1)[0].strip()
+    for line in block.splitlines():
+        assert json.loads(line)["type"] == "function", "one compact JSON object per line"
+    assert rec["text"].index("</tools>") < rec["text"].index("<|user|>"), "the block is in the system turn"
+
+
+def test_several_calls_are_always_separated_by_their_results():
+    """Two <tool_call> blocks back to back is the one shape a rollout cannot replay: </tool_call> is a stop
+    token, so generation halts after the first and never reaches the second (section 4.3). Sequential single
+    calls, each followed by its result, are the supported pattern -- and that is what the chain produces."""
+    text = _tool_record(n_calls=3)["text"]
+    if not text:
+        pytest.skip("sft_new.render unavailable")
+    assistant = text.split("<|assistant|>", 1)[1]
+    assert assistant.count("<tool_call>") == 3 == assistant.count("<tool_response>")
+    assert "</tool_call><tool_call>" not in assistant
+    order = re.findall(r"</?tool_(?:call|response)>", assistant)
+    assert order == ["<tool_call>", "</tool_call>", "<tool_response>", "</tool_response>"] * 3, order

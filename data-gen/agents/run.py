@@ -51,21 +51,47 @@ def build_ask(provider, *, temperature: float = 0.85, tag: str = "agent"):
     return ask
 
 
-def tool_specs(seed: Seed, names: list[str]) -> list[dict]:
-    """The seed's own tool definitions, so the agent sees exactly what the single-call path advertises."""
-    out = []
+def _seed_tool(seed: Seed, name: str) -> Optional[tuple[str, dict]]:
     for t in (seed.tools or []):
-        name = t.get("name") if isinstance(t, dict) else getattr(t, "name", None)
-        if name not in names:
+        n = t.get("name") if isinstance(t, dict) else getattr(t, "name", None)
+        if n != name:
             continue
         if isinstance(t, dict):
-            params = t.get("parameters") or {}
-            desc = t.get("description") or ""
-        else:
-            params = getattr(t, "parameters", None) or {}
-            desc = getattr(t, "description", "") or ""
+            return (t.get("description") or ""), (t.get("parameters") or {})
+        return (getattr(t, "description", "") or ""), (getattr(t, "parameters", None) or {})
+    return None
+
+
+def tool_specs(seed: Seed, names: list[str]) -> list[dict]:
+    """The seed's own tool definitions, flattened for the agent's own system prompt."""
+    out = []
+    for name in names:
+        got = _seed_tool(seed, name)
+        if not got:
+            continue
+        desc, params = got
         props = (params.get("properties") if isinstance(params, dict) else None) or {}
         out.append({"name": name, "description": desc, "arguments": props})
+    return out
+
+
+def openai_tools(seed: Seed, names: list[str]) -> list[dict]:
+    """The same tools in the shape the chat template expects as its `tools` argument.
+
+    docs/TOOL_CALL_FORMAT.md section 2: function definitions are no longer free text in the system prompt --
+    they are a `tools` list the template renders as a `<tools>` block, one compact JSON object per line, in
+    the system turn. A tool-calling row that does not carry them is not tool-calling data (section 3), so
+    this rides on every record and is passed when the `text` column is rendered.
+    """
+    out = []
+    for name in names:
+        got = _seed_tool(seed, name)
+        if not got:
+            continue
+        desc, params = got
+        out.append({"type": "function",
+                    "function": {"name": name, "description": desc,
+                                 "parameters": params if isinstance(params, dict) else {}}})
     return out
 
 
@@ -129,6 +155,7 @@ def run_row(seed: Seed, row: dict, provider, *, retriever: Optional[Retriever] =
                 tags=list(row.get("tags") or []), library=library)
     conv = loop.run(n_turns, findings_for=findings_for)
     kw = dict(row=row, lang=lang.code, target_lang=row.get("target_lang") or lang.code,
+              openai_tools=openai_tools(seed, names),
               model=model or getattr(provider, "model", ""), subject=subject,
               tasks=list(row.get("tasks") or ([row["task"]] if row.get("task") else [])),
               tools=names)

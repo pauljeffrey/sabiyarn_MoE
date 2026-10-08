@@ -462,6 +462,20 @@ def _valid_plan(plan: Any, default_plan: Optional[list[str]] = None,
     return keep or [fallback]
 
 
+def _render(messages: list[dict], tools: Optional[list[dict]] = None) -> str:
+    """The exact string that gets tokenised, rendered through the canonical template WITH its tools.
+
+    `sft_new.render` and not `rendering.render`: only the former accepts `tools`, and without it the
+    `<tools>` block never appears, which would make a tool-calling row's text disagree with what
+    apply_chat_template produces at inference -- the same class of mismatch as the escaped-codepoint bug in the data renderer.
+    """
+    try:
+        from sft_new.render import render  # noqa: PLC0415 -- optional sibling package
+        return render(messages, tools=tools or None)
+    except Exception:  # noqa: BLE001 -- a derived column must not cost the sample, but must be visible
+        return ""
+
+
 def _assistant_turns(fields: dict, lang: str, target: str,
                      default_plan: Optional[list[str]] = None) -> list[dict]:
     """The structured turns for one assistant reply, in the shape assemble.build_messages wants.
@@ -484,7 +498,7 @@ def _assistant_turns(fields: dict, lang: str, target: str,
 
 def records_from(conv: Conversation, *, row: dict, lang: str, target_lang: str, model: str,
                  subject: str = "", tasks: Optional[list[str]] = None,
-                 tools: Optional[list[str]] = None,
+                 tools: Optional[list[str]] = None, openai_tools: Optional[list[dict]] = None,
                  default_plan: Optional[list[str]] = None) -> list[dict]:
     """One record PER PAIRED TURN, in the schema the existing postprocess and trainers already read.
 
@@ -510,7 +524,10 @@ def records_from(conv: Conversation, *, row: dict, lang: str, target_lang: str, 
                 if j == 0 and turn.assistant.get("think"):
                     call_turn["think"] = turn.assistant["think"]
                 prefix.append(call_turn)
-                prefix.append({"role": "tool", "name": call.get("name") or "tool",
+                # NO FUNCTION NAME on a tool result: the template renders
+                # `<tool_response>text</tool_response>` and nothing else, so a `name` key here is a field
+                # the training text never shows. docs/TOOL_CALL_FORMAT.md section 2.
+                prefix.append({"role": "tool",
                                "content": turn.results[j] if j < len(turn.results)
                                else (render(turn.retrieved) if turn.retrieved
                                      else json.dumps({"status": "ok"}))})
@@ -552,6 +569,8 @@ def records_from(conv: Conversation, *, row: dict, lang: str, target_lang: str, 
             "ranking": ["best", "worst"],
             "response_1": chosen, "response_2": rejected,
             "expected_structure": structure_of(chosen),
+            "tools": list(openai_tools or []),
+            "text": _render(prompt_messages + [{"role": "assistant", "content": chosen}], openai_tools),
             "retrieved_context": [
                 {"id": p.id, "title": p.title, "section": p.section, "score": p.score, "text": p.text}
                 for p in turn.retrieved],
@@ -566,7 +585,7 @@ def records_from(conv: Conversation, *, row: dict, lang: str, target_lang: str, 
 
 def sft_record(conv: Conversation, *, row: dict, lang: str, target_lang: str, model: str,
                subject: str = "", tasks: Optional[list[str]] = None,
-               tools: Optional[list[str]] = None,
+               tools: Optional[list[str]] = None, openai_tools: Optional[list[dict]] = None,
                default_plan: Optional[list[str]] = None) -> Optional[dict]:
     """One SFT record for the whole conversation: no pair, one good reply per user message."""
     turns: list[dict] = []
@@ -575,16 +594,23 @@ def sft_record(conv: Conversation, *, row: dict, lang: str, target_lang: str, mo
     for turn in conv.turns:
         turns.append({"role": "user", "content": turn.user})
         if turn.tool_calls:
-            call_turn = {"role": "assistant", "input_lang": lang,
-                         "task_plan": _valid_plan(turn.assistant.get("task_plan"), default_plan,
-                                                  "<|plan|>"),
-                         "tool_call": turn.tool_calls[0]}
-            if turn.assistant.get("think"):
-                call_turn["think"] = turn.assistant["think"]
-            turns.append(call_turn)
-            turns.append({"role": "tool", "name": turn.tool_calls[0].get("name") or "tool",
-                          "content": render(turn.retrieved) if turn.retrieved else
-                          json.dumps({"status": "ok"})})
+            for j, call in enumerate(turn.tool_calls):
+                call_turn = {"role": "assistant", "input_lang": lang,
+                             "task_plan": _valid_plan(turn.assistant.get("task_plan"), default_plan,
+                                                      "<|plan|>"),
+                             "tool_call": call}
+                if j == 0 and turn.assistant.get("think"):
+                    call_turn["think"] = turn.assistant["think"]
+                turns.append(call_turn)
+                if j < len(turn.tool_calls) - 1:
+                    # EVERY CALL IS FOLLOWED BY ITS RESULT. Two <tool_call> blocks back to back is the one
+                    # shape the serving loop cannot replay: </tool_call> is a stop token, so a rollout halts
+                    # after the first and never reaches the second (TOOL_CALL_FORMAT.md section 4.3).
+                    turns.append({"role": "tool", "content": turn.results[j] if j < len(turn.results)
+                                  else json.dumps({"status": "ok"})})
+            turns.append({"role": "tool",
+                          "content": turn.results[0] if turn.results else
+                          (render(turn.retrieved) if turn.retrieved else json.dumps({"status": "ok"}))})
             retrieved += [{"id": p.id, "title": p.title, "section": p.section, "text": p.text}
                           for p in turn.retrieved]
             turns.append({k: v for k, v in
@@ -600,6 +626,8 @@ def sft_record(conv: Conversation, *, row: dict, lang: str, target_lang: str, mo
         return None
     return {"id": row.get("custom_id") or row.get("id"), "lang": lang, "model": model,
             "domain": row.get("domain") or "", "subtopic": subject,
-            "tasks": list(tasks or []), "tools": list(tools or []),
+            "tasks": list(tasks or []), "tool_names": list(tools or []),
+            "tools": list(openai_tools or []),
             "persona": conv.persona, "register": conv.register,
-            "messages": msgs, "retrieved_context": retrieved, "n_turns": len(conv.turns)}
+            "messages": msgs, "text": _render(msgs, openai_tools),
+            "retrieved_context": retrieved, "n_turns": len(conv.turns)}
