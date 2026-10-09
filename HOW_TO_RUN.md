@@ -497,6 +497,43 @@ python -m sft_new.combine --stats /path/to/scratch/sft-all                      
 See `data-gen/sft_new/SAMPLES.md` for converted examples of every source, and the module docstrings of `old_format.py`, `tagged_parse.py`,
 `langdetect.py` and `converters.py` for the rules (language certainty levels, the `unsure, but most likely` form, what is dropped and why).
 
+### 2.15 Serving it as an agent (tools, RAG, structured output)
+
+`agent/` is a standalone agentic runtime for the trained model, following chat
+template v2 ([docs/TOOL_CALL_FORMAT.md](docs/TOOL_CALL_FORMAT.md)): it passes the
+function schemas as `tools=` so they render as a `<tools>` block, stops at
+`</tool_call>`, runs the Python function, appends
+`<tool_response>RESULT</tool_response>`, and lets the model continue the SAME
+turn. Full documentation: [agent/README.md](agent/README.md).
+
+```python
+from agent import Agent, HFBackend, tool
+
+@tool
+def get_weather(city: str) -> dict:
+    """Current weather for a city."""
+    return {"city": city, "temp": 31}
+
+bot = Agent(HFBackend(model, tokenizer), tools=[get_weather])
+bot.chat("What's the weather in Lagos?")
+```
+
+The core is standard-library only, so the directory ports to another codebase
+as-is; `torch`/`transformers` are needed only for `HFBackend` and `pydantic`
+only for model-class schemas. Try it without a GPU:
+
+```bash
+python -m agent.example --dry-run
+```
+
+Its renderer is pinned byte-for-byte against `sabiyarn/chat_template.jinja`
+(`tests/test_agent_render_parity.py`), because jinja2 is not a root dependency
+and `tokenizer.apply_chat_template` is therefore unavailable in this env.
+`data-gen/agents/loop.py` uses this package rather than its own copy of the
+format.
+
+---
+
 ## 3. Tests
 
 ```bash

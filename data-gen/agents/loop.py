@@ -468,11 +468,30 @@ def _render(messages: list[dict], tools: Optional[list[dict]] = None) -> str:
     `sft_new.render` and not `rendering.render`: only the former accepts `tools`, and without it the
     `<tools>` block never appears, which would make a tool-calling row's text disagree with what
     apply_chat_template produces at inference -- the same class of mismatch as the escaped-codepoint bug in the data renderer.
+
+    Falls back to `agent.protocol.render` (the repo's standalone agent framework) rather than to "".
+    That fallback is a hand-written equivalent of the same template, pinned to it byte-for-byte by
+    tests/test_agent_render_parity.py, and it needs no jinja2 -- so an import or environment problem in
+    sft_new costs a slightly weaker guarantee instead of silently emptying the `text` column of every row
+    in the run. The template path stays FIRST on purpose: for the column that actually gets tokenised,
+    rendering through the template beats rendering through a copy of it.
     """
     try:
         from sft_new.render import render  # noqa: PLC0415 -- optional sibling package
         return render(messages, tools=tools or None)
-    except Exception:  # noqa: BLE001 -- a derived column must not cost the sample, but must be visible
+    except Exception:  # noqa: BLE001 -- fall through to the dependency-free renderer
+        pass
+    try:
+        import sys  # noqa: PLC0415
+        from pathlib import Path  # noqa: PLC0415
+
+        root = str(Path(__file__).resolve().parents[2])
+        if root not in sys.path:
+            sys.path.insert(0, root)
+        from agent.protocol import render as agent_render  # noqa: PLC0415
+
+        return agent_render(messages, tools=tools or None, add_generation_prompt=False)
+    except Exception:  # noqa: BLE001 -- a derived column must not cost the sample
         return ""
 
 
