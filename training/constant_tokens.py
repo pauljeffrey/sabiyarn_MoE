@@ -45,6 +45,10 @@ _id = lambda s: tokenizer.encode(s, add_special_tokens=False)[-1]
 system_token = _id("<|system|>")
 user_token = _id("<|user|>")
 assistant_token = _id("<|assistant|>")
+# Spans that are INPUT to the model even when they sit inside an assistant turn's neighbourhood: what a tool returned, and retrieved RAG context.
+# SFT masks them out of the loss (training/label_masking.process_sft_labels_turns).
+tool_response_tokens = (_id("<tool_response>"), _id("</tool_response>"))
+context_tokens = (_id("<context>"), _id("</context>"))
 
 # Task tokens
 lang_id_token = _id("<lang_ID>")

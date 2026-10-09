@@ -61,3 +61,15 @@ def test_lifetime_fields_are_omitted_when_there_is_no_earlier_run():
     t.tokens_seen = 5
     assert "lifetime_tokens_seen_b" not in t._token_log_fields()
     assert "train/lifetime_tokens_seen" not in t._token_metrics()
+
+
+def test_every_log_interval_reports_tokens_seen_lifetime_and_per_bin_counts():
+    t = make_trainer()
+    t.tokens_seen = 3_000
+    t.tokens_seen_offset = 1_000
+    t.tokens_seen_by_bin = {"eng_training": 1_000, "training_cleaned": 1_200, "other_african_pretrain": 800}
+    for fields in (t._token_log_fields(), t._token_metrics()):
+        assert fields["tokens_seen"] == 3_000 and fields["tokens_seen_lifetime"] == 4_000
+        assert fields["tokens_seen/other_african_pretrain"] == 800 and fields["tokens_seen/eng_training"] == 1_000
+    t.tokens_seen_offset = 0
+    assert t._token_log_fields()["tokens_seen_lifetime"] == 3_000  # the new names are always present

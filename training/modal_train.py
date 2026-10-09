@@ -6,10 +6,11 @@ GPU topology (num_nodes, gpus_per_node, gpu_type) is read from train_config.yaml
 per Function, not a runtime argument. Edit the yaml and redeploy to change
 topology. `mode` and `override` remain true runtime arguments.
 
-Every training run syncs and mixes *both* the eng and afr bins configured under
-`data.<mode>` -- there's no `--data-type` flag here (that only makes sense for
-`data/prepare_modal.py`, which tokenizes one language's raw datasets at a time).
-The eng/afr mix ratio is controlled by `data.sampling` in train_config.yaml.
+Every training run syncs and mixes *all* the bins configured under `data.<mode>`
+(eng, afr and, for pretraining, other_afr) -- there's no `--data-type` flag here (that only makes
+sense for `data/prepare_modal.py`, which tokenizes one language's raw datasets at a time).
+The mix ratio is controlled by `data.sampling` in train_config.yaml. The stratified-eval manifest
+(training.eval_manifest_path) is synced next to the eval bin and passed as EVAL_MANIFEST_PATH.
 
 Multi-node rendezvous uses modal.experimental.clustered()/get_cluster_info(),
 which provisions `num_nodes` networked containers per invocation and hands back
@@ -44,7 +45,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from training.load_config import load_train_config
-from training.s3_utils import sync_training_files
+from training.s3_utils import sync_eval_manifest, sync_training_files
 
 DATA_DIR = "/data"
 CONFIG_PATH = str(ROOT / "training" / "train_config.yaml")
@@ -155,6 +156,20 @@ def _sync_data(env: dict[str, str]) -> None:
         env["TRAIN_DATA_PATHS_LOCAL"] = ",".join(local_train)
     if local_eval:
         env["VAL_DATA_PATH"] = local_eval
+    # The stratified-eval manifest (training.eval_manifest_path) travels with the eval bin; it is
+    # only used for pretraining, so skip it for other modes.
+    if cfg.eval_manifest_path and env.get("TRAIN_MODE", "pretrain") == "pretrain":
+        local_manifest = sync_eval_manifest(
+            cfg.eval_manifest_path,
+            DATA_DIR,
+            bucket=cfg.s3_bucket,
+            endpoint=cfg.s3_endpoint,
+            access_key=cfg.s3_access_key,
+            secret_key=cfg.s3_secret_key,
+            prefix=cfg.s3_prefix,
+        )
+        print(f"[data sync] eval manifest: {local_manifest}")
+        env["EVAL_MANIFEST_PATH"] = local_manifest
 
 
 def _run_and_commit(cmd: list[str], env: dict[str, str]) -> None:

@@ -31,14 +31,24 @@ from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.optim import AdamW
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from training.constant_tokens import MASK, assistant_token, end_of_text_token, system_token, user_token
+from training.constant_tokens import MASK, assistant_token, context_tokens, end_of_text_token, system_token, tool_response_tokens, user_token
 from training.label_masking import apply_label_mask
 from sabiyarn.hub import register_local_model_code  # noqa: F401  (re-exported for tests)
-from training.load_config import TrainConfig, load_train_config, sampling_weights
+from training.load_config import (
+    TrainConfig,
+    active_bin_indices,
+    load_train_config,
+    mixture_weights,
+    sampling_weights,
+    select_bin_weights,
+)
+from training.log_format import format_eval_block, format_step_line
 from training.mfu import compute_mfu, model_flops_per_token, peak_flops_for_current_device
 from training.lr_schedule import lr_at
 from training.muon import Muon, split_muon_params
 from training.data_sampler import MixedBlockSampler, n_blocks_for, read_blocks
+from training.eval_plan import build_eval_plan, load_manifest, read_windows, resolve_manifest_path, summarize_segments
+from training.token_accounting import record_micro_batch, restore_token_state, token_metrics, token_state_for_save
 from training.curated_eval import CuratedTotals, build_sequence, load_curated_samples, resolve_path
 from training.tracking import MlflowTracker, bits_per_byte, build_token_byte_lengths
 from training.s3_utils import (
@@ -210,6 +220,12 @@ class Trainer:
         self.tokens_seen_offset = 0
         self.tokens_seen_by_bin: dict[str, int] = {}
         self._tokens_seen_estimated = False
+        # tokens_seen / by-bin as of the best checkpoint, written next to its weights so a resume
+        # from ckpt_best restores exact counts instead of an estimate (see token_accounting.py).
+        self._best_tokens: dict | None = None
+        self._eval_plan = None  # stratified eval plan (training/eval_plan.py), None = original eval
+        self._eval_sanity_limit: int | None = None  # tokens of the eval bin the sanity batch may draw from
+        self._bin_index: tuple[int, ...] | None = None  # kept train bins as indices into [eng, afr, other_afr]
         self._last_train_bin = None
         self._fresh_start_active = False  # set by _setup_dirs: this process is the one-time step-0 restart
         self._fresh_started = False  # persisted in trainer_state.json: this run dir began as a fresh start
@@ -368,13 +384,40 @@ class Trainer:
                 bins={n: {"blocks": b, "tokens_b": round(b * sl / 1e9, 3)} for n, b in zip(names, blocks)},
                 eval_blocks=eval_blocks,
             )
+        self._eval_plan = self._build_eval_plan()
+
+    def _build_eval_plan(self):
+        """Stratified eval plan from the manifest next to the eval bin, or None when no manifest is
+        configured (the original single random fixed eval set). Fails at startup, not mid-run, if the
+        manifest is missing or does not describe this bin."""
+        if not self.cfg.eval_manifest_path or not self.cfg.is_pretrain:
+            return None
+        path = resolve_manifest_path(self.cfg.eval_manifest_path, self.eval_bin)
+        manifest = load_manifest(path, file_tokens=len(self._read_memmap(self.eval_bin)))
+        plan = build_eval_plan(
+            manifest, block_size=self.cfg.block_size, total_blocks=self.cfg.eval_total_blocks,
+            old_share=self.cfg.eval_old_share, seed=self.cfg.seed + 2,
+        )
+        old = next((s for s in manifest.segments if s.name == "old"), None)
+        self._eval_sanity_limit = old.end if old is not None else None
+        if self.master:
+            (LOG.warning if plan.n_blocks < plan.requested_total else LOG.info)(
+                "eval_plan", manifest=path, requested_blocks=plan.requested_total, blocks=plan.n_blocks,
+                tokens_m=round(plan.n_blocks * self.cfg.block_size / 1e6, 2), segments=plan.describe(),
+            )
+        return plan
+
+    def _kept_bins(self) -> tuple[int, ...]:
+        """Indices into [eng, afr, other_afr] of the train bins this trainer actually opened."""
+        idx = getattr(self, "_bin_index", None)
+        return idx if idx is not None else tuple(range(len(self.train_bins)))
 
     def _bin_weights(self) -> tuple[float, ...]:
-        if len(self.train_bins) == 1:
+        """Per-kept-bin sampling weights for MixedBlockSampler (1, 2 or 3 bins), normalised."""
+        idx = self._kept_bins()
+        if len(idx) == 1:
             return (1.0,)
-        if len(self.train_bins) == 2:
-            return self._sampling_weights()
-        return tuple([1.0 / len(self.train_bins)] * len(self.train_bins))
+        return select_bin_weights(self._sampling_weights(), idx)
 
     def _resolve_max_iters(self) -> None:
         """If training.max_tokens / optimizer.max_tokens is set, derive max_iters from
@@ -403,6 +446,28 @@ class Trainer:
             register_local_model_code()
             return GPTJXMoEForCausalLM.from_pretrained(path, **kwargs)
         return AutoModelForCausalLM.from_pretrained(path, trust_remote_code=True, **kwargs)
+
+    def _resize_for_sft(self) -> None:
+        """Grow wte/lm_head/wpe to the SFT shape. Runs on the freshly loaded base model, BEFORE any resumed state
+        dict is loaded, so a resumed SFT checkpoint (already 52160 x 65536) loads strictly into a matching model.
+        The regressor only fills positions on a fresh start: a resumed run's rows are already trained."""
+        c = self.cfg
+        if not (c.resize_vocab_size or c.resize_block_size):
+            return
+        from sabiyarn.model.resize import piece_map_from_hub, resize_for_sft
+        piece_map = None
+        if c.resize_vocab_size and c.init_from != "resume":               # fresh rows only: a resumed run's new rows are already trained
+            try:                                                           # new tokens start as the mean of their pieces (tags, "arguments", ...)
+                piece_map = piece_map_from_hub(self.cfg.tokenizer_name, self.model.transformer.wte.weight.shape[0])
+            except Exception as e:                                         # noqa: BLE001 -- offline: fall back to mean + noise, say so
+                LOG.warning("piece_init_unavailable_using_mean_noise", error=str(e)[:200])
+        report = resize_for_sft(self.model, vocab_size=c.resize_vocab_size or None,
+                                block_size=c.resize_block_size or self.model.config.block_size, piece_map=piece_map)
+        if c.fill_positions_from and c.init_from != "resume":
+            from sabiyarn.model.position_regressor import fill_untrained_positions
+            report["position_fill"] = fill_untrained_positions(self.model, n_trained=c.fill_positions_from)
+        if self.master:
+            LOG.info("sft_resize", **report)
 
     def _apply_model_options(self) -> None:
         """Apply yaml model options that are not stored in checkpoints."""
@@ -528,6 +593,8 @@ class Trainer:
                     meta["best_iter_num"] = meta.get("iter_num", 0)
                     meta["best_sanity_loss"] = meta.get("sanity_loss")
                     meta["best_sanity_batch_hash"] = meta.get("sanity_batch_hash")
+                    meta["best_tokens_seen"] = meta.get("tokens_seen")
+                    meta["best_tokens_seen_by_bin"] = meta.get("tokens_seen_by_bin")
                     with open(meta_path, "w") as f:
                         json.dump(meta, f)
                     LOG.info(
@@ -768,8 +835,31 @@ class Trainer:
         if not self.cfg.train_data_paths:
             raise ValueError("No train_data_paths configured")
 
+        # Bins whose sampling weight is 0 for the whole run are neither checked, opened nor sampled
+        # (the third bin's file need not exist while other_afr_sampling_weight is 0).
+        paths = list(self.cfg.train_data_paths)
+        keep = tuple(range(len(paths)))
+        if 1 < len(paths) <= 3:
+            c = self.cfg
+            live = active_bin_indices(
+                c.eng_sampling_weight, c.afr_sampling_weight, c.other_afr_sampling_weight,
+                c.use_scheduled_sampling, c.sampling_schedule, 3,
+            )
+            unreachable = [i for i in live if i >= len(paths)]
+            if unreachable:
+                msg = (
+                    f"data.sampling gives weight to bin(s) {unreachable} (0=eng, 1=afr, 2=other_afr) but only "
+                    f"{len(paths)} train path(s) are configured: {paths}. A stale TRAIN_DATA_PATHS_LOCAL (e.g. "
+                    "from `python -m data.prefetch_bins --write-env`) lists paths in [eng, afr, other_afr] order "
+                    "-- re-run the prefetch, or set that weight to 0."
+                )
+                if c.is_pretrain:
+                    raise ValueError(msg)
+                LOG.warning("sampling_weight_without_path", detail=msg)
+            keep = tuple(i for i in live if i < len(paths)) or keep
+        train_paths = [paths[i] for i in keep]
         missing = []
-        for path in self.cfg.train_data_paths + [self.cfg.eval_data_path]:
+        for path in train_paths + [self.cfg.eval_data_path]:
             if not os.path.isfile(path) or os.path.getsize(path) == 0:
                 missing.append(path)
         if missing:
@@ -779,7 +869,8 @@ class Trainer:
                 "(bare box / vast.ai), or `modal run data/prepare_modal.py` to build them (Modal)."
             )
 
-        self.train_bins = self.cfg.train_data_paths
+        self.train_bins = train_paths
+        self._bin_index = keep
         self.eval_bin = self.cfg.eval_data_path
         # trust_remote_code=True: see training/constant_tokens.py (interactive prompt on a tty).
         self.tokenizer = AutoTokenizer.from_pretrained(self.cfg.tokenizer_name, trust_remote_code=True)
@@ -848,6 +939,7 @@ class Trainer:
         # _setup_accelerator for why cpu_ram_efficient_loading/
         # sync_module_states aren't used despite the extra host RAM cost).
         self.model = self._load_lm(self.cfg.model_name, torch_dtype=torch_dtype)
+        self._resize_for_sft()
         self._apply_model_options()
         # from_pretrained's torch_dtype cast isn't always exhaustive for every
         # parameter (e.g. LayerNorm weights can be left in the checkpoint's
@@ -1127,14 +1219,19 @@ class Trainer:
                 )
                 # Token accounting: exact if the checkpoint recorded it, else estimated from iter_num
                 # x this run's tokens/step (older checkpoints; wrong if the batch size changed).
-                if meta.get("tokens_seen") is not None and not resume_from_best:
-                    self.tokens_seen = int(meta["tokens_seen"])
-                    self.tokens_seen_by_bin = {k: int(v) for k, v in meta.get("tokens_seen_by_bin", {}).items()}
-                else:
-                    self.tokens_seen = int(self.iter_num * meta.get("tokens_per_step", self._tokens_per_step()))
-                    self.tokens_seen_by_bin = {}
-                    self._tokens_seen_estimated = True
-                self.tokens_seen_offset = int(meta.get("tokens_seen_offset", 0))
+                # Resume from ckpt_best restores the counts saved WITH that checkpoint (best_tokens_seen*)
+                # when present, else estimates them from the rewound iter_num.
+                restored = restore_token_state(
+                    meta, use_best=resume_from_best, iter_num=self.iter_num,
+                    fallback_tokens_per_step=self._tokens_per_step(),
+                )
+                self.tokens_seen, self.tokens_seen_by_bin = restored.seen, restored.by_bin
+                self.tokens_seen_offset, self._tokens_seen_estimated = restored.offset, restored.estimated
+                if meta.get("best_tokens_seen") is not None:
+                    self._best_tokens = {
+                        "seen": int(meta["best_tokens_seen"]),
+                        "by_bin": {k: int(v) for k, v in (meta.get("best_tokens_seen_by_bin") or {}).items()},
+                    }
                 # Data position: continue mid-epoch instead of replaying batches already trained on.
                 # Not restored for a fresh start (new run, new epoch 0), for resume-from-best (its
                 # data position wasn't recorded), or for checkpoints from before this sampler existed.
@@ -1233,6 +1330,7 @@ class Trainer:
             self.tokens_seen_offset += self.tokens_seen  # earlier runs' tokens live on as the lifetime offset
             self.tokens_seen = 0
             self.tokens_seen_by_bin = {}
+            self._best_tokens = None
             self.iter_num = 0
             self.best_val = 1e9
             self._best_ckpt_dir = None
@@ -1271,7 +1369,11 @@ class Trainer:
         rng = np.random.default_rng(1234567)
         bs, sl = self.cfg.train_batch_size, self.cfg.block_size
         data = self._read_memmap(self.eval_bin)
-        ix = rng.integers(0, len(data) - sl - 1, size=bs)
+        # With a stratified eval bin only the "old" segment (the previous validation.bin, unchanged at the
+        # front of the file) is drawn from, so the sanity batch -- and its saved loss/hash -- stay identical
+        # to the ones recorded by checkpoints that were saved against the old validation.bin.
+        limit = getattr(self, "_eval_sanity_limit", None) or len(data)
+        ix = rng.integers(0, limit - sl - 1, size=bs)
         return data, ix
 
     def _sanity_batch(self):
@@ -1511,23 +1613,30 @@ class Trainer:
             ),
         )
 
-    def _sampling_weights(self) -> tuple[float, float]:
-        return sampling_weights(
-            self.cfg.eng_sampling_weight,
-            self.cfg.afr_sampling_weight,
-            self.iter_num,
-            self.cfg.max_iters,
-            self.cfg.use_scheduled_sampling,
-            self.cfg.sampling_schedule,
+    def _effective_mixture(self, iter_num: int, max_iters: int, scheduled: bool) -> tuple[float, float, float]:
+        """(eng, afr, other_afr) weights normalised over the bins actually kept (a dropped bin shows 0.0)."""
+        raw = mixture_weights(
+            self.cfg.eng_sampling_weight, self.cfg.afr_sampling_weight, iter_num, max_iters,
+            scheduled, self.cfg.sampling_schedule, self.cfg.other_afr_sampling_weight,
         )
+        idx = self._kept_bins()
+        if any(i >= 3 for i in idx):
+            return raw
+        out = [0.0, 0.0, 0.0]
+        for i, w in zip(idx, select_bin_weights(raw, idx)):
+            out[i] = w
+        return out[0], out[1], out[2]
+
+    def _sampling_weights(self) -> tuple[float, float, float]:
+        return self._effective_mixture(self.iter_num, self.cfg.max_iters, self.cfg.use_scheduled_sampling)
 
     def _eval_bin_weights(self) -> tuple[float, ...]:
         """Fixed (iteration-independent) mixture for the train-loss probe, so successive evals score
         the same blocks and the curve stays comparable while the training mixture is scheduled."""
-        n = len(self.train_bins)
-        if n == 2:
-            return sampling_weights(self.cfg.eng_sampling_weight, self.cfg.afr_sampling_weight, 0, 1, False)
-        return tuple([1.0 / n] * n)
+        idx = self._kept_bins()
+        if len(idx) == 1:
+            return (1.0,)
+        return select_bin_weights(self._effective_mixture(0, 1, False), idx)
 
     def get_batch(self, split: str, track: bool = False):
         """One micro-batch for this rank.
@@ -1548,6 +1657,10 @@ class Trainer:
             _, ids = self._eval_val_sampler.next_batch((1.0,))
             path = self.eval_bin
         x_np, y_np = read_blocks(self._read_memmap(path), ids, self.cfg.block_size)
+        return self._finalize_batch(x_np, y_np)
+
+    def _finalize_batch(self, x_np, y_np):
+        """numpy (x, y) windows -> optionally label-masked tensors on the training device."""
         x, y = torch.from_numpy(x_np), torch.from_numpy(y_np)
 
         if self.cfg.use_loss_mask:
@@ -1556,6 +1669,8 @@ class Trainer:
                     row.clone(), self.cfg.mode,
                     user_token=user_token, assistant_token=assistant_token,
                     system_token=system_token, mask=MASK,
+                    eos_token=end_of_text_token,        # SFT: loss on every assistant turn (not only the first), none on user/system/tool_response
+                    mask_spans=(tool_response_tokens, context_tokens),      # ... nor on tool output or RAG context wherever it appears
                 )
                 for row in y
             ])
@@ -1983,6 +2098,9 @@ class Trainer:
         out = {}
         local_iters = max(1, self.cfg.eval_iters // max(1, self.world_size))
         for split in ("train", "val"):
+            if split == "val" and getattr(self, "_eval_plan", None) is not None:
+                out.update(self._estimate_val_stratified(self._eval_plan))
+                continue
             losses = torch.zeros(local_iters, device=self.device)
             # Running [sum of CE nats, supervised tokens, decoded bytes] for bits-per-byte.
             totals = torch.zeros(3, device=self.device, dtype=torch.float64)
@@ -1999,6 +2117,47 @@ class Trainer:
                 out[f"{split}_ce"] = ce_total / tok_total  # pure CE, without the MoE aux term in out[split]
                 out[f"{split}_bpb"] = bits_per_byte(out[f"{split}_ce"], tok_total, bytes_total)
         self.model.train()
+        return out
+
+    @torch.no_grad()
+    def _estimate_val_stratified(self, plan) -> dict:
+        """Validation over the fixed stratified plan (training/eval_plan.py). Each rank scores its
+        round-robin share of every segment in micro-batches that never mix segments, so a batch's mean loss
+        belongs to one segment; per-segment sums of (loss, CE, tokens, bytes) are all-reduced and combined.
+        Every rank runs the same number of forwards (dummy steps carry weight 0), which FSDP requires.
+
+        Returns the same keys as the original eval (val, val_ce, val_bpb: token-weighted over ALL blocks, so
+        best-checkpoint logic is unchanged) plus val_old, val_lang_macro, val_by_lang, val_bpb_by_lang.
+        """
+        data = self._read_memmap(self.eval_bin)
+        row = {name: i for i, name in enumerate(plan.segments)}
+        totals = torch.zeros(len(row), 4, device=self.device, dtype=torch.float64)
+        for seg, starts, real in plan.rank_steps(
+            self.accelerator.process_index, self.world_size, self.cfg.train_batch_size,
+        ):
+            x, y = self._finalize_batch(*read_windows(data, starts, self.cfg.block_size))
+            loss = self._forward_loss(x, y).detach()
+            if not real:
+                continue
+            n_tok, n_bytes = self._target_stats(y)
+            totals[row[seg]] += torch.stack([
+                loss.double() * n_tok, self._last_ce_loss.double() * n_tok, n_tok.double(), n_bytes.double(),
+            ])
+        rows = self.accelerator.reduce(totals, reduction="sum").tolist()
+        summary = summarize_segments({name: rows[i] for name, i in row.items()})
+        out = {"val": summary.get("val", float("nan"))}
+        if summary["tokens"] > 0:
+            out["val_ce"] = summary["val_ce"]
+            out["val_bpb"] = bits_per_byte(summary["val_ce"], summary["tokens"], summary["bytes"])
+        for key in ("val_old", "val_lang_macro"):
+            if key in summary:
+                out[key] = summary[key]
+        out["val_by_lang"] = summary["val_by_lang"]
+        out["val_bpb_by_lang"] = {
+            lang: bits_per_byte(summary["by_segment"][lang]["ce"], summary["by_segment"][lang]["tokens"],
+                                summary["by_segment"][lang]["bytes"])
+            for lang in summary["val_by_lang"]
+        }
         return out
 
     def _should_push_to_hf(self, val_loss: float) -> bool:
@@ -2280,6 +2439,7 @@ class Trainer:
                 self._best_iter_num = self.iter_num
                 self._best_sanity_loss = sanity_loss
                 self._best_sanity_batch_hash = sanity_batch_hash
+                self._best_tokens = {"seen": self.tokens_seen, "by_bin": dict(self.tokens_seen_by_bin)}
             if push_now:
                 self._last_hf_push_loss = val_loss
                 self._last_hf_push_iter = self.iter_num
@@ -2298,13 +2458,18 @@ class Trainer:
                     "last_hf_push_iter": self._last_hf_push_iter,
                     "optimizer_name": self.cfg.optimizer_name,
                     "fresh_started": self._fresh_started,
-                    "tokens_seen": self.tokens_seen,
-                    "tokens_seen_offset": self.tokens_seen_offset,
-                    "tokens_seen_by_bin": self.tokens_seen_by_bin,
+                    # tokens_seen / _offset / _lifetime / _by_bin at THIS save (every save, best or not),
+                    # plus the same counts as of the best checkpoint so resume_from=best restores them.
+                    **token_state_for_save(self.tokens_seen, self.tokens_seen_offset, self.tokens_seen_by_bin),
+                    "best_tokens_seen": self._best_tokens["seen"] if self._best_tokens else None,
+                    "best_tokens_seen_by_bin": self._best_tokens["by_bin"] if self._best_tokens else None,
                     "tokens_per_step": self._tokens_per_step(),
                     "sampler": self.sampler.state_dict(),
                 }, f)
-            LOG.info("checkpoint_saved", path=ckpt_dir, iter=self.iter_num, is_new_best=is_new_best, tokens_seen=self.tokens_seen)
+            LOG.info(
+                "checkpoint_saved", path=ckpt_dir, iter=self.iter_num, is_new_best=is_new_best,
+                tokens_seen=self.tokens_seen, tokens_seen_lifetime=self.tokens_seen_offset + self.tokens_seen,
+            )
 
         self.accelerator.save_state(os.path.join(self.run_dir, "resume_state"))
         self.accelerator.wait_for_everyone()
@@ -2404,7 +2569,10 @@ class Trainer:
             return
         try:
             import wandb
-            wandb.log({"eval/train": losses["train"], "eval/val": losses["val"], "lr": lr}, step=self.iter_num)
+            wandb.log({
+                "eval/train": losses["train"], "eval/val": losses["val"], "lr": lr,
+                **self._val_metrics(losses), **token_metrics(self.tokens_seen, self.tokens_seen_offset, self.tokens_seen_by_bin),
+            }, step=self.iter_num)
         except Exception as exc:
             LOG.warning("wandb_log_failed", error=str(exc))
             self.cfg.wandb_log = False
@@ -2417,14 +2585,27 @@ class Trainer:
             m[f"eval/{split}_bpb"] = losses.get(f"{split}_bpb")
             m[f"eval/{split}_ppl"] = math.exp(min(ce, 50.0)) if ce is not None else None
         m.update(self._token_metrics())
+        m.update(self._val_metrics(losses))
         self.tracker.log_metrics(m, step=self.iter_num)
+
+    @staticmethod
+    def _val_metrics(losses: dict) -> dict:
+        """val_loss (token-weighted over all eval blocks), val_loss_old, val_loss_lang_macro,
+        val_loss/<lang> and val_bpb/<lang>; only the first is present without a stratified eval."""
+        m = {"val_loss": losses.get("val")}
+        m["val_loss_old"] = losses.get("val_old")
+        m["val_loss_lang_macro"] = losses.get("val_lang_macro")
+        for lang, v in (losses.get("val_by_lang") or {}).items():
+            m[f"val_loss/{lang}"] = v
+        for lang, v in (losses.get("val_bpb_by_lang") or {}).items():
+            m[f"val_bpb/{lang}"] = v
+        return {k: v for k, v in m.items() if v is not None}
 
     def _token_log_fields(self) -> dict:
         fields = {"tokens_seen": self.tokens_seen, "tokens_seen_b": round(self.tokens_seen / 1e9, 4)}
+        fields.update(token_metrics(self.tokens_seen, self.tokens_seen_offset, self.tokens_seen_by_bin))
         if self.tokens_seen_offset:
             fields["lifetime_tokens_seen_b"] = round((self.tokens_seen_offset + self.tokens_seen) / 1e9, 4)
-        if len(self.tokens_seen_by_bin) > 1:
-            fields["tokens_seen_by_bin"] = dict(self.tokens_seen_by_bin)
         if getattr(self, "sampler", None) is not None:
             fields["epochs_by_bin"] = self.sampler.epochs_done()
         return fields
@@ -2435,6 +2616,7 @@ class Trainer:
             m["train/lifetime_tokens_seen"] = self.tokens_seen_offset + self.tokens_seen
         for name, n in self.tokens_seen_by_bin.items():
             m[f"train/tokens_seen_{name}"] = n
+        m.update(token_metrics(self.tokens_seen, self.tokens_seen_offset, self.tokens_seen_by_bin))
         if getattr(self, "sampler", None) is not None:
             for name, e in self.sampler.epochs_done().items():
                 m[f"train/epoch_{name}"] = e
@@ -2459,6 +2641,7 @@ class Trainer:
             "train/peak_mem_gib": log_kwargs.get("peak_mem_gib"),
             "train/eng_sampling_weight": log_kwargs.get("eng_sampling_weight"),
             "train/afr_sampling_weight": log_kwargs.get("afr_sampling_weight"),
+            "train/other_afr_sampling_weight": log_kwargs.get("other_afr_sampling_weight"),
         }, step=self.iter_num)
 
     def _log_step_wandb(self, loss: float, tokens_per_sec: float, tflops_per_gpu: float, mfu: float | None) -> None:
@@ -2470,6 +2653,7 @@ class Trainer:
                 "train/loss": loss,
                 "train/tokens_per_sec": tokens_per_sec,
                 "train/tflops_per_gpu": tflops_per_gpu,
+                **token_metrics(self.tokens_seen, self.tokens_seen_offset, self.tokens_seen_by_bin),
             }
             if mfu is not None:
                 log_dict["train/mfu"] = mfu
@@ -2506,6 +2690,7 @@ class Trainer:
         if self.master:
             lr = self._lr(self.iter_num) if self.cfg.decay_lr else self.cfg.learning_rate
             LOG.info("eval", iter=self.iter_num, tokens_seen=self.tokens_seen, **losses)
+            print(format_eval_block(self.iter_num, self.tokens_seen, losses), flush=True)
             self._maybe_log_wandb(losses, lr)
             self._log_eval_mlflow(losses, lr)
             self._log_moe_stats()
@@ -2576,6 +2761,7 @@ class Trainer:
                 self._log_curated_eval(self._curated_eval())
                 if self.master:
                     LOG.info("eval", iter=self.iter_num, tokens_seen=self.tokens_seen, **losses)
+                    print(format_eval_block(self.iter_num, self.tokens_seen, losses), flush=True)
                     self._maybe_log_wandb(losses, lr)
                     self._log_eval_mlflow(losses, lr)
                     self._log_moe_stats()
@@ -2608,9 +2794,10 @@ class Trainer:
                 self._log_sample_generation(self._sample_prompt(x))
 
             for _ in range(self.cfg.gradient_accumulation_steps):
-                self.tokens_seen_by_bin[cur_bin] = (
-                    self.tokens_seen_by_bin.get(cur_bin, 0)
-                    + self.cfg.train_batch_size * self.cfg.block_size * self.world_size
+                # Tokens this micro-batch really holds, summed over ranks, credited to the bin that
+                # supplied it: tokens_seen and tokens_seen_by_bin move together, so they always agree.
+                self.tokens_seen += record_micro_batch(
+                    self.tokens_seen_by_bin, cur_bin, int(x.shape[0]) * int(x.shape[1]) * self.world_size,
                 )
                 with self.accelerator.accumulate(self.model):
                     loss = self._forward_loss(x, y)
@@ -2622,7 +2809,6 @@ class Trainer:
                 last_y = y
                 x, y = self.get_batch("train", track=True)
                 cur_bin = self._last_train_bin
-            self.tokens_seen += self._tokens_per_step()
             last_loss = loss
 
             if self.iter_num % self.cfg.log_interval == 0 and self.master:
@@ -2650,10 +2836,21 @@ class Trainer:
                     # this GPU's limit. Raise the batch if it is far below, lower it before an OOM.
                     log_kwargs["peak_mem_gib"] = round(torch.cuda.max_memory_allocated() / 2**30, 2)
                     torch.cuda.reset_peak_memory_stats()
-                if self.cfg.use_scheduled_sampling and len(self.train_bins) > 1:
-                    eng_w, afr_w = self._sampling_weights()
-                    log_kwargs.update(eng_sampling_weight=eng_w, afr_sampling_weight=afr_w)
+                if len(self.train_bins) > 1:
+                    # Logged whether or not the mixture is scheduled: with a FIXED mixture these
+                    # two numbers are the only confirmation in the logs that the configured ratio
+                    # is the one actually being drawn (previously they were omitted exactly when
+                    # the ratio was constant, which is when you most want to verify it).
+                    eng_w, afr_w, other_w = self._sampling_weights()
+                    log_kwargs.update(
+                        eng_sampling_weight=eng_w, afr_sampling_weight=afr_w, other_afr_sampling_weight=other_w,
+                    )
                 LOG.info("step", **log_kwargs)
+                if self.master:
+                    _ce = self._last_ce_loss.item() if self._last_ce_loss is not None else None
+                    _nt, _nb = (t.item() for t in self._target_stats(last_y))
+                    print(format_step_line(self.iter_num, self.tokens_seen, last_loss.item(), _ce,
+                                           bits_per_byte(_ce, _nt, _nb) if _ce is not None else None, lr, tokens_per_sec, mfu), flush=True)
                 self._log_step_wandb(last_loss.item(), tokens_per_sec, tflops_per_gpu, mfu)
                 self._log_step_mlflow(
                     last_loss.item(), last_y, lr, tokens_per_sec, tflops_per_gpu, mfu, log_kwargs,

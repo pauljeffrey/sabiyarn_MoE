@@ -116,3 +116,46 @@ def test_apply_label_mask_pretrain_mode_delegates():
     # pretrain mode ignores user/assistant/system entirely, delegates to
     # process_labels_optimized via the stubbed prompting/action token lists
     assert result[0].item() == 1
+
+
+def test_sft_turns_train_on_every_assistant_turn_and_nothing_else():
+    from training.label_masking import apply_label_mask, process_sft_labels, process_sft_labels_turns
+
+    EOS, TOOL = 0, 40
+    seq = [USER, 5, 6, EOS, ASSISTANT, 7, 8, EOS, TOOL, 41, 42, EOS, ASSISTANT, 9, EOS, USER, 12, EOS, ASSISTANT, 13, 14, EOS]
+    out = process_sft_labels_turns(torch.tensor(seq), ASSISTANT, EOS, mask=MASK).tolist()
+    keep = {5, 6, 7, 13, 14, 15} | {19, 20, 21}                       # tool-call turn (7,8,EOS), final answer (13), second exchange (19..)
+    expect = [t if i in {5, 6, 7, 13, 14, 19, 20, 21} else MASK for i, t in enumerate(seq)]
+    assert out == expect
+    assert out[9] == MASK and out[10] == MASK and out[16] == MASK       # the tool response and the later user turn are never trained on
+    single = [SYSTEM, 5, USER, 6, EOS, ASSISTANT, 9, 10, EOS]
+    assert process_sft_labels_turns(torch.tensor(single), ASSISTANT, EOS).tolist() == [MASK] * 6 + [9, 10, EOS]
+    assert apply_label_mask(torch.tensor(single), "sft", user_token=USER, assistant_token=ASSISTANT, system_token=SYSTEM, eos_token=EOS).tolist() == [MASK] * 6 + [9, 10, EOS]
+    # without an eos id the legacy behaviour (everything after the first assistant marker) is unchanged
+    assert apply_label_mask(torch.tensor(single), "sft", user_token=USER, assistant_token=ASSISTANT, system_token=SYSTEM).tolist() == [MASK] * 6 + [9, 10, EOS]
+    unfinished = [USER, 5, ASSISTANT, 9, 10]
+    assert process_sft_labels_turns(torch.tensor(unfinished), ASSISTANT, EOS).tolist() == [MASK, MASK, MASK, 9, 10]
+
+
+def test_sft_masks_tool_output_and_rag_context_wherever_they_appear():
+    from training.label_masking import apply_label_mask, process_sft_labels_turns
+
+    EOS, TR_O, TR_C, CT_O, CT_C = 0, 60, 61, 62, 63
+    spans = ((TR_O, TR_C), (CT_O, CT_C))
+    # user asks; assistant calls a tool (trained); tool answers inside <tool_response> (masked); assistant answers (trained) and quotes a context span (masked)
+    seq = [USER, 5, EOS, ASSISTANT, 20, 21, EOS, TR_O, 30, 31, TR_C, EOS, ASSISTANT, 22, CT_O, 40, 41, CT_C, 23, EOS]
+    out = process_sft_labels_turns(torch.tensor(seq), ASSISTANT, EOS, mask_spans=spans).tolist()
+    assert out == [MASK] * 4 + [20, 21, EOS] + [MASK] * 6 + [22] + [MASK] * 4 + [23, EOS]
+    # even a tool_response that (wrongly) sits inside an assistant turn is masked, markers included
+    inside = [ASSISTANT, 7, TR_O, 8, TR_C, 9, EOS]
+    assert process_sft_labels_turns(torch.tensor(inside), ASSISTANT, EOS, mask_spans=spans).tolist() == [MASK, 7, MASK, MASK, MASK, 9, EOS]
+    assert apply_label_mask(torch.tensor(inside), "sft", user_token=USER, assistant_token=ASSISTANT, eos_token=EOS, mask_spans=spans).tolist() == [MASK, 7, MASK, MASK, MASK, 9, EOS]
+    # an unclosed span masks to the end (it cannot be told apart from a truncated tool message)
+    assert process_sft_labels_turns(torch.tensor([ASSISTANT, 7, CT_O, 8, 9]), ASSISTANT, EOS, mask_spans=spans).tolist() == [MASK, 7, MASK, MASK, MASK]
+    # the real shape: ONE assistant turn = scaffold + call (trained, incl. </tool_call>) + <tool_response> (masked) + final answer (trained) + one </s>
+    TC_C = 64
+    turn = [USER, 5, EOS, ASSISTANT, 20, 21, TC_C, TR_O, 30, 31, TR_C, 22, 23, EOS]
+    assert process_sft_labels_turns(torch.tensor(turn), ASSISTANT, EOS, mask_spans=spans).tolist() == [MASK] * 4 + [20, 21, TC_C] + [MASK] * 4 + [22, 23, EOS]
+    # reasoning is trained: <think> tokens are plain assistant tokens
+    think = [USER, 5, EOS, ASSISTANT, 70, 71, 72, 73, EOS]
+    assert process_sft_labels_turns(torch.tensor(think), ASSISTANT, EOS, mask_spans=spans).tolist() == [MASK] * 4 + [70, 71, 72, 73, EOS]

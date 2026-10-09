@@ -169,6 +169,13 @@ class TrainConfig:
     mode: str = "pretrain"
     train_batch_size: int = 8
     block_size: int = 4096
+    # Grow the model before SFT (sabiyarn/model/resize.py). 0 = leave the checkpoint's shape alone.
+    # resize_vocab_size must be a multiple of 64 and >= the tokenizer's highest id + 1 (52117 -> 52160);
+    # resize_block_size is the wpe length (65536). fill_positions_from = how many wpe rows pretraining really
+    # trained (4096): the rest are re-guessed by the PCA + MLP regressor instead of kept at random init. 0 = off.
+    resize_vocab_size: int = 0
+    resize_block_size: int = 0
+    fill_positions_from: int = 0
     gradient_accumulation_steps: int = 40
     max_iters: int = 600_000
     learning_rate: float = 3e-4
@@ -275,6 +282,14 @@ class TrainConfig:
     # evaluated next to every train/val eval. Relative paths resolve against the
     # repo root; blank disables it.
     curated_eval_path: str = ""
+    # Stratified eval (training/eval_plan.py). None = the original single random fixed set of
+    # eval_iters x train_batch_size blocks from eval_data_path. A manifest JSON next to the eval bin
+    # ({"dtype","total_tokens","segments":[{"name","start","end"}]}, "old" + language segments) switches
+    # to a fixed plan of eval_total_blocks blocks: eval_old_share of them from "old", the rest shared
+    # equally by the language segments. Env EVAL_MANIFEST_PATH overrides (modal_train.py sets it).
+    eval_manifest_path: Optional[str] = None
+    eval_total_blocks: int = 500
+    eval_old_share: float = 0.4
     seed: int = 42
     world_size: int = 1
     rank: int = 0
@@ -325,12 +340,15 @@ class TrainConfig:
     eval_data_path: str = "data/val.bin"
     overwrite_data: bool = False
 
-    # data sampling (mixing train_data_paths[0]=eng / [1]=afr into each batch)
+    # data sampling (mixing train_data_paths[0]=eng / [1]=afr / [2]=other_afr into each batch).
+    # The three weights are normalised; a bin whose weight is 0 is never drawn (nor opened).
     use_scheduled_sampling: bool = False
     eng_sampling_weight: float = 0.5
     afr_sampling_weight: float = 0.5
-    # Optional piecewise-linear schedule [(progress in [0,1], afr_weight), ...]. When set (and
-    # use_scheduled_sampling is on) it replaces the default cosine swap; eng = 1 - afr.
+    other_afr_sampling_weight: float = 0.0  # 3rd bin (other African languages); 0 = old 2-bin behaviour
+    # Optional piecewise-linear schedule [(progress in [0,1], afr_weight[, other_weight]), ...]. When set
+    # (and use_scheduled_sampling is on) it replaces the default cosine swap; eng = 1 - afr - other, and
+    # a point without `other` means other = 0.
     sampling_schedule: tuple = ()
 
     # s3
@@ -389,26 +407,80 @@ class TrainConfig:
 
 
 def parse_sampling_schedule(raw: Any) -> tuple:
-    """Validate `data.sampling.schedule`: [[progress, afr_weight], ...] -> sorted tuple of floats.
+    """Validate `data.sampling.schedule`: [[progress, afr_weight(, other_weight)], ...] -> sorted tuple.
 
     Progress is the fraction of the run (iter_num / max_iters); afr_weight is the share of each batch
-    drawn from the African bin at that point (English gets 1 - afr_weight). Weights are interpolated
-    linearly between knots and held flat before the first / after the last knot.
+    drawn from the African bin at that point and the optional other_weight the share from the third
+    (other African languages) bin; English gets 1 - afr_weight - other_weight. Weights are interpolated
+    linearly between knots and held flat before the first / after the last knot. Knots are 2-tuples
+    (progress, afr) when none of them carries an `other` weight (the original format), else 3-tuples.
     """
     if not raw:
         return ()
     knots = []
     for k in raw:
-        if not isinstance(k, (list, tuple)) or len(k) != 2:
-            raise ValueError(f"data.sampling.schedule entries must be [progress, afr_weight], got {k!r}")
+        if not isinstance(k, (list, tuple)) or len(k) not in (2, 3):
+            raise ValueError(f"data.sampling.schedule entries must be [progress, afr_weight(, other_weight)], got {k!r}")
         p, w = float(k[0]), float(k[1])
-        if not (0.0 <= p <= 1.0) or not (0.0 <= w <= 1.0):
-            raise ValueError(f"data.sampling.schedule knot {k!r}: progress and afr_weight must be in [0, 1]")
-        knots.append((p, w))
+        o = float(k[2]) if len(k) == 3 else 0.0
+        if not (0.0 <= p <= 1.0) or not (0.0 <= w <= 1.0) or not (0.0 <= o <= 1.0):
+            raise ValueError(f"data.sampling.schedule knot {k!r}: progress and weights must be in [0, 1]")
+        if w + o > 1.0 + 1e-9:
+            raise ValueError(f"data.sampling.schedule knot {k!r}: afr_weight + other_weight must be <= 1")
+        knots.append((p, w, o) if len(k) == 3 else (p, w))
     knots.sort()
-    if len({p for p, _ in knots}) != len(knots):
+    if len({kn[0] for kn in knots}) != len(knots):
         raise ValueError("data.sampling.schedule has duplicate progress values")
+    if any(len(kn) == 3 for kn in knots):
+        knots = [kn if len(kn) == 3 else (kn[0], kn[1], 0.0) for kn in knots]
     return tuple(knots)
+
+
+def mixture_weights(
+    eng_weight: float,
+    afr_weight: float,
+    iter_num: int,
+    max_iters: int,
+    use_scheduled_sampling: bool,
+    schedule: tuple = (),
+    other_weight: float = 0.0,
+) -> tuple[float, float, float]:
+    """(eng, afr, other) sampling weights, always normalised to sum to 1.
+
+    Fixed mode holds the configured preset (normalised) for the whole run. Scheduled mode with a
+    `schedule` follows its piecewise-linear afr (and optional other) curve over progress =
+    iter_num / max_iters, eng = 1 - afr - other. Scheduled mode without one cosine-anneals the
+    eng/afr split from the preset toward the swapped ratio by max_iters, with the `other` share held
+    constant. Either way it is a pure function of iter_num, so every rank computes the same weights and
+    a resumed run continues exactly where it left off. other_weight = 0 gives the original two-bin
+    behaviour bit for bit.
+    """
+    total = eng_weight + afr_weight + other_weight
+    if total <= 0:
+        eng0, afr0, oth0 = 0.5, 0.5, 0.0
+    else:
+        eng0, afr0, oth0 = eng_weight / total, afr_weight / total, other_weight / total
+    if not use_scheduled_sampling:
+        return eng0, afr0, oth0
+    progress = min(1.0, iter_num / max(1, max_iters))
+    if schedule:
+        knots = [(k[0], k[1], k[2] if len(k) > 2 else 0.0) for k in schedule]
+
+        def at(col: int) -> float:
+            if progress <= knots[0][0]:
+                return knots[0][col]
+            if progress >= knots[-1][0]:
+                return knots[-1][col]
+            for k0, k1 in zip(knots, knots[1:]):
+                if k0[0] <= progress <= k1[0]:
+                    return k0[col] + (k1[col] - k0[col]) * (progress - k0[0]) / (k1[0] - k0[0])
+            return knots[-1][col]
+
+        afr_w, oth_w = at(1), at(2)
+        return max(0.0, 1.0 - afr_w - oth_w), afr_w, oth_w
+    coeff = 0.5 * (1.0 - math.cos(math.pi * progress))  # 0 -> 1 over training
+    eng_w = eng0 + (afr0 - eng0) * coeff
+    return eng_w, (1.0 - oth0) - eng_w, oth0
 
 
 def sampling_weights(
@@ -419,34 +491,56 @@ def sampling_weights(
     use_scheduled_sampling: bool,
     schedule: tuple = (),
 ) -> tuple[float, float]:
-    """(eng_weight, afr_weight) for picking between the eng/afr training bins.
+    """(eng_weight, afr_weight) for picking between the eng/afr training bins: the two-bin view of
+    `mixture_weights` (no `other` bin). Kept for the original two-bin callers."""
+    eng_w, afr_w, _ = mixture_weights(eng_weight, afr_weight, iter_num, max_iters, use_scheduled_sampling, schedule)
+    return eng_w, afr_w
 
-    Fixed mode holds the configured preset (normalized to sum to 1) for the whole run.
-    Scheduled mode with a `schedule` follows its piecewise-linear afr_weight curve over
-    progress = iter_num / max_iters. Scheduled mode without one cosine-anneals from the preset
-    toward the swapped ratio by max_iters. Either way it is a pure function of iter_num, so every
-    rank computes the same weights and a resumed run continues exactly where it left off.
-    """
-    total = eng_weight + afr_weight
-    eng0, afr0 = (0.5, 0.5) if total <= 0 else (eng_weight / total, afr_weight / total)
-    if not use_scheduled_sampling:
-        return eng0, afr0
-    progress = min(1.0, iter_num / max(1, max_iters))
-    if schedule:
-        if progress <= schedule[0][0]:
-            afr_w = schedule[0][1]
-        elif progress >= schedule[-1][0]:
-            afr_w = schedule[-1][1]
-        else:
-            afr_w = schedule[-1][1]
-            for (p0, w0), (p1, w1) in zip(schedule, schedule[1:]):
-                if p0 <= progress <= p1:
-                    afr_w = w0 + (w1 - w0) * (progress - p0) / (p1 - p0)
-                    break
-        return 1.0 - afr_w, afr_w
-    coeff = 0.5 * (1.0 - math.cos(math.pi * progress))  # 0 -> 1 over training
-    eng_w = eng0 + (afr0 - eng0) * coeff
-    return eng_w, 1.0 - eng_w
+
+def active_bin_indices(
+    eng_weight: float,
+    afr_weight: float,
+    other_weight: float,
+    use_scheduled_sampling: bool,
+    schedule: tuple,
+    n_bins: int,
+) -> tuple[int, ...]:
+    """Indices (0=eng, 1=afr, 2=other_afr) of the training bins that can EVER be drawn under this
+    sampling config, among the first `n_bins` configured paths. A bin whose weight is 0 for the whole
+    run is not listed, so the trainer neither opens nor samples it. Never empty."""
+    if n_bins > 3:  # no weights are defined for a 4th+ bin: they are mixed uniformly
+        return tuple(range(n_bins))
+    total = eng_weight + afr_weight + other_weight
+    if total <= 0:
+        return tuple(range(n_bins))
+    if use_scheduled_sampling and schedule:
+        knots = [(k[1], k[2] if len(k) > 2 else 0.0) for k in schedule]
+        live = (
+            any(1.0 - a - o > 1e-12 for a, o in knots),
+            any(a > 0 for a, _ in knots),
+            any(o > 0 for _, o in knots),
+        )
+    elif use_scheduled_sampling:  # cosine swap: eng and afr trade places, so both are live if either is
+        swap = eng_weight > 0 or afr_weight > 0
+        live = (swap, swap, other_weight > 0)
+    else:
+        live = (eng_weight > 0, afr_weight > 0, other_weight > 0)
+    keep = tuple(i for i in range(n_bins) if live[i])
+    return keep or tuple(range(n_bins))
+
+
+def select_bin_weights(weights: tuple, indices: tuple) -> tuple[float, ...]:
+    """Weights of the kept bins (`indices` into the (eng, afr, other) vector), renormalised to sum to 1.
+    One bin -> (1.0,); all-zero -> uniform; any index past the third bin -> uniform over the kept bins."""
+    if len(indices) == 1:
+        return (1.0,)
+    if any(i >= len(weights) for i in indices):
+        return tuple([1.0 / len(indices)] * len(indices))
+    picked = [float(weights[i]) for i in indices]
+    total = sum(picked)
+    if total <= 0:
+        return tuple([1.0 / len(indices)] * len(indices))
+    return tuple(w / total for w in picked)
 
 
 def _optimizer_name(raw: Any) -> str:
@@ -521,7 +615,7 @@ def load_train_config(path: Optional[str] = None) -> TrainConfig:
     if not mode_data and mode != "pretrain":
         mode_data = _nested_list_dict(data.get("pretrain", []))
 
-    # TRAIN_DATA_PATHS_LOCAL (comma-separated, same eng-then-afr order as below) is set
+    # TRAIN_DATA_PATHS_LOCAL (comma-separated, same eng-then-afr-then-other_afr order as below) is set
     # by modal_train.py after it downloads the yaml-configured S3 objects to local disk --
     # it must win over the yaml so training reads the local copies, not the S3 keys.
     env_train_paths = os.getenv("TRAIN_DATA_PATHS_LOCAL")
@@ -529,7 +623,7 @@ def load_train_config(path: Optional[str] = None) -> TrainConfig:
         train_paths = [p for p in env_train_paths.split(",") if p]
     else:
         train_paths = []
-        for key in ("eng_train_data_path", "afr_train_data_path"):
+        for key in ("eng_train_data_path", "afr_train_data_path", "other_afr_train_data_path"):
             if key in mode_data:
                 train_paths.append(mode_data[key])
         if not train_paths and "train_data_path" in data:
@@ -560,6 +654,9 @@ def load_train_config(path: Optional[str] = None) -> TrainConfig:
         # different micro-batch) needs no file edit; keep batch * accum ~= 192 for the same global batch.
         train_batch_size=int(os.getenv("TRAIN_BATCH_SIZE") or _phase("train_batch_size", 8)),
         block_size=int(_phase("block_size", 4096)),
+        resize_vocab_size=int(_phase("resize_vocab_size", 0)),
+        resize_block_size=int(_phase("resize_block_size", 0)),
+        fill_positions_from=int(_phase("fill_positions_from", 0)),
         gradient_accumulation_steps=_safe_int(os.getenv("GRAD_ACCUM_STEPS")
                                              or _phase("gradient_accumulation_steps", None), 40),
         max_iters=int(optimizer.get("max_iters", training.get("max_iters", 600_000))),
@@ -592,7 +689,7 @@ def load_train_config(path: Optional[str] = None) -> TrainConfig:
             if os.getenv("GRADIENT_CHECKPOINTING") is not None
             else bool(_phase("gradient_checkpointing", False))
         ),
-        use_loss_mask=bool(training.get("use_loss_mask", True)),
+        use_loss_mask=bool(_phase("use_loss_mask", True)),                 # sft_use_loss_mask wins in SFT: pretraining keeps its own setting
         init_from=str(training.get("init_from", "hf")),
         resume_run_dir=training.get("resume_run_dir"),
         resume_from=str(training.get("resume_from", "latest") or "latest"),
@@ -635,6 +732,7 @@ def load_train_config(path: Optional[str] = None) -> TrainConfig:
         use_scheduled_sampling=bool(sampling_cfg.get("use_scheduled_sampling", False)),
         eng_sampling_weight=float(sampling_cfg.get("eng_sampling_weight", 0.5)),
         afr_sampling_weight=float(sampling_cfg.get("afr_sampling_weight", 0.5)),
+        other_afr_sampling_weight=float(sampling_cfg.get("other_afr_sampling_weight", 0.0) or 0.0),
         sampling_schedule=parse_sampling_schedule(sampling_cfg.get("schedule")),
         s3_endpoint=s3.get("s3_endpoint") or os.getenv("S3_ENDPOINT"),
         s3_bucket=s3.get("s3_bucket_name") or os.getenv("S3_BUCKET"),
@@ -655,6 +753,9 @@ def load_train_config(path: Optional[str] = None) -> TrainConfig:
         mlflow_ui_host=str((mlflow_cfg.get("ui", {}) or {}).get("host", "0.0.0.0")),
         mlflow_ui_port=int(os.getenv("MLFLOW_UI_PORT") or (mlflow_cfg.get("ui", {}) or {}).get("port", 5000)),
         hf_chkpt_path=training.get("hf_chkpt_path") or None,
+        eval_manifest_path=(os.getenv("EVAL_MANIFEST_PATH") or training.get("eval_manifest_path") or None),
+        eval_total_blocks=int(training.get("eval_total_blocks", 500)),
+        eval_old_share=float(training.get("eval_old_share", 0.4)),
         curated_eval_path=str(os.getenv("CURATED_EVAL_PATH") or training.get("curated_eval_path", "") or ""),
         hf_push_interval=int(training.get("hf_push_interval", 100)),
         test_run=(
