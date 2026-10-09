@@ -69,9 +69,9 @@ def parse(text: str) -> Parsed:
     p.n_plan, p.n_response = t.count("<task_plan>"), t.count("<response>")
     i_in, i_pl = t.find("<|input_lang|>"), t.find("<task_plan>")
     i_pe, i_tg, i_rs = t.find("</task_plan>"), t.find("<|target_lang|>"), t.find("<response>")
-    m = re.match(r"<\|input_lang\|>(<[^<>]+>)", t[i_in:]) if i_in >= 0 else None
-    p.input_lang = m.group(1) if m else ""
-    m = re.match(r"<\|target_lang\|>(<[^<>]+>)", t[i_tg:]) if i_tg >= 0 else None
+    m = re.match(r"<\|input_lang\|>(?: unsure, but most likely )?((?:<[a-z]{2,4}>)+|<[^<>]+>)", t[i_in:]) if i_in >= 0 else None
+    p.input_lang = m.group(1) if m else ""            # every language of the user's turn, e.g. "<ibo><efi>" (instruction language, then text language)
+    m = re.match(r"<\|target_lang\|>(?: unsure, but most likely )?(<[^<>]+>)", t[i_tg:]) if i_tg >= 0 else None
     p.target_lang = m.group(1) if m else ""
     if i_pl >= 0 and i_pe > i_pl:
         p.plan = _TOKEN.findall(t[i_pl + len("<task_plan>"): i_pe])
@@ -201,7 +201,7 @@ def format_score(completion: str, expected: str, weights: dict[str, float] | Non
     # scoring the absent component as 0 while it still carried weight 0.30 meant a PERFECT tool turn scored
     # 0.572 against its own structure, systematically under-rewarding roughly 60% of the corpus. Measured on
     # live records, where chosen replies scored as low as 0.572 against structures extracted from themselves.
-    s_in = float(pred.input_lang == exp.input_lang) if exp.input_lang else None
+    s_in = _langs_score(pred.input_lang, exp.input_lang) if exp.input_lang else None
     s_tg = float(pred.target_lang == exp.target_lang) if exp.target_lang else None
     s_pl = plan_f1(pred.plan, exp.plan)
     s_or = plan_order(pred.plan, exp.plan)        # None when fewer than two verbs are shared
@@ -245,5 +245,21 @@ def shape_reward(r: float, threshold: float = 0.46, negative_scale: float = 2.0)
     return -negative_scale * (threshold - r) / max(1e-9, threshold)
 
 
-def expected_translation_structure(src: str, tgt: str) -> str:
-    return f"<|input_lang|><{src}><task_plan><translate></task_plan><|target_lang|><{tgt}><response>"
+def input_lang_tags(src: str, instruction_lang: str | None = None, position: str = "prepend") -> str:
+    """The <|input_lang|> field of a request whose text is in `src` and whose instruction is in `instruction_lang`: every language of the
+    turn in reading order, once each. "<ibo><efi>" = instruction in Igbo before text in Efik; "<efi><ibo>" when the instruction comes after."""
+    langs = [src] if not instruction_lang or instruction_lang == src else ([instruction_lang, src] if position != "append" else [src, instruction_lang])
+    return "".join(f"<{l}>" for l in langs)
+
+
+def expected_translation_structure(src: str, tgt: str, instruction_lang: str | None = None, position: str = "prepend") -> str:
+    return f"<|input_lang|>{input_lang_tags(src, instruction_lang, position)}<task_plan><translate></task_plan><|target_lang|><{tgt}><response>"
+
+
+def _langs_score(pred: str, exp: str) -> float:
+    """1 for the same languages in the same order; otherwise half the overlap of the two sets (right languages in the wrong order score 0.5,
+    one of two right 0.25, none 0). With a single expected tag this is the old exact 0/1 match."""
+    if pred == exp:
+        return 1.0
+    a, b = set(re.findall(r"<[^<>]+>", pred)), set(re.findall(r"<[^<>]+>", exp))
+    return 0.5 * len(a & b) / len(a | b) if (a and b) else 0.0

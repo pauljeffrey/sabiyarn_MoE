@@ -55,7 +55,8 @@ def main() -> int:
                 import torch
 
                 out = model.predict(req["data"], batch_size=int(req.get("batch_size", 16)),
-                                    gpus=1 if torch.cuda.is_available() else 0, progress_bar=False)
+                                    gpus=1 if torch.cuda.is_available() else 0, progress_bar=False,
+                                    num_workers=int(os.environ.get("COMET_NUM_WORKERS", "1")))  # comet 2.2 + new torch: 0 workers is rejected
                 scores = [float(s) for s in (out.scores if hasattr(out, "scores") else out)]
             proto.write(json.dumps({"scores": scores}) + "\n")
         except Exception as exc:  # keep serving; the client decides what to do

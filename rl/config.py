@@ -23,13 +23,13 @@ import yaml
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_CONFIG_PATH = ROOT / "rl" / "config.yaml"
 
-ALGOS = ("sft", "dpo", "rl")
+ALGOS = ("sft", "dpo", "rl", "rs")
 DPO_LOSSES = ("sigmoid", "ipo", "hinge")
 
 
 @dataclass
 class RLConfig:
-    algo: str = "dpo"  # sft | dpo | rl
+    algo: str = "dpo"  # sft | dpo | rl | rs (rejection sampling: rl/rejection_sampling.py, writes a jsonl for `algo: sft`)
 
     # ---- model ---------------------------------------------------------------------------------------
     model_path: str = "Aletheia-ng/SabiYarn_MoE-280M"  # checkpoint dir or Hub id: the policy's starting point
@@ -43,6 +43,7 @@ class RLConfig:
     data_path: str = "data-gen/data/processed/dpo.jsonl"  # jsonl (data-gen output) ...
     dataset_id: Optional[str] = None  # ... or a Hub dataset (overrides data_path)
     dataset_split: str = "train"
+    rl_bin_prefix: Optional[str] = None  # algo rl: pre-tokenized prompt bin built by rlhf/scripts/build_rl_bin.py (rl/bin_data.py); overrides dataset_id/data_path
     max_samples: int = 0  # 0 = all
     eval_samples: int = 500  # held out from the same file (deterministic, by seed)
     # MEASURED on 4,736 real data-gen SFT records with BeardedMonster/SabiYarn-32k, taking the conversation
@@ -105,7 +106,7 @@ class RLConfig:
     kl_coef: float = 0.05  # per-token k3 KL penalty against the reference
     advantage_std_norm: bool = True  # divide advantages by the group std
     rl_micro_batch: int = 16  # sequences per forward/backward chunk
-    reward: str = "chrf"  # chrf | africomet | verifier | verifier+africomet
+    reward: str = "chrf"  # chrf | africomet | verifier | verifier+africomet | structured_africomet | structured_chrf
     reward_id: str = "masakhane/africomet-stl"
     reward_python: Optional[str] = None  # python of an env with `unbabel-comet` (it needs transformers<5); null = in-process
     reward_batch_size: int = 16
@@ -118,6 +119,38 @@ class RLConfig:
     # programmatic reward fails SILENTLY when a check is always "unknown", and the per-check detail is the
     # only way to see that happening.
     reward_log_every: int = 0
+    # structured_africomet: reward = w_f * scaffold_score + (1 - w_f) * gate * content_score  (rl/structure.py, rl/rewards.py).
+    # The scaffold is <|input_lang|><src><task_plan>..</task_plan><|target_lang|><tgt><response> and is matched field by field
+    # (plan tokens order-agnostic); the content after <response> is scored by AfriCOMET (reference-based when the sample has a
+    # reference, reference-free `reward_qe_id` otherwise) blended with a chrF++ anchor when a reference exists.
+    # The content is scored WITHOUT a reference by default: AfriCOMET-QE (source, translation) -> score. `reward_use_reference`
+    # switches on the reference-based model (`reward_id`) plus the chrF++ anchor for rows that carry a reference.
+    reward_format_weight: float = 0.2  # translation content outweighs the scaffold: R = 0.2 * scaffold + 0.8 * gate * content
+    reward_qe_id: Optional[str] = "masakhane/africomet-qe-stl-1.1"
+    reward_use_reference: bool = False
+    reward_chrf_anchor: float = 0.2  # only with reward_use_reference: share of chrF++ in the content score
+    reward_length_guard: bool = True  # halve the content score when the length ratio to the source is implausible
+    # ---- rejection sampling (algo: rs): use the reward to choose SFT data instead of running RL ----------------------
+    rs_mode: str = "filter"  # filter | best_of_n  (see rl/rejection_sampling.py)
+    rs_input: str = ""  # filter: jsonl/parquet glob, or hub://<repo>/<glob> (rows with input, response, source_lang, targ_lang)
+    rs_filter_keep_frac: float = 0.5  # filter: keep this top fraction inside every (source_lang, targ_lang) group ...
+    rs_filter_min_score: float = 0.0  # ... that also scores at least this AfriCOMET-QE value
+    rs_n: int = 8  # best_of_n: completions sampled per prompt
+    rs_keep_top: int = 1  # best_of_n: best completions kept per prompt
+    rs_min_reward: float = 0.57  # best_of_n: ... if their (unshaped, 0-1) reward clears this bar (= perfect scaffold + QE 0.46)
+    # Reward shaping (structured rewards): "threshold" maps R < reward_threshold to a large negative number
+    # (-reward_negative_scale at R = 0) and R >= reward_threshold to a positive number in [0, 1]; "none" keeps R in [0, 1].
+    # "calibrated": per-language-pair anchors (t_fail, t_mid, t_great) = P10/P50/P90 of human-reference QE scores, produced by
+    # rlhf/scripts/calibrate_shaping.py (t_fail = max(0.46, P90 of QE on fluent-but-wrong translations), t_mid/t_great = P50/P90 of human
+    # references; pairs where QE cannot separate real from mismatched translations are excluded; the rest are weighted by that AUC); "adaptive": t_fail stays calibrated, t_mid/t_great follow rolling quantiles of the policy's
+    # own scores. See rl/shaping.py. "threshold" is the single-number version (kept for comparison).
+    reward_shaping: str = "calibrated"  # none | threshold | calibrated (default) | adaptive (switch to it once calibrated plateaus)
+    reward_threshold: float = 0.46  # single-threshold mode; 0.46 = where AfriCOMET-QE output stops being gibberish (hand-checked)
+    reward_negative_scale: float = 2.0
+    reward_calibration_path: Optional[str] = None
+    reward_default_anchors: str = "0.46,0.60,0.75"  # t_fail,t_mid,t_great used for pairs with no calibration entry
+    reward_adaptive_window: int = 2000
+    reward_adaptive_warmup: int = 200
     # Drop DPO pairs whose two sides scored within this of each other (data-gen's own 0-10 scores). A pair
     # that close teaches almost nothing and its gradient is noise. 0 disables the filter; generation already
     # drops anything under 2.0, so this is for corpora built before that existed.
@@ -153,6 +186,14 @@ class RLConfig:
             raise ValueError("param_dtype must be 'float32' or 'bfloat16'")
         if self.max_prompt_len >= self.max_seq_len:
             raise ValueError("max_prompt_len must be smaller than max_seq_len")
+        if self.rs_mode not in ("filter", "best_of_n"):
+            raise ValueError("rs_mode must be 'filter' or 'best_of_n'")
+        if self.reward_shaping not in ("none", "threshold", "calibrated", "adaptive"):
+            raise ValueError("reward_shaping must be one of: none, threshold, calibrated, adaptive")
+        if not 0.0 < self.reward_threshold < 1.0:
+            raise ValueError("reward_threshold must be in (0, 1)")
+        if not 0.0 <= self.reward_format_weight <= 1.0 or not 0.0 <= self.reward_chrf_anchor <= 1.0:
+            raise ValueError("reward_format_weight and reward_chrf_anchor must be in [0, 1]")
         if self.group_size < 2 and self.algo == "rl":
             raise ValueError("group_size must be >= 2: the baseline is the group mean")
         for name in ("batch_size", "grad_accum_steps", "rl_micro_batch"):

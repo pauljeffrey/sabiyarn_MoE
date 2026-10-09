@@ -29,6 +29,7 @@ import random
 from typing import Callable, Optional
 
 import structlog
+import numpy as np
 import torch
 
 from rl.common import Run, build_optimizer, load_model, load_tokenizer, pad_id_of, token_logps
@@ -86,6 +87,11 @@ def sample_completions(model, tok, prompts: list[list[int]], cfg: RLConfig, *, g
     return comps
 
 
+def _prompt_ids(tok, item: dict) -> list[int]:
+    """Prompt token ids of an RL item: pre-tokenized (bin-backed items) or rendered from `prompt_messages`."""
+    return item["prompt_ids"] if "prompt_ids" in item else render_prompt(tok, item["prompt_messages"])
+
+
 def _chunks(n: int, size: int):
     for i in range(0, n, size):
         yield slice(i, min(i + size, n))
@@ -136,12 +142,14 @@ def evaluate(run: Run, policy, tok, items: list[dict], reward_fn: Callable, cfg:
     mine = items[acc.process_index :: acc.num_processes][: max(1, 32)]
     if not mine:
         return {}
-    prompts = [render_prompt(tok, it["prompt_messages"]) for it in mine]
+    prompts = [_prompt_ids(tok, it) for it in mine]
     with acc.autocast():
         comps = sample_completions(acc.unwrap_model(policy), tok, prompts, cfg, greedy=True, device=run.device)
-    texts = [tok.decode(c, skip_special_tokens=True) for c in comps]
+    texts = [tok.decode(c, skip_special_tokens=not getattr(reward_fn, "wants_raw", False)) for c in comps]
     r = reward_fn(mine, texts)
-    return run.mean_over_ranks({"eval/reward": sum(r) / len(r)})
+    out = {"eval/reward": sum(r) / len(r)}
+    out.update({f"eval/{k}": v for k, v in (getattr(reward_fn, "last_stats", None) or {}).items()})
+    return run.mean_over_ranks(out)
 
 
 def train_rl(cfg: RLConfig, reward_fn: Optional[Callable] = None, run: Optional[Run] = None,
@@ -153,9 +161,14 @@ def train_rl(cfg: RLConfig, reward_fn: Optional[Callable] = None, run: Optional[
     tok = load_tokenizer(cfg)
     run.pad_id = pad_id_of(tok)
     rows = records if records is not None else load_records(cfg)
-    train_rows, eval_rows = split_records([to_rl_item(r) for r in rows], cfg.eval_samples)
-    train_items = [r for r in train_rows if len(render_prompt(tok, r["prompt_messages"])) <= cfg.max_prompt_len]
-    eval_items = [r for r in eval_rows if len(render_prompt(tok, r["prompt_messages"])) <= cfg.max_prompt_len]
+    if getattr(rows, "is_bin", False):             # rl/bin_data.RLPromptBin: lazy, prompts already tokenized, never materialised as a list
+        if rows.max_prompt_tokens > cfg.max_prompt_len:
+            raise SystemExit(f"the prompt bin holds prompts of up to {rows.max_prompt_tokens} tokens but max_prompt_len is {cfg.max_prompt_len}")
+        train_items, eval_items = rows.train_view(), rows.eval_view(cfg.eval_samples)
+    else:
+        train_rows, eval_rows = split_records([to_rl_item(r) for r in rows], cfg.eval_samples)
+        train_items = [r for r in train_rows if len(render_prompt(tok, r["prompt_messages"])) <= cfg.max_prompt_len]
+        eval_items = [r for r in eval_rows if len(render_prompt(tok, r["prompt_messages"])) <= cfg.max_prompt_len]
     if len(train_items) < acc.num_processes:
         raise SystemExit("not enough prompts within max_prompt_len for this many ranks")
     if reward_fn is None:
@@ -179,19 +192,23 @@ def train_rl(cfg: RLConfig, reward_fn: Optional[Callable] = None, run: Optional[
         cursor, epoch, order = 0, 0, []
         while run.step < total:
             if cursor + prompts_per_step > len(order):  # new epoch: same permutation on every rank, disjoint slices
-                order = random.Random(cfg.seed + epoch).sample(range(len(train_items)), len(train_items))
+                order = np.random.default_rng(cfg.seed + epoch).permutation(len(train_items))   # same permutation on every rank
                 order = order[acc.process_index :: acc.num_processes]
                 cursor, epoch = 0, epoch + 1
-            batch_items = [train_items[i] for i in order[cursor : cursor + prompts_per_step]]
+            batch_items = [train_items[int(i)] for i in order[cursor : cursor + prompts_per_step]]
             cursor += prompts_per_step
 
-            prompts = [render_prompt(tok, it["prompt_messages"]) for it in batch_items]
+            prompts = [_prompt_ids(tok, it) for it in batch_items]
             with acc.autocast():
                 comps = sample_completions(acc.unwrap_model(policy), tok, prompts, cfg, device=run.device)
-            texts = [tok.decode(c, skip_special_tokens=True) for c in comps]
+            # a structured reward scores the scaffold, which is made of special tokens: decode them (and the closing </s>)
+            texts = [tok.decode(c, skip_special_tokens=not getattr(reward_fn, "wants_raw", False)) for c in comps]
             expanded = [it for it in batch_items for _ in range(cfg.group_size)]
             rewards = reward_fn(expanded, texts)
             adv, flat = group_advantages(rewards, cfg.group_size, cfg.advantage_std_norm)
+            wts = getattr(reward_fn, "last_weights", None)         # e.g. QE reliability of the language pair (0 = metric blind there)
+            if wts is not None and len(wts) == len(adv):
+                adv = adv * torch.tensor(wts, dtype=adv.dtype)
             seqs = [Encoded(prompts[i // cfg.group_size], c) for i, c in enumerate(comps) if c]
             keep = [i for i, c in enumerate(comps) if c]
             adv = adv[keep]
@@ -204,6 +221,7 @@ def train_rl(cfg: RLConfig, reward_fn: Optional[Callable] = None, run: Optional[
             if run.step % cfg.log_every == 0 or run.step == 1:
                 r = torch.tensor(rewards)
                 eos = tok.eos_token_id
+                m.update({f"train/{k}": v for k, v in (getattr(reward_fn, "last_stats", None) or {}).items()})
                 m.update({"train/reward": r.mean().item(), "train/reward_std": r.std(unbiased=False).item(),
                           "train/flat_group_frac": flat,
                           "train/completion_len": sum(len(c) for c in comps) / len(comps),
