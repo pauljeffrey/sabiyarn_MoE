@@ -326,9 +326,8 @@ EDGE_DEVICE_TOOLS_BY_NAME: dict[str, dict[str, Any]] = {
 def format_tools_for_system_prompt(tools: list[dict[str, Any]]) -> str:
     """Text block describing available tools, embedded in the system prompt.
 
-    Convention: a labeled JSON array. Keep this EXACT function as the only
-    place that decides the textual convention, so every generator and the
-    eventual inference-side system prompt builder stay in sync.
+    Convention (identical to what sabiyarn/chat_template.jinja renders from its `tools` argument): a `<tools>` block with ONE compact JSON object per
+    line, e.g.  <tools>\n{"type": "function", "function": {...}}\n</tools>.  Keep this EXACT function as the only place that decides the textual
+    convention, so every generator and the inference-side system prompt builder stay in sync.
     """
-    tools_json = json.dumps(tools, ensure_ascii=False, indent=2)
-    return f"You have access to the following tools:\n{tools_json}"
+    return "<tools>\n" + "\n".join(json.dumps(t, ensure_ascii=False) for t in tools) + "\n</tools>"

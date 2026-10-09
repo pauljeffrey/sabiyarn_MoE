@@ -295,7 +295,7 @@ def _candidate_text(content: Any, md: dict) -> str:
                 continue
             if not isinstance(args, str):
                 args = json.dumps(args, ensure_ascii=False)
-            body += f"<tool_call>{name}\n{args}</tool_call>"
+            body += f'<tool_call>{{"name": {json.dumps(name, ensure_ascii=False)}, "arguments": {args}}}</tool_call>'          # as chat_template.jinja renders it
         return body.strip()
     return ""
 

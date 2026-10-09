@@ -104,9 +104,11 @@ def test_tool_calls_are_visible_to_the_scorer():
     into text. Measured: 0 of 108 candidates contained <tool_call>, so every tool check was unscoreable and
     a tool-call candidate looked like an empty answer."""
     text = ('<|input_lang|><eng><think>need the weather</think><task_plan><|plan|></task_plan>'
-            '<tool_call>get_weather\n{"location": "Ibi"}</tool_call>')
+            '<tool_call>{"name": "get_weather", "arguments": {"location": "Ibi"}}</tool_call>')
     ctx = Ctx(text, {"lang": "pcm"})
     assert ctx.tool_calls == [("get_weather", '{"location": "Ibi"}')]
+    # the older "name\\n{args}" body is still understood
+    assert Ctx('<tool_call>get_weather\n{"location": "Ibi"}</tool_call>', {"lang": "pcm"}).tool_calls == [("get_weather", '{"location": "Ibi"}')]
     # Any check that depends on seeing the call now sees it.
     assert REGISTRY["two_distinct_tools_called"](ctx) is False, "one call is one call"
     assert REGISTRY["think_precedes_tool_call"](ctx) is True
@@ -342,8 +344,8 @@ def test_group_scoring_does_not_reward_being_unscoreable():
         {"name": "brief", "weight": 0.4, "expect": True, "fn": "response_under_120_words"},
     ]
     acted = ('<|input_lang|><eng><task_plan><|plan|></task_plan>'
-             '<tool_call>get_market_prices\n{"commodity":"maize"}</tool_call>'
-             '<tool_call>get_exchange_rate\n{"base":"NGN"}</tool_call>')
+             '<tool_call>{"name": "get_market_prices", "arguments": {"commodity": "maize"}}</tool_call>'
+             '<tool_call>{"name": "get_exchange_rate", "arguments": {"base": "NGN"}}</tool_call>')
     did_nothing = "<|input_lang|><eng><|target_lang|><eng><response>It is about 2000.</response>"
 
     (r_acted, r_idle), _ = score_group([acted, did_nothing], item, checks)

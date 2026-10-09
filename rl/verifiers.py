@@ -44,12 +44,32 @@ from typing import Any, Optional
 R_THINK = re.compile(r"<think>(.*?)</think>", re.S)
 R_RESPONSE = re.compile(r"<response>(.*)", re.S)
 R_TASK_PLAN = re.compile(r"<task_plan>(.*?)</task_plan>", re.S)
-R_TOOL_CALL = re.compile(r"<tool_call>([^\n<]+)\n(.*?)</tool_call>", re.S)
+# A call is ONE JSON object: <tool_call>{"name": "f", "arguments": {...}}</tool_call> (the standard Hermes/Qwen shape; see sabiyarn/chat_template.jinja).
+# The older "name\n{args}" body is still read so that data written before the change keeps scoring.
+R_TOOL_CALL = re.compile(r"<tool_call>(.*?)</tool_call>", re.S)
+
+
+def _parse_tool_call(body: str) -> Optional[tuple[str, str]]:
+    """The inside of one <tool_call>..</tool_call> -> (name, arguments as a JSON string); None if it is neither the JSON object nor the legacy form."""
+    body = body.strip()
+    try:
+        obj = json.loads(body)
+        if isinstance(obj, dict) and isinstance(obj.get("name"), str):
+            args = obj.get("arguments", obj.get("parameters", {}))
+            return obj["name"].strip(), args if isinstance(args, str) else json.dumps(args, ensure_ascii=False)
+    except ValueError:
+        pass
+    name, sep, args = body.partition("\n")
+    return (name.strip(), args) if sep and name.strip() and "<" not in name else None
+
+
+def _tool_calls_in(text: str) -> list[tuple[str, str]]:
+    return [c for c in (_parse_tool_call(m.group(1)) for m in R_TOOL_CALL.finditer(text)) if c]
 # The tool-result marker is <tool_response>, which IS a token in this tokenizer (52037/52038).
 # <tool_result> appears in the published chat_template but is NOT in the vocabulary -- see
 # data-gen/templates/chat_template.jinja and the test that guards it.
 R_TOOL_RESULT = re.compile(r"<tool_response>(.*?)</tool_response>", re.S)
-R_INPUT_LANG = re.compile(r"<\|input_lang\|><([a-z]{2,4})>")
+R_INPUT_LANG = re.compile(r"<\|input_lang\|>(?: unsure, but most likely )?<([a-z]{2,4})>")        # first of the listed input languages
 R_TARGET_LANG = re.compile(r"<\|target_lang\|><([a-z]{2,4})>")
 R_PIPE_TOKEN = re.compile(r"<\|([a-zA-Z_]+)\|>")
 
@@ -195,7 +215,7 @@ class Ctx:
     # -- helpers ----------------------------------------------------------
     @property
     def tool_calls(self) -> list[tuple[str, str]]:
-        return [(m.group(1).strip(), m.group(2)) for m in R_TOOL_CALL.finditer(self.text)]
+        return _tool_calls_in(self.text)
 
     @property
     def target_lang(self) -> str:
@@ -445,7 +465,7 @@ def think_precedes_tool_call(ctx: Ctx) -> Optional[bool]:
 def at_least_two_tool_calls(ctx: Ctx) -> Optional[bool]:
     """A chain: the first result was insufficient and a second call followed. Counted across the whole sample
     -- the prefix plus this candidate -- because the chain is usually spread over several turns."""
-    n = len(ctx.tool_calls) + len(R_TOOL_CALL.findall(ctx.prompt_text))
+    n = len(ctx.tool_calls) + len(_tool_calls_in(ctx.prompt_text))
     return n >= 2
 
 
@@ -960,7 +980,7 @@ def invented_argument_in_tool_call(ctx: Ctx) -> Optional[bool]:
 def two_distinct_tools_called(ctx: Ctx) -> Optional[bool]:
     """Distinct tool NAMES across the whole sample. One tool plus an estimate is the failure."""
     names = {n for n, _ in ctx.tool_calls}
-    names |= {m.group(1).strip() for m in R_TOOL_CALL.finditer(ctx.prompt_text)}
+    names |= {n for n, _ in _tool_calls_in(ctx.prompt_text)}
     return len(names) >= 2
 
 

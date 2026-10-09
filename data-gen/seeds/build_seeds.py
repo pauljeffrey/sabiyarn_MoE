@@ -80,7 +80,7 @@ ASSISTANT_FORMAT = {
     "plain": "<|input_lang|>{src}<task_plan>{verbs}</task_plan><|target_lang|>{tgt}<response>{text}",
     "with_think": ("<|input_lang|>{src}<think>{reasoning}</think>"
                    "<task_plan>{verbs}</task_plan><|target_lang|>{tgt}<response>{text}"),
-    "tool_call": "<|input_lang|>{src}<think>{reasoning}</think><tool_call>{name}\n{arguments_json}</tool_call>",
+    "tool_call": '<|input_lang|>{src}<think>{reasoning}</think><tool_call>{{"name": "{name}", "arguments": {arguments_json}}}</tool_call>',
     "notes": (
         "src/tgt are language tags like <yor>; for translation they differ and must match the real "
         "direction. A turn that calls a tool emits ONLY the tool_call form (no <response>); the tool result "

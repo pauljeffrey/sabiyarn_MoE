@@ -108,7 +108,7 @@ def test_structure_of_round_trips():
 def test_structure_of_handles_a_tool_calling_turn():
     """A tool call has no target language or response, so the scaffold stops where the turn does."""
     s = structure_of("<|input_lang|><eng><task_plan><|plan|><|RAG|></task_plan>"
-                     '<tool_call>search_documents\n{"query":"x"}</tool_call>')
+                     '<tool_call>{"name": "search_documents", "arguments": {"query": "x"}}</tool_call>')
     assert "<|target_lang|>" not in s and "<response>" not in s
     assert "<task_plan><|plan|><|RAG|></task_plan>" in s
 

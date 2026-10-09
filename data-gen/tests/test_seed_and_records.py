@@ -450,7 +450,7 @@ def test_sft_record_keeps_both_representations(seeds):
     assert isinstance(r["messages"], list) and len(r["messages"]) == 9           # dict form
     assert r["confidence"] == 0.9
     assert r["text"].startswith("<s><|system|>") and r["text"].endswith("</s>")  # rendered form
-    assert "<tool_call>search_internet" in r["text"] and "<tool_response>" in r["text"]
+    assert "<tool_call>{\"name\": \"search_internet\"" in r["text"] and "<tool_response>" in r["text"]
     assert "knowledge-boundary" in r["tags"]
     assert r["instruction"] == "O se." and "Amazon" in r["context"]
 

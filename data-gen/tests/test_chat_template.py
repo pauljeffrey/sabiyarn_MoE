@@ -20,8 +20,9 @@ sys.path.insert(0, str(HERE))
 
 from config.settings import CHAT_TEMPLATE_PATH  # noqa: E402
 
+# newest snapshot last (by modification time -- snapshot directory names are commit hashes, so name order means nothing)
 TOKENIZER_DIRS = sorted(
-    Path.home().glob(".cache/huggingface/hub/models--BeardedMonster--SabiYarn-32k/snapshots/*"))
+    Path.home().glob(".cache/huggingface/hub/models--BeardedMonster--SabiYarn-32k/snapshots/*"), key=lambda p: p.stat().st_mtime)
 
 
 def _vocab() -> set[str]:
