@@ -349,6 +349,14 @@ Writes `eval_results/<name>/results.json`, `summary.md` (language × task table)
 - **Evals use a fixed set of windows** (the same ones every time, never advancing the training stream), so eval curves are comparable across steps instead of carrying fresh sampling noise; the "train" eval mixes the training bins.
 - Logged per step: `epochs_by_bin` (fractional epochs, e.g. `{"eng_training": 0.37, "training_cleaned": 1.2}`); MLflow: `train/epoch_<bin>`.
 
+### 2.11b Three train bins, tokens-seen log, stratified eval
+
+- **Third train bin.** `data.pretrain` lists `[eng_training.bin, training_cleaned.bin, other_african_pretrain.bin]` and `data.sampling` has three weights (`eng_sampling_weight` 0.15, `afr_sampling_weight` 0.55, `other_afr_sampling_weight` 0.30 — normalised, so only the ratio matters). `other_afr_sampling_weight` defaults to 0, which is exactly the old two-bin run; a bin with weight 0 is never opened (its file may be absent). A scheduled `schedule` point is `[progress, afr]` or `[progress, afr, other]` (eng = 1 − afr − other; a point without the 3rd number means other = 0). The bin is named `other_african_pretrain` in `tokens_seen_by_bin` / `train/epoch_<bin>`. **Re-run `python -m data.prefetch_bins --mode pretrain --write-env`** (or `modal run data/prefetch_bins_modal.py`) so `TRAIN_DATA_PATHS_LOCAL` lists three paths — a stale two-path env with a positive third weight stops at startup with that hint.
+- **Tokens seen.** Every micro-batch adds `batch × block_size × world` tokens to `tokens_seen` and to its bin. They go into `trainer_state.json` at **every** checkpoint save (`tokens_seen`, `tokens_seen_offset`, `tokens_seen_lifetime`, `tokens_seen_by_bin`, plus `best_tokens_seen*` so `resume_from: best` restores exact counts) and are pushed to S3 with it; a checkpoint without them falls back to `iter_num × tokens_per_step` and logs `tokens_seen_estimated=true`. Logged at every `log_interval` to the console `step` line, wandb and MLflow as `tokens_seen`, `tokens_seen_lifetime`, `tokens_seen/<bin name>` (raw token counts; `fresh_start` folds the run's total into the lifetime offset).
+- **Stratified eval.** `eval_data_path: datasets/validation_v2.bin` = the old `validation.bin` (segment `old`, ~1.8B tokens) + ~13M tokens of multilingual validation text, described by `datasets/validation_v2_manifest.json` (`training.eval_manifest_path`, downloaded from S3 next to the bin and passed as `EVAL_MANIFEST_PATH`):
+  `{"dtype":"uint16","total_tokens":N,"segments":[{"name":"old","start":0,"end":1800000000},{"name":"zul","start":1800000000,"end":1801000000}, ...]}` (contiguous, covering the file; names other than `old` are language codes; checked against the bin's size at startup).
+  `training/eval_plan.py` builds one FIXED plan of `eval_total_blocks` (500 ≈ 2.05M tokens at 4096) blocks that never cross a segment boundary: `round(500 × eval_old_share)` (0.4 → 200) from `old` at equally spaced offsets over the whole segment, the rest shared equally by the languages (a language holding fewer full blocks is capped and its shortfall goes to the others), equally spaced inside each. Blocks are split over ranks round-robin. Logged at every eval: `val_loss` (token-weighted over all blocks — what best-checkpoint selection uses), `val_loss_old` (comparable with earlier runs), `val_loss_lang_macro` (unweighted mean over languages), `val_loss/<lang>` and `val_bpb/<lang>`. The resume sanity batch is drawn from the `old` segment only, so its saved loss/hash still match checkpoints from the old `validation.bin`. `eval_manifest_path: null` restores the original eval (`eval_iters × batch` random fixed blocks of `eval_data_path`).
+
 ### 2.12 Generating synthetic data (`data-gen/`)
 
 Independent of the training code (own README, own venv). Besides the six tool-use/task generators it now builds three larger, **diversity-sampled** datasets for the 12 non-English languages with `gpt-4o-mini` through the OpenAI Batch API: **pretraining documents**, **Alpaca-style SFT** (`instruction`/`input`/`response` over ~33 standard task types) and **DPO pairs** (`instruction`/`input`/`chosen`/`rejected` with a sampled flaw type).
@@ -369,7 +377,7 @@ Sample counts per language live in `data-gen/configs/{pretrain,sft,dpo}.yaml` (p
 
 ### 2.13 The chat template (one source of truth)
 
-`sabiyarn/chat_template.jinja` is the canonical template. `data-gen/templates/chat_template.jinja` (which renders the SFT/DPO data) must be byte-identical — `tests/test_chat_template.py` fails if they drift. Anything that builds prompts (`eval_suite --style chat`, `rl/`, `rlhf/`) calls `sabiyarn.chat.use_sabiyarn_chat_template(tokenizer)` instead of trusting the copy on the Hub tokenizer, which can be stale. The template renders exactly `<s><|system|>…</s><|user|>…</s><|assistant|>answer</s>` with **no stray whitespace**, and the generation prompt is an exact prefix of the training text (both are tested). **After changing the template, push it to the tokenizer repo** so other users get it: `tokenizer.chat_template = sabiyarn.chat.load_chat_template(); tokenizer.push_to_hub("BeardedMonster/SabiYarn-32k")`. Note the template renders tool results as `<tool_result>…</tool_result>` while the tokenizer's special tokens include `<tool_call>`; make sure the token you want for results exists before generating tool-use data.
+`sabiyarn/chat_template.jinja` is the canonical template. `data-gen/templates/chat_template.jinja` (which renders the SFT/DPO data) must be byte-identical — `tests/test_chat_template.py` fails if they drift. Anything that builds prompts (`eval_suite --style chat`, `rl/`, `rlhf/`) calls `sabiyarn.chat.use_sabiyarn_chat_template(tokenizer)` instead of trusting the copy on the Hub tokenizer, which can be stale. The template renders exactly `<s><|system|>…</s><|user|>…</s><|assistant|>answer</s>` with **no stray whitespace**, and the generation prompt is an exact prefix of the training text (both are tested). A tool-call assistant turn renders its content (the `<|input_lang|>..<task_plan>..</task_plan>` scaffold) before `<tool_call>`, so tool turns have the same structure as every other assistant turn (`tests/test_chat_template.py::test_tool_call_turn_keeps_the_scaffold_before_the_call`). **After changing the template, push it to the tokenizer repo** so other users get it: `tokenizer.chat_template = sabiyarn.chat.load_chat_template(); tokenizer.push_to_hub("BeardedMonster/SabiYarn-32k")`. Note the template renders tool results as `<tool_result>…</tool_result>` while the tokenizer's special tokens include `<tool_call>`; make sure the token you want for results exists before generating tool-use data.
 
 ### 2.14 Post-training: DPO, reward-based RL, SFT warm-start (`rl/`)
 
@@ -408,9 +416,86 @@ python -m eval_suite.run --model outputs/rlhf/final --tasks translation --style 
 
 Why a second environment: `unbabel-comet` pins `transformers<5`, `huggingface_hub<1`, `numpy<2`, which cannot coexist with the `transformers==5.14.1` this repo's model code needs. Its pins live in **`rlhf/requirements.txt`** — install them into their own virtualenv, never next to the root `requirements.txt`. `--system-site-packages` reuses the torch you already have (~2.5 GB saved). `rl/comet_worker.py` runs in that environment and talks to the trainer over a pipe (one worker per GPU rank); nothing else changes. On Modal, `modal run rl/modal_rl.py --config rlhf/configs/default.yaml` builds that venv into the image automatically and wires `reward_python` to it. `rlhf/configs/default.yaml` now starts from `Aletheia-ng/SabiYarn_MoE-280M` (was `google/gemma-3-270m-it`). AfriCOMET is a **learned, reference-based** metric: optimising it hard finds its blind spots. Keep `kl_coef` on, and judge progress on chrF++/BLEU from `eval_suite` (not used as a reward) and by reading samples. If the reward rises while chrF++ falls, raise `kl_coef` or stop earlier.
 
+**Scaffold + content reward** (`reward=structured_africomet`, `rl/structure.py`, `StructuredTranslationReward` in `rl/rewards.py`). The model's turn is `<|input_lang|><src><task_plan><translate></task_plan><|target_lang|><tgt><response>CONTENT</s>`. The scaffold has one right answer, so it is matched field by field, not with BLEU/chrF (on one-token fields they are just 0 or 1): input and target language tags exactly; the tokens inside `<task_plan>` as an **unordered multiset (F1, partial credit)**; and structure = 0.6·order + 0.2·clean + 0.2·closed, where **order of the landmarks matters** (`<|input_lang|>` < `<task_plan>` < `</task_plan>` < `<|target_lang|>` < `<response>`, graded by the longest correctly-ordered subsequence) and only the order *inside* the plan is free. The content after `<response>` is scored by **reference-free AfriCOMET-QE** on (source, translation) — no reference is needed (`reward_use_reference=true` switches rows that have one to the reference model + a chrF++ anchor) — with a length guard and a zero for copying the source. `R = w_f·R_format + (1−w_f)·gate·R_content`, `w_f = reward_format_weight = 0.2`, so the translation carries 80%; the gate opens only when the target tag is right and the content non-empty and clean. **Shaping** (`reward_shaping=threshold`, default): `R < 0.46` becomes a large negative number (down to −2) and `R ≥ 0.46` a positive one up to +2 (0.46 is where AfriCOMET-QE output stops being gibberish); it is monotone, so the best completion in a group is unchanged, but bad samples are pushed down hard and the zero point sits at the acceptance bar (`reward_threshold`, `reward_negative_scale`; `none` keeps [0, 1]). Completions are decoded **with** special tokens for this reward; the trainer logs `train/fmt_*`, `train/gate_rate`, `train/content_mean_gated`. Data: the AfriCOMET RL dataset carries `output_structure` and `text`; `rlhf/translation.py` builds records without a system turn, matching the SFT `text`. `reward=structured_chrf` runs the same wiring with no COMET install.
+
+**Per-language shaping** (`reward_shaping=calibrated`, the default; `adaptive` once it plateaus; `rl/shaping.py`, `rlhf/scripts/calibrate_shaping.py`). A single fixed threshold cannot be right for every pair: on FLORES+ (42 pairs, AfriCOMET-QE) human translations score a median of 0.76 for Afrikaans but 0.49 for Wolof→Swahili, so fixed anchors would favour the easy languages. `calibrate_shaping.py` measures, per pair: **t_fail = max(0.46, P90 of QE on fluent-but-wrong (mismatched) translations)** — a wrong sentence must never land above the failure line (a mismatched sentence scores ~0.44-0.46, a half-omitted one ~0.42, and output below ~0.46 was hand-checked as gibberish); **t_mid / t_great = P50 / P90 of QE on human references**; the **AUC** with which QE separates the human reference from a mismatched one (and from a copy of the source and a half-omitted reference); and a **reliability** = clip((AUC−0.65)/0.25, 0, 1). The content curve maps QE to a −2 … +2 reward: −2 at 0 → 0 at `t_fail` → +1 at `t_mid` → +2 at `t_great` → +2.25 at 1 (above what humans score earns almost nothing: that is where a learned metric is gamed). Pairs with AUC < 0.7 are **excluded**: their prompts are dropped from the RL data (`rlhf/translation.py`) and, if any slip through, they get scaffold-only reward and zero advantage weight. Remaining pairs' advantages are multiplied by their reliability (done on the advantage because per-group standardisation cancels any per-pair scale on the reward). Workflow: after SFT run `python rlhf/scripts/calibrate_shaping.py --bench <FLORES+ pairs jsonl> --model outputs/translate-sft/final --reward-python .venv-comet/bin/python --out outputs/shaping.json` (also reports where the SFT model sits against each pair's anchors), then train with `reward_calibration_path=outputs/shaping.json`. `adaptive` keeps `t_fail` fixed and lets `t_mid`/`t_great` follow rolling P50/P90 of the policy's own scores per pair (200-score warm-up on the calibrated anchors). With no calibration file the default anchors `reward_default_anchors` (0.46,0.60,0.75) apply to every pair and a warning is printed.
+
+**Rejection sampling instead of RL** (`algo=rs`, `rl/rejection_sampling.py`; toggle with `rs_mode`). Use the same AfriCOMET reward only to choose which text to train on, then run ordinary SFT on it:
+
+```bash
+# A. filter an existing SFT translation set by AfriCOMET-QE (no model, no sampling): keeps the top rs_filter_keep_frac of every language pair
+python rlhf/scripts/run_rlhf.py algo=rs rs_mode=filter rs_filter_keep_frac=0.5 rs_input='hub://BeardedMonster/sft-new/data/translation-multi-open-*/*.parquet' out_dir=outputs/rs
+# B. best-of-N from the current policy: sample rs_n, keep the best rs_keep_top that clear rs_min_reward, write SFT records
+python rlhf/scripts/run_rlhf.py algo=rs rs_mode=best_of_n rs_n=8 model_path=outputs/translate-sft/final reward=structured_africomet out_dir=outputs/rs
+# then SFT on the written jsonl (its `messages` column) and repeat B with the new model for another round
+python -m rl.run --algo sft data_path=outputs/rs/rs_best_of_n.jsonl model_path=outputs/translate-sft/final
+```
+
+Why it works: RL's gradient is E[(R − baseline)·∇log π]. Replace the advantage by "is this sample in the top-k and above the bar" and the gradient is just maximum likelihood on the accepted samples, so the policy is pulled toward its own best outputs. It gives up pushing *down* on bad samples and only sees what the model already samples (diversity narrows over rounds); it gains stability — no KL to tune, no reward hacking inside a run (a bad reward mislabels one round of data, and you can read the file before training), trivial to resume, one GPU.
+
 **Batched generation and padding.** Positions are learned and absolute, so left-padded batches need per-row positions; `generate()` now derives them from the attention mask (regression-tested against one-prompt-at-a-time generation). A 2D `attention_mask` is now combined with the causal mask — earlier versions let padded/masked forward passes (including `generate()` prefill with an all-ones mask) attend to future tokens, so **re-run evals of anything generated with a 2D mask on older code**. Training itself (no mask, or the document mask) was never affected.
 
 ---
+
+### SFT-only model growth (never during continuous pretraining)
+
+The model that continuous pretraining builds is untouched: `sabiyarn/model/config.json` / `configuration.py` still say 52050 x 32768. Before the first
+SFT step the trainer grows the loaded base model (`sabiyarn/model/resize.py`, `Trainer._resize_for_sft` in `training/new_train.py`), driven by keys that
+exist only with the `sft_` prefix in `training/train_config.yaml`:
+
+| key | value | meaning |
+|---|---|---|
+| `sft_resize_vocab_size` | 52160 | token embedding (and the tied `lm_head`) 52050 -> 52160 rows: 52117 tokenizer ids (highest is `<POS>` = 52116) rounded up to a multiple of 64. +0.1M parameters. New rows start as the mean of the old rows plus 0.1 x their std |
+| `sft_resize_block_size` | 0 | 0 = keep the 32768-row position table. wpe costs 768 parameters per row: 32768 rows = 25.2M (8% of the model); 49152 would add 12.6M, 65536 add 25.2M. No sample in the SFT data is longer than 32768 tokens, so nothing is gained by growing it unless you add longer data |
+| `sft_fill_positions_from` | 4096 | pretraining only trained `wpe[:4096]`; the rows after it are re-guessed by the regressor below (fresh start only, never when resuming) |
+
+A resumed SFT checkpoint already has the grown shapes, so the resize is a no-op and the state dict loads strictly. SFT loss now covers EVERY assistant turn
+of a sample and nothing else (`process_sft_labels_turns` in `training/label_masking.py`): system and user turns, the `<|assistant|>` marker and above all
+`<tool_response>` turns (text the environment wrote) are masked. The masking is applied to the batch at training time; the bins hold plain tokens.
+
+**Position regressor** (`sabiyarn/model/position_regressor.py`): PCA on the trained position rows (99.5% of the variance, at most 128 components),
+a small MLP from position (scalar + 16 sin/cos frequencies) to every PCA coordinate, then the PCA is inverted to full width. `fit` holds out the last
+15% of the trained range, extrapolates it from the head, and reports the error next to two trivial baselines (the mean row, the last row);
+`fill_untrained_positions` writes nothing unless the regressor beat both. To check how many rows pretraining really trained (instead of assuming 4096):
+
+```python
+from sabiyarn.model.position_regressor import estimate_trained_rows
+estimate_trained_rows(model.transformer.wpe.weight)     # length of the prefix that left its N(0, 0.02) initialisation
+```
+
+### The assistant turn
+
+```
+<|input_lang|><lang of the instruction><lang of the text>[<think>..</think>]<task_plan>[domain flag]<verb>[label|<tag>]</task_plan><|target_lang|><tgt><response>CONTENT
+```
+
+`<|input_lang|>` lists EVERY language present in the user turn, in reading order, once each (at most 3): `<ibo><efi>` = an Igbo instruction before an Efik text,
+`<efi><ibo>` when the instruction comes after the text, `<eng>` when the whole turn is English. `<|input_lang|> unsure, but most likely <yor>` is written
+when language ID cannot settle a language we support. Tool use happens inside ONE assistant turn, in the standard JSON shape (full contract for anyone building data, rewards or a serving loop: `docs/TOOL_CALL_FORMAT.md`):
+`<|assistant|><scaffold><tool_call>{"name": "f", "arguments": {...}}</tool_call><tool_response>RESULT</tool_response><scaffold><response>ANSWER</response></s>`.
+`</tool_call>` ends what the model generates (it is a stop token); `<tool_response>..</tool_response>` is written by the tool and masked from the loss; the turn's only `</s>` comes after the final answer. Function definitions are passed as `tools` and rendered as `<tools>`/`</tools>` lines in the system turn.
+
+### Pretrain additions and the tail of the bin
+
+`python -m sft_new.pretrain_add --run NAME ... --out DIR --push` adds documents to `BeardedMonster/pretrain-new`. Nigerian English news (`naijaweb`, `naijaweb-edu`,
+`naijaweb-edu2`) goes to `data/eng-tail/` and `data/prepare_unimax.py` appends that folder to the END of `other_african_pretrain.bin`, after the shuffled
+body: tokenize it with `--langs eng-tail`, leave it out of `plan`; `assemble` appends it (no UniMax share, no validation split, one end-of-text per document).
+Plain text left over from the SFT conversions (task not certain, or the `*_monolingual` files of naija/naija2) goes to `pretrain-new/late/<lang>/`, which the bin
+builder never reads until you move it.
+
+### Building the combined SFT dataset
+
+```bash
+cd data-gen
+export HF_HOME=/path/to/scratch/hf            # required: the run deletes this cache after every converter, so it must not be your own
+python -m sft_new.combine --list              # every converter and what it reads
+python -m sft_new.samples NAME --limit 300    # look at converted rows before committing to a full run (writes nothing to the Hub)
+python -m sft_new.combine --run [NAME ...] --out /path/to/scratch/sft-all --push      # stream, convert, dedupe (hash), push, delete
+python -m sft_new.combine --stats /path/to/scratch/sft-all                             # tasks and language pairs written
+```
+
+See `data-gen/sft_new/SAMPLES.md` for converted examples of every source, and the module docstrings of `old_format.py`, `tagged_parse.py`,
+`langdetect.py` and `converters.py` for the rules (language certainty levels, the `unsure, but most likely` form, what is dropped and why).
 
 ## 3. Tests
 
