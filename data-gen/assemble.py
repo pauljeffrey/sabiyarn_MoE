@@ -55,12 +55,12 @@ def structure_of(assembled: str) -> str:
         verbs = _re.findall(r"<\|?[A-Za-z_]+\|?>", plan.group(1))
         if verbs:
             out.append("<task_plan>" + "".join(verbs) + "</task_plan>")
-    call = _re.search(r"<tool_call>([^\n<]*)", assembled or "")
+    call = _re.search(r'<tool_call>\s*(?:\{"name":\s*"([^"]*)"|([^\n<{]*))', assembled or "")          # JSON object (standard) or the legacy "name\\nargs"
     tgt = _re.search(r"<\|target_lang\|><([a-z]{2,4})>", assembled or "")
     if tgt:
         out.append(f"<|target_lang|><{tgt.group(1)}>")
     if call:
-        out.append(f"<tool_call>{call.group(1).strip()}</tool_call>")
+        out.append(f"<tool_call>{(call.group(1) or call.group(2) or '').strip()}</tool_call>")
     elif "<response>" in (assembled or ""):
         label = _re.search(r"<response>\s*(<[a-zA-Z_]+>)", assembled or "")
         out.append("<response>" + (label.group(1) if label else ""))
@@ -250,9 +250,15 @@ def split_verbs(items: list[str]) -> list[str]:
     return out
 
 
+UNSURE = " unsure, but most likely "
+# <|input_lang|> lists EVERY language present in the user's turn, in the order they appear (instruction language, then the language of the
+# text it is about, or the reverse when the instruction comes after the text); one tag when the whole turn is in one language.
+MAX_INPUT_LANGS = 3
+
+
 def assistant_content(
     *,
-    input_lang: str,
+    input_lang: "str | list[str]",
     target_lang: Optional[str] = None,
     think: Optional[str] = None,
     task_plan: Optional[list[str]] = None,
@@ -260,11 +266,23 @@ def assistant_content(
     label_token: Optional[str] = None,
     is_tool_call: bool = False,
     sequence_labels: bool = False,
+    unsure_input: bool = False,
+    unsure_target: bool = False,
 ) -> str:
-    """Build one assistant turn's content. Raises AssemblyError on anything it cannot build correctly."""
-    if input_lang not in VALID_LANGS:
-        raise AssemblyError(f"input_lang {input_lang!r} is not a supported language tag")
-    parts = [f"<|input_lang|><{input_lang}>"]
+    """Build one assistant turn's content. Raises AssemblyError on anything it cannot build correctly.
+
+    unsure_input / unsure_target: the language is the best guess, not a certainty (language detection could not settle it
+    but the language is one we support). It is written in the turn as `<|input_lang|> unsure, but most likely <yor>` so the
+    model learns to hedge instead of asserting a tag."""
+    langs = [input_lang] if isinstance(input_lang, str) else list(input_lang)
+    if not langs or len(langs) > MAX_INPUT_LANGS:
+        raise AssemblyError(f"input_lang needs 1..{MAX_INPUT_LANGS} languages, got {langs!r}")
+    for lg in langs:
+        if lg not in VALID_LANGS:
+            raise AssemblyError(f"input_lang {lg!r} is not a supported language tag")
+    if len(set(langs)) != len(langs):
+        raise AssemblyError(f"input_lang repeats a language: {langs!r}")
+    parts = [f"<|input_lang|>{UNSURE if unsure_input else ''}" + "".join(f"<{lg}>" for lg in langs)]
 
     if think:
         t = _check_plain(think, "think")
@@ -299,7 +317,7 @@ def assistant_content(
             f"response is {len(body)} chars, over the ~{MAX_RESPONSE_TOKENS}-token budget for "
             f"{target_lang} ({budget} chars). Each response must be complete and self-contained within it, "
             f"not truncated.")
-    parts.append(f"<|target_lang|><{target_lang}><response>")
+    parts.append(f"<|target_lang|>{UNSURE if unsure_target else ''}<{target_lang}><response>")
     if label_token:
         tok = LABEL_TOKENS.get(label_token, label_token)
         if tok not in LABEL_TOKENS.values():

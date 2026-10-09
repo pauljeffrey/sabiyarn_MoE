@@ -24,7 +24,7 @@ from __future__ import annotations
 import random
 from dataclasses import dataclass
 
-LANGS = ("eng", "pcm", "yor", "hau", "ibo", "fon", "ewe", "twi", "efi", "ibb")
+LANGS = ("eng", "pcm", "yor", "hau", "ibo", "fon", "ewe", "twi", "efi", "ibb", "urh")
 
 # Names used when a language is *mentioned* inside an instruction.
 DISPLAY_NAMES: dict[str, list[str]] = {
@@ -38,6 +38,19 @@ DISPLAY_NAMES: dict[str, list[str]] = {
     "twi": ["Twi"],
     "efi": ["Efik", "Efịk"],
     "ibb": ["Ibibio"],
+    "urh": ["Urhobo"],
+    "kin": ["Kinyarwanda"],
+    "sna": ["Shona", "chiShona"],
+    "zul": ["Zulu", "isiZulu"],
+    "swh": ["Swahili", "Kiswahili"],
+    "orm": ["Oromo", "Afaan Oromoo"],
+    "wol": ["Wolof"],
+    "xho": ["Xhosa", "isiXhosa"],
+    "tsn": ["Tswana", "Setswana"],
+    "nya": ["Chewa", "Chichewa", "Nyanja"],
+    "afr": ["Afrikaans"],
+    "som": ["Somali", "Soomaali"],
+    "sot": ["Sesotho", "Southern Sotho"],
 }
 # How the word for English reads in an instruction written in that language (confident cases only).
 LOCALIZED_ENGLISH = {"yor": "Gẹ̀ẹ́sì", "hau": "Turanci", "ibo": "Bekee"}
@@ -297,3 +310,10 @@ def compose_prompt(instruction: Instruction, text: str, rng: random.Random) -> s
         sep = rng.choice(["\n\n", "\n", "\n\n", " "] if not instruction.text.endswith(":") else ["\n", "\n\n", " "])
         return f"{instruction.text}{sep}{text}"
     return f"{text}{rng.choice(['\n\n', '\n', ' '])}{instruction.text}"
+
+
+def input_lang_tags(src: str, instruction_lang: str | None, position: str) -> str:
+    """The <|input_lang|> field for a request: every language of the user turn in reading order, once each ("<ibo><efi>" = Igbo instruction,
+    then Efik text; "<efi><ibo>" when the instruction is appended). Mirrors rl.structure.input_lang_tags (a test keeps the two equal)."""
+    langs = [src] if not instruction_lang or instruction_lang == src else ([instruction_lang, src] if position != "append" else [src, instruction_lang])
+    return "".join(f"<{l}>" for l in langs)

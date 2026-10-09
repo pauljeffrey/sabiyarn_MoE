@@ -30,7 +30,7 @@ NEW_LANGS = ["afr", "zul", "sna", "nya", "xho", "sot", "kin", "tsn", "orm", "wol
 LANGS = ["pcm", "yor", "hau", "ibo", "fon", "ewe", "twi", "efi", *NEW_LANGS, "eng"]
 FINAL_COLUMNS = ["instruction", "input", "response", "source_lang", "targ_lang", "id", "prompt", "instruction_position",
                  "instruction_language", "template_confidence", "n_sentences", "src_tokens", "source_dataset",
-                 "source_license", "source_kind", "africomet_supported"]
+                 "source_license", "source_kind", "africomet_supported", "output_structure", "text"]
 
 
 def _priority_by_slug() -> dict[str, int]:
@@ -156,7 +156,7 @@ def render_shard(out: Path, lang: str, i: int, free_weights: dict[str, float], s
     import pyarrow as pa
     import pyarrow.parquet as pq
     from .build import rng_for
-    from .instructions import compose_prompt, instruction_languages, make_instruction
+    from .instructions import compose_prompt, input_lang_tags, instruction_languages, make_instruction
     from .sources import AFRICOMET_SUPPORTED
     t = pa.concat_tables([pq.read_table(p) for p in sorted((out / "tmp" / lang / f"{i:05d}").glob("*.parquet"))])
     n = t.num_rows
@@ -181,12 +181,16 @@ def render_shard(out: Path, lang: str, i: int, free_weights: dict[str, float], s
         tgt = targets[j]
         ins = make_instruction(ins_langs[j], lang, tgt, rng)
         sup = lang in AFRICOMET_SUPPORTED and tgt in AFRICOMET_SUPPORTED
+        prompt_j = compose_prompt(ins, text[j], rng)
         for k, v in (("instruction", ins.text), ("input", text[j]), ("response", ref[j] or ""), ("source_lang", lang),
                      ("targ_lang", tgt), ("id", f"{lang}-{tag}-{i:04d}-{j:06d}"),
-                     ("prompt", compose_prompt(ins, text[j], rng)), ("instruction_position", ins.position),
+                     ("prompt", prompt_j), ("instruction_position", ins.position),
                      ("instruction_language", ins.language), ("template_confidence", ins.confidence),
                      ("n_sentences", ks[j]), ("src_tokens", toks[j]), ("source_dataset", src[j]),
-                     ("source_license", lic[j]), ("source_kind", kind[j]), ("africomet_supported", sup)):
+                     ("source_license", lic[j]), ("source_kind", kind[j]), ("africomet_supported", sup),
+                     # what the policy must emit before the translation, and the exact string that is tokenized as the prompt
+                     ("output_structure", f"<|input_lang|>{input_lang_tags(lang, ins.language, ins.position)}<task_plan><translate></task_plan><|target_lang|><{tgt}><response>"),
+                     ("text", f"<s><|user|>{prompt_j}</s><|assistant|>")):
             cols[k].append(v)
         stats["pairs"][f"{lang}>{tgt}"] += 1
     stats["rows"][lang] += n

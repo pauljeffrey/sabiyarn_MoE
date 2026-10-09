@@ -92,7 +92,7 @@ def split_sentences(text: str) -> list[str]:
 
 
 def good_sentence(
-    s: str, *, min_words: int = 3, max_words: int = 90, require_terminal: bool = False,
+    s: str, *, min_words: int = 3, max_words: int = 90, require_terminal: bool = False, lenient: bool = False,
 ) -> bool:
     """Cheap hygiene filter: drops markup remnants, URLs, headings, tables, mostly-numeric and all-caps lines."""
     words = s.split()
@@ -100,14 +100,15 @@ def good_sentence(
         return False
     if _URLISH.search(s) or _MARKUP.search(s) or _PII.search(s):
         return False
-    if len(words) >= 8 and len({w.lower() for w in words}) / len(words) < 0.45:     # "buy buy buy ..." spam
+    if len(words) >= 8 and len({w.lower() for w in words}) / len(words) < (0.25 if lenient else 0.45):     # "buy buy buy ..." spam
         return False
     letters = [c for c in s if c.isalpha()]
-    if len(letters) < 8:
+    if len(letters) < (4 if lenient else 8):
         return False
-    if sum(c.isdigit() for c in s) / max(1, len(s)) > 0.25:
+    # lenient: Bible verses and citations carry many digits and capitals; keep them
+    if sum(c.isdigit() for c in s) / max(1, len(s)) > (0.5 if lenient else 0.25):
         return False
-    if sum(c.isupper() for c in letters) / len(letters) > 0.5:
+    if sum(c.isupper() for c in letters) / len(letters) > (0.85 if lenient else 0.5):
         return False
     if require_terminal and not s.rstrip(_CLOSERS).endswith((".", "!", "?", "…")):
         return False

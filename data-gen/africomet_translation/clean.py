@@ -28,6 +28,9 @@ from pathlib import Path
 
 import numpy as np
 
+# Low-resource languages whose clean data is scarce: they keep verse numbers and scripture references and are only
+# rejected for clearly broken text (mojibake, near-empty, runaway repetition, mostly English).
+LENIENT = frozenset({"pcm", "efi", "ibb", "fon", "urh", "twi", "ewe"})
 SCORED_KINDS = {"web"}
 # Hand-translated or edited human text only. Encyclopedia is excluded: low-resource Wikipedias (Igbo especially) are
 # themselves partly machine-translated, and a classifier trained on them cannot tell MT from prose.
@@ -63,6 +66,12 @@ _WORD = re.compile(rf"{_LET}+(?:['’\-]{_LET}+)*", re.UNICODE)
 def clean_sentence(s: str, lang: str) -> str:
     s = unicodedata.normalize("NFC", s).strip()
     s = _BULLET.sub("", s)
+    if lang in LENIENT:                     # keep "12:20", "(1 Kọr. 3 : 6)" and trailing citations: they are content here
+        s = _ELLIPSIS_SP.sub("...", s)
+        s = _PUNCT_RUN.sub(lambda m: m.group(1) * (3 if m.group(1) == "." else 1), s)
+        s = re.sub(r"(?<=[^\W\d_,.;:!?])\+(?=[\s,.;:!?]|$)|(?<=[,.;:!?])\+", "", s)
+        s = _SPACE_PUNCT.sub(r"\1", s)
+        return re.sub(r"\s{2,}", " ", _OPEN_SPACE.sub(r"\1", s)).strip()
     if lang != "eng":
         s = _LEAD_NUM.sub("", s)
     s = _SCRIPTURE.sub("", s)
@@ -77,7 +86,37 @@ def clean_sentence(s: str, lang: str) -> str:
     return re.sub(r"\s{2,}", " ", s).strip()
 
 
+def _reject_lenient(text: str, lang: str) -> str | None:
+    n_chars = len(text)
+    if n_chars < 10:
+        return "short"
+    if _MOJIBAKE.search(text):
+        return "mojibake"
+    if sum(c.isalpha() or unicodedata.category(c) == "Mn" for c in text) / n_chars < 0.45:
+        return "few_letters"
+    words = _WORD.findall(text)
+    nw = len(words)
+    if nw < 2:
+        return "few_words"
+    if not 1.8 <= sum(map(len, words)) / nw <= 16:
+        return "word_length"
+    low = [w.lower() for w in words]
+    if nw >= 12 and len(set(low)) / nw < 0.25:
+        return "repetition"
+    if any(low[i] == low[i + 1] == low[i + 2] == low[i + 3] for i in range(nw - 3)):
+        return "repetition"
+    if any(unicodedata.category(c) in ("Cs", "Co") for c in text):
+        return "symbols"
+    if sum(not c.isalnum() and not c.isspace() for c in text) / n_chars > 0.35:
+        return "punctuation"
+    if lang != "pcm" and nw >= 8 and sum(w in _EN_STOP for w in low) / nw > 0.30:
+        return "english_leak"
+    return None
+
+
 def reject_reason(text: str, lang: str, kind: str = "web") -> str | None:
+    if lang in LENIENT:
+        return _reject_lenient(text, lang)
     """None if the window passes the rule-based checks, else a short reason (used for the stats report)."""
     n_chars = len(text)
     if n_chars < 20:
@@ -226,6 +265,16 @@ def clean_file(path: str, lang: str, out_dir: str, threshold: float = THRESHOLD)
     keep = []
     for r in rows:
         stats["in"] += 1
+        r.setdefault("ref", "")
+        r.setdefault("ref_lang", "")
+        if r["ref"]:                       # aligned pair: never re-split (would break the alignment); rules only
+            why = reject_reason(r["text"], lang, r["kind"])
+            if why:
+                stats["rej:" + why] += 1
+            else:
+                r["_changed"] = False
+                keep.append(r)
+            continue
         sents = [clean_sentence(s, lang) for s in split_sentences(r["text"])]
         sents = [s for s in sents if s]
         if not sents or len(sents) > 5:
@@ -259,7 +308,7 @@ def clean_file(path: str, lang: str, out_dir: str, threshold: float = THRESHOLD)
     stats["out"] = len(keep)
     dest = out / "clean" / lang / Path(path).name
     dest.parent.mkdir(parents=True, exist_ok=True)
-    cols = {k: [r[k] for r in keep] for k in ("text", "n_sentences", "tokens", "hashes", "source", "license", "kind")}
+    cols = {k: [r[k] for r in keep] for k in ("text", "n_sentences", "tokens", "hashes", "source", "license", "kind", "ref", "ref_lang")}
     from .extract import _schema
     pq.write_table(pa.table(cols, schema=_schema()), dest, compression="zstd")
     return {"file": Path(path).name, "lang": lang, **stats}
